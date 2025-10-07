@@ -98,6 +98,7 @@ members = [
     "crates/ress/protocol",
     "crates/ress/provider",
     "crates/revm/",
+    "crates/research/",
     "crates/rpc/ipc/",
     "crates/rpc/rpc-api/",
     "crates/rpc/rpc-builder/",

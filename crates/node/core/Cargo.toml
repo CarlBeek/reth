@@ -36,6 +36,7 @@ reth-stages-types.workspace = true
 reth-ethereum-forks.workspace = true
 reth-engine-local.workspace = true
 reth-engine-primitives.workspace = true
+reth-research = { path = "../../research", optional = true }
 
 # ethereum
 alloy-primitives.workspace = true
@@ -77,6 +78,7 @@ tokio.workspace = true
 # Features for vergen to generate correct env vars
 jemalloc = ["reth-cli-util/jemalloc"]
 asm-keccak = ["alloy-primitives/asm-keccak"]
+research = ["dep:reth-research"]
 
 [build-dependencies]
 vergen = { workspace = true, features = ["build", "cargo", "emit_and_set"] }

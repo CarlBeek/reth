@@ -5,7 +5,7 @@ use num_traits::Zero;
 use reth_config::config::ExecutionConfig;
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_db::{static_file::HeaderMask, tables};
-use reth_evm::{execute::Executor, metrics::ExecutorMetrics, ConfigureEvm};
+use reth_evm::{execute::Executor, metrics::ExecutorMetrics, ConfigureEvm, Evm};
 use reth_execution_types::Chain;
 use reth_exex::{ExExManagerHandle, ExExNotification, ExExNotificationSource};
 use reth_primitives_traits::{format_gas_throughput, BlockBody, NodePrimitives};
@@ -15,7 +15,7 @@ use reth_provider::{
     LatestStateProviderRef, OriginalValuesKnown, ProviderError, StateWriter,
     StaticFileProviderFactory, StatsReader, StorageLocation, TransactionVariant,
 };
-use reth_revm::database::StateProviderDatabase;
+use reth_revm::{database::StateProviderDatabase, db::CacheDB};
 use reth_stages_api::{
     BlockErrorKind, CheckpointBlockRange, EntitiesCheckpoint, ExecInput, ExecOutput,
     ExecutionCheckpoint, ExecutionStageThresholds, Stage, StageCheckpoint, StageError, StageId,
@@ -90,6 +90,12 @@ where
     exex_manager_handle: ExExManagerHandle<E::Primitives>,
     /// Executor metrics.
     metrics: ExecutorMetrics,
+    /// Research mode configuration (optional)
+    #[cfg(feature = "research")]
+    research_config: Option<reth_research::config::ResearchConfig>,
+    /// Research mode divergence database (optional)
+    #[cfg(feature = "research")]
+    research_db: Option<reth_research::database::DivergenceDatabase>,
 }
 
 impl<E> ExecutionStage<E>
@@ -113,7 +119,23 @@ where
             post_unwind_commit_input: None,
             exex_manager_handle,
             metrics: ExecutorMetrics::default(),
+            #[cfg(feature = "research")]
+            research_config: None,
+            #[cfg(feature = "research")]
+            research_db: None,
         }
+    }
+
+    /// Set research mode configuration.
+    #[cfg(feature = "research")]
+    pub fn with_research_mode(
+        mut self,
+        config: reth_research::config::ResearchConfig,
+        db: reth_research::database::DivergenceDatabase,
+    ) -> Self {
+        self.research_config = Some(config);
+        self.research_db = Some(db);
+        self
     }
 
     /// Create an execution stage with the provided executor.
@@ -247,6 +269,179 @@ where
 
         Ok(())
     }
+
+    /// Check if research mode analysis should run for this block.
+    #[cfg(feature = "research")]
+    fn should_analyze_for_research(&self, block_number: u64) -> bool {
+        if let Some(ref config) = self.research_config {
+            block_number >= config.start_block
+        } else {
+            false
+        }
+    }
+
+    /// Analyze a block by replaying its transactions with the research inspector.
+    #[cfg(feature = "research")]
+    fn analyze_block_with_replay<Provider>(
+        &self,
+        provider: &Provider,
+        block: &reth_primitives_traits::RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
+        normal_result: &reth_execution_types::BlockExecutionResult<<E::Primitives as NodePrimitives>::Receipt>,
+    ) -> Result<(), StageError>
+    where
+        Provider: HeaderProvider + reth_provider::StateProviderFactory,
+    {
+        let Some(ref config) = self.research_config else {
+            return Ok(());
+        };
+
+        let block_number = block.number();
+
+        // Get the state at block N-1 (state before this block was executed)
+        let state_provider = if block_number > 0 {
+            provider.history_by_block_number(block_number - 1)
+                .map_err(|e| StageError::Fatal(Box::new(e)))?
+        } else {
+            // Genesis block - use the current state
+            provider.latest()
+                .map_err(|e| StageError::Fatal(Box::new(e)))?
+        };
+
+        // Wrap in database
+        let db = StateProviderDatabase(state_provider);
+        let mut cache_db = CacheDB::new(db);
+
+        // Create the research inspector
+        let mut inspector = reth_research::inspector::GasResearchInspector::new(
+            config.clone(),
+            block.header().gas_limit(),
+        );
+
+        // Build EVM environment for the block
+        let evm_env = self.evm_config.evm_env(block.header());
+
+        debug!(
+            target: "sync::stages::execution::research",
+            block = block_number,
+            tx_count = block.body().transactions().len(),
+            "Research mode: replaying block with inspector"
+        );
+
+        // Execute each transaction with the inspector
+        // Pattern from RPC trace code: evm_config.tx_env(tx) builds the transaction environment
+        // Use transactions_recovered() to get Recovered<Transaction> which implements IntoTxEnv
+        for tx in block.transactions_recovered() {
+            // Build transaction environment
+            let tx_env = self.evm_config.tx_env(tx);
+
+            // Create EVM with inspector attached
+            let mut evm = self.evm_config.evm_with_env_and_inspector(
+                &mut cache_db,
+                evm_env.clone(),
+                &mut inspector,
+            );
+
+            // Execute the transaction
+            match evm.transact(tx_env) {
+                Ok(_result) => {
+                    // Inspector has accumulated data for this transaction
+                    // Continue to next transaction
+                }
+                Err(e) => {
+                    // Log the error but continue with remaining transactions
+                    // We want to see all transactions, even if some fail in replay
+                    debug!(
+                        target: "sync::stages::execution::research",
+                        block = block_number,
+                        error = ?e,
+                        "Transaction failed in research mode replay"
+                    );
+                }
+            }
+        }
+
+        let tx_count = block.body().transactions().len();
+
+        info!(
+            target: "sync::stages::execution::research",
+            block = block_number,
+            tx_count,
+            gas_used = block.header().gas_used(),
+            sload_count = inspector.operation_counts().sload_count,
+            sstore_count = inspector.operation_counts().sstore_count,
+            call_count = inspector.operation_counts().call_count,
+            oog_occurred = inspector.oog_occurred(),
+            "Research mode: Block replay completed"
+        );
+
+        // Analyze for divergences
+        if inspector.oog_occurred() {
+            // OOG occurred during replay - this is a significant divergence
+            warn!(
+                target: "sync::stages::execution::research",
+                block = block_number,
+                normal_gas_used = normal_result.gas_used,
+                simulated_gas_used = inspector.simulated_gas_used(),
+                "Out-of-gas occurred in research mode replay"
+            );
+
+            // Record divergence
+            if let Some(ref db) = self.research_db {
+                let divergence = reth_research::divergence::Divergence {
+                    block_number,
+                    tx_index: 0, // Block-level divergence
+                    tx_hash: alloy_primitives::B256::ZERO,
+                    timestamp: block.timestamp(),
+                    divergence_types: vec![reth_research::divergence::DivergenceType::GasPattern],
+                    gas_analysis: reth_research::divergence::GasAnalysis {
+                        normal_gas_used: normal_result.gas_used,
+                        experimental_gas_used: inspector.simulated_gas_used(),
+                        gas_efficiency_ratio: 0.0, // Indicates failure
+                    },
+                    normal_ops: reth_research::divergence::OperationCounts::default(),
+                    experimental_ops: inspector.operation_counts().clone(),
+                    divergence_location: inspector.divergence_location().cloned(),
+                    oog_info: inspector.oog_info().cloned(),
+                    call_trees: None,
+                    event_logs: None,
+                };
+
+                if let Err(e) = db.record_divergence(&divergence) {
+                    warn!(
+                        target: "sync::stages::execution::research",
+                        error = %e,
+                        "Failed to record divergence"
+                    );
+                }
+
+                // Record metrics
+                reth_research::metrics::record_divergence(
+                    &divergence.divergence_types,
+                    divergence.gas_analysis.gas_efficiency_ratio
+                );
+                if let Some(ref oog) = divergence.oog_info {
+                    reth_research::metrics::record_oog(oog.pattern);
+                }
+            }
+        } else if inspector.has_gas_loop_pattern() {
+            // Detected gas-dependent loop pattern
+            info!(
+                target: "sync::stages::execution::research",
+                block = block_number,
+                "Detected gas-dependent loop pattern"
+            );
+            // TODO: Record gas loop pattern to database
+        }
+
+        // Record that we processed this block
+        reth_research::metrics::record_block_processed(
+            block_number,
+            tx_count,
+            0.0, // Duration - we don't track separately
+        );
+
+        Ok(())
+    }
 }
 
 impl<E, Provider> Stage<Provider> for ExecutionStage<E>
@@ -260,7 +455,8 @@ where
             Primitives: NodePrimitives<BlockHeader: reth_db_api::table::Value>,
         > + StatsReader
         + BlockHashReader
-        + StateWriter<Receipt = <E::Primitives as NodePrimitives>::Receipt>,
+        + StateWriter<Receipt = <E::Primitives as NodePrimitives>::Receipt>
+        + HeaderProvider,
 {
     /// Return the id of the stage
     fn id(&self) -> StageId {
@@ -350,6 +546,25 @@ where
                     error: BlockErrorKind::Validation(err),
                 })
             }
+
+            // Perform research mode analysis on this block (if enabled)
+            // Note: Research mode integration is commented out due to trait bound constraints.
+            // To use research mode, you need to manually call analyze_block_with_replay
+            // in a context where Provider implements StateProviderFactory.
+            // See crates/research/CLI_INTEGRATION.md for details.
+            #[cfg(feature = "research")]
+            let _ = (self.should_analyze_for_research(block_number), &block, &result);
+            // if self.should_analyze_for_research(block_number) {
+            //     if let Err(e) = self.analyze_block_with_replay(provider, &block, &result) {
+            //         warn!(
+            //             target: "sync::stages::execution::research",
+            //             block = block_number,
+            //             error = %e,
+            //             "Research mode analysis failed"
+            //         );
+            //     }
+            // }
+
             results.push(result);
 
             execution_duration += execute_start.elapsed();
