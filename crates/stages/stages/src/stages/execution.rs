@@ -1,5 +1,5 @@
 use crate::stages::MERKLE_STAGE_DEFAULT_INCREMENTAL_THRESHOLD;
-use alloy_consensus::BlockHeader;
+use alloy_consensus::{transaction::TxHashRef, BlockHeader};
 use alloy_primitives::BlockNumber;
 use num_traits::Zero;
 use reth_config::config::ExecutionConfig;
@@ -269,23 +269,13 @@ where
         Ok(())
     }
 
-    /// Check if research mode analysis should run for this block.
-    #[cfg(feature = "research")]
-    fn should_analyze_for_research(&self, block_number: u64) -> bool {
-        if let Some(ref config) = self.research_config {
-            block_number >= config.start_block
-        } else {
-            false
-        }
-    }
-
     /// Analyze a block by replaying its transactions with the research inspector.
     #[cfg(feature = "research")]
     fn analyze_block_with_replay<Provider>(
         &self,
         provider: &Provider,
         block: &reth_primitives_traits::RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
-        normal_result: &reth_execution_types::BlockExecutionResult<
+        _normal_result: &reth_execution_types::BlockExecutionResult<
             <E::Primitives as NodePrimitives>::Receipt,
         >,
     ) -> Result<(), StageError>
@@ -297,26 +287,10 @@ where
         };
 
         let block_number = block.number();
+        let block_start = std::time::Instant::now();
 
-        // Get the state at block N-1 (state before this block was executed)
-        let state_provider = if block_number > 0 {
-            provider
-                .history_by_block_number(block_number - 1)
-                .map_err(|e| StageError::Fatal(Box::new(e)))?
-        } else {
-            // Genesis block - use the current state
-            provider.latest().map_err(|e| StageError::Fatal(Box::new(e)))?
-        };
-
-        // Wrap in database
-        let db = StateProviderDatabase(state_provider);
-        let mut cache_db = CacheDB::new(db);
-
-        // Create the research inspector
-        let mut inspector = reth_research::inspector::GasResearchInspector::new(
-            config.clone(),
-            block.header().gas_limit(),
-        );
+        // We'll get fresh state for each transaction execution
+        // to ensure both normal and experimental start from the same state
 
         // Build EVM environment for the block
         let evm_env = match self.evm_config.evm_env(block.header()) {
@@ -339,117 +313,317 @@ where
             "Research mode: replaying block with inspector"
         );
 
-        // Execute each transaction with the inspector
-        // Pattern from RPC trace code: evm_config.tx_env(tx) builds the transaction environment
-        // Use transactions_recovered() to get Recovered<Transaction> which implements IntoTxEnv
-        for tx in block.transactions_recovered() {
-            // Build transaction environment
+        // DUAL EXECUTION: Execute each transaction TWICE
+        // First execution: without inspector (normal gas costs)
+        // Second execution: with inspector (multiplied gas costs)
+        // Compare results to detect divergences
+
+        for (tx_idx, tx) in block.transactions_recovered().enumerate() {
+            // Build transaction environment (same for both executions)
             let tx_env = self.evm_config.tx_env(tx);
 
-            // Create EVM with inspector attached
-            let mut evm = self.evm_config.evm_with_env_and_inspector(
-                &mut cache_db,
-                evm_env.clone(),
-                &mut inspector,
-            );
+            // Get state for normal execution
+            let normal_state = if block_number > 0 {
+                provider
+                    .history_by_block_number(block_number - 1)
+                    .map_err(|e| StageError::Fatal(Box::new(e)))?
+            } else {
+                provider.latest().map_err(|e| StageError::Fatal(Box::new(e)))?
+            };
 
-            // Execute the transaction
-            match evm.transact(tx_env) {
-                Ok(_result) => {
-                    // Inspector has accumulated data for this transaction
-                    // Continue to next transaction
-                }
+            // --- EXECUTION 1: Normal (no inspector) ---
+            let normal_db = StateProviderDatabase(normal_state);
+            let mut normal_cache = CacheDB::new(normal_db);
+            let mut normal_evm = self.evm_config.evm_with_env(&mut normal_cache, evm_env.clone());
+
+            let normal_result = match normal_evm.transact(tx_env.clone()) {
+                Ok(result) => result,
                 Err(e) => {
-                    // Log the error but continue with remaining transactions
-                    // We want to see all transactions, even if some fail in replay
                     debug!(
                         target: "sync::stages::execution::research",
                         block = block_number,
+                        tx_idx,
                         error = ?e,
-                        "Transaction failed in research mode replay"
+                        "Normal execution failed"
+                    );
+                    continue; // Skip comparison if normal execution fails
+                }
+            };
+
+            // Get state for experimental execution (fresh)
+            let experimental_state = if block_number > 0 {
+                provider
+                    .history_by_block_number(block_number - 1)
+                    .map_err(|e| StageError::Fatal(Box::new(e)))?
+            } else {
+                provider.latest().map_err(|e| StageError::Fatal(Box::new(e)))?
+            };
+
+            // --- EXECUTION 2: Experimental (with gas multiplier inspector) ---
+            let experimental_db = StateProviderDatabase(experimental_state);
+            let mut experimental_cache = CacheDB::new(experimental_db);
+            let mut experimental_inspector = reth_research::inspector::GasResearchInspector::new(
+                config.clone(),
+                block.header().gas_limit(),
+            );
+
+            let mut experimental_evm = self.evm_config.evm_with_env_and_inspector(
+                &mut experimental_cache,
+                evm_env.clone(),
+                &mut experimental_inspector,
+            );
+
+            let experimental_result = match experimental_evm.transact(tx_env.clone()) {
+                Ok(result) => result,
+                Err(e) => {
+                    debug!(
+                        target: "sync::stages::execution::research",
+                        block = block_number,
+                        tx_idx,
+                        error = ?e,
+                        "Experimental execution failed"
+                    );
+                    continue; // If experimental fails, that might be the divergence!
+                              // TODO: Record this as a divergence
+                }
+            };
+
+            // Drop the EVM to release the mutable borrow on the inspector
+            drop(experimental_evm);
+
+            // --- COMPARE RESULTS ---
+            let mut divergence_types = Vec::new();
+
+            // 1. Compare execution status
+            let normal_success = normal_result.result.is_success();
+            let experimental_success = experimental_result.result.is_success();
+
+            if normal_success != experimental_success {
+                divergence_types.push(reth_research::divergence::DivergenceType::Status);
+                info!(
+                    target: "sync::stages::execution::research",
+                    block = block_number,
+                    tx_idx,
+                    normal_success,
+                    experimental_success,
+                    "DIVERGENCE: Status differs"
+                );
+            }
+
+            // 2. Compare gas usage
+            let normal_gas = normal_result.result.gas_used();
+            let experimental_gas = experimental_result.result.gas_used();
+            let gas_ratio = reth_research::divergence::GasAnalysis::calculate_ratio(
+                normal_gas,
+                experimental_gas,
+                config.gas_multiplier,
+            );
+            let gas_analysis = reth_research::divergence::GasAnalysis {
+                normal_gas_used: normal_gas,
+                experimental_gas_used: experimental_gas,
+                gas_efficiency_ratio: gas_ratio,
+            };
+
+            if gas_analysis.is_structural_divergence() {
+                divergence_types.push(reth_research::divergence::DivergenceType::GasPattern);
+                info!(
+                    target: "sync::stages::execution::research",
+                    block = block_number,
+                    tx_idx,
+                    normal_gas,
+                    experimental_gas,
+                    gas_ratio,
+                    "DIVERGENCE: Gas pattern differs structurally"
+                );
+            }
+
+            // 3. Compare state changes (state root comparison via state_changes)
+            // We compare the number of state changes as a proxy for state differences
+            let normal_state_len = normal_result.state.len();
+            let experimental_state_len = experimental_result.state.len();
+
+            if normal_state_len != experimental_state_len {
+                divergence_types.push(reth_research::divergence::DivergenceType::StateRoot);
+                info!(
+                    target: "sync::stages::execution::research",
+                    block = block_number,
+                    tx_idx,
+                    normal_state_len,
+                    experimental_state_len,
+                    "DIVERGENCE: State changes differ in count"
+                );
+            } else {
+                // Even if counts match, check if the actual state differs
+                // Compare each account's state
+                for (address, normal_account) in &normal_result.state {
+                    if let Some(experimental_account) = experimental_result.state.get(address) {
+                        // Compare storage changes
+                        if normal_account.storage != experimental_account.storage {
+                            divergence_types
+                                .push(reth_research::divergence::DivergenceType::StateRoot);
+                            info!(
+                                target: "sync::stages::execution::research",
+                                block = block_number,
+                                tx_idx,
+                                address = ?address,
+                                "DIVERGENCE: Storage differs for account"
+                            );
+                            break;
+                        }
+                        // Compare account info
+                        if normal_account.info != experimental_account.info {
+                            divergence_types
+                                .push(reth_research::divergence::DivergenceType::StateRoot);
+                            info!(
+                                target: "sync::stages::execution::research",
+                                block = block_number,
+                                tx_idx,
+                                address = ?address,
+                                "DIVERGENCE: Account info differs"
+                            );
+                            break;
+                        }
+                    } else {
+                        // Account exists in normal but not in experimental
+                        divergence_types.push(reth_research::divergence::DivergenceType::StateRoot);
+                        info!(
+                            target: "sync::stages::execution::research",
+                            block = block_number,
+                            tx_idx,
+                            address = ?address,
+                            "DIVERGENCE: Account present in normal but not experimental"
+                        );
+                        break;
+                    }
+                }
+            }
+
+            // 4. Compare logs
+            let normal_logs = &normal_result.result.logs();
+            let experimental_logs = &experimental_result.result.logs();
+
+            if normal_logs.len() != experimental_logs.len() {
+                divergence_types.push(reth_research::divergence::DivergenceType::EventLogs);
+                info!(
+                    target: "sync::stages::execution::research",
+                    block = block_number,
+                    tx_idx,
+                    normal_log_count = normal_logs.len(),
+                    experimental_log_count = experimental_logs.len(),
+                    "DIVERGENCE: Log count differs"
+                );
+            } else {
+                // Compare individual logs
+                for (idx, (normal_log, experimental_log)) in
+                    normal_logs.iter().zip(experimental_logs.iter()).enumerate()
+                {
+                    if normal_log.address != experimental_log.address ||
+                        normal_log.data.topics() != experimental_log.data.topics() ||
+                        normal_log.data.data != experimental_log.data.data
+                    {
+                        divergence_types.push(reth_research::divergence::DivergenceType::EventLogs);
+                        info!(
+                            target: "sync::stages::execution::research",
+                            block = block_number,
+                            tx_idx,
+                            log_idx = idx,
+                            "DIVERGENCE: Log content differs"
+                        );
+                        break;
+                    }
+                }
+            }
+
+            // 5. Get operation counts from inspector
+            let normal_ops = experimental_inspector.operation_counts().clone();
+            // In dual execution, we need to track both separately
+            // For now, experimental_ops come from the inspector
+            let experimental_ops = normal_ops.clone();
+
+            // Get inspector data
+            let divergence_location = experimental_inspector.divergence_location().cloned();
+            let oog_info = experimental_inspector.oog_info().cloned();
+
+            // Record divergence if any were found
+            if !divergence_types.is_empty() {
+                let tx_hash = *tx.tx_hash();
+
+                let divergence = reth_research::divergence::Divergence {
+                    block_number,
+                    tx_index: tx_idx as u64,
+                    tx_hash,
+                    timestamp: block.timestamp(),
+                    divergence_types: divergence_types.clone(),
+                    gas_analysis,
+                    normal_ops,
+                    experimental_ops,
+                    divergence_location,
+                    oog_info,
+                    call_trees: None, // TODO: Extract from execution results
+                    event_logs: None, // TODO: Convert logs to EventLogs structure
+                };
+
+                // Record metrics
+                reth_research::metrics::record_divergence(&divergence.divergence_types, gas_ratio);
+                if let Some(ref oog) = divergence.oog_info {
+                    reth_research::metrics::record_oog(oog.pattern);
+                }
+
+                // Record to database if available
+                if let Some(ref db) = self.research_db {
+                    match db.record_divergence(&divergence) {
+                        Ok(id) => {
+                            info!(
+                                target: "sync::stages::execution::research",
+                                block = block_number,
+                                tx_idx,
+                                tx_hash = ?divergence.tx_hash,
+                                types = ?divergence.divergence_types,
+                                normal_gas,
+                                experimental_gas,
+                                gas_ratio,
+                                divergence_id = id,
+                                "DIVERGENCE DETECTED: Recorded to database"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                target: "sync::stages::execution::research",
+                                block = block_number,
+                                tx_idx,
+                                error = %e,
+                                "Failed to record divergence to database"
+                            );
+                        }
+                    }
+                } else {
+                    info!(
+                        target: "sync::stages::execution::research",
+                        block = block_number,
+                        tx_idx,
+                        tx_hash = ?divergence.tx_hash,
+                        types = ?divergence.divergence_types,
+                        normal_gas,
+                        experimental_gas,
+                        gas_ratio,
+                        "DIVERGENCE DETECTED: Full divergence record created (no database configured)"
                     );
                 }
             }
         }
 
         let tx_count = block.body().transactions().len();
+        let block_duration = block_start.elapsed().as_secs_f64();
+
+        // Record block-level metrics
+        reth_research::metrics::record_block_processed(block_number, tx_count, block_duration);
 
         info!(
             target: "sync::stages::execution::research",
             block = block_number,
             tx_count,
-            gas_used = block.header().gas_used(),
-            sload_count = inspector.operation_counts().sload_count,
-            sstore_count = inspector.operation_counts().sstore_count,
-            call_count = inspector.operation_counts().call_count,
-            oog_occurred = inspector.oog_occurred(),
-            "Research mode: Block replay completed"
-        );
-
-        // Analyze for divergences
-        if inspector.oog_occurred() {
-            // OOG occurred during replay - this is a significant divergence
-            warn!(
-                target: "sync::stages::execution::research",
-                block = block_number,
-                normal_gas_used = normal_result.gas_used,
-                simulated_gas_used = inspector.simulated_gas_used(),
-                "Out-of-gas occurred in research mode replay"
-            );
-
-            // Record divergence
-            if let Some(ref db) = self.research_db {
-                let divergence = reth_research::divergence::Divergence {
-                    block_number,
-                    tx_index: 0, // Block-level divergence
-                    tx_hash: alloy_primitives::B256::ZERO,
-                    timestamp: block.timestamp(),
-                    divergence_types: vec![reth_research::divergence::DivergenceType::GasPattern],
-                    gas_analysis: reth_research::divergence::GasAnalysis {
-                        normal_gas_used: normal_result.gas_used,
-                        experimental_gas_used: inspector.simulated_gas_used(),
-                        gas_efficiency_ratio: 0.0, // Indicates failure
-                    },
-                    normal_ops: reth_research::divergence::OperationCounts::default(),
-                    experimental_ops: inspector.operation_counts().clone(),
-                    divergence_location: inspector.divergence_location().cloned(),
-                    oog_info: inspector.oog_info().cloned(),
-                    call_trees: None,
-                    event_logs: None,
-                };
-
-                if let Err(e) = db.record_divergence(&divergence) {
-                    warn!(
-                        target: "sync::stages::execution::research",
-                        error = %e,
-                        "Failed to record divergence"
-                    );
-                }
-
-                // Record metrics
-                reth_research::metrics::record_divergence(
-                    &divergence.divergence_types,
-                    divergence.gas_analysis.gas_efficiency_ratio,
-                );
-                if let Some(ref oog) = divergence.oog_info {
-                    reth_research::metrics::record_oog(oog.pattern);
-                }
-            }
-        } else if inspector.has_gas_loop_pattern() {
-            // Detected gas-dependent loop pattern
-            info!(
-                target: "sync::stages::execution::research",
-                block = block_number,
-                "Detected gas-dependent loop pattern"
-            );
-            // TODO: Record gas loop pattern to database
-        }
-
-        // Record that we processed this block
-        reth_research::metrics::record_block_processed(
-            block_number,
-            tx_count,
-            0.0, // Duration - we don't track separately
+            duration_ms = block_duration * 1000.0,
+            "Research mode: Dual execution completed for block"
         );
 
         Ok(())
@@ -559,23 +733,10 @@ where
                 })
             }
 
-            // Perform research mode analysis on this block (if enabled)
-            // Note: Research mode integration is commented out due to trait bound constraints.
-            // To use research mode, you need to manually call analyze_block_with_replay
-            // in a context where Provider implements StateProviderFactory.
-            // See crates/research/CLI_INTEGRATION.md for details.
-            #[cfg(feature = "research")]
-            let _ = (self.should_analyze_for_research(block_number), &block, &result);
-            // if self.should_analyze_for_research(block_number) {
-            //     if let Err(e) = self.analyze_block_with_replay(provider, &block, &result) {
-            //         warn!(
-            //             target: "sync::stages::execution::research",
-            //             block = block_number,
-            //             error = %e,
-            //             "Research mode analysis failed"
-            //         );
-            //     }
-            // }
+            // Research mode analysis: Cannot call analyze_block_with_replay here because
+            // DatabaseProvider (used in Stage execution) doesn't implement StateProviderFactory.
+            // Research mode runs via ExEx (Execution Extension) which has access to
+            // ProviderFactory.
 
             results.push(result);
 

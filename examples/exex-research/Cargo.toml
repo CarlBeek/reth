@@ -1,0 +1,31 @@
+[package]
+name = "example-exex-research"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# reth
+reth-ethereum = { workspace = true, features = ["full", "cli"] }
+reth-tracing.workspace = true
+reth-node-api.workspace = true
+reth-provider.workspace = true
+reth-primitives-traits.workspace = true
+reth-evm.workspace = true
+reth-revm.workspace = true
+
+# Research mode
+reth-research = { path = "../../crates/research" }
+
+# Alloy
+alloy-consensus.workspace = true
+
+# Revm
+revm.workspace = true
+
+# Standard
+eyre.workspace = true
+futures.workspace = true
+clap = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["sync"] }

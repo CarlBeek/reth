@@ -4,7 +4,8 @@
       "Bash(cargo check:*)",
       "Read(//Users/carl/.cargo/registry/src/**)",
       "Bash(cargo tree:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(cargo:*)"
     ],
     "deny": [],
     "ask": []

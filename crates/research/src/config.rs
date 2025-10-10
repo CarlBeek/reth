@@ -95,6 +95,18 @@ pub enum TraceDetail {
     Detailed,
 }
 
+impl TraceDetail {
+    /// Check if call trees should be included.
+    pub const fn include_call_trees(self) -> bool {
+        matches!(self, TraceDetail::Detailed)
+    }
+
+    /// Check if event logs should be included.
+    pub const fn include_event_logs(self) -> bool {
+        matches!(self, TraceDetail::Detailed)
+    }
+}
+
 impl std::str::FromStr for TraceDetail {
     type Err = String;
 
