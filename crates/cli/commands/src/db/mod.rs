@@ -62,7 +62,7 @@ macro_rules! db_ro_exec {
     ($env:expr, $tool:ident, $N:ident, $command:block) => {
         let Environment { provider_factory, .. } = $env.init::<$N>(AccessRights::RO)?;
 
-        let $tool = DbTool::new(provider_factory.clone())?;
+        let $tool = DbTool::new(provider_factory)?;
         $command;
     };
 }
@@ -139,7 +139,9 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
                 command.execute(provider_factory)?;
             }
             Subcommands::RepairTrie(command) => {
-                let Environment { provider_factory, .. } = self.env.init::<N>(AccessRights::RW)?;
+                let access_rights =
+                    if command.dry_run { AccessRights::RO } else { AccessRights::RW };
+                let Environment { provider_factory, .. } = self.env.init::<N>(access_rights)?;
                 command.execute(provider_factory)?;
             }
             Subcommands::Version => {
