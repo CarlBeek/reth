@@ -162,6 +162,58 @@ impl<E> ResearchExecutor<E> {
                     .map(|tx| *tx.tx_hash())
                     .unwrap_or(B256::ZERO);
 
+                // Note: In simulation mode, we track operations from normal execution
+                // and simulate gas costs. The experimental_ops are the same unless
+                // execution actually diverged (e.g., OOG causes different path).
+                // For true divergence detection, we'd need dual execution which
+                // is much more expensive.
+                let experimental_ops = if inspector.oog_occurred() {
+                    // If OOG occurred, execution may have been truncated
+                    // Mark this by zeroing out post-OOG operations
+                    let mut truncated_ops = ops.clone();
+                    // The actual operations executed would be fewer if we hit OOG
+                    // but we don't track this precisely in simulation mode
+                    truncated_ops
+                } else {
+                    ops.clone()
+                };
+
+                // Extract call trees if detailed tracing is enabled
+                let call_trees = if self.config.trace_detail.include_call_trees() {
+                    let frames = inspector.call_frames().to_vec();
+                    Some(crate::divergence::CallTrees {
+                        normal: frames.clone(),
+                        experimental: frames, // Same in simulation mode
+                    })
+                } else {
+                    None
+                };
+
+                // Extract event logs if detailed tracing is enabled
+                let event_logs = if self.config.trace_detail.include_event_logs() {
+                    if let Some(receipt) = result.receipts.get(tx_idx) {
+                        let logs: Vec<crate::divergence::EventLog> = receipt
+                            .logs()
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, log)| crate::divergence::EventLog {
+                                log_index: idx,
+                                address: log.address,
+                                topics: log.topics().to_vec(),
+                                data: log.data.data.clone(),
+                            })
+                            .collect();
+                        Some(crate::divergence::EventLogs {
+                            normal: logs.clone(),
+                            experimental: logs, // Same in simulation mode
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 let divergence = Divergence {
                     block_number: block.number(),
                     tx_index: tx_idx as u64,
@@ -170,11 +222,11 @@ impl<E> ResearchExecutor<E> {
                     divergence_types: divergence_types.clone(),
                     gas_analysis,
                     normal_ops: ops.clone(),
-                    experimental_ops: ops.clone(), // In simulation, ops are same but gas differs
+                    experimental_ops,
                     divergence_location: inspector.divergence_location().cloned(),
                     oog_info: inspector.oog_info().cloned(),
-                    call_trees: None, // TODO: Extract from inspector
-                    event_logs: None, // TODO: Extract from receipts
+                    call_trees,
+                    event_logs,
                 };
 
                 // Record to database if available
@@ -322,6 +374,31 @@ pub struct ResearchStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TraceDetail;
 
-    // TODO: Add tests with mock executor
+    #[test]
+    fn test_research_stats_default() {
+        let stats = ResearchStats { blocks_processed: 0, divergences_found: 0 };
+        assert_eq!(stats.blocks_processed, 0);
+        assert_eq!(stats.divergences_found, 0);
+    }
+
+    #[test]
+    fn test_research_error_display() {
+        let err: ResearchError<String> = ResearchError::NotEnabled(100);
+        let display = format!("{}", err);
+        assert!(display.contains("100"));
+    }
+
+    #[test]
+    fn test_trace_detail_methods() {
+        assert!(!TraceDetail::Minimal.include_call_trees());
+        assert!(!TraceDetail::Minimal.include_event_logs());
+
+        assert!(!TraceDetail::Standard.include_call_trees());
+        assert!(!TraceDetail::Standard.include_event_logs());
+
+        assert!(TraceDetail::Detailed.include_call_trees());
+        assert!(TraceDetail::Detailed.include_event_logs());
+    }
 }

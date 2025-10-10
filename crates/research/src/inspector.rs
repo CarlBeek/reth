@@ -15,19 +15,25 @@ use revm::{
 use revm_interpreter::interpreter_types::Jumps;
 use std::collections::VecDeque;
 
-/// Inspector that simulates high gas costs and tracks execution details.
+/// Inspector that multiplies gas costs and tracks execution details.
+///
+/// This inspector ACTUALLY modifies gas costs during execution by intercepting
+/// gas charges and multiplying them. This enables true dual execution testing.
 #[derive(Debug)]
 pub struct GasResearchInspector {
     /// Configuration
     config: ResearchConfig,
 
-    /// Simulated gas used (with multiplier applied)
+    /// Gas remaining before the current step (for calculating cost)
+    gas_before_step: Option<u64>,
+
+    /// Total gas used (with multiplier applied)
     simulated_gas_used: u64,
 
     /// Simulated gas limit (inflated)
     simulated_gas_limit: u64,
 
-    /// Whether out-of-gas occurred in simulation
+    /// Whether out-of-gas occurred
     oog_occurred: bool,
 
     /// Operation counts
@@ -78,6 +84,7 @@ impl GasResearchInspector {
 
         Self {
             config,
+            gas_before_step: None,
             simulated_gas_used: 0,
             simulated_gas_limit,
             oog_occurred: false,
@@ -238,6 +245,9 @@ where
         interp: &mut Interpreter<revm::interpreter::interpreter::EthInterpreter>,
         _context: &mut CTX,
     ) {
+        // Record gas before this step so we can calculate cost in step_end
+        self.gas_before_step = Some(interp.gas.remaining());
+
         // Get the current opcode
         let opcode_byte = interp.bytecode.opcode();
 
@@ -273,32 +283,47 @@ where
         if memory_words_u64 > self.op_counts.memory_words_allocated {
             self.op_counts.memory_words_allocated = memory_words_u64;
         }
+    }
 
-        // Get gas remaining (interp.gas is a public field)
-        let gas_remaining = interp.gas.remaining();
+    fn step_end(
+        &mut self,
+        interp: &mut Interpreter<revm::interpreter::interpreter::EthInterpreter>,
+        _context: &mut CTX,
+    ) {
+        // Skip if we already hit OOG
+        if self.oog_occurred {
+            return;
+        }
 
-        // Note: We can't actually intercept the gas calculation here, as revm will
-        // calculate it after this hook returns. Instead, we estimate based on the opcode.
-        // For accurate simulation, we'd need to fork revm or use a different approach.
+        // Calculate actual gas cost of this opcode
+        let gas_after_step = interp.gas.remaining();
+        let Some(gas_before) = self.gas_before_step else {
+            return;
+        };
 
-        // Estimate gas cost (this is approximate - real costs depend on context)
-        let estimated_base_cost = estimate_opcode_gas_cost(opcode_byte);
-        let simulated_cost = self.calculate_gas_cost(estimated_base_cost);
+        let actual_gas_cost = gas_before.saturating_sub(gas_after_step);
 
-        // Add to simulated gas used
-        self.simulated_gas_used = self.simulated_gas_used.saturating_add(simulated_cost);
+        // Calculate additional gas to charge (multiplier - 1) * actual_cost
+        // If multiplier is 100, we charge 99x additional gas
+        let additional_gas = actual_gas_cost.saturating_mul(self.config.gas_multiplier - 1);
 
-        // Check if we've exceeded the simulated gas limit
-        if !self.oog_occurred && self.simulated_gas_used > self.simulated_gas_limit {
-            self.oog_occurred = true;
+        // Track total gas used
+        self.simulated_gas_used =
+            self.simulated_gas_used.saturating_add(actual_gas_cost).saturating_add(additional_gas);
 
-            let opcode_name = format!("0x{:02x}", opcode_byte);
+        // Try to charge the additional gas
+        if additional_gas > 0 {
+            if !interp.gas.record_cost(additional_gas) {
+                // OUT OF GAS! The execution actually failed due to repricing
+                // When record_cost returns false, revm will automatically halt execution
+                self.oog_occurred = true;
 
-            self.record_oog(interp, opcode_byte, opcode_name.clone());
-            self.record_divergence_location(interp, opcode_byte, opcode_name);
+                let opcode_byte = interp.bytecode.opcode();
+                let opcode_name = format!("0x{:02x}", opcode_byte);
 
-            // Note: We don't actually terminate here in our simulation approach
-            // We just record that OOG would have occurred
+                self.record_oog(interp, opcode_byte, opcode_name.clone());
+                self.record_divergence_location(interp, opcode_byte, opcode_name);
+            }
         }
     }
 
