@@ -2,8 +2,10 @@
 
 use crate::divergence::{CallFrame, Divergence, DivergenceType, EventLog};
 use rusqlite::{params, Connection};
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 use thiserror::Error;
 
 /// Errors that can occur when working with the divergence database.
@@ -32,9 +34,7 @@ impl DivergenceDatabase {
     /// Open or create a database at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, DatabaseError> {
         let conn = Connection::open(path)?;
-        let db = Self {
-            conn: Arc::new(Mutex::new(conn)),
-        };
+        let db = Self { conn: Arc::new(Mutex::new(conn)) };
         db.initialize_schema()?;
         Ok(db)
     }
@@ -43,9 +43,7 @@ impl DivergenceDatabase {
     #[cfg(test)]
     pub fn in_memory() -> Result<Self, DatabaseError> {
         let conn = Connection::open_in_memory()?;
-        let db = Self {
-            conn: Arc::new(Mutex::new(conn)),
-        };
+        let db = Self { conn: Arc::new(Mutex::new(conn)) };
         db.initialize_schema()?;
         Ok(db)
     }
@@ -201,12 +199,8 @@ impl DivergenceDatabase {
         let conn = self.conn.lock().unwrap();
 
         // Format divergence types as comma-separated string
-        let types_str = divergence
-            .divergence_types
-            .iter()
-            .map(|t| t.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
+        let types_str =
+            divergence.divergence_types.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",");
 
         let divergence_id = conn.execute(
             "INSERT INTO divergences (
@@ -250,7 +244,10 @@ impl DivergenceDatabase {
                 divergence.experimental_ops.memory_words_allocated,
                 divergence.experimental_ops.create_count,
                 divergence.divergence_location.as_ref().map(|l| l.contract.as_slice()),
-                divergence.divergence_location.as_ref().and_then(|l| l.function_selector.as_ref().map(|s| s.as_slice())),
+                divergence
+                    .divergence_location
+                    .as_ref()
+                    .and_then(|l| l.function_selector.as_ref().map(|s| s.as_slice())),
                 divergence.divergence_location.as_ref().map(|l| l.pc as i64),
                 divergence.divergence_location.as_ref().map(|l| l.call_depth as i64),
                 divergence.divergence_location.as_ref().map(|l| l.opcode as i64),
@@ -270,10 +267,9 @@ impl DivergenceDatabase {
 
         // Store call trees if present
         if let Some(ref call_trees) = divergence.call_trees {
-            for (is_experimental, frames) in [
-                (false, &call_trees.normal),
-                (true, &call_trees.experimental),
-            ] {
+            for (is_experimental, frames) in
+                [(false, &call_trees.normal), (true, &call_trees.experimental)]
+            {
                 for frame in frames {
                     self.insert_call_frame(&conn, divergence_id, is_experimental, frame)?;
                 }
@@ -282,10 +278,9 @@ impl DivergenceDatabase {
 
         // Store event logs if present
         if let Some(ref event_logs) = divergence.event_logs {
-            for (is_experimental, logs) in [
-                (false, &event_logs.normal),
-                (true, &event_logs.experimental),
-            ] {
+            for (is_experimental, logs) in
+                [(false, &event_logs.normal), (true, &event_logs.experimental)]
+            {
                 for log in logs {
                     self.insert_event_log(&conn, divergence_id, is_experimental, log)?;
                 }

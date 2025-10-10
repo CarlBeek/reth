@@ -20,11 +20,7 @@ pub struct ResearchArgs {
     pub start_block: u64,
 
     /// Path to divergence database file
-    #[arg(
-        long = "research.db-path",
-        default_value = "./divergence.db",
-        help_heading = "Research"
-    )]
+    #[arg(long = "research.db-path", default_value = "./divergence.db", help_heading = "Research")]
     pub db_path: PathBuf,
 
     /// Refund multiplier for research mode
@@ -32,7 +28,11 @@ pub struct ResearchArgs {
     pub refund_multiplier: f64,
 
     /// Stipend multiplier for research mode
-    #[arg(long = "research.stipend-multiplier", default_value_t = 128.0, help_heading = "Research")]
+    #[arg(
+        long = "research.stipend-multiplier",
+        default_value_t = 128.0,
+        help_heading = "Research"
+    )]
     pub stipend_multiplier: f64,
 }
 
@@ -64,7 +64,10 @@ impl ResearchArgs {
     }
 
     /// Opens the divergence database
-    pub fn open_database(&self) -> Result<reth_research::database::DivergenceDatabase, reth_research::database::DatabaseError> {
+    pub fn open_database(
+        &self,
+    ) -> Result<reth_research::database::DivergenceDatabase, reth_research::database::DatabaseError>
+    {
         reth_research::database::DivergenceDatabase::open(&self.db_path)
     }
 }

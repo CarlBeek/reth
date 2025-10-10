@@ -286,7 +286,9 @@ where
         &self,
         provider: &Provider,
         block: &reth_primitives_traits::RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
-        normal_result: &reth_execution_types::BlockExecutionResult<<E::Primitives as NodePrimitives>::Receipt>,
+        normal_result: &reth_execution_types::BlockExecutionResult<
+            <E::Primitives as NodePrimitives>::Receipt,
+        >,
     ) -> Result<(), StageError>
     where
         Provider: HeaderProvider + reth_provider::StateProviderFactory,
@@ -299,12 +301,12 @@ where
 
         // Get the state at block N-1 (state before this block was executed)
         let state_provider = if block_number > 0 {
-            provider.history_by_block_number(block_number - 1)
+            provider
+                .history_by_block_number(block_number - 1)
                 .map_err(|e| StageError::Fatal(Box::new(e)))?
         } else {
             // Genesis block - use the current state
-            provider.latest()
-                .map_err(|e| StageError::Fatal(Box::new(e)))?
+            provider.latest().map_err(|e| StageError::Fatal(Box::new(e)))?
         };
 
         // Wrap in database
@@ -318,7 +320,18 @@ where
         );
 
         // Build EVM environment for the block
-        let evm_env = self.evm_config.evm_env(block.header());
+        let evm_env = match self.evm_config.evm_env(block.header()) {
+            Ok(env) => env,
+            Err(e) => {
+                warn!(
+                    target: "sync::stages::execution::research",
+                    block = block_number,
+                    error = ?e,
+                    "Failed to build EVM environment for research mode"
+                );
+                return Ok(()); // Skip this block if we can't build the environment
+            }
+        };
 
         debug!(
             target: "sync::stages::execution::research",
@@ -417,7 +430,7 @@ where
                 // Record metrics
                 reth_research::metrics::record_divergence(
                     &divergence.divergence_types,
-                    divergence.gas_analysis.gas_efficiency_ratio
+                    divergence.gas_analysis.gas_efficiency_ratio,
                 );
                 if let Some(ref oog) = divergence.oog_info {
                     reth_research::metrics::record_oog(oog.pattern);

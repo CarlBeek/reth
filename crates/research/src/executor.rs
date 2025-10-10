@@ -7,11 +7,13 @@ use crate::{
     inspector::GasResearchInspector,
     metrics,
 };
-use alloy_consensus::TxReceipt;
+use alloy_consensus::{transaction::TxHashRef, TxReceipt};
 use alloy_primitives::B256;
 use reth_evm::execute::Executor;
 use reth_execution_types::BlockExecutionResult;
-use reth_primitives_traits::{AlloyBlockHeader, BlockBody, NodePrimitives, RecoveredBlock, SignedTransaction};
+use reth_primitives_traits::{
+    AlloyBlockHeader, BlockBody, NodePrimitives, RecoveredBlock, SignedTransaction,
+};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -70,13 +72,7 @@ impl<E> ResearchExecutor<E> {
         // Register metrics
         metrics::register_metrics();
 
-        Ok(Self {
-            inner,
-            config,
-            divergence_db,
-            blocks_processed: 0,
-            divergences_found: 0,
-        })
+        Ok(Self { inner, config, divergence_db, blocks_processed: 0, divergences_found: 0 })
     }
 
     /// Get statistics.
@@ -133,18 +129,13 @@ impl<E> ResearchExecutor<E> {
             }
 
             // Get gas metrics
-            let normal_gas = result.receipts
-                .get(tx_idx)
-                .map(|r| r.cumulative_gas_used())
-                .unwrap_or(0);
+            let normal_gas =
+                result.receipts.get(tx_idx).map(|r| r.cumulative_gas_used()).unwrap_or(0);
 
             let simulated_gas = inspector.simulated_gas_used();
 
-            let gas_ratio = GasAnalysis::calculate_ratio(
-                normal_gas,
-                simulated_gas,
-                self.config.gas_multiplier,
-            );
+            let gas_ratio =
+                GasAnalysis::calculate_ratio(normal_gas, simulated_gas, self.config.gas_multiplier);
 
             let gas_analysis = GasAnalysis {
                 normal_gas_used: normal_gas,
@@ -164,7 +155,9 @@ impl<E> ResearchExecutor<E> {
             if !divergence_types.is_empty() || inspector.oog_occurred() {
                 // For a RecoveredBlock, transactions should already be recovered
                 // We'll just compute the hash from the transaction itself
-                let tx_hash = block.body().transactions()
+                let tx_hash = block
+                    .body()
+                    .transactions()
                     .get(tx_idx)
                     .map(|tx| *tx.tx_hash())
                     .unwrap_or(B256::ZERO);
@@ -250,7 +243,8 @@ where
     fn execute_one(
         &mut self,
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
-    ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error> {
+    ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
+    {
         let block_number = block.number();
 
         // If research mode is not enabled for this block, execute normally
@@ -306,9 +300,7 @@ where
     {
         // For now, just execute normally
         // In a complete implementation, we would wrap the state_hook with our inspector
-        self.inner
-            .execute_one_with_state_hook(block, state_hook)
-            .map_err(ResearchError::Execution)
+        self.inner.execute_one_with_state_hook(block, state_hook).map_err(ResearchError::Execution)
     }
 
     fn into_state(self) -> revm::database::State<DB> {

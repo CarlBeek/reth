@@ -7302,6 +7302,7 @@ dependencies = [
  "reth-payload-primitives",
  "reth-primitives",
  "reth-provider",
+ "reth-research",
  "reth-ress-protocol",
  "reth-ress-provider",
  "reth-revm",
@@ -9869,7 +9870,7 @@ dependencies = [
 
 [[package]]
 name = "reth-research"
-version = "1.7.0"
+version = "1.8.2"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",

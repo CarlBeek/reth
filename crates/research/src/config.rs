@@ -142,10 +142,7 @@ mod tests {
 
     #[test]
     fn test_invalid_multiplier() {
-        let config = ResearchConfig {
-            gas_multiplier: 0,
-            ..Default::default()
-        };
+        let config = ResearchConfig { gas_multiplier: 0, ..Default::default() };
         assert!(config.validate().is_err());
     }
 

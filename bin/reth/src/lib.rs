@@ -27,6 +27,9 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[cfg(feature = "research")]
+use reth_research as _;
+
 pub mod cli;
 
 /// Re-exported utils.

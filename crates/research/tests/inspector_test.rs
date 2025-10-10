@@ -3,7 +3,7 @@
 use reth_research::{config::ResearchConfig, inspector::GasResearchInspector};
 use revm::{
     context_interface::ContextTr,
-    interpreter::{Interpreter, interpreter::EthInterpreter},
+    interpreter::{interpreter::EthInterpreter, Interpreter},
     Inspector,
 };
 

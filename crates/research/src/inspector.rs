@@ -143,7 +143,12 @@ impl GasResearchInspector {
     }
 
     /// Record a divergence location if not already recorded.
-    fn record_divergence_location(&mut self, interp: &Interpreter<revm::interpreter::interpreter::EthInterpreter>, opcode: u8, opcode_name: String) {
+    fn record_divergence_location(
+        &mut self,
+        interp: &Interpreter<revm::interpreter::interpreter::EthInterpreter>,
+        opcode: u8,
+        opcode_name: String,
+    ) {
         if self.first_divergence_location.is_none() {
             let contract = if let Some(entry) = self.call_stack.last() {
                 entry.contract
@@ -193,7 +198,8 @@ impl GasResearchInspector {
             0x54 | 0x55 => OogPattern::StorageHeavy, // SLOAD, SSTORE
 
             // Call operations
-            0xF1 | 0xF2 | 0xF4 | 0xFA => OogPattern::CallChain, // CALL, CALLCODE, DELEGATECALL, STATICCALL
+            0xF1 | 0xF2 | 0xF4 | 0xFA => OogPattern::CallChain, /* CALL, CALLCODE, DELEGATECALL,
+                                                                  * STATICCALL */
 
             // Memory operations
             0x51 | 0x52 | 0x53 => OogPattern::MemoryExpansion, // MLOAD, MSTORE, MSTORE8
@@ -207,11 +213,8 @@ impl GasResearchInspector {
 
     /// Track a GAS opcode usage.
     fn track_gas_opcode(&mut self, interp: &Interpreter) {
-        let contract = if let Some(entry) = self.call_stack.last() {
-            entry.contract
-        } else {
-            Address::ZERO
-        };
+        let contract =
+            if let Some(entry) = self.call_stack.last() { entry.contract } else { Address::ZERO };
 
         self.gas_opcode_usage.push_back(GasOpcodeEvent {
             pc: interp.bytecode.pc(),
@@ -230,7 +233,11 @@ impl<CTX> Inspector<CTX, revm::interpreter::interpreter::EthInterpreter> for Gas
 where
     CTX: ContextTr,
 {
-    fn step(&mut self, interp: &mut Interpreter<revm::interpreter::interpreter::EthInterpreter>, _context: &mut CTX) {
+    fn step(
+        &mut self,
+        interp: &mut Interpreter<revm::interpreter::interpreter::EthInterpreter>,
+        _context: &mut CTX,
+    ) {
         // Get the current opcode
         let opcode_byte = interp.bytecode.opcode();
 
@@ -239,16 +246,19 @@ where
 
         // Track specific operations
         match opcode_byte {
-            0x54 => self.op_counts.sload_count += 1, // SLOAD
+            0x54 => self.op_counts.sload_count += 1,  // SLOAD
             0x55 => self.op_counts.sstore_count += 1, // SSTORE
-            0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 => { // LOG0-LOG4
+            0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 => {
+                // LOG0-LOG4
                 self.op_counts.log_count += 1
             }
-            0xF1 | 0xF2 | 0xF4 | 0xFA => { // CALL, CALLCODE, DELEGATECALL, STATICCALL
+            0xF1 | 0xF2 | 0xF4 | 0xFA => {
+                // CALL, CALLCODE, DELEGATECALL, STATICCALL
                 self.op_counts.call_count += 1
             }
             0xF0 | 0xF5 => self.op_counts.create_count += 1, // CREATE, CREATE2
-            0x5A => { // GAS
+            0x5A => {
+                // GAS
                 if self.config.detect_gas_loops {
                     self.track_gas_opcode(interp);
                 }
@@ -311,12 +321,7 @@ where
         None // Let execution continue normally
     }
 
-    fn call_end(
-        &mut self,
-        _context: &mut CTX,
-        inputs: &CallInputs,
-        outcome: &mut CallOutcome,
-    ) {
+    fn call_end(&mut self, _context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
         // Record the call frame
         if let Some(entry) = self.call_stack.pop() {
             let gas_used = self.simulated_gas_used.saturating_sub(entry.gas_at_start);
@@ -324,7 +329,8 @@ where
             // Extract input bytes based on CallInput enum
             let input_bytes = match &inputs.input {
                 revm::interpreter::CallInput::Bytes(bytes) => Some(bytes.clone()),
-                revm::interpreter::CallInput::SharedBuffer(_) => None, // Can't safely access without context
+                revm::interpreter::CallInput::SharedBuffer(_) => None, /* Can't safely access
+                                                                        * without context */
             };
 
             self.call_frames.push(CallFrame {
@@ -439,10 +445,7 @@ mod tests {
 
     #[test]
     fn test_gas_calculation() {
-        let config = ResearchConfig {
-            gas_multiplier: 128,
-            ..Default::default()
-        };
+        let config = ResearchConfig { gas_multiplier: 128, ..Default::default() };
 
         let inspector = GasResearchInspector::new(config, 100_000);
 

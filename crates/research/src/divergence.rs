@@ -96,11 +96,7 @@ pub struct GasAnalysis {
 
 impl GasAnalysis {
     /// Calculate gas efficiency ratio.
-    pub fn calculate_ratio(
-        normal_gas: u64,
-        experimental_gas: u64,
-        gas_multiplier: u64,
-    ) -> f64 {
+    pub fn calculate_ratio(normal_gas: u64, experimental_gas: u64, gas_multiplier: u64) -> f64 {
         if normal_gas == 0 {
             return 1.0;
         }

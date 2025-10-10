@@ -14,10 +14,7 @@ pub fn register_metrics() {
         "Total number of transactions processed in research mode"
     );
 
-    describe_counter!(
-        "reth_research_divergences_total",
-        "Total number of divergences detected"
-    );
+    describe_counter!("reth_research_divergences_total", "Total number of divergences detected");
 
     describe_counter!(
         "reth_research_divergences_by_type",
@@ -34,10 +31,7 @@ pub fn register_metrics() {
         "Time to execute a block in research mode (both executions)"
     );
 
-    describe_histogram!(
-        "reth_research_gas_efficiency_ratio",
-        "Gas efficiency ratio distribution"
-    );
+    describe_histogram!("reth_research_gas_efficiency_ratio", "Gas efficiency ratio distribution");
 
     describe_histogram!(
         "reth_research_divergence_detection_seconds",
@@ -61,7 +55,10 @@ pub fn record_block_processed(block_number: u64, tx_count: usize, duration_secs:
 }
 
 /// Record a divergence being detected.
-pub fn record_divergence(divergence_types: &[crate::divergence::DivergenceType], gas_efficiency_ratio: f64) {
+pub fn record_divergence(
+    divergence_types: &[crate::divergence::DivergenceType],
+    gas_efficiency_ratio: f64,
+) {
     counter!("reth_research_divergences_total").increment(1);
 
     for dtype in divergence_types {
