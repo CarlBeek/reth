@@ -27,9 +27,9 @@ use reth_node_api::{BlockTy, FullNodeComponents, NodePrimitives};
 use reth_primitives_traits::BlockBody;
 use reth_provider::StateProviderFactory;
 use reth_research::{
-    config::ResearchConfig,
+    config::{ResearchConfig, TraceDetail},
     database::DivergenceDatabase,
-    divergence::{Divergence, DivergenceType, GasAnalysis},
+    divergence::{CallTrees, Divergence, DivergenceType, EventLog, EventLogs, GasAnalysis},
     inspector::GasResearchInspector,
     metrics,
     tracking_inspector::TrackingInspector,
@@ -302,6 +302,33 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     );
 
                     // Record as a critical divergence - experimental failure
+                    let call_trees = if matches!(self.config.trace_detail, TraceDetail::Detailed) {
+                        Some(CallTrees {
+                            normal: normal_inspector.call_frames().to_vec(),
+                            experimental: experimental_inspector.call_frames().to_vec(),
+                        })
+                    } else {
+                        None
+                    };
+
+                    let event_logs = if matches!(self.config.trace_detail, TraceDetail::Detailed) {
+                        Some(EventLogs {
+                            normal: normal_inspector
+                                .event_logs()
+                                .iter()
+                                .map(|e| EventLog {
+                                    log_index: e.log_index,
+                                    address: e.address,
+                                    topics: e.topics.clone(),
+                                    data: e.data.clone(),
+                                })
+                                .collect(),
+                            experimental: vec![],
+                        })
+                    } else {
+                        None
+                    };
+
                     let divergence = Divergence {
                         block_number,
                         tx_index: tx_idx as u64,
@@ -317,8 +344,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         experimental_ops: experimental_inspector.operation_counts().clone(),
                         divergence_location: experimental_inspector.divergence_location().cloned(),
                         oog_info: experimental_inspector.oog_info().cloned(),
-                        call_trees: None,
-                        event_logs: None,
+                        call_trees,
+                        event_logs,
                     };
 
                     self.record_divergence(&divergence);
@@ -435,6 +462,34 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
 
             // If divergences detected or OOG occurred, record it
             if !divergence_types.is_empty() || experimental_inspector.oog_occurred() {
+                // Extract call trees and event logs if detailed tracing is enabled
+                let call_trees = if matches!(self.config.trace_detail, TraceDetail::Detailed) {
+                    Some(CallTrees {
+                        normal: normal_inspector.call_frames().to_vec(),
+                        experimental: experimental_inspector.call_frames().to_vec(),
+                    })
+                } else {
+                    None
+                };
+
+                let event_logs = if matches!(self.config.trace_detail, TraceDetail::Detailed) {
+                    Some(EventLogs {
+                        normal: normal_inspector
+                            .event_logs()
+                            .iter()
+                            .map(|e| EventLog {
+                                log_index: e.log_index,
+                                address: e.address,
+                                topics: e.topics.clone(),
+                                data: e.data.clone(),
+                            })
+                            .collect(),
+                        experimental: vec![], // GasResearchInspector doesn't track logs yet
+                    })
+                } else {
+                    None
+                };
+
                 let divergence = Divergence {
                     block_number,
                     tx_index: tx_idx as u64,
@@ -446,8 +501,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     experimental_ops: experimental_inspector.operation_counts().clone(),
                     divergence_location: experimental_inspector.divergence_location().cloned(),
                     oog_info: experimental_inspector.oog_info().cloned(),
-                    call_trees: None,
-                    event_logs: None,
+                    call_trees,
+                    event_logs,
                 };
 
                 self.record_divergence(&divergence);
