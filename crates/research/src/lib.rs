@@ -35,12 +35,14 @@ pub mod divergence;
 pub mod executor;
 pub mod inspector;
 pub mod metrics;
+pub mod tracking_inspector;
 
 pub use config::{ResearchConfig, TraceDetail};
 pub use database::DivergenceDatabase;
 pub use divergence::{Divergence, DivergenceType, OperationCounts};
 pub use executor::ResearchExecutor;
 pub use inspector::GasResearchInspector;
+pub use tracking_inspector::TrackingInspector;
 
 /// Re-export error types
 pub use database::DatabaseError;
