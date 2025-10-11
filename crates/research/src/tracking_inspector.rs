@@ -1,6 +1,7 @@
 //! Simple inspector that only tracks operations without modifying execution.
 
-use crate::divergence::OperationCounts;
+use crate::divergence::{CallFrame, CallType, OperationCounts};
+use alloy_primitives::{Address, Bytes};
 use revm::{
     context_interface::ContextTr,
     interpreter::{CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter},
@@ -16,17 +17,61 @@ use revm_interpreter::interpreter_types::Jumps;
 pub struct TrackingInspector {
     /// Operation counts
     op_counts: OperationCounts,
+
+    /// Call stack for tracking depth
+    call_stack: Vec<CallStackEntry>,
+
+    /// Recorded call frames
+    call_frames: Vec<CallFrame>,
+
+    /// Event logs captured
+    event_logs: Vec<EventLogEntry>,
+}
+
+/// Entry in the call stack.
+#[derive(Debug, Clone)]
+struct CallStackEntry {
+    call_index: usize,
+    depth: usize,
+    from: Address,
+    to: Option<Address>,
+    call_type: CallType,
+    gas_provided: u64,
+}
+
+/// Captured event log.
+#[derive(Debug, Clone)]
+pub struct EventLogEntry {
+    pub log_index: usize,
+    pub address: Address,
+    pub topics: Vec<alloy_primitives::B256>,
+    pub data: Bytes,
 }
 
 impl TrackingInspector {
     /// Create a new tracking inspector.
     pub fn new() -> Self {
-        Self { op_counts: OperationCounts::default() }
+        Self {
+            op_counts: OperationCounts::default(),
+            call_stack: Vec::new(),
+            call_frames: Vec::new(),
+            event_logs: Vec::new(),
+        }
     }
 
     /// Get the operation counts.
     pub fn operation_counts(&self) -> &OperationCounts {
         &self.op_counts
+    }
+
+    /// Get the call frames.
+    pub fn call_frames(&self) -> &[CallFrame] {
+        &self.call_frames
+    }
+
+    /// Get the event logs.
+    pub fn event_logs(&self) -> &[EventLogEntry] {
+        &self.event_logs
     }
 }
 
@@ -74,34 +119,123 @@ where
     fn call(
         &mut self,
         _context: &mut CTX,
-        _inputs: &mut CallInputs,
+        inputs: &mut CallInputs,
     ) -> Option<CallOutcome> {
+        let call_index = self.call_frames.len();
+        let depth = self.call_stack.len();
+
+        let call_type = match inputs.scheme {
+            revm::interpreter::CallScheme::Call => CallType::Call,
+            revm::interpreter::CallScheme::CallCode => CallType::CallCode,
+            revm::interpreter::CallScheme::DelegateCall => CallType::DelegateCall,
+            revm::interpreter::CallScheme::StaticCall => CallType::StaticCall,
+        };
+
+        self.call_stack.push(CallStackEntry {
+            call_index,
+            depth,
+            from: inputs.caller,
+            to: Some(inputs.target_address),
+            call_type,
+            gas_provided: inputs.gas_limit,
+        });
+
         None
     }
 
     fn call_end(
         &mut self,
         _context: &mut CTX,
-        _inputs: &CallInputs,
-        _outcome: &mut CallOutcome,
+        inputs: &CallInputs,
+        outcome: &mut CallOutcome,
     ) {
-        // No-op
+        if let Some(entry) = self.call_stack.pop() {
+            // Extract input bytes based on CallInput enum
+            let input_bytes = match &inputs.input {
+                revm::interpreter::CallInput::Bytes(bytes) => Some(bytes.clone()),
+                revm::interpreter::CallInput::SharedBuffer(_) => None,
+            };
+
+            // Calculate gas used (gas_provided - gas_remaining)
+            let gas_used = entry.gas_provided.saturating_sub(outcome.result.gas.remaining());
+
+            self.call_frames.push(CallFrame {
+                call_index: entry.call_index,
+                depth: entry.depth,
+                from: entry.from,
+                to: entry.to,
+                call_type: entry.call_type,
+                gas_provided: entry.gas_provided,
+                gas_used,
+                success: outcome.result.result.is_ok(),
+                input: input_bytes,
+                output: Some(outcome.result.output.clone()),
+            });
+        }
     }
 
     fn create(
         &mut self,
         _context: &mut CTX,
-        _inputs: &mut CreateInputs,
+        inputs: &mut CreateInputs,
     ) -> Option<CreateOutcome> {
+        let call_index = self.call_frames.len();
+        let depth = self.call_stack.len();
+
+        let call_type = match inputs.scheme {
+            revm::context_interface::CreateScheme::Create => CallType::Create,
+            revm::context_interface::CreateScheme::Create2 { .. } |
+            revm::context_interface::CreateScheme::Custom { .. } => CallType::Create2,
+        };
+
+        self.call_stack.push(CallStackEntry {
+            call_index,
+            depth,
+            from: inputs.caller,
+            to: None, // CREATE doesn't have a target address yet
+            call_type,
+            gas_provided: inputs.gas_limit,
+        });
+
         None
     }
 
     fn create_end(
         &mut self,
         _context: &mut CTX,
-        _inputs: &CreateInputs,
-        _outcome: &mut CreateOutcome,
+        inputs: &CreateInputs,
+        outcome: &mut CreateOutcome,
     ) {
-        // No-op
+        if let Some(entry) = self.call_stack.pop() {
+            let created_address = outcome.address.unwrap_or(Address::ZERO);
+            let gas_used = entry.gas_provided.saturating_sub(outcome.result.gas.remaining());
+
+            self.call_frames.push(CallFrame {
+                call_index: entry.call_index,
+                depth: entry.depth,
+                from: entry.from,
+                to: Some(created_address),
+                call_type: entry.call_type,
+                gas_provided: entry.gas_provided,
+                gas_used,
+                success: outcome.result.result.is_ok(),
+                input: Some(inputs.init_code.clone()),
+                output: Some(outcome.result.output.clone()),
+            });
+        }
+    }
+
+    fn log(
+        &mut self,
+        _interp: &mut Interpreter,
+        _context: &mut CTX,
+        log: alloy_primitives::Log,
+    ) {
+        self.event_logs.push(EventLogEntry {
+            log_index: self.event_logs.len(),
+            address: log.address,
+            topics: log.topics().to_vec(),
+            data: log.data.data.clone(),
+        });
     }
 }
