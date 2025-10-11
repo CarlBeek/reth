@@ -32,6 +32,7 @@ use reth_research::{
     divergence::{Divergence, DivergenceType, GasAnalysis},
     inspector::GasResearchInspector,
     metrics,
+    tracking_inspector::TrackingInspector,
 };
 use reth_revm::{database::StateProviderDatabase, db::CacheDB};
 use reth_tracing::tracing::{debug, info, warn};
@@ -238,10 +239,15 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 provider.latest()?
             };
 
-            // --- EXECUTION 1: Normal (no inspector) ---
+            // --- EXECUTION 1: Normal (with tracking inspector) ---
             let normal_db = StateProviderDatabase(normal_state);
             let mut normal_cache = CacheDB::new(normal_db);
-            let mut normal_evm = self.ctx.evm_config().evm_with_env(&mut normal_cache, evm_env.clone());
+            let mut normal_inspector = TrackingInspector::new();
+            let mut normal_evm = self.ctx.evm_config().evm_with_env_and_inspector(
+                &mut normal_cache,
+                evm_env.clone(),
+                &mut normal_inspector,
+            );
             let normal_result = match normal_evm.transact(tx_env.clone()) {
                 Ok(result) => result,
                 Err(e) => {
@@ -255,6 +261,9 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     continue;
                 }
             };
+
+            // Drop normal EVM to release the inspector
+            drop(normal_evm);
 
             // Get fresh state for experimental execution
             let experimental_state = if block_number > 0 {
@@ -304,7 +313,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                             experimental_gas_used: 0, // Failed before completion
                             gas_efficiency_ratio: 0.0,
                         },
-                        normal_ops: experimental_inspector.operation_counts().clone(),
+                        normal_ops: normal_inspector.operation_counts().clone(),
                         experimental_ops: experimental_inspector.operation_counts().clone(),
                         divergence_location: experimental_inspector.divergence_location().cloned(),
                         oog_info: experimental_inspector.oog_info().cloned(),
@@ -433,7 +442,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     timestamp: block.timestamp(),
                     divergence_types,
                     gas_analysis,
-                    normal_ops: experimental_inspector.operation_counts().clone(),
+                    normal_ops: normal_inspector.operation_counts().clone(),
                     experimental_ops: experimental_inspector.operation_counts().clone(),
                     divergence_location: experimental_inspector.divergence_location().cloned(),
                     oog_info: experimental_inspector.oog_info().cloned(),
