@@ -3567,26 +3567,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "example-exex-research"
-version = "0.0.0"
-dependencies = [
- "alloy-consensus",
- "clap",
- "eyre",
- "futures",
- "reth-ethereum",
- "reth-evm",
- "reth-node-api",
- "reth-primitives-traits",
- "reth-provider",
- "reth-research",
- "reth-revm",
- "reth-tracing",
- "revm",
- "tokio",
-]
-
-[[package]]
 name = "example-exex-test"
 version = "0.0.0"
 dependencies = [
@@ -9906,6 +9886,26 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.16",
  "tracing",
+]
+
+[[package]]
+name = "reth-research-bin"
+version = "1.8.2"
+dependencies = [
+ "alloy-consensus",
+ "clap",
+ "eyre",
+ "futures",
+ "reth-ethereum",
+ "reth-evm",
+ "reth-node-api",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-research",
+ "reth-revm",
+ "reth-tracing",
+ "revm",
+ "tokio",
 ]
 
 [[package]]

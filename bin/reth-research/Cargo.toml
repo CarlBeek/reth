@@ -1,9 +1,13 @@
 [package]
-name = "example-exex-research"
-version = "0.0.0"
+name = "reth-research-bin"
+version.workspace = true
 publish = false
 edition.workspace = true
 license.workspace = true
+
+[[bin]]
+name = "reth-research"
+path = "src/main.rs"
 
 [dependencies]
 # reth
