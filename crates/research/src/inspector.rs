@@ -31,6 +31,7 @@ pub struct GasResearchInspector {
     simulated_gas_used: u64,
 
     /// Simulated gas limit (inflated)
+    #[allow(dead_code)]
     simulated_gas_limit: u64,
 
     /// Whether out-of-gas occurred
@@ -71,7 +72,9 @@ struct CallStackEntry {
 #[derive(Debug, Clone)]
 struct GasOpcodeEvent {
     pc: usize,
+    #[allow(dead_code)]
     gas_remaining: u64,
+    #[allow(dead_code)]
     contract: Address,
 }
 
@@ -145,6 +148,7 @@ impl GasResearchInspector {
     }
 
     /// Calculate the gas cost for an operation with the multiplier applied.
+    #[allow(dead_code)]
     fn calculate_gas_cost(&self, base_cost: u64) -> u64 {
         base_cost.saturating_mul(self.config.gas_multiplier)
     }
@@ -416,20 +420,20 @@ where
 
 /// Estimate base gas cost for an opcode.
 /// This is a simplified estimation - real costs depend on context (memory, storage, etc.)
+#[allow(dead_code)]
 fn estimate_opcode_gas_cost(opcode: u8) -> u64 {
     match opcode {
+        // Medium: 5-10 gas
+        0x0A => 10, // EXP - Base cost, can be much higher
+
         // Very cheap: 2-3 gas (arithmetic, stack, etc.)
-        0x01..=0x0B | // ADD through SIGNEXTEND
-        0x10..=0x1D | // LT through BYTE
-        0x1B..=0x1D | // SHL, SHR, SAR
+        0x01..=0x09 | 0x0B | // ADD through SIGNEXTEND (except EXP)
+        0x10..=0x1D | // LT through BYTE (includes SHL, SHR, SAR)
         0x50 | // POP
         0x51 | 0x52 | 0x53 | // MLOAD, MSTORE, MSTORE8
         0x5F..=0x7F | // PUSH0-PUSH32
         0x80..=0x8F | // DUP1-DUP16
         0x90..=0x9F => 3, // SWAP1-SWAP16
-
-        // Medium: 5-10 gas
-        0x0A => 10, // EXP - Base cost, can be much higher
         0x20 => 30, // SHA3 - Base cost
         0x35 | 0x36 | 0x37 => 3, // CALLDATALOAD, CALLDATASIZE, CALLDATACOPY
         0x38 | 0x39 => 3, // CODESIZE, CODECOPY

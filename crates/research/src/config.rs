@@ -123,9 +123,11 @@ impl std::str::FromStr for TraceDetail {
 /// Configuration errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// Invalid gas multiplier value
     #[error("Invalid multiplier: {0}")]
     InvalidMultiplier(&'static str),
 
+    /// Invalid file path
     #[error("Invalid path: {0}")]
     InvalidPath(String),
 }

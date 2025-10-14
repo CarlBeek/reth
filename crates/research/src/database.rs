@@ -11,15 +11,19 @@ use thiserror::Error;
 /// Errors that can occur when working with the divergence database.
 #[derive(Debug, Error)]
 pub enum DatabaseError {
+    /// SQLite database error
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    /// I/O error
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// JSON serialization/deserialization error
     #[error("Serialization error: {0}")]
     Serialization(String),
 
+    /// Database has not been initialized
     #[error("Database not initialized")]
     NotInitialized,
 }
@@ -202,7 +206,7 @@ impl DivergenceDatabase {
         let types_str =
             divergence.divergence_types.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",");
 
-        let divergence_id = conn.execute(
+        let _divergence_id = conn.execute(
             "INSERT INTO divergences (
                 block_number, tx_index, tx_hash, timestamp,
                 divergence_types,

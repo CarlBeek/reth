@@ -20,15 +20,19 @@ use tracing::{debug, info, warn};
 /// Errors that can occur in the research executor.
 #[derive(Debug, Error)]
 pub enum ResearchError<E = std::convert::Infallible> {
+    /// Underlying execution error
     #[error("Execution error: {0}")]
     Execution(E),
 
+    /// Database operation error
     #[error("Database error: {0}")]
     Database(#[from] crate::database::DatabaseError),
 
+    /// Configuration validation error
     #[error("Configuration error: {0}")]
     Config(#[from] crate::config::ConfigError),
 
+    /// Research mode not enabled for the given block
     #[error("Research mode not enabled for this block: {0}")]
     NotEnabled(u64),
 }
@@ -37,6 +41,7 @@ pub enum ResearchError<E = std::convert::Infallible> {
 ///
 /// This executor wraps an existing executor and uses an inspector to simulate
 /// high gas costs during normal execution, then detects divergences.
+#[derive(Debug)]
 pub struct ResearchExecutor<E> {
     /// The underlying executor
     inner: E,
@@ -45,6 +50,7 @@ pub struct ResearchExecutor<E> {
     config: ResearchConfig,
 
     /// Divergence database
+    #[allow(dead_code)]
     divergence_db: Option<DivergenceDatabase>,
 
     /// Statistics
@@ -61,7 +67,7 @@ impl<E> ResearchExecutor<E> {
     ) -> Result<Self, ResearchError> {
         config.validate()?;
 
-        if let Some(ref db) = divergence_db {
+        if let Some(ref _db) = divergence_db {
             info!(
                 target: "reth::research",
                 path = ?config.divergence_db_path,
@@ -92,6 +98,7 @@ impl<E> ResearchExecutor<E> {
     ///
     /// This method simulates what would have happened with modified gas costs
     /// by examining the inspector's findings during normal execution.
+    #[allow(dead_code)]
     fn analyze_execution<N: NodePrimitives>(
         &mut self,
         block: &RecoveredBlock<N::Block>,
@@ -170,7 +177,7 @@ impl<E> ResearchExecutor<E> {
                 let experimental_ops = if inspector.oog_occurred() {
                     // If OOG occurred, execution may have been truncated
                     // Mark this by zeroing out post-OOG operations
-                    let mut truncated_ops = ops.clone();
+                    let truncated_ops = ops.clone();
                     // The actual operations executed would be fewer if we hit OOG
                     // but we don't track this precisely in simulation mode
                     truncated_ops
@@ -367,7 +374,9 @@ where
 /// Statistics from research execution.
 #[derive(Debug, Clone, Copy)]
 pub struct ResearchStats {
+    /// Number of blocks processed
     pub blocks_processed: u64,
+    /// Number of divergences found
     pub divergences_found: u64,
 }
 
