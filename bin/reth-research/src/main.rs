@@ -23,7 +23,7 @@ use reth_ethereum::{
     node::EthereumNode,
 };
 use reth_evm::{ConfigureEvm, Evm};
-use reth_node_api::{BlockTy, FullNodeComponents, NodePrimitives};
+use reth_node_api::{BlockTy, FullNodeComponents};
 use reth_primitives_traits::BlockBody;
 use reth_provider::StateProviderFactory;
 use reth_research::{

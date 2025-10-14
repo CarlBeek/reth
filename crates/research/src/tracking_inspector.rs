@@ -42,9 +42,13 @@ struct CallStackEntry {
 /// Captured event log.
 #[derive(Debug, Clone)]
 pub struct EventLogEntry {
+    /// Index of the log in the transaction
     pub log_index: usize,
+    /// Contract address that emitted the log
     pub address: Address,
+    /// Log topics (indexed parameters)
     pub topics: Vec<alloy_primitives::B256>,
+    /// Log data (non-indexed parameters)
     pub data: Bytes,
 }
 

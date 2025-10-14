@@ -263,11 +263,17 @@ pub struct CallFrame {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CallType {
+    /// Regular call
     Call,
+    /// Delegate call
     DelegateCall,
+    /// Static call
     StaticCall,
+    /// Call code
     CallCode,
+    /// Contract creation
     Create,
+    /// Contract creation with CREATE2
     Create2,
 }
 
