@@ -10,13 +10,12 @@
 //! Run with:
 //!
 //! ```sh
-//! cargo run --release -p reth-research -- node --dev --dev.block-time 5s \
+//! cargo run --release -p reth-research node --dev --dev.block-time 5s \
 //!   --research.gas-multiplier 128 \
 //!   --research.db-path ./divergences.db
 //! ```
 
 use alloy_consensus::{transaction::TxHashRef, BlockHeader};
-use clap::Parser;
 use futures::TryStreamExt;
 use reth_ethereum::{
     exex::{ExExContext, ExExEvent, ExExNotification},
@@ -37,42 +36,6 @@ use reth_research::{
 use reth_revm::{database::StateProviderDatabase, db::CacheDB};
 use reth_tracing::tracing::{debug, info, warn};
 
-/// Additional CLI arguments for research mode
-#[derive(Debug, Parser)]
-struct ResearchArgs {
-    /// Gas cost multiplier for experimental execution
-    #[arg(long = "research.gas-multiplier", default_value = "128")]
-    gas_multiplier: u64,
-
-    /// Path to divergence database
-    #[arg(long = "research.db-path", default_value = "./research_divergences.db")]
-    db_path: String,
-
-    /// Block number to start research analysis from
-    #[arg(long = "research.start-block", default_value = "0")]
-    start_block: u64,
-
-    /// Maximum divergences to record per block (None = unlimited)
-    #[arg(long = "research.max-divergences-per-block")]
-    max_divergences_per_block: Option<usize>,
-}
-
-impl From<ResearchArgs> for ResearchConfig {
-    fn from(args: ResearchArgs) -> Self {
-        Self {
-            gas_multiplier: args.gas_multiplier,
-            divergence_db_path: args.db_path.into(),
-            start_block: args.start_block,
-            max_divergences_per_block: args.max_divergences_per_block,
-            trace_detail: reth_research::config::TraceDetail::Standard,
-            refund_multiplier: 1.0,
-            stipend_multiplier: 1.0,
-            loop_detection_db_path: None,
-            gas_limit_multiplier: None,
-            detect_gas_loops: false,
-        }
-    }
-}
 
 /// Research ExEx that performs dual execution analysis on committed blocks.
 struct ResearchExEx<Node: FullNodeComponents> {
@@ -594,11 +557,25 @@ async fn research_exex<Node: FullNodeComponents>(
 }
 
 fn main() -> eyre::Result<()> {
-    // Parse research args
-    let args = ResearchArgs::parse();
-    let config: ResearchConfig = args.into();
+    reth_ethereum::cli::Cli::parse_args().run(|builder, _ext| {
+        // Extract research config from node config
+        let node_config = builder.config();
+        let research_args = &node_config.research;
 
-    reth_ethereum::cli::Cli::parse_args().run(|builder, _| {
+        // Build research config from the built-in research args
+        let config = ResearchConfig {
+            gas_multiplier: research_args.gas_multiplier,
+            divergence_db_path: research_args.db_path.clone(),
+            start_block: research_args.start_block,
+            max_divergences_per_block: None,
+            trace_detail: TraceDetail::Standard,
+            refund_multiplier: research_args.refund_multiplier,
+            stipend_multiplier: research_args.stipend_multiplier,
+            loop_detection_db_path: None,
+            gas_limit_multiplier: None,
+            detect_gas_loops: false,
+        };
+
         Box::pin(async move {
             let handle = builder
                 .node(EthereumNode::default())
