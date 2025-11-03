@@ -142,8 +142,10 @@ pub struct DivergenceLocation {
     /// Contract address where divergence occurred
     pub contract: Address,
 
-    /// Function selector (first 4 bytes of calldata)
-    pub function_selector: Option<[u8; 4]>,
+    /// Function selector call stack (first 4 bytes of calldata for each call in the stack)
+    /// Ordered from root (index 0) to deepest call (last index)
+    /// None entries represent calls without selectors (e.g., value transfers, creates)
+    pub function_selectors: Vec<Option<[u8; 4]>>,
 
     /// Program counter at divergence
     pub pc: usize,

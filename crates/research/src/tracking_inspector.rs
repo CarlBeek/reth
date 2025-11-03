@@ -37,6 +37,8 @@ struct CallStackEntry {
     to: Option<Address>,
     call_type: CallType,
     gas_provided: u64,
+    #[allow(dead_code)]
+    function_selector: Option<[u8; 4]>,
 }
 
 /// Captured event log.
@@ -76,6 +78,16 @@ impl TrackingInspector {
     /// Get the event logs.
     pub fn event_logs(&self) -> &[EventLogEntry] {
         &self.event_logs
+    }
+
+    /// Extract function selector (first 4 bytes) from call input
+    fn extract_function_selector(input: &revm::interpreter::CallInput) -> Option<[u8; 4]> {
+        match input {
+            revm::interpreter::CallInput::Bytes(bytes) if bytes.len() >= 4 => {
+                Some([bytes[0], bytes[1], bytes[2], bytes[3]])
+            }
+            _ => None,
+        }
     }
 }
 
@@ -135,6 +147,8 @@ where
             revm::interpreter::CallScheme::StaticCall => CallType::StaticCall,
         };
 
+        let function_selector = Self::extract_function_selector(&inputs.input);
+
         self.call_stack.push(CallStackEntry {
             call_index,
             depth,
@@ -142,6 +156,7 @@ where
             to: Some(inputs.target_address),
             call_type,
             gas_provided: inputs.gas_limit,
+            function_selector,
         });
 
         None
@@ -199,6 +214,7 @@ where
             to: None, // CREATE doesn't have a target address yet
             call_type,
             gas_provided: inputs.gas_limit,
+            function_selector: None, // CREATE operations don't have function selectors
         });
 
         None

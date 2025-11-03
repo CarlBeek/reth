@@ -66,6 +66,7 @@ struct CallStackEntry {
     contract: Address,
     call_type: CallType,
     gas_at_start: u64,
+    function_selector: Option<[u8; 4]>,
 }
 
 /// Gas opcode usage event for loop detection.
@@ -98,6 +99,16 @@ impl GasResearchInspector {
             oog_info: None,
             gas_opcode_usage: VecDeque::new(),
             max_gas_events: 1000,
+        }
+    }
+
+    /// Extract function selector (first 4 bytes) from call input
+    fn extract_function_selector(input: &revm::interpreter::CallInput) -> Option<[u8; 4]> {
+        match input {
+            revm::interpreter::CallInput::Bytes(bytes) if bytes.len() >= 4 => {
+                Some([bytes[0], bytes[1], bytes[2], bytes[3]])
+            }
+            _ => None,
         }
     }
 
@@ -167,9 +178,13 @@ impl GasResearchInspector {
                 Address::ZERO
             };
 
+            // Collect function selectors from the entire call stack
+            let function_selectors: Vec<Option<[u8; 4]>> =
+                self.call_stack.iter().map(|entry| entry.function_selector).collect();
+
             self.first_divergence_location = Some(DivergenceLocation {
                 contract,
-                function_selector: None, // Could extract from calldata
+                function_selectors,
                 pc: interp.bytecode.pc(),
                 call_depth: self.call_stack.len(),
                 opcode,
@@ -340,11 +355,14 @@ where
             revm::interpreter::CallScheme::StaticCall => CallType::StaticCall,
         };
 
+        let function_selector = Self::extract_function_selector(&inputs.input);
+
         self.call_stack.push(CallStackEntry {
             depth: self.call_stack.len(),
             contract: inputs.bytecode_address,
             call_type,
             gas_at_start: self.simulated_gas_used,
+            function_selector,
         });
 
         None // Let execution continue normally
@@ -387,6 +405,7 @@ where
                 revm::context_interface::CreateScheme::Custom { .. } => CallType::Create2,
             },
             gas_at_start: self.simulated_gas_used,
+            function_selector: None, // CREATE operations don't have function selectors
         });
 
         None
