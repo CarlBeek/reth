@@ -37,6 +37,11 @@ pub struct ResearchConfig {
 
     /// Enable gas-dependent loop detection
     pub detect_gas_loops: bool,
+
+    /// Maximum number of transactions to analyze in parallel per block
+    /// Set to 1 for sequential processing, or higher to utilize multiple cores
+    /// Recommended: number of physical cores for CPU-bound workloads
+    pub max_parallel_txs: usize,
 }
 
 impl Default for ResearchConfig {
@@ -52,6 +57,7 @@ impl Default for ResearchConfig {
             gas_limit_multiplier: None,
             max_divergences_per_block: None,
             detect_gas_loops: true,
+            max_parallel_txs: num_cpus::get(),
         }
     }
 }

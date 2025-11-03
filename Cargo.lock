@@ -9822,6 +9822,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-primitives",
  "metrics",
+ "num_cpus",
  "reth-db",
  "reth-evm",
  "reth-execution-types",
@@ -9841,9 +9842,11 @@ name = "reth-research-bin"
 version = "1.8.2"
 dependencies = [
  "alloy-consensus",
+ "alloy-primitives",
  "clap",
  "eyre",
  "futures",
+ "rayon",
  "reth-ethereum",
  "reth-evm",
  "reth-node-api",

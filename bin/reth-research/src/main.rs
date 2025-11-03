@@ -35,6 +35,7 @@ use reth_research::{
 };
 use reth_revm::{database::StateProviderDatabase, db::CacheDB};
 use reth_tracing::tracing::{debug, info, warn};
+use tokio::sync::mpsc;
 
 
 /// Research ExEx that performs dual execution analysis on committed blocks.
@@ -43,8 +44,8 @@ struct ResearchExEx<Node: FullNodeComponents> {
     ctx: ExExContext<Node>,
     /// Research configuration
     config: ResearchConfig,
-    /// Divergence database
-    divergence_db: Option<DivergenceDatabase>,
+    /// Channel sender for async database writes
+    db_tx: Option<mpsc::UnboundedSender<Divergence>>,
     /// Statistics
     blocks_processed: u64,
     divergences_found: u64,
@@ -58,25 +59,59 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
     ) -> eyre::Result<Self> {
         config.validate()?;
 
-        // Initialize database
-        let divergence_db = if config.divergence_db_path.to_str() != Some(":memory:") {
-            Some(DivergenceDatabase::open(&config.divergence_db_path)?)
+        // Initialize database and async writer
+        let db_tx = if config.divergence_db_path.to_str() != Some(":memory:") {
+            let divergence_db = DivergenceDatabase::open(&config.divergence_db_path)?;
+
+            info!(
+                target: "exex::research",
+                path = ?config.divergence_db_path,
+                "Research ExEx initialized with async divergence database writer"
+            );
+
+            // Spawn database writer task
+            let (tx, mut rx) = mpsc::unbounded_channel::<Divergence>();
+            tokio::spawn(async move {
+                let mut write_count = 0u64;
+                while let Some(divergence) = rx.recv().await {
+                    match divergence_db.record_divergence(&divergence) {
+                        Ok(_id) => {
+                            write_count += 1;
+                            if write_count % 100 == 0 {
+                                debug!(
+                                    target: "exex::research::db_writer",
+                                    total_writes = write_count,
+                                    "Database writer progress"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                target: "exex::research::db_writer",
+                                block = divergence.block_number,
+                                tx_idx = divergence.tx_index,
+                                error = %e,
+                                "Failed to record divergence to database"
+                            );
+                        }
+                    }
+                }
+                info!(
+                    target: "exex::research::db_writer",
+                    total_writes = write_count,
+                    "Database writer task exiting"
+                );
+            });
+
+            Some(tx)
         } else {
             None
         };
 
-        if let Some(ref _db) = divergence_db {
-            info!(
-                target: "exex::research",
-                path = ?config.divergence_db_path,
-                "Research ExEx initialized with divergence database"
-            );
-        }
-
         // Register metrics
         metrics::register_metrics();
 
-        Ok(Self { ctx, config, divergence_db, blocks_processed: 0, divergences_found: 0 })
+        Ok(Self { ctx, config, db_tx, blocks_processed: 0, divergences_found: 0 })
     }
 
     /// Run the ExEx.
@@ -512,29 +547,25 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             metrics::record_oog(oog.pattern);
         }
 
-        // Record to database if available
-        if let Some(ref db) = self.divergence_db {
-            match db.record_divergence(divergence) {
-                Ok(id) => {
-                    info!(
-                        target: "exex::research",
-                        block = divergence.block_number,
-                        tx_idx = divergence.tx_index,
-                        tx_hash = ?divergence.tx_hash,
-                        types = ?divergence.divergence_types,
-                        divergence_id = id,
-                        "Divergence recorded to database"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        target: "exex::research",
-                        block = divergence.block_number,
-                        tx_idx = divergence.tx_index,
-                        error = %e,
-                        "Failed to record divergence to database"
-                    );
-                }
+        // Send to async database writer if available
+        if let Some(ref tx) = self.db_tx {
+            if let Err(e) = tx.send(divergence.clone()) {
+                warn!(
+                    target: "exex::research",
+                    block = divergence.block_number,
+                    tx_idx = divergence.tx_index,
+                    error = %e,
+                    "Failed to send divergence to database writer"
+                );
+            } else {
+                debug!(
+                    target: "exex::research",
+                    block = divergence.block_number,
+                    tx_idx = divergence.tx_index,
+                    tx_hash = ?divergence.tx_hash,
+                    types = ?divergence.divergence_types,
+                    "Divergence queued for async database write"
+                );
             }
         } else {
             info!(
@@ -574,6 +605,7 @@ fn main() -> eyre::Result<()> {
             loop_detection_db_path: None,
             gas_limit_multiplier: None,
             detect_gas_loops: false,
+            max_parallel_txs: 48, // Placeholder - will be used when parallelization is implemented
         };
 
         Box::pin(async move {

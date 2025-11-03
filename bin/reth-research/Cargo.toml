@@ -24,6 +24,7 @@ reth-research = { path = "../../crates/research" }
 
 # Alloy
 alloy-consensus.workspace = true
+alloy-primitives.workspace = true
 
 # Revm
 revm.workspace = true
@@ -33,3 +34,4 @@ eyre.workspace = true
 futures.workspace = true
 clap = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["sync"] }
+rayon.workspace = true
