@@ -94,6 +94,7 @@ impl DivergenceDatabase {
                 -- Divergence location
                 divergence_contract BLOB,
                 divergence_function_selector BLOB,
+                divergence_function_selectors_json TEXT,
                 divergence_pc INTEGER,
                 divergence_call_depth INTEGER,
                 divergence_opcode INTEGER,
@@ -206,6 +207,17 @@ impl DivergenceDatabase {
         let types_str =
             divergence.divergence_types.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",");
 
+        // Prepare function selector fields
+        let deepest_selector = divergence
+            .divergence_location
+            .as_ref()
+            .and_then(|l| l.function_selectors.last().and_then(|s| *s));
+
+        let selectors_json = divergence
+            .divergence_location
+            .as_ref()
+            .map(|l| serde_json::to_string(&l.function_selectors).unwrap_or_default());
+
         let _divergence_id = conn.execute(
             "INSERT INTO divergences (
                 block_number, tx_index, tx_hash, timestamp,
@@ -215,14 +227,14 @@ impl DivergenceDatabase {
                 normal_log_count, normal_total_ops, normal_memory_words, normal_create_count,
                 exp_sload_count, exp_sstore_count, exp_call_count,
                 exp_log_count, exp_total_ops, exp_memory_words, exp_create_count,
-                divergence_contract, divergence_function_selector, divergence_pc,
+                divergence_contract, divergence_function_selector, divergence_function_selectors_json, divergence_pc,
                 divergence_call_depth, divergence_opcode, divergence_opcode_name,
                 oog_occurred, oog_opcode, oog_opcode_name, oog_pc,
                 oog_contract, oog_call_depth, oog_gas_remaining, oog_pattern
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-                ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36
+                ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37
             )",
             params![
                 divergence.block_number,
@@ -248,10 +260,8 @@ impl DivergenceDatabase {
                 divergence.experimental_ops.memory_words_allocated,
                 divergence.experimental_ops.create_count,
                 divergence.divergence_location.as_ref().map(|l| l.contract.as_slice()),
-                divergence
-                    .divergence_location
-                    .as_ref()
-                    .and_then(|l| l.function_selector.as_ref().map(|s| s.as_slice())),
+                deepest_selector.as_ref().map(|s| s.as_slice()),
+                selectors_json,
                 divergence.divergence_location.as_ref().map(|l| l.pc as i64),
                 divergence.divergence_location.as_ref().map(|l| l.call_depth as i64),
                 divergence.divergence_location.as_ref().map(|l| l.opcode as i64),

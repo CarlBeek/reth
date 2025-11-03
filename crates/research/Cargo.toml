@@ -29,6 +29,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Serialization
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 
 # Logging and metrics
 tracing.workspace = true
