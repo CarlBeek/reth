@@ -88,6 +88,7 @@ js-tracer = [
     "reth-rpc-eth-api/js-tracer",
     "reth-rpc-eth-types/js-tracer",
 ]
+research = ["reth-node-builder/research"]
 test-utils = [
     "reth-node-builder/test-utils",
     "reth-chainspec/test-utils",

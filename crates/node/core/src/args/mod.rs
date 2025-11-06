@@ -76,4 +76,9 @@ pub use ress_args::RessArgs;
 mod era;
 pub use era::{DefaultEraHost, EraArgs, EraSourceArgs};
 
+/// ResearchArgs for configuring gas price research mode
+mod research_args;
+pub use research_args::ResearchArgs;
+
+mod error;
 pub mod types;

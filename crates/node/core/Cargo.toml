@@ -36,6 +36,7 @@ reth-stages-types.workspace = true
 reth-ethereum-forks.workspace = true
 reth-engine-local.workspace = true
 reth-engine-primitives.workspace = true
+reth-research = { path = "../../research", optional = true }
 
 # ethereum
 alloy-primitives.workspace = true
@@ -85,6 +86,7 @@ min-warn-logs = ["tracing/release_max_level_warn"]
 min-info-logs = ["tracing/release_max_level_info"]
 min-debug-logs = ["tracing/release_max_level_debug"]
 min-trace-logs = ["tracing/release_max_level_trace"]
+research = ["dep:reth-research"]
 
 [build-dependencies]
 vergen = { workspace = true, features = ["build", "cargo", "emit_and_set"] }

@@ -47,6 +47,7 @@ reth-consensus.workspace = true
 reth-tokio-util.workspace = true
 reth-ress-protocol.workspace = true
 reth-ress-provider.workspace = true
+reth-research = { path = "../../crates/research", optional = true }
 
 # alloy
 alloy-rpc-types = { workspace = true, features = ["engine"] }
@@ -67,7 +68,7 @@ backon.workspace = true
 tempfile.workspace = true
 
 [features]
-default = ["jemalloc", "otlp", "reth-revm/portable", "js-tracer"]
+default = ["jemalloc", "otlp", "reth-revm/portable", "js-tracer", "research"]
 
 otlp = [
     "reth-ethereum-cli/otlp",
@@ -79,6 +80,7 @@ js-tracer = [
     "reth-rpc/js-tracer",
     "reth-rpc-eth-types/js-tracer",
 ]
+research = ["dep:reth-research", "reth-node-ethereum/research"]
 
 dev = ["reth-ethereum-cli/dev"]
 

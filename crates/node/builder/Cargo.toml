@@ -100,6 +100,7 @@ js-tracer = [
     "reth-node-ethereum/js-tracer",
     "reth-rpc-eth-types/js-tracer",
 ]
+research = ["reth-node-core/research", "reth-stages/research"]
 test-utils = [
     "reth-db/test-utils",
     "reth-chain-state/test-utils",

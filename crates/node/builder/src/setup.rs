@@ -42,6 +42,7 @@ pub fn build_networked_pipeline<N, Client, Evm>(
     evm_config: Evm,
     exex_manager_handle: ExExManagerHandle<N::Primitives>,
     era_import_source: Option<EraImportSource>,
+    #[cfg(feature = "research")] research_args: Option<&reth_node_core::args::ResearchArgs>,
 ) -> eyre::Result<Pipeline<N>>
 where
     N: ProviderNodeTypes,
@@ -70,6 +71,8 @@ where
         evm_config,
         exex_manager_handle,
         era_import_source,
+        #[cfg(feature = "research")]
+        research_args,
     )?;
 
     Ok(pipeline)
@@ -90,6 +93,7 @@ pub fn build_pipeline<N, H, B, Evm>(
     evm_config: Evm,
     exex_manager_handle: ExExManagerHandle<N::Primitives>,
     era_import_source: Option<EraImportSource>,
+    #[cfg(feature = "research")] research_args: Option<&reth_node_core::args::ResearchArgs>,
 ) -> eyre::Result<Pipeline<N>>
 where
     N: ProviderNodeTypes,
@@ -130,6 +134,12 @@ where
             )),
         )
         .build(provider_factory, static_file_producer);
+
+    // Note: research_args parameter exists but automatic wiring is not possible
+    // due to Rust trait constraints. See crates/research/CLI_INTEGRATION.md for
+    // how to manually integrate research mode with CLI args.
+    #[cfg(feature = "research")]
+    let _ = research_args;
 
     Ok(pipeline)
 }
