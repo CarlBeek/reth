@@ -10,7 +10,7 @@
 //! Run with:
 //!
 //! ```sh
-//! cargo run -p example-exex-research -- node --dev --dev.block-time 5s \
+//! cargo run --release -p reth-research -- node --dev --dev.block-time 5s \
 //!   --research.gas-multiplier 128 \
 //!   --research.db-path ./divergences.db
 //! ```
