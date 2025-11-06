@@ -80,5 +80,4 @@ pub use era::{DefaultEraHost, EraArgs, EraSourceArgs};
 mod research_args;
 pub use research_args::ResearchArgs;
 
-mod error;
 pub mod types;
