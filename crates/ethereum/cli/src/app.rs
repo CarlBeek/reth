@@ -14,9 +14,12 @@ use reth_node_ethereum::{consensus::EthBeaconConsensus, EthEvmConfig, EthereumNo
 use reth_node_metrics::recorder::install_prometheus_recorder;
 use reth_rpc_server_types::RpcModuleValidator;
 use reth_tracing::{FileWorkerGuard, Layers};
-use reth_tracing_otlp::OtlpProtocol;
 use std::{fmt, sync::Arc};
 use tracing::info;
+
+#[cfg(feature = "otlp")]
+use reth_tracing_otlp::OtlpProtocol;
+#[cfg(feature = "otlp")]
 use url::Url;
 
 /// A wrapper around a parsed CLI that handles command execution.
@@ -110,8 +113,9 @@ where
     ///
     /// If file logging is enabled, this function stores guard to the struct.
     /// For gRPC OTLP, it requires tokio runtime context.
-    pub fn init_tracing(&mut self, runner: &CliRunner) -> Result<()> {
+    pub fn init_tracing(&mut self, #[allow(unused_variables)] runner: &CliRunner) -> Result<()> {
         if self.guard.is_none() {
+            #[allow(unused_mut)]
             let mut layers = self.layers.take().unwrap_or_default();
 
             #[cfg(feature = "otlp")]
