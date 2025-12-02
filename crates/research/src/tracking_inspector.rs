@@ -247,7 +247,6 @@ where
 
     fn log(
         &mut self,
-        _interp: &mut Interpreter,
         _context: &mut CTX,
         log: alloy_primitives::Log,
     ) {
