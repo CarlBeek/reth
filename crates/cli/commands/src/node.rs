@@ -10,7 +10,7 @@ use reth_node_builder::NodeBuilder;
 use reth_node_core::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs, MetricArgs,
-        NetworkArgs, PayloadBuilderArgs, PruningArgs, ResearchArgs, RpcServerArgs, TxPoolArgs,
+        NetworkArgs, PayloadBuilderArgs, PruningArgs, ResearchArgs, RpcServerArgs, StaticFilesArgs, TxPoolArgs,
     },
     node_config::NodeConfig,
     version,
@@ -114,6 +114,10 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     #[command(flatten, next_help_heading = "Research")]
     pub research: ResearchArgs,
 
+    /// All static files related arguments
+    #[command(flatten, next_help_heading = "Static Files")]
+    pub static_files: StaticFilesArgs,
+
     /// Additional cli arguments
     #[command(flatten, next_help_heading = "Extension")]
     pub ext: Ext,
@@ -149,7 +153,7 @@ where
     where
         L: Launcher<C, Ext>,
     {
-        tracing::info!(target: "reth::cli", version = ?version::version_metadata().short_version, "Starting reth");
+        tracing::info!(target: "reth::cli", version = ?version::version_metadata().short_version, "Starting {}",  version::version_metadata().name_client);
 
         let Self {
             datadir,
@@ -166,10 +170,11 @@ where
             db,
             dev,
             pruning,
-            ext,
             engine,
             era,
             research,
+            static_files,
+            ext,
         } = self;
 
         // set up node config
@@ -190,6 +195,7 @@ where
             engine,
             era,
             research,
+            static_files,
         };
 
         let data_dir = node_config.datadir();

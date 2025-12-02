@@ -3,7 +3,7 @@
 use crate::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, NetworkArgs, PayloadBuilderArgs,
-        PruningArgs, ResearchArgs, RpcServerArgs, TxPoolArgs,
+        PruningArgs, ResearchArgs, RpcServerArgs, StaticFilesArgs, TxPoolArgs,
     },
     dirs::{ChainPath, DataDirPath},
     utils::get_single_header,
@@ -150,6 +150,9 @@ pub struct NodeConfig<ChainSpec> {
 
     /// All research related arguments with --research prefix
     pub research: ResearchArgs,
+
+    /// All static files related arguments
+    pub static_files: StaticFilesArgs,
 }
 
 impl NodeConfig<ChainSpec> {
@@ -181,6 +184,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             engine: EngineArgs::default(),
             era: EraArgs::default(),
             research: ResearchArgs::default(),
+            static_files: StaticFilesArgs::default(),
         }
     }
 
@@ -235,6 +239,48 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
     pub fn with_chain(mut self, chain: impl Into<Arc<ChainSpec>>) -> Self {
         self.chain = chain.into();
         self
+    }
+
+    /// Set the [`ChainSpec`] for the node and converts the type to that chainid.
+    pub fn map_chain<C>(self, chain: impl Into<Arc<C>>) -> NodeConfig<C> {
+        let Self {
+            datadir,
+            config,
+            metrics,
+            instance,
+            network,
+            rpc,
+            txpool,
+            builder,
+            debug,
+            db,
+            dev,
+            pruning,
+            engine,
+            era,
+            research,
+            static_files,
+            ..
+        } = self;
+        NodeConfig {
+            datadir,
+            config,
+            chain: chain.into(),
+            metrics,
+            instance,
+            network,
+            rpc,
+            txpool,
+            builder,
+            debug,
+            db,
+            dev,
+            pruning,
+            engine,
+            era,
+            research,
+            static_files,
+        }
     }
 
     /// Set the metrics address for the node
@@ -504,6 +550,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             engine: self.engine,
             era: self.era,
             research: self.research,
+            static_files: self.static_files,
         }
     }
 
@@ -545,6 +592,7 @@ impl<ChainSpec> Clone for NodeConfig<ChainSpec> {
             engine: self.engine.clone(),
             era: self.era.clone(),
             research: self.research.clone(),
+            static_files: self.static_files,
         }
     }
 }

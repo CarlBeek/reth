@@ -26,7 +26,7 @@ pub use log::{ColorMode, LogArgs, Verbosity};
 
 /// `TraceArgs` for tracing and spans support
 mod trace;
-pub use trace::TraceArgs;
+pub use trace::{OtlpInitStatus, TraceArgs};
 
 /// `MetricArgs` to configure metrics.
 mod metric;
@@ -34,7 +34,7 @@ pub use metric::MetricArgs;
 
 /// `PayloadBuilderArgs` struct for configuring the payload builder
 mod payload_builder;
-pub use payload_builder::PayloadBuilderArgs;
+pub use payload_builder::{DefaultPayloadBuilderValues, PayloadBuilderArgs};
 
 /// Stage related arguments
 mod stage;
@@ -80,4 +80,9 @@ pub use era::{DefaultEraHost, EraArgs, EraSourceArgs};
 mod research_args;
 pub use research_args::ResearchArgs;
 
+/// `StaticFilesArgs` for configuring static files.
+mod static_files;
+pub use static_files::StaticFilesArgs;
+
+mod error;
 pub mod types;
