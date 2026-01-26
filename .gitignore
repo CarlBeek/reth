@@ -72,3 +72,6 @@ __pycache__/
 # direnv
 .envrc
 .direnv/
+
+# Disable CI workflows on this fork
+.github/workflows/
