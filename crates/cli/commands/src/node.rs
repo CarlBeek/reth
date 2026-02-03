@@ -10,7 +10,8 @@ use reth_node_builder::NodeBuilder;
 use reth_node_core::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs, MetricArgs,
-        NetworkArgs, PayloadBuilderArgs, PruningArgs, ResearchArgs, RpcServerArgs, StaticFilesArgs, TxPoolArgs,
+        NetworkArgs, PayloadBuilderArgs, PruningArgs, ResearchArgs, RocksDbArgs, RpcServerArgs,
+        StaticFilesArgs, TxPoolArgs,
     },
     node_config::NodeConfig,
     version,
@@ -102,6 +103,10 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     #[command(flatten)]
     pub pruning: PruningArgs,
 
+    /// All `RocksDB` table routing arguments
+    #[command(flatten)]
+    pub rocksdb: RocksDbArgs,
+
     /// Engine cli arguments
     #[command(flatten, next_help_heading = "Engine")]
     pub engine: EngineArgs,
@@ -170,12 +175,16 @@ where
             db,
             dev,
             pruning,
+            rocksdb,
             engine,
             era,
             research,
             static_files,
             ext,
         } = self;
+
+        // Validate RocksDB arguments
+        rocksdb.validate()?;
 
         // set up node config
         let mut node_config = NodeConfig {
@@ -192,6 +201,7 @@ where
             db,
             dev,
             pruning,
+            rocksdb,
             engine,
             era,
             research,
@@ -202,7 +212,7 @@ where
         let db_path = data_dir.db();
 
         tracing::info!(target: "reth::cli", path = ?db_path, "Opening database");
-        let database = Arc::new(init_db(db_path.clone(), self.db.database_args())?.with_metrics());
+        let database = init_db(db_path.clone(), self.db.database_args())?.with_metrics();
 
         if with_unused_ports {
             node_config = node_config.with_unused_ports();

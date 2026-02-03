@@ -218,7 +218,7 @@ impl<B: Block> RecoveredBlock<B> {
 
     /// A safer variant of [`Self::new_sealed`] that checks if the number of senders is equal to
     /// the number of transactions in the block and recovers the senders from the transactions, if
-    /// not using [`SignedTransaction::recover_signer_unchecked`](crate::transaction::signed::SignedTransaction)
+    /// not using [`SignedTransaction::recover_signer`](crate::transaction::signed::SignedTransaction)
     /// to recover the senders.
     ///
     /// Returns an error if any of the transactions fail to recover the sender.
@@ -472,7 +472,7 @@ impl<B: Block + Default> Default for RecoveredBlock<B> {
 impl<B: Block> InMemorySize for RecoveredBlock<B> {
     #[inline]
     fn size(&self) -> usize {
-        self.block.size() + self.senders.len() * core::mem::size_of::<Address>()
+        self.block.size() + self.senders.capacity() * core::mem::size_of::<Address>()
     }
 }
 
@@ -584,6 +584,11 @@ impl<B: crate::test_utils::TestBlock> RecoveredBlock<B> {
     /// Updates the block number.
     pub fn set_block_number(&mut self, number: alloy_primitives::BlockNumber) {
         self.block.set_block_number(number);
+    }
+
+    /// Updates the block timestamp.
+    pub fn set_timestamp(&mut self, timestamp: u64) {
+        self.block.set_timestamp(timestamp);
     }
 
     /// Updates the block state root.
@@ -793,12 +798,14 @@ mod rpc_compat {
                 .zip(senders)
                 .enumerate()
                 .map(|(idx, (tx, sender))| {
+                    #[allow(clippy::needless_update)]
                     let tx_info = TransactionInfo {
                         hash: Some(*tx.tx_hash()),
                         block_hash,
                         block_number: Some(block_number),
                         base_fee,
                         index: Some(idx as u64),
+                        ..Default::default()
                     };
 
                     converter(Recovered::new_unchecked(tx, sender), tx_info)

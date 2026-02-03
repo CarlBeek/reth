@@ -3,7 +3,7 @@
 use crate::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, NetworkArgs, PayloadBuilderArgs,
-        PruningArgs, ResearchArgs, RpcServerArgs, StaticFilesArgs, TxPoolArgs,
+        PruningArgs, ResearchArgs, RocksDbArgs, RpcServerArgs, StaticFilesArgs, TxPoolArgs,
     },
     dirs::{ChainPath, DataDirPath},
     utils::get_single_header,
@@ -21,6 +21,7 @@ use reth_primitives_traits::SealedHeader;
 use reth_stages_types::StageId;
 use reth_storage_api::{
     BlockHashReader, DatabaseProviderFactory, HeaderProvider, StageCheckpointReader,
+    StorageSettings,
 };
 use reth_storage_errors::provider::ProviderResult;
 use reth_transaction_pool::TransactionPool;
@@ -38,7 +39,7 @@ pub use reth_engine_primitives::{
 };
 
 /// Default size of cross-block cache in megabytes.
-pub const DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB: u64 = 4 * 1024;
+pub const DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB: usize = 4 * 1024;
 
 /// This includes all necessary configuration to launch the node.
 /// The individual configuration options can be overwritten before launching the node.
@@ -153,6 +154,9 @@ pub struct NodeConfig<ChainSpec> {
 
     /// All static files related arguments
     pub static_files: StaticFilesArgs,
+
+    /// All `RocksDB` table routing arguments
+    pub rocksdb: RocksDbArgs,
 }
 
 impl NodeConfig<ChainSpec> {
@@ -185,6 +189,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era: EraArgs::default(),
             research: ResearchArgs::default(),
             static_files: StaticFilesArgs::default(),
+            rocksdb: RocksDbArgs::default(),
         }
     }
 
@@ -260,6 +265,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era,
             research,
             static_files,
+            rocksdb,
             ..
         } = self;
         NodeConfig {
@@ -280,6 +286,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era,
             research,
             static_files,
+            rocksdb,
         }
     }
 
@@ -354,6 +361,18 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         ChainSpec: EthereumHardforks,
     {
         self.pruning.prune_config(&self.chain)
+    }
+
+    /// Returns the effective storage settings derived from static-file and `RocksDB` CLI args.
+    pub const fn storage_settings(&self) -> StorageSettings {
+        StorageSettings::base()
+            .with_receipts_in_static_files(self.static_files.receipts)
+            .with_transaction_senders_in_static_files(self.static_files.transaction_senders)
+            .with_account_changesets_in_static_files(self.static_files.account_changesets)
+            .with_storage_changesets_in_static_files(self.static_files.storage_changesets)
+            .with_transaction_hash_numbers_in_rocksdb(self.rocksdb.all || self.rocksdb.tx_hash)
+            .with_storages_history_in_rocksdb(self.rocksdb.all || self.rocksdb.storages_history)
+            .with_account_history_in_rocksdb(self.rocksdb.all || self.rocksdb.account_history)
     }
 
     /// Returns the max block that the node should run to, looking it up from the network if
@@ -551,6 +570,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era: self.era,
             research: self.research,
             static_files: self.static_files,
+            rocksdb: self.rocksdb,
         }
     }
 
@@ -593,6 +613,7 @@ impl<ChainSpec> Clone for NodeConfig<ChainSpec> {
             era: self.era.clone(),
             research: self.research.clone(),
             static_files: self.static_files,
+            rocksdb: self.rocksdb,
         }
     }
 }
