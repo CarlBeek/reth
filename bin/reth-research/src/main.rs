@@ -37,7 +37,6 @@ use reth_revm::{database::StateProviderDatabase, db::CacheDB};
 use reth_tracing::tracing::{debug, info, warn};
 use tokio::sync::mpsc;
 
-
 /// Research ExEx that performs dual execution analysis on committed blocks.
 struct ResearchExEx<Node: FullNodeComponents> {
     /// ExEx context
@@ -53,10 +52,7 @@ struct ResearchExEx<Node: FullNodeComponents> {
 
 impl<Node: FullNodeComponents> ResearchExEx<Node> {
     /// Create a new research ExEx.
-    fn new(
-        ctx: ExExContext<Node>,
-        config: ResearchConfig,
-    ) -> eyre::Result<Self> {
+    fn new(ctx: ExExContext<Node>, config: ResearchConfig) -> eyre::Result<Self> {
         config.validate()?;
 
         // Initialize database and async writer
@@ -611,9 +607,10 @@ fn main() -> eyre::Result<()> {
         Box::pin(async move {
             let handle = builder
                 .node(EthereumNode::default())
-                .install_exex("research", |ctx| async move {
-                    Ok(research_exex(ctx, config.clone()))
-                })
+                .install_exex(
+                    "research",
+                    |ctx| async move { Ok(research_exex(ctx, config.clone())) },
+                )
                 .launch()
                 .await?;
 

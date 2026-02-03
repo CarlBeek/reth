@@ -96,18 +96,23 @@ pub struct GasAnalysis {
 
 impl GasAnalysis {
     /// Calculate gas efficiency ratio.
-    pub fn calculate_ratio(normal_gas: u64, experimental_gas: u64, gas_multiplier: u64) -> f64 {
+    ///
+    /// For CSV-based repricing, experimental_gas is now the additional gas charged
+    /// (not total gas * multiplier). The ratio represents how much additional gas
+    /// was charged relative to normal gas.
+    ///
+    /// A ratio near 0 means minimal repricing impact, higher ratios mean more impact.
+    pub fn calculate_ratio(normal_gas: u64, additional_gas: u64) -> f64 {
         if normal_gas == 0 {
-            return 1.0;
+            return 0.0;
         }
-        let normalized_exp_gas = experimental_gas as f64 / gas_multiplier as f64;
-        normalized_exp_gas / normal_gas as f64
+        additional_gas as f64 / normal_gas as f64
     }
 
     /// Check if the gas pattern indicates a structural divergence.
-    /// Threshold of 5% difference
+    /// A divergence occurs if additional gas exceeds 5% of normal gas.
     pub fn is_structural_divergence(&self) -> bool {
-        (self.gas_efficiency_ratio - 1.0).abs() > 0.05
+        self.gas_efficiency_ratio > 0.05
     }
 }
 
@@ -324,32 +329,32 @@ mod tests {
 
     #[test]
     fn test_gas_efficiency_ratio() {
-        // Same execution path: experimental gas is exactly multiplier * normal gas
-        let ratio = GasAnalysis::calculate_ratio(1000, 128_000, 128);
-        assert!((ratio - 1.0).abs() < 0.01);
+        // No additional gas: ratio should be 0
+        let ratio = GasAnalysis::calculate_ratio(1000, 0);
+        assert!((ratio - 0.0).abs() < 0.01);
         assert!(!GasAnalysis {
             normal_gas_used: 1000,
-            experimental_gas_used: 128_000,
+            experimental_gas_used: 0,
             gas_efficiency_ratio: ratio,
         }
         .is_structural_divergence());
 
-        // Different execution path: experimental uses less gas (shorter path)
-        let ratio = GasAnalysis::calculate_ratio(1000, 100_000, 128);
-        assert!(ratio < 0.9);
-        assert!(GasAnalysis {
+        // Small additional gas (1%): below threshold
+        let ratio = GasAnalysis::calculate_ratio(1000, 10);
+        assert!((ratio - 0.01).abs() < 0.01);
+        assert!(!GasAnalysis {
             normal_gas_used: 1000,
-            experimental_gas_used: 100_000,
+            experimental_gas_used: 10,
             gas_efficiency_ratio: ratio,
         }
         .is_structural_divergence());
 
-        // Different execution path: experimental uses more gas (longer path)
-        let ratio = GasAnalysis::calculate_ratio(1000, 150_000, 128);
-        assert!(ratio > 1.1);
+        // Large additional gas (10%): above threshold
+        let ratio = GasAnalysis::calculate_ratio(1000, 100);
+        assert!((ratio - 0.1).abs() < 0.01);
         assert!(GasAnalysis {
             normal_gas_used: 1000,
-            experimental_gas_used: 150_000,
+            experimental_gas_used: 100,
             gas_efficiency_ratio: ratio,
         }
         .is_structural_divergence());

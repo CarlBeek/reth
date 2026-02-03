@@ -10346,10 +10346,11 @@ dependencies = [
 
 [[package]]
 name = "reth-research"
-version = "1.9.3"
+version = "1.10.2"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
+ "csv",
  "metrics",
  "num_cpus",
  "reth-db",
@@ -10362,13 +10363,13 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.17",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
 [[package]]
 name = "reth-research-bin"
-version = "1.9.3"
+version = "1.10.2"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",

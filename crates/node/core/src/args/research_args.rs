@@ -11,9 +11,13 @@ pub struct ResearchArgs {
     #[arg(long = "research.enabled", help_heading = "Research")]
     pub enabled: bool,
 
-    /// Gas cost multiplier for research mode
-    #[arg(long = "research.gas-multiplier", default_value_t = 128, help_heading = "Research")]
-    pub gas_multiplier: u64,
+    /// Path to CSV file with gas pricing data (EIP-7904 format)
+    #[arg(
+        long = "research.gas-pricing-csv",
+        default_value = "./7904_prelim_numbers.csv",
+        help_heading = "Research"
+    )]
+    pub gas_pricing_csv: PathBuf,
 
     /// Block number to start research analysis
     #[arg(long = "research.start-block", default_value_t = 0, help_heading = "Research")]
@@ -22,29 +26,15 @@ pub struct ResearchArgs {
     /// Path to divergence database file
     #[arg(long = "research.db-path", default_value = "./divergence.db", help_heading = "Research")]
     pub db_path: PathBuf,
-
-    /// Refund multiplier for research mode
-    #[arg(long = "research.refund-multiplier", default_value_t = 128.0, help_heading = "Research")]
-    pub refund_multiplier: f64,
-
-    /// Stipend multiplier for research mode
-    #[arg(
-        long = "research.stipend-multiplier",
-        default_value_t = 128.0,
-        help_heading = "Research"
-    )]
-    pub stipend_multiplier: f64,
 }
 
 impl Default for ResearchArgs {
     fn default() -> Self {
         Self {
             enabled: false,
-            gas_multiplier: 128,
+            gas_pricing_csv: PathBuf::from("./7904_prelim_numbers.csv"),
             start_block: 0,
             db_path: PathBuf::from("./divergence.db"),
-            refund_multiplier: 128.0,
-            stipend_multiplier: 128.0,
         }
     }
 }
@@ -52,15 +42,19 @@ impl Default for ResearchArgs {
 #[cfg(feature = "research")]
 impl ResearchArgs {
     /// Converts ResearchArgs into a ResearchConfig
-    pub fn to_research_config(&self) -> reth_research::config::ResearchConfig {
-        reth_research::config::ResearchConfig {
-            gas_multiplier: self.gas_multiplier,
+    pub fn to_research_config(
+        &self,
+    ) -> Result<reth_research::config::ResearchConfig, reth_research::gas_pricing::GasPricingError>
+    {
+        let gas_pricing =
+            reth_research::gas_pricing::GasPricingTable::from_csv_path(&self.gas_pricing_csv)?;
+
+        Ok(reth_research::config::ResearchConfig {
+            gas_pricing,
             start_block: self.start_block,
-            refund_multiplier: self.refund_multiplier,
-            stipend_multiplier: self.stipend_multiplier,
             divergence_db_path: self.db_path.clone(),
             ..Default::default()
-        }
+        })
     }
 
     /// Opens the divergence database
@@ -91,11 +85,9 @@ mod tests {
             args,
             ResearchArgs {
                 enabled: false,
-                gas_multiplier: 128,
+                gas_pricing_csv: PathBuf::from("./7904_prelim_numbers.csv"),
                 start_block: 0,
                 db_path: PathBuf::from("./divergence.db"),
-                refund_multiplier: 128.0,
-                stipend_multiplier: 128.0,
             }
         );
     }
@@ -112,8 +104,8 @@ mod tests {
         let args = CommandParser::<ResearchArgs>::parse_from([
             "reth",
             "--research.enabled",
-            "--research.gas-multiplier",
-            "256",
+            "--research.gas-pricing-csv",
+            "/path/to/pricing.csv",
             "--research.start-block",
             "18000000",
         ])
@@ -122,11 +114,9 @@ mod tests {
             args,
             ResearchArgs {
                 enabled: true,
-                gas_multiplier: 256,
+                gas_pricing_csv: PathBuf::from("/path/to/pricing.csv"),
                 start_block: 18000000,
                 db_path: PathBuf::from("./divergence.db"),
-                refund_multiplier: 128.0,
-                stipend_multiplier: 128.0,
             }
         );
     }

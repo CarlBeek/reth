@@ -5,8 +5,9 @@ use crate::{
     divergence::{
         CallFrame, CallType, DivergenceLocation, OogPattern, OperationCounts, OutOfGasInfo,
     },
+    gas_pricing::OPCODE_KECCAK256,
 };
-use alloy_primitives::Address;
+use alloy_primitives::{Address, Bytes};
 use revm::{
     context_interface::ContextTr,
     interpreter::{CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter},
@@ -15,24 +16,17 @@ use revm::{
 use revm_interpreter::interpreter_types::Jumps;
 use std::collections::VecDeque;
 
-/// Inspector that multiplies gas costs and tracks execution details.
+/// Inspector that applies per-opcode gas repricing and tracks execution details.
 ///
-/// This inspector ACTUALLY modifies gas costs during execution by intercepting
-/// gas charges and multiplying them. This enables true dual execution testing.
+/// This inspector charges additional gas based on the difference between new and current
+/// gas costs as specified in the gas pricing CSV. Operations not in the CSV are unaffected.
 #[derive(Debug)]
 pub struct GasResearchInspector {
-    /// Configuration
+    /// Configuration including gas pricing table
     config: ResearchConfig,
 
-    /// Gas remaining before the current step (for calculating cost)
-    gas_before_step: Option<u64>,
-
-    /// Total gas used (with multiplier applied)
-    simulated_gas_used: u64,
-
-    /// Simulated gas limit (inflated)
-    #[allow(dead_code)]
-    simulated_gas_limit: u64,
+    /// Total additional gas charged due to repricing
+    additional_gas_charged: u64,
 
     /// Whether out-of-gas occurred
     oog_occurred: bool,
@@ -57,6 +51,9 @@ pub struct GasResearchInspector {
 
     /// Maximum entries to track for gas loop detection
     max_gas_events: usize,
+
+    /// Pending precompile call info for gas charging in call_end
+    pending_precompile: Option<PendingPrecompile>,
 }
 
 /// Entry in the call stack.
@@ -79,18 +76,19 @@ struct GasOpcodeEvent {
     contract: Address,
 }
 
+/// Pending precompile call for additional gas charging
+#[derive(Debug, Clone)]
+struct PendingPrecompile {
+    address: Address,
+    input: Bytes,
+}
+
 impl GasResearchInspector {
     /// Create a new inspector.
-    pub fn new(config: ResearchConfig, gas_limit: u64) -> Self {
-        let simulated_gas_limit = gas_limit
-            .saturating_mul(config.effective_gas_limit_multiplier())
-            .saturating_sub(21000 * (config.gas_multiplier - 1)); // Adjust for intrinsic gas
-
+    pub fn new(config: ResearchConfig, _gas_limit: u64) -> Self {
         Self {
             config,
-            gas_before_step: None,
-            simulated_gas_used: 0,
-            simulated_gas_limit,
+            additional_gas_charged: 0,
             oog_occurred: false,
             op_counts: OperationCounts::default(),
             call_stack: Vec::new(),
@@ -99,6 +97,7 @@ impl GasResearchInspector {
             oog_info: None,
             gas_opcode_usage: VecDeque::new(),
             max_gas_events: 1000,
+            pending_precompile: None,
         }
     }
 
@@ -137,9 +136,14 @@ impl GasResearchInspector {
         self.oog_occurred
     }
 
-    /// Get simulated gas used.
+    /// Get total additional gas charged due to repricing.
+    pub fn additional_gas_charged(&self) -> u64 {
+        self.additional_gas_charged
+    }
+
+    /// Get simulated gas used (for compatibility with existing code).
     pub fn simulated_gas_used(&self) -> u64 {
-        self.simulated_gas_used
+        self.additional_gas_charged
     }
 
     /// Check if a potential gas-dependent loop is detected.
@@ -158,10 +162,80 @@ impl GasResearchInspector {
         pc_counts.values().any(|&count| count >= 3)
     }
 
-    /// Calculate the gas cost for an operation with the multiplier applied.
-    #[allow(dead_code)]
-    fn calculate_gas_cost(&self, base_cost: u64) -> u64 {
-        base_cost.saturating_mul(self.config.gas_multiplier)
+    /// Calculate the new gas cost for an opcode based on the pricing table.
+    /// Returns 0 if the opcode is not in the table (unaffected by repricing).
+    fn calculate_opcode_new_gas(
+        &self,
+        opcode: u8,
+        interp: &Interpreter<revm::interpreter::interpreter::EthInterpreter>,
+    ) -> u64 {
+        let Some(pricing) = self.config.gas_pricing.get_opcode_pricing(opcode) else {
+            return 0;
+        };
+
+        if opcode == OPCODE_KECCAK256 {
+            // KECCAK256 has variable cost based on message size
+            // Stack: [offset, size, ...] - we need to read size from stack
+            let msg_size = self.get_keccak_msg_size(interp);
+            let msg_words = (msg_size + 31) / 32; // Round up to words
+            pricing.total_new_gas(msg_words as u64)
+        } else {
+            // Constant cost only
+            pricing.new_constant_gas()
+        }
+    }
+
+    /// Get KECCAK256 message size from the interpreter stack.
+    /// KECCAK256 stack is [offset, size] so size is second from top.
+    fn get_keccak_msg_size(
+        &self,
+        interp: &Interpreter<revm::interpreter::interpreter::EthInterpreter>,
+    ) -> usize {
+        // Stack layout for KECCAK256: top=[offset], second=[size]
+        // We need the second element (size)
+        if interp.stack.len() >= 2 {
+            // stack.peek returns the nth element from the top (0 = top)
+            if let Ok(size) = interp.stack.peek(1) {
+                // Convert U256 to usize, saturating at usize::MAX
+                return size.try_into().unwrap_or(usize::MAX);
+            }
+        }
+        0
+    }
+
+    /// Calculate the new gas cost for a precompile call based on the pricing table.
+    /// Returns 0 if the precompile is not in the table (unaffected by repricing).
+    fn calculate_precompile_new_gas(&self, address: &Address, input: &[u8]) -> u64 {
+        let Some(pricing) = self.config.gas_pricing.get_precompile_pricing(address) else {
+            return 0;
+        };
+
+        // Calculate variable units based on the precompile type
+        let variable_units = self.get_precompile_variable_units(address, input);
+        pricing.total_new_gas(variable_units)
+    }
+
+    /// Get variable units for precompile gas calculation.
+    fn get_precompile_variable_units(&self, address: &Address, input: &[u8]) -> u64 {
+        // Check the last byte of the address to identify the precompile
+        let addr_byte = address.0[19];
+
+        match addr_byte {
+            // ECPAIRING (0x08): num_pairs = input.len() / 192
+            0x08 => (input.len() / 192) as u64,
+
+            // BLAKE2F (0x09): num_rounds from first 4 bytes
+            0x09 => {
+                if input.len() >= 4 {
+                    u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as u64
+                } else {
+                    0
+                }
+            }
+
+            // Other precompiles: constant cost only
+            _ => 0,
+        }
     }
 
     /// Record a divergence location if not already recorded.
@@ -228,7 +302,7 @@ impl GasResearchInspector {
                                                                   * STATICCALL */
 
             // Memory operations
-            0x51 | 0x52 | 0x53 => OogPattern::MemoryExpansion, // MLOAD, MSTORE, MSTORE8
+            0x51..=0x53 => OogPattern::MemoryExpansion, // MLOAD, MSTORE, MSTORE8
 
             // If we detected a gas loop pattern, assume it's a loop
             _ if self.has_gas_loop_pattern() => OogPattern::Loop,
@@ -264,9 +338,6 @@ where
         interp: &mut Interpreter<revm::interpreter::interpreter::EthInterpreter>,
         _context: &mut CTX,
     ) {
-        // Record gas before this step so we can calculate cost in step_end
-        self.gas_before_step = Some(interp.gas.remaining());
-
         // Get the current opcode
         let opcode_byte = interp.bytecode.opcode();
 
@@ -277,7 +348,7 @@ where
         match opcode_byte {
             0x54 => self.op_counts.sload_count += 1,  // SLOAD
             0x55 => self.op_counts.sstore_count += 1, // SSTORE
-            0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 => {
+            0xA0..=0xA4 => {
                 // LOG0-LOG4
                 self.op_counts.log_count += 1
             }
@@ -297,7 +368,7 @@ where
 
         // Track memory usage
         let memory_size = interp.memory.len();
-        let memory_words = (memory_size + 31) / 32;
+        let memory_words = memory_size.div_ceil(32);
         let memory_words_u64 = memory_words as u64;
         if memory_words_u64 > self.op_counts.memory_words_allocated {
             self.op_counts.memory_words_allocated = memory_words_u64;
@@ -314,30 +385,21 @@ where
             return;
         }
 
-        // Calculate actual gas cost of this opcode
-        let gas_after_step = interp.gas.remaining();
-        let Some(gas_before) = self.gas_before_step else {
-            return;
-        };
+        let opcode_byte = interp.bytecode.opcode();
 
-        let actual_gas_cost = gas_before.saturating_sub(gas_after_step);
+        // Calculate additional gas for this opcode based on pricing table
+        let additional_gas = self.calculate_opcode_new_gas(opcode_byte, interp);
 
-        // Calculate additional gas to charge (multiplier - 1) * actual_cost
-        // If multiplier is 100, we charge 99x additional gas
-        let additional_gas = actual_gas_cost.saturating_mul(self.config.gas_multiplier - 1);
-
-        // Track total gas used
-        self.simulated_gas_used =
-            self.simulated_gas_used.saturating_add(actual_gas_cost).saturating_add(additional_gas);
-
-        // Try to charge the additional gas
         if additional_gas > 0 {
+            // Track additional gas charged
+            self.additional_gas_charged =
+                self.additional_gas_charged.saturating_add(additional_gas);
+
+            // Try to charge the additional gas
             if !interp.gas.record_cost(additional_gas) {
-                // OUT OF GAS! The execution actually failed due to repricing
-                // When record_cost returns false, revm will automatically halt execution
+                // OUT OF GAS! The execution failed due to repricing
                 self.oog_occurred = true;
 
-                let opcode_byte = interp.bytecode.opcode();
                 let opcode_name = format!("0x{:02x}", opcode_byte);
 
                 self.record_oog(interp, opcode_byte, opcode_name.clone());
@@ -361,17 +423,69 @@ where
             depth: self.call_stack.len(),
             contract: inputs.bytecode_address,
             call_type,
-            gas_at_start: self.simulated_gas_used,
+            gas_at_start: self.additional_gas_charged,
             function_selector,
         });
+
+        // Check if this is a precompile that needs repricing
+        if self.config.gas_pricing.is_repriced_precompile(&inputs.bytecode_address) {
+            // Extract input bytes for gas calculation in call_end
+            let input_bytes = match &inputs.input {
+                revm::interpreter::CallInput::Bytes(bytes) => bytes.clone(),
+                revm::interpreter::CallInput::SharedBuffer(_) => Bytes::new(),
+            };
+
+            self.pending_precompile =
+                Some(PendingPrecompile { address: inputs.bytecode_address, input: input_bytes });
+        }
 
         None // Let execution continue normally
     }
 
     fn call_end(&mut self, _context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
+        // Handle precompile additional gas charging
+        if let Some(pending) = self.pending_precompile.take() {
+            // Only charge if the precompile call succeeded
+            if outcome.result.result.is_ok() {
+                let additional_gas =
+                    self.calculate_precompile_new_gas(&pending.address, &pending.input);
+
+                if additional_gas > 0 {
+                    self.additional_gas_charged =
+                        self.additional_gas_charged.saturating_add(additional_gas);
+
+                    // For precompiles, we check if there's enough gas remaining in the outcome
+                    let gas_remaining = outcome.gas().remaining();
+                    if gas_remaining < additional_gas {
+                        // Mark as OOG
+                        self.oog_occurred = true;
+
+                        // Record OOG info for precompile
+                        if self.oog_info.is_none() {
+                            self.oog_info = Some(OutOfGasInfo {
+                                opcode: 0xF1, // CALL opcode
+                                opcode_name: format!("PRECOMPILE_{:?}", pending.address),
+                                pc: 0,
+                                contract: pending.address,
+                                call_depth: self.call_stack.len(),
+                                gas_remaining,
+                                pattern: OogPattern::CallChain,
+                            });
+                        }
+
+                        // Modify outcome to reflect OOG
+                        outcome.result.result = revm::interpreter::InstructionResult::OutOfGas;
+                    } else {
+                        // Deduct the additional gas from the outcome
+                        let _ = outcome.gas().record_cost(additional_gas);
+                    }
+                }
+            }
+        }
+
         // Record the call frame
         if let Some(entry) = self.call_stack.pop() {
-            let gas_used = self.simulated_gas_used.saturating_sub(entry.gas_at_start);
+            let gas_used = self.additional_gas_charged.saturating_sub(entry.gas_at_start);
 
             // Extract input bytes based on CallInput enum
             let input_bytes = match &inputs.input {
@@ -399,12 +513,12 @@ where
         self.call_stack.push(CallStackEntry {
             depth: self.call_stack.len(),
             contract: Address::ZERO, // Will be filled in create_end
-            call_type: match inputs.scheme {
+            call_type: match inputs.scheme() {
                 revm::context_interface::CreateScheme::Create => CallType::Create,
                 revm::context_interface::CreateScheme::Create2 { .. } |
                 revm::context_interface::CreateScheme::Custom { .. } => CallType::Create2,
             },
-            gas_at_start: self.simulated_gas_used,
+            gas_at_start: self.additional_gas_charged,
             function_selector: None, // CREATE operations don't have function selectors
         });
 
@@ -418,103 +532,104 @@ where
         outcome: &mut CreateOutcome,
     ) {
         if let Some(entry) = self.call_stack.pop() {
-            let gas_used = self.simulated_gas_used.saturating_sub(entry.gas_at_start);
+            let gas_used = self.additional_gas_charged.saturating_sub(entry.gas_at_start);
             let created_address = outcome.address.unwrap_or(Address::ZERO);
 
             self.call_frames.push(CallFrame {
                 call_index: self.call_frames.len(),
                 depth: entry.depth,
-                from: inputs.caller,
+                from: inputs.caller(),
                 to: Some(created_address),
                 call_type: entry.call_type,
-                gas_provided: inputs.gas_limit,
+                gas_provided: inputs.gas_limit(),
                 gas_used,
                 success: outcome.result.result.is_ok(),
-                input: Some(inputs.init_code.clone()),
+                input: Some(inputs.init_code().clone()),
                 output: Some(outcome.result.output.clone()),
             });
         }
     }
 }
 
-/// Estimate base gas cost for an opcode.
-/// This is a simplified estimation - real costs depend on context (memory, storage, etc.)
-#[allow(dead_code)]
-fn estimate_opcode_gas_cost(opcode: u8) -> u64 {
-    match opcode {
-        // Medium: 5-10 gas
-        0x0A => 10, // EXP - Base cost, can be much higher
-
-        // Very cheap: 2-3 gas (arithmetic, stack, etc.)
-        0x01..=0x09 | 0x0B | // ADD through SIGNEXTEND (except EXP)
-        0x10..=0x1D | // LT through BYTE (includes SHL, SHR, SAR)
-        0x50 | // POP
-        0x51 | 0x52 | 0x53 | // MLOAD, MSTORE, MSTORE8
-        0x5F..=0x7F | // PUSH0-PUSH32
-        0x80..=0x8F | // DUP1-DUP16
-        0x90..=0x9F => 3, // SWAP1-SWAP16
-        0x20 => 30, // SHA3 - Base cost
-        0x35 | 0x36 | 0x37 => 3, // CALLDATALOAD, CALLDATASIZE, CALLDATACOPY
-        0x38 | 0x39 => 3, // CODESIZE, CODECOPY
-        0x3D | 0x3E => 3, // RETURNDATASIZE, RETURNDATACOPY
-
-        // Expensive: Storage operations
-        0x54 => 800, // SLOAD - Warm access, can be 2100 for cold
-        0x55 => 2900, // SSTORE - Can be 20000 for cold or creation
-
-        // Very expensive: External calls and creates
-        0xF1 | 0xF2 => 700, // CALL, CALLCODE - Base cost, can be much higher
-        0xF4 | 0xFA => 700, // DELEGATECALL, STATICCALL
-        0xF0 => 32000, // CREATE
-        0xF5 => 32000, // CREATE2
-
-        // Logs
-        0xA0 => 375, // LOG0
-        0xA1 => 375, // LOG1
-        0xA2 => 375, // LOG2
-        0xA3 => 375, // LOG3
-        0xA4 => 375, // LOG4
-
-        // Other operations
-        0x57 => 10, // JUMPI
-        0x56 => 8,  // JUMP
-        0x58 => 2,  // PC
-        0x59 => 2,  // MSIZE
-        0x5A => 2,  // GAS
-
-        // Default
-        _ => 3,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gas_pricing::GasPricingTable;
+
+    const TEST_CSV: &str = r#"Opcode,Parameter,Current Gas,New Gas
+DIV,constant,5,15
+KECCAK256,constant,30,45
+KECCAK256,msg_size,6,6
+ECPAIRING,constant,45000,45000
+ECPAIRING,num_pairs,34000,34103
+"#;
 
     #[test]
-    fn test_gas_calculation() {
-        let config = ResearchConfig { gas_multiplier: 128, ..Default::default() };
+    fn test_inspector_creation() {
+        let table = GasPricingTable::from_csv(TEST_CSV.as_bytes()).unwrap();
+        let config = ResearchConfig { gas_pricing: table, ..Default::default() };
 
         let inspector = GasResearchInspector::new(config, 100_000);
 
-        // Base cost of 100 should become 12,800
-        assert_eq!(inspector.calculate_gas_cost(100), 12_800);
-    }
-
-    #[test]
-    fn test_opcode_gas_estimation() {
-        assert_eq!(estimate_opcode_gas_cost(0x01), 3); // ADD
-        assert_eq!(estimate_opcode_gas_cost(0x54), 800); // SLOAD
-        assert_eq!(estimate_opcode_gas_cost(0x55), 2900); // SSTORE
-        assert_eq!(estimate_opcode_gas_cost(0xF1), 700); // CALL
-    }
-
-    #[test]
-    fn test_operation_counts_tracking() {
-        let config = ResearchConfig::default();
-        let inspector = GasResearchInspector::new(config, 100_000);
-
+        assert_eq!(inspector.additional_gas_charged(), 0);
+        assert!(!inspector.oog_occurred());
         assert_eq!(inspector.operation_counts().total_ops, 0);
-        assert_eq!(inspector.operation_counts().sload_count, 0);
+    }
+
+    #[test]
+    fn test_precompile_variable_units() {
+        let table = GasPricingTable::from_csv(TEST_CSV.as_bytes()).unwrap();
+        let config = ResearchConfig { gas_pricing: table, ..Default::default() };
+
+        let inspector = GasResearchInspector::new(config, 100_000);
+
+        // ECPAIRING address (0x08)
+        let ecpairing_addr =
+            Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08]);
+
+        // 3 pairs = 576 bytes (192 * 3)
+        let input = vec![0u8; 576];
+        let units = inspector.get_precompile_variable_units(&ecpairing_addr, &input);
+        assert_eq!(units, 3);
+
+        // BLAKE2F address (0x09)
+        let blake2f_addr =
+            Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x09]);
+
+        // 100 rounds encoded in first 4 bytes (big endian)
+        let mut input = vec![0u8; 213]; // BLAKE2F input is 213 bytes
+        input[0..4].copy_from_slice(&100u32.to_be_bytes());
+        let units = inspector.get_precompile_variable_units(&blake2f_addr, &input);
+        assert_eq!(units, 100);
+    }
+
+    #[test]
+    fn test_precompile_new_gas() {
+        let table = GasPricingTable::from_csv(TEST_CSV.as_bytes()).unwrap();
+        let config = ResearchConfig { gas_pricing: table, ..Default::default() };
+
+        let inspector = GasResearchInspector::new(config, 100_000);
+
+        // ECPAIRING with 3 pairs
+        // New gas = 45000 + 3 * 34103 = 147309
+        let ecpairing_addr =
+            Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08]);
+        let input = vec![0u8; 576]; // 3 pairs
+        let new_gas = inspector.calculate_precompile_new_gas(&ecpairing_addr, &input);
+        assert_eq!(new_gas, 147309);
+    }
+
+    #[test]
+    fn test_non_repriced_precompile() {
+        let table = GasPricingTable::from_csv(TEST_CSV.as_bytes()).unwrap();
+        let config = ResearchConfig { gas_pricing: table, ..Default::default() };
+
+        let inspector = GasResearchInspector::new(config, 100_000);
+
+        // Precompile at 0x99 is not in the pricing table
+        let non_repriced_addr =
+            Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99]);
+        let new_gas = inspector.calculate_precompile_new_gas(&non_repriced_addr, &[0u8; 32]);
+        assert_eq!(new_gas, 0);
     }
 }

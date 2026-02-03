@@ -141,8 +141,7 @@ impl<E> ResearchExecutor<E> {
 
             let simulated_gas = inspector.simulated_gas_used();
 
-            let gas_ratio =
-                GasAnalysis::calculate_ratio(normal_gas, simulated_gas, self.config.gas_multiplier);
+            let gas_ratio = GasAnalysis::calculate_ratio(normal_gas, simulated_gas);
 
             let gas_analysis = GasAnalysis {
                 normal_gas_used: normal_gas,

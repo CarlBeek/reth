@@ -1,23 +1,17 @@
 //! Configuration types for research mode.
 
+use crate::gas_pricing::{GasPricingError, GasPricingTable};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Configuration for research mode execution.
 #[derive(Debug, Clone)]
 pub struct ResearchConfig {
-    /// Multiply all gas costs by this factor (default: 128)
-    pub gas_multiplier: u64,
+    /// Gas pricing table loaded from CSV
+    pub gas_pricing: GasPricingTable,
 
     /// Block number to start research mode (default: 0)
     pub start_block: u64,
-
-    /// Multiply gas refunds by this factor (default: 1.0)
-    pub refund_multiplier: f64,
-
-    /// Multiply the 2300 gas stipend by this factor (default: 1.0)
-    /// Set to 1.0 to keep it unchanged (this is the interesting case)
-    pub stipend_multiplier: f64,
 
     /// Path to the divergence database
     pub divergence_db_path: PathBuf,
@@ -27,10 +21,6 @@ pub struct ResearchConfig {
 
     /// Level of detail for divergence traces
     pub trace_detail: TraceDetail,
-
-    /// Inflate transaction gas limits by this factor (default: same as gas_multiplier)
-    /// This prevents trivial OOG failures
-    pub gas_limit_multiplier: Option<u64>,
 
     /// Maximum number of divergences to record per block (default: unlimited)
     pub max_divergences_per_block: Option<usize>,
@@ -47,14 +37,11 @@ pub struct ResearchConfig {
 impl Default for ResearchConfig {
     fn default() -> Self {
         Self {
-            gas_multiplier: 128,
+            gas_pricing: GasPricingTable::new(),
             start_block: 0,
-            refund_multiplier: 1.0,
-            stipend_multiplier: 1.0,
             divergence_db_path: PathBuf::from("divergence.db"),
             loop_detection_db_path: None,
             trace_detail: TraceDetail::Standard,
-            gas_limit_multiplier: None,
             max_divergences_per_block: None,
             detect_gas_loops: true,
             max_parallel_txs: num_cpus::get(),
@@ -63,27 +50,35 @@ impl Default for ResearchConfig {
 }
 
 impl ResearchConfig {
-    /// Get the effective gas limit multiplier.
-    /// Defaults to the gas multiplier if not explicitly set.
-    pub fn effective_gas_limit_multiplier(&self) -> u64 {
-        self.gas_limit_multiplier.unwrap_or(self.gas_multiplier)
+    /// Create a new config with gas pricing loaded from a CSV file.
+    pub fn with_csv_pricing(csv_path: &std::path::Path) -> Result<Self, GasPricingError> {
+        let gas_pricing = GasPricingTable::from_csv_path(csv_path)?;
+        Ok(Self { gas_pricing, ..Default::default() })
     }
 
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.gas_multiplier == 0 {
-            return Err(ConfigError::InvalidMultiplier("gas_multiplier must be > 0"));
-        }
-
-        if self.refund_multiplier < 0.0 {
-            return Err(ConfigError::InvalidMultiplier("refund_multiplier must be >= 0"));
-        }
-
-        if self.stipend_multiplier < 0.0 {
-            return Err(ConfigError::InvalidMultiplier("stipend_multiplier must be >= 0"));
-        }
-
+        // CSV-based pricing is always valid (empty table means no repricing)
         Ok(())
+    }
+
+    /// Check if any opcodes are repriced.
+    pub fn has_opcode_repricing(&self) -> bool {
+        self.gas_pricing.opcode_count() > 0
+    }
+
+    /// Check if any precompiles are repriced.
+    pub fn has_precompile_repricing(&self) -> bool {
+        self.gas_pricing.precompile_count() > 0
+    }
+
+    /// Get summary of loaded pricing.
+    pub fn pricing_summary(&self) -> String {
+        format!(
+            "{} opcodes, {} precompiles repriced",
+            self.gas_pricing.opcode_count(),
+            self.gas_pricing.precompile_count()
+        )
     }
 }
 
@@ -129,13 +124,13 @@ impl std::str::FromStr for TraceDetail {
 /// Configuration errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// Invalid gas multiplier value
-    #[error("Invalid multiplier: {0}")]
-    InvalidMultiplier(&'static str),
-
     /// Invalid file path
     #[error("Invalid path: {0}")]
     InvalidPath(String),
+
+    /// Gas pricing error
+    #[error("Gas pricing error: {0}")]
+    GasPricing(#[from] GasPricingError),
 }
 
 #[cfg(test)]
@@ -145,25 +140,23 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = ResearchConfig::default();
-        assert_eq!(config.gas_multiplier, 128);
-        assert_eq!(config.effective_gas_limit_multiplier(), 128);
+        assert_eq!(config.gas_pricing.opcode_count(), 0);
+        assert_eq!(config.gas_pricing.precompile_count(), 0);
         assert!(config.validate().is_ok());
     }
 
     #[test]
-    fn test_custom_gas_limit_multiplier() {
-        let config = ResearchConfig {
-            gas_multiplier: 128,
-            gas_limit_multiplier: Some(256),
-            ..Default::default()
-        };
-        assert_eq!(config.effective_gas_limit_multiplier(), 256);
-    }
+    fn test_config_with_pricing() {
+        let csv_data = r#"Opcode,Parameter,Current Gas,New Gas
+DIV,constant,5,15
+ECPAIRING,constant,45000,45000
+"#;
+        let table = GasPricingTable::from_csv(csv_data.as_bytes()).unwrap();
+        let config = ResearchConfig { gas_pricing: table, ..Default::default() };
 
-    #[test]
-    fn test_invalid_multiplier() {
-        let config = ResearchConfig { gas_multiplier: 0, ..Default::default() };
-        assert!(config.validate().is_err());
+        assert!(config.has_opcode_repricing());
+        assert!(config.has_precompile_repricing());
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -172,5 +165,11 @@ mod tests {
         assert_eq!("standard".parse::<TraceDetail>().unwrap(), TraceDetail::Standard);
         assert_eq!("detailed".parse::<TraceDetail>().unwrap(), TraceDetail::Detailed);
         assert!("invalid".parse::<TraceDetail>().is_err());
+    }
+
+    #[test]
+    fn test_pricing_summary() {
+        let config = ResearchConfig::default();
+        assert_eq!(config.pricing_summary(), "0 opcodes, 0 precompiles repriced");
     }
 }

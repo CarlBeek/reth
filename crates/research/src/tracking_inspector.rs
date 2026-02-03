@@ -132,11 +132,7 @@ where
         }
     }
 
-    fn call(
-        &mut self,
-        _context: &mut CTX,
-        inputs: &mut CallInputs,
-    ) -> Option<CallOutcome> {
+    fn call(&mut self, _context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
         let call_index = self.call_frames.len();
         let depth = self.call_stack.len();
 
@@ -162,12 +158,7 @@ where
         None
     }
 
-    fn call_end(
-        &mut self,
-        _context: &mut CTX,
-        inputs: &CallInputs,
-        outcome: &mut CallOutcome,
-    ) {
+    fn call_end(&mut self, _context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
         if let Some(entry) = self.call_stack.pop() {
             // Extract input bytes based on CallInput enum
             let input_bytes = match &inputs.input {
@@ -193,15 +184,11 @@ where
         }
     }
 
-    fn create(
-        &mut self,
-        _context: &mut CTX,
-        inputs: &mut CreateInputs,
-    ) -> Option<CreateOutcome> {
+    fn create(&mut self, _context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
         let call_index = self.call_frames.len();
         let depth = self.call_stack.len();
 
-        let call_type = match inputs.scheme {
+        let call_type = match inputs.scheme() {
             revm::context_interface::CreateScheme::Create => CallType::Create,
             revm::context_interface::CreateScheme::Create2 { .. } |
             revm::context_interface::CreateScheme::Custom { .. } => CallType::Create2,
@@ -210,10 +197,10 @@ where
         self.call_stack.push(CallStackEntry {
             call_index,
             depth,
-            from: inputs.caller,
+            from: inputs.caller(),
             to: None, // CREATE doesn't have a target address yet
             call_type,
-            gas_provided: inputs.gas_limit,
+            gas_provided: inputs.gas_limit(),
             function_selector: None, // CREATE operations don't have function selectors
         });
 
@@ -239,17 +226,13 @@ where
                 gas_provided: entry.gas_provided,
                 gas_used,
                 success: outcome.result.result.is_ok(),
-                input: Some(inputs.init_code.clone()),
+                input: Some(inputs.init_code().clone()),
                 output: Some(outcome.result.output.clone()),
             });
         }
     }
 
-    fn log(
-        &mut self,
-        _context: &mut CTX,
-        log: alloy_primitives::Log,
-    ) {
+    fn log(&mut self, _context: &mut CTX, log: alloy_primitives::Log) {
         self.event_logs.push(EventLogEntry {
             log_index: self.event_logs.len(),
             address: log.address,

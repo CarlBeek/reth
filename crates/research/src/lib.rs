@@ -15,10 +15,14 @@
 //! # Example Usage
 //!
 //! ```rust,ignore
-//! use reth_research::{ResearchExecutor, ResearchConfig};
+//! use reth_research::{ResearchExecutor, ResearchConfig, GasPricingTable};
+//! use std::path::Path;
+//!
+//! // Load gas pricing from CSV
+//! let gas_pricing = GasPricingTable::from_csv_path(Path::new("7904_prelim_numbers.csv"))?;
 //!
 //! let config = ResearchConfig {
-//!     gas_multiplier: 128,
+//!     gas_pricing,
 //!     divergence_db_path: "divergence.db".into(),
 //!     ..Default::default()
 //! };
@@ -33,6 +37,7 @@ pub mod config;
 pub mod database;
 pub mod divergence;
 pub mod executor;
+pub mod gas_pricing;
 pub mod inspector;
 pub mod metrics;
 pub mod tracking_inspector;
@@ -41,6 +46,7 @@ pub use config::{ResearchConfig, TraceDetail};
 pub use database::DivergenceDatabase;
 pub use divergence::{CallTrees, Divergence, DivergenceType, EventLog, EventLogs, OperationCounts};
 pub use executor::ResearchExecutor;
+pub use gas_pricing::{GasPricingError, GasPricingTable, OperationPricing};
 pub use inspector::GasResearchInspector;
 pub use tracking_inspector::{EventLogEntry, TrackingInspector};
 

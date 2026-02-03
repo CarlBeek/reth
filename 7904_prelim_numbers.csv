@@ -1,0 +1,18 @@
+Opcode,Parameter,Current Gas,New Gas
+ADDMOD,constant,8,8
+BLAKE2F,constant,0,170
+BLAKE2F,num_rounds,1,2
+BLS12_G1ADD,constant,375,643
+BLS12_G2ADD,constant,600,765
+DIV,constant,5,15
+ECADD,constant,150,314
+ECPAIRING,constant,45000,45000
+ECPAIRING,num_pairs,34000,34103
+ECRECOVER,constant,3000,3000
+KECCAK256,constant,30,45
+KECCAK256,msg_size,6,6
+MOD,constant,5,12
+MULMOD,constant,8,11
+POINT_EVALUATION,constant,50000,89363
+SDIV,constant,5,20
+SMOD,constant,5,5
