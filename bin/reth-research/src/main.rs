@@ -3,7 +3,7 @@
 //! This ExEx performs dual execution analysis to detect divergences caused by modified gas costs.
 //! Each committed block's transactions are executed twice:
 //! 1. Normal execution (standard gas costs)
-//! 2. Experimental execution (multiplied gas costs)
+//! 2. Experimental execution (repriced gas costs from CSV)
 //!
 //! Divergences in execution results (status, gas, state, logs) are recorded to a database.
 //!
@@ -11,7 +11,7 @@
 //!
 //! ```sh
 //! cargo run --release -p reth-research node --dev --dev.block-time 5s \
-//!   --research.gas-multiplier 128 \
+//!   --research.gas-pricing-csv ./7904_prelim_numbers.csv \
 //!   --research.db-path ./divergences.db
 //! ```
 
@@ -115,7 +115,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
         info!(
             target: "exex::research",
             start_block = self.config.start_block,
-            gas_multiplier = self.config.gas_multiplier,
+            pricing_summary = %self.config.pricing_summary(),
             "Research ExEx started"
         );
 
@@ -387,11 +387,9 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             // 2. Compare gas usage
             let normal_gas = normal_result.result.gas_used();
             let experimental_gas = experimental_result.result.gas_used();
-            let gas_ratio = GasAnalysis::calculate_ratio(
-                normal_gas,
-                experimental_gas,
-                self.config.gas_multiplier,
-            );
+            // Calculate additional gas charged by repricing
+            let additional_gas = experimental_inspector.additional_gas_charged();
+            let gas_ratio = GasAnalysis::calculate_ratio(normal_gas, additional_gas);
             let gas_analysis = GasAnalysis {
                 normal_gas_used: normal_gas,
                 experimental_gas_used: experimental_gas,
@@ -589,17 +587,38 @@ fn main() -> eyre::Result<()> {
         let node_config = builder.config();
         let research_args = &node_config.research;
 
+        // Load gas pricing from CSV
+        let gas_pricing =
+            match reth_research::GasPricingTable::from_csv_path(&research_args.gas_pricing_csv) {
+                Ok(table) => {
+                    info!(
+                        target: "exex::research",
+                        csv_path = ?research_args.gas_pricing_csv,
+                        opcodes = table.opcode_count(),
+                        precompiles = table.precompile_count(),
+                        "Loaded gas pricing from CSV"
+                    );
+                    table
+                }
+                Err(e) => {
+                    warn!(
+                        target: "exex::research",
+                        csv_path = ?research_args.gas_pricing_csv,
+                        error = %e,
+                        "Failed to load gas pricing CSV, using empty table (no repricing)"
+                    );
+                    reth_research::GasPricingTable::new()
+                }
+            };
+
         // Build research config from the built-in research args
         let config = ResearchConfig {
-            gas_multiplier: research_args.gas_multiplier,
+            gas_pricing,
             divergence_db_path: research_args.db_path.clone(),
             start_block: research_args.start_block,
             max_divergences_per_block: None,
             trace_detail: TraceDetail::Standard,
-            refund_multiplier: research_args.refund_multiplier,
-            stipend_multiplier: research_args.stipend_multiplier,
             loop_detection_db_path: None,
-            gas_limit_multiplier: None,
             detect_gas_loops: false,
             max_parallel_txs: 48, // Placeholder - will be used when parallelization is implemented
         };
