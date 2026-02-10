@@ -206,7 +206,7 @@ pub use comparison::{
     ScheduleComparisonResult,
 };
 pub use config::{ResearchConfig, TraceDetail};
-pub use database::DivergenceDatabase;
+pub use database::{DivergenceDatabase, ScheduleDivergence};
 pub use divergence::{CallTrees, Divergence, DivergenceType, EventLog, EventLogs, OperationCounts};
 pub use executor::ResearchExecutor;
 pub use inspector::GasResearchInspector;

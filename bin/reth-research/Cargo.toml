@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 # reth
 reth-ethereum = { workspace = true, features = ["full", "cli"] }
+reth-node-core = { workspace = true, features = ["research"] }
 reth-tracing.workspace = true
 reth-node-api.workspace = true
 reth-provider.workspace = true

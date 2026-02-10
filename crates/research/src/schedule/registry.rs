@@ -39,7 +39,7 @@ pub enum ScheduleError {
 ///
 /// println!("Loaded {} schedules", registry.len());
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ScheduleRegistry {
     schedules: HashMap<String, Arc<dyn GasSchedule>>,
     /// Order in which schedules were registered (for deterministic iteration)

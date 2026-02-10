@@ -9787,6 +9787,7 @@ dependencies = [
  "reth-ethereum",
  "reth-evm",
  "reth-node-api",
+ "reth-node-core",
  "reth-primitives-traits",
  "reth-provider",
  "reth-research",
