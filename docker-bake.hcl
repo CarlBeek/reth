@@ -1,8 +1,4 @@
-// Docker Bake configuration for reth and op-reth images
-// Usage:
-//   docker buildx bake ethereum    # Build reth
-//   docker buildx bake optimism    # Build op-reth
-//   docker buildx bake             # Build all
+// Docker Bake configuration for reth images
 
 variable "REGISTRY" {
   default = "ghcr.io/paradigmxyz"
@@ -35,11 +31,11 @@ variable "VERGEN_GIT_DIRTY" {
 
 // Common settings for all targets
 group "default" {
-  targets = ["ethereum", "optimism"]
+  targets = ["ethereum"]
 }
 
 group "nightly" {
-  targets = ["ethereum", "ethereum-profiling", "ethereum-edge-profiling", "optimism", "optimism-profiling"]
+  targets = ["ethereum", "ethereum-profiling", "ethereum-edge-profiling"]
 }
 
 // Base target with shared configuration
@@ -97,34 +93,50 @@ target "ethereum-edge-profiling" {
   tags = ["${REGISTRY}/reth:nightly-edge-profiling"]
 }
 
-// Optimism (op-reth)
-target "optimism" {
-  inherits = ["_base"]
+// Hive test targets — single-platform, hivetests profile, tar output
+target "_base_hive" {
+  inherits  = ["_base"]
+  platforms = ["linux/amd64"]
   args = {
-    BINARY        = "op-reth"
-    MANIFEST_PATH = "crates/optimism/bin"
+    BUILD_PROFILE = "hivetests"
   }
-  tags = ["${REGISTRY}/op-reth:${TAG}"]
 }
 
-target "optimism-profiling" {
-  inherits = ["_base_profiling"]
-  args = {
-    BINARY        = "op-reth"
-    MANIFEST_PATH = "crates/optimism/bin"
-    BUILD_PROFILE = "profiling"
-    FEATURES      = "jemalloc jemalloc-prof asm-keccak min-debug-logs"
-  }
-  tags = ["${REGISTRY}/op-reth:nightly-profiling"]
+variable "HIVE_OUTPUT_DIR" {
+  default = "./artifacts"
 }
 
-target "optimism-edge-profiling" {
-  inherits = ["_base_profiling"]
+target "hive-stable" {
+  inherits = ["_base_hive"]
   args = {
-    BINARY        = "op-reth"
-    MANIFEST_PATH = "crates/optimism/bin"
-    BUILD_PROFILE = "profiling"
-    FEATURES      = "jemalloc jemalloc-prof asm-keccak min-debug-logs edge"
+    BINARY        = "reth"
+    MANIFEST_PATH = "bin/reth"
+    FEATURES      = "asm-keccak"
   }
-  tags = ["${REGISTRY}/op-reth:nightly-edge-profiling"]
+  tags   = ["reth:local"]
+  output = ["type=docker,dest=${HIVE_OUTPUT_DIR}/reth_image.tar"]
 }
+
+target "hive-edge" {
+  inherits = ["_base_hive"]
+  args = {
+    BINARY        = "reth"
+    MANIFEST_PATH = "bin/reth"
+    FEATURES      = "asm-keccak edge"
+  }
+  tags   = ["reth:local"]
+  output = ["type=docker,dest=${HIVE_OUTPUT_DIR}/reth_image.tar"]
+}
+
+// Kurtosis test target
+target "kurtosis" {
+  inherits  = ["_base_hive"]
+  args = {
+    BINARY        = "reth"
+    MANIFEST_PATH = "bin/reth"
+    FEATURES      = "asm-keccak"
+  }
+  tags   = ["ghcr.io/paradigmxyz/reth:kurtosis-ci"]
+  output = ["type=docker,dest=${HIVE_OUTPUT_DIR}/reth_image.tar"]
+}
+

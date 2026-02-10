@@ -11,7 +11,7 @@ use reth_node_core::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs, MetricArgs,
         NetworkArgs, PayloadBuilderArgs, PruningArgs, ResearchArgs, RocksDbArgs, RpcServerArgs,
-        StaticFilesArgs, TxPoolArgs,
+        StaticFilesArgs, StorageArgs, TxPoolArgs,
     },
     node_config::NodeConfig,
     version,
@@ -123,6 +123,10 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     #[command(flatten, next_help_heading = "Static Files")]
     pub static_files: StaticFilesArgs,
 
+    /// Storage mode configuration (v2 vs v1/legacy)
+    #[command(flatten)]
+    pub storage: StorageArgs,
+
     /// Additional cli arguments
     #[command(flatten, next_help_heading = "Extension")]
     pub ext: Ext,
@@ -180,6 +184,7 @@ where
             era,
             research,
             static_files,
+            storage,
             ext,
         } = self;
 
@@ -206,6 +211,7 @@ where
             era,
             research,
             static_files,
+            storage,
         };
 
         let data_dir = node_config.datadir();
