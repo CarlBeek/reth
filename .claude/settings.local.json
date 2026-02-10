@@ -5,7 +5,9 @@
       "Read(//Users/carl/.cargo/registry/src/**)",
       "Bash(cargo tree:*)",
       "Bash(cargo test:*)",
-      "Bash(cargo:*)"
+      "Bash(cargo:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nfeat\\(research\\): add multi-schedule gas research system\n\nImplements a comprehensive system for running multiple gas schedule\nexperiments simultaneously and comparing each against baseline execution.\n\nKey features:\n- GasSchedule trait abstraction for defining gas pricing experiments\n- EIP-2780 schedule: reduced intrinsic gas by transaction category\n- CSV pricing schedule: per-opcode/precompile repricing from CSV files\n- Multiplier schedule: uniform gas cost multiplication\n- ScheduleRegistry for managing multiple schedules\n- MultiScheduleInspector for tracking gas deltas in a single execution pass\n- MultiScheduleAnalyzer for coordinating comparison and recording divergences\n- CLI argument types for easy configuration\n- Unified database schema with schedule identification\n- 111 tests including integration tests\n\nThis enables A/B testing of gas pricing hypotheses without code changes -\njust add new CSV files for different pricing experiments.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")"
     ],
     "deny": [],
     "ask": []

@@ -399,7 +399,7 @@ where
         self.call_stack.push(CallStackEntry {
             depth: self.call_stack.len(),
             contract: Address::ZERO, // Will be filled in create_end
-            call_type: match inputs.scheme {
+            call_type: match inputs.scheme() {
                 revm::context_interface::CreateScheme::Create => CallType::Create,
                 revm::context_interface::CreateScheme::Create2 { .. } |
                 revm::context_interface::CreateScheme::Custom { .. } => CallType::Create2,
@@ -424,13 +424,13 @@ where
             self.call_frames.push(CallFrame {
                 call_index: self.call_frames.len(),
                 depth: entry.depth,
-                from: inputs.caller,
+                from: inputs.caller(),
                 to: Some(created_address),
                 call_type: entry.call_type,
-                gas_provided: inputs.gas_limit,
+                gas_provided: inputs.gas_limit(),
                 gas_used,
                 success: outcome.result.result.is_ok(),
-                input: Some(inputs.init_code.clone()),
+                input: Some(inputs.init_code().clone()),
                 output: Some(outcome.result.output.clone()),
             });
         }

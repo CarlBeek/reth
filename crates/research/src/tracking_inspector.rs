@@ -201,7 +201,7 @@ where
         let call_index = self.call_frames.len();
         let depth = self.call_stack.len();
 
-        let call_type = match inputs.scheme {
+        let call_type = match inputs.scheme() {
             revm::context_interface::CreateScheme::Create => CallType::Create,
             revm::context_interface::CreateScheme::Create2 { .. } |
             revm::context_interface::CreateScheme::Custom { .. } => CallType::Create2,
@@ -210,10 +210,10 @@ where
         self.call_stack.push(CallStackEntry {
             call_index,
             depth,
-            from: inputs.caller,
+            from: inputs.caller(),
             to: None, // CREATE doesn't have a target address yet
             call_type,
-            gas_provided: inputs.gas_limit,
+            gas_provided: inputs.gas_limit(),
             function_selector: None, // CREATE operations don't have function selectors
         });
 
@@ -239,7 +239,7 @@ where
                 gas_provided: entry.gas_provided,
                 gas_used,
                 success: outcome.result.result.is_ok(),
-                input: Some(inputs.init_code.clone()),
+                input: Some(inputs.init_code().clone()),
                 output: Some(outcome.result.output.clone()),
             });
         }
