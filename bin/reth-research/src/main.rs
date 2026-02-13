@@ -242,6 +242,30 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             }
         };
 
+        // Get state for baseline execution once per block (all txs share the same pre-state).
+        // During initial pipeline sync the Finish stage checkpoint lags behind Execution,
+        // so history_by_block_number may reject blocks that have been executed but whose
+        // checkpoint hasn't been committed yet. Skip the block and let subsequent
+        // notifications pick it up once the pipeline run completes.
+        let normal_state = if block_number > 0 {
+            match provider.history_by_block_number(block_number - 1) {
+                Ok(state) => state,
+                Err(err) => {
+                    debug!(
+                        target: "exex::research",
+                        block = block_number,
+                        %err,
+                        "Historical state not yet available, skipping block \
+                         (expected during initial pipeline sync)"
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            provider.latest()?
+        };
+        let normal_db = StateProviderDatabase(normal_state);
+
         for (tx_idx, tx) in block.transactions_recovered().enumerate() {
             let tx_env = self.ctx.evm_config().tx_env(tx);
             let sender = tx.signer();
@@ -265,16 +289,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 recipient_info: None,
             };
 
-            // Get state for baseline execution
-            let normal_state = if block_number > 0 {
-                provider.history_by_block_number(block_number - 1)?
-            } else {
-                provider.latest()?
-            };
-
             // --- EXECUTION: Baseline ---
-            let normal_db = StateProviderDatabase(normal_state);
-            let mut normal_cache = CacheDB::new(normal_db);
+            let mut normal_cache = CacheDB::new(&normal_db);
             let mut normal_evm =
                 self.ctx.evm_config().evm_with_env(&mut normal_cache, evm_env.clone());
             let normal_result = match normal_evm.transact(tx_env.clone()) {
@@ -307,7 +323,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 // Calculate gas deltas based on schedule kind
                 let (intrinsic_delta, tx_category) = match schedule.kind() {
                     ScheduleKind::IntrinsicOnly | ScheduleKind::Both => {
-                        // For intrinsic-modifying schedules (like EIP-2780), calculate intrinsic gas
+                        // For intrinsic-modifying schedules (like EIP-2780), calculate intrinsic
+                        // gas
                         let baseline_intrinsic = 21000u64;
                         let schedule_intrinsic =
                             schedule.intrinsic_gas(&tx_context).unwrap_or(baseline_intrinsic);
