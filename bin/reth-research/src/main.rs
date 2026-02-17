@@ -42,6 +42,11 @@ use reth_tracing::tracing::{debug, info, warn};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+enum DbCommand {
+    Record(ScheduleDivergence),
+    DeleteRange { from_block: u64, to_block: u64 },
+}
+
 /// Research ExEx that performs multi-schedule execution analysis on committed blocks.
 struct ResearchExEx<Node: FullNodeComponents> {
     /// ExEx context
@@ -51,7 +56,7 @@ struct ResearchExEx<Node: FullNodeComponents> {
     /// Start block for analysis
     start_block: u64,
     /// Channel sender for async database writes
-    db_tx: Option<mpsc::UnboundedSender<ScheduleDivergence>>,
+    db_tx: Option<mpsc::UnboundedSender<DbCommand>>,
     /// Statistics
     blocks_processed: u64,
     divergences_found: u64,
@@ -91,30 +96,58 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             }
 
             // Spawn database writer task
-            let (tx, mut rx) = mpsc::unbounded_channel::<ScheduleDivergence>();
+            let (tx, mut rx) = mpsc::unbounded_channel::<DbCommand>();
             tokio::spawn(async move {
                 let mut write_count = 0u64;
-                while let Some(div) = rx.recv().await {
-                    match divergence_db.record_schedule_divergence(&div) {
-                        Ok(_id) => {
-                            write_count += 1;
-                            if write_count % 100 == 0 {
-                                debug!(
-                                    target: "exex::research::db_writer",
-                                    total_writes = write_count,
-                                    "Database writer progress"
-                                );
+                while let Some(cmd) = rx.recv().await {
+                    match cmd {
+                        DbCommand::Record(div) => {
+                            match divergence_db.record_schedule_divergence(&div) {
+                                Ok(_id) => {
+                                    write_count += 1;
+                                    if write_count % 100 == 0 {
+                                        debug!(
+                                            target: "exex::research::db_writer",
+                                            total_writes = write_count,
+                                            "Database writer progress"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        target: "exex::research::db_writer",
+                                        block = div.block_number,
+                                        tx_idx = div.tx_index,
+                                        schedule = div.schedule_name,
+                                        error = %e,
+                                        "Failed to record divergence to database"
+                                    );
+                                }
                             }
                         }
-                        Err(e) => {
-                            warn!(
-                                target: "exex::research::db_writer",
-                                block = div.block_number,
-                                tx_idx = div.tx_index,
-                                schedule = div.schedule_name,
-                                error = %e,
-                                "Failed to record divergence to database"
-                            );
+                        DbCommand::DeleteRange { from_block, to_block } => {
+                            match divergence_db
+                                .delete_schedule_divergences_in_block_range(from_block, to_block)
+                            {
+                                Ok(deleted) => {
+                                    info!(
+                                        target: "exex::research::db_writer",
+                                        from_block,
+                                        to_block,
+                                        deleted,
+                                        "Deleted schedule divergences for non-canonical block range"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        target: "exex::research::db_writer",
+                                        from_block,
+                                        to_block,
+                                        error = %e,
+                                        "Failed to delete non-canonical schedule divergences"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -181,7 +214,14 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
 
                     self.ctx.events.send(ExExEvent::FinishedHeight(new.tip().num_hash()))?;
                 }
-                ExExNotification::ChainReorged { old: _, new } => {
+                ExExNotification::ChainReorged { old, new } => {
+                    let range = old.range();
+                    let from_block = (*range.start()).max(self.start_block);
+                    let to_block = *range.end();
+                    if from_block <= to_block {
+                        self.delete_divergences_in_block_range(from_block, to_block);
+                    }
+
                     info!(
                         target: "exex::research",
                         "Chain reorg detected, processing new chain"
@@ -206,6 +246,13 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     self.ctx.events.send(ExExEvent::FinishedHeight(new.tip().num_hash()))?;
                 }
                 ExExNotification::ChainReverted { old } => {
+                    let range = old.range();
+                    let from_block = (*range.start()).max(self.start_block);
+                    let to_block = *range.end();
+                    if from_block <= to_block {
+                        self.delete_divergences_in_block_range(from_block, to_block);
+                    }
+
                     info!(
                         target: "exex::research",
                         reverted_tip = old.tip().number(),
@@ -409,7 +456,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
     /// Record a divergence to database.
     fn record_divergence(&self, divergence: ScheduleDivergence) {
         if let Some(ref tx) = self.db_tx {
-            if let Err(e) = tx.send(divergence.clone()) {
+            if let Err(e) = tx.send(DbCommand::Record(divergence.clone())) {
                 warn!(
                     target: "exex::research",
                     block = divergence.block_number,
@@ -438,6 +485,27 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 gas_delta = divergence.gas_delta,
                 "Divergence detected (no database configured)"
             );
+        }
+    }
+
+    fn delete_divergences_in_block_range(&self, from_block: u64, to_block: u64) {
+        if let Some(ref tx) = self.db_tx {
+            if let Err(e) = tx.send(DbCommand::DeleteRange { from_block, to_block }) {
+                warn!(
+                    target: "exex::research",
+                    from_block,
+                    to_block,
+                    error = %e,
+                    "Failed to queue non-canonical divergence cleanup"
+                );
+            } else {
+                info!(
+                    target: "exex::research",
+                    from_block,
+                    to_block,
+                    "Queued non-canonical divergence cleanup"
+                );
+            }
         }
     }
 }

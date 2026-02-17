@@ -651,6 +651,20 @@ impl DivergenceDatabase {
         Ok(count as u64)
     }
 
+    /// Delete schedule divergences in an inclusive block range.
+    pub fn delete_schedule_divergences_in_block_range(
+        &self,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<usize, DatabaseError> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM schedule_divergences WHERE block_number >= ?1 AND block_number <= ?2",
+            params![from_block, to_block],
+        )?;
+        Ok(deleted)
+    }
+
     /// Get total gas delta for a schedule.
     pub fn total_gas_delta_for_schedule(&self, schedule_name: &str) -> Result<i64, DatabaseError> {
         let conn = self.conn.lock().unwrap();
@@ -1048,5 +1062,40 @@ mod tests {
         let total = db.total_gas_delta_for_schedule("test").unwrap();
         // 15000 - 9000 + 13900 + 12900 = 32800
         assert_eq!(total, 32800);
+    }
+
+    #[test]
+    fn test_delete_schedule_divergences_in_block_range() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+
+        for block in [100_u64, 101, 102, 200] {
+            let divergence = ScheduleDivergence {
+                schedule_name: "test".to_string(),
+                block_number: block,
+                tx_index: 0,
+                tx_hash: B256::repeat_byte(block as u8),
+                timestamp: 1234567890,
+                divergence_type: DivergenceType::GasPattern,
+                baseline_success: true,
+                baseline_gas_used: 21000,
+                baseline_intrinsic_gas: 21000,
+                schedule_success: true,
+                schedule_gas_used: 21000,
+                schedule_intrinsic_gas: None,
+                gas_delta: 0,
+                gas_efficiency_ratio: None,
+                tx_category: None,
+                affected_opcodes: None,
+                affected_precompiles: None,
+                oog_info: None,
+                divergence_location: None,
+                operation_counts: None,
+            };
+            db.record_schedule_divergence(&divergence).unwrap();
+        }
+
+        let deleted = db.delete_schedule_divergences_in_block_range(100, 102).unwrap();
+        assert_eq!(deleted, 3);
+        assert_eq!(db.count_by_schedule("test").unwrap(), 1);
     }
 }
