@@ -1,11 +1,6 @@
 //! Test that the inspector works with the current revm API
 
 use reth_research::{config::ResearchConfig, inspector::GasResearchInspector};
-use revm::{
-    context_interface::ContextTr,
-    interpreter::{interpreter::EthInterpreter, Interpreter},
-    Inspector,
-};
 
 #[test]
 fn test_inspector_compiles_and_has_correct_api() {
