@@ -194,10 +194,12 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
         while let Some(notification) = self.ctx.notifications.try_next().await? {
             match &notification {
                 ExExNotification::ChainCommitted { new } => {
+                    let mut highest_finished = None;
                     for (_block_number, block) in new.blocks() {
                         let block_number = block.number();
 
                         if block_number < self.start_block {
+                            highest_finished = Some(block.num_hash());
                             continue;
                         }
 
@@ -209,19 +211,34 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                             self.registry.len()
                         );
 
-                        if let Err(e) = self.analyze_block(block).await {
-                            warn!(
-                                target: "exex::research",
-                                block = block_number,
-                                error = %e,
-                                "Failed to analyze block"
-                            );
+                        match self.analyze_block(block).await {
+                            Ok(true) => {
+                                self.blocks_processed += 1;
+                                highest_finished = Some(block.num_hash());
+                            }
+                            Ok(false) => {
+                                debug!(
+                                    target: "exex::research",
+                                    block = block_number,
+                                    "Deferred block analysis until historical state is available"
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    target: "exex::research",
+                                    block = block_number,
+                                    error = %e,
+                                    "Failed to analyze block"
+                                );
+                                break;
+                            }
                         }
-
-                        self.blocks_processed += 1;
                     }
 
-                    self.ctx.events.send(ExExEvent::FinishedHeight(new.tip().num_hash()))?;
+                    if let Some(num_hash) = highest_finished {
+                        self.ctx.events.send(ExExEvent::FinishedHeight(num_hash))?;
+                    }
                 }
                 ExExNotification::ChainReorged { old, new } => {
                     let range = old.range();
@@ -236,23 +253,42 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         "Chain reorg detected, processing new chain"
                     );
 
+                    let mut highest_finished = None;
                     for (_block_number, block) in new.blocks() {
                         let block_number = block.number();
                         if block_number < self.start_block {
+                            highest_finished = Some(block.num_hash());
                             continue;
                         }
 
-                        if let Err(e) = self.analyze_block(block).await {
-                            warn!(
-                                target: "exex::research",
-                                block = block_number,
-                                error = %e,
-                                "Failed to analyze block after reorg"
-                            );
+                        match self.analyze_block(block).await {
+                            Ok(true) => {
+                                self.blocks_processed += 1;
+                                highest_finished = Some(block.num_hash());
+                            }
+                            Ok(false) => {
+                                debug!(
+                                    target: "exex::research",
+                                    block = block_number,
+                                    "Deferred reorg block analysis until historical state is available"
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    target: "exex::research",
+                                    block = block_number,
+                                    error = %e,
+                                    "Failed to analyze block after reorg"
+                                );
+                                break;
+                            }
                         }
                     }
 
-                    self.ctx.events.send(ExExEvent::FinishedHeight(new.tip().num_hash()))?;
+                    if let Some(num_hash) = highest_finished {
+                        self.ctx.events.send(ExExEvent::FinishedHeight(num_hash))?;
+                    }
                 }
                 ExExNotification::ChainReverted { old } => {
                     let range = old.range();
@@ -290,7 +326,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
     async fn analyze_block(
         &mut self,
         block: &reth_primitives_traits::RecoveredBlock<BlockTy<Node::Types>>,
-    ) -> eyre::Result<()>
+    ) -> eyre::Result<bool>
     where
         Node::Evm: ConfigureEvm,
     {
@@ -308,7 +344,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     error = ?e,
                     "Failed to build EVM environment"
                 );
-                return Ok(());
+                return Err(e.into());
             }
         };
 
@@ -328,7 +364,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         "Historical state not yet available, skipping block \
                          (expected during initial pipeline sync)"
                     );
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         } else {
@@ -345,7 +381,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         "Historical state not yet available for inspected pass, skipping block \
                          (expected during initial pipeline sync)"
                     );
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         } else {
@@ -568,7 +604,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             "Block analyzed with multi-schedule research mode"
         );
 
-        Ok(())
+        Ok(true)
     }
 
     /// Record a divergence to database.
