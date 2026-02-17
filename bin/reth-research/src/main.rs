@@ -643,25 +643,33 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
     /// Record a divergence to database.
     fn record_divergence(&self, divergence: ScheduleDivergence) {
         if let Some(ref tx) = self.db_tx {
-            if let Err(e) = tx.send(DbCommand::Record(divergence.clone())) {
-                warn!(
-                    target: "exex::research",
-                    block = divergence.block_number,
-                    tx_idx = divergence.tx_index,
-                    schedule = divergence.schedule_name,
-                    error = %e,
-                    "Failed to send divergence to database writer"
-                );
-            } else {
-                debug!(
-                    target: "exex::research",
-                    block = divergence.block_number,
-                    tx_idx = divergence.tx_index,
-                    schedule = divergence.schedule_name,
-                    gas_delta = divergence.gas_delta,
-                    category = ?divergence.tx_category,
-                    "Divergence queued for database"
-                );
+            let block_number = divergence.block_number;
+            let tx_index = divergence.tx_index;
+            let gas_delta = divergence.gas_delta;
+            match tx.send(DbCommand::Record(divergence)) {
+                Ok(()) => {
+                    debug!(
+                        target: "exex::research",
+                        block = block_number,
+                        tx_idx = tx_index,
+                        gas_delta,
+                        "Divergence queued for database"
+                    );
+                }
+                Err(e) => {
+                    let error = e.to_string();
+                    let DbCommand::Record(divergence) = e.0 else {
+                        return;
+                    };
+                    warn!(
+                        target: "exex::research",
+                        block = divergence.block_number,
+                        tx_idx = divergence.tx_index,
+                        schedule = divergence.schedule_name,
+                        %error,
+                        "Failed to send divergence to database writer"
+                    );
+                }
             }
         } else {
             info!(
