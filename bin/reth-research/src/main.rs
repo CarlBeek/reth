@@ -370,30 +370,34 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
         } else {
             provider.latest()?
         };
-        let inspected_state = if block_number > 0 {
-            match provider.history_by_block_number(block_number - 1) {
-                Ok(state) => state,
-                Err(err) => {
-                    debug!(
-                        target: "exex::research",
-                        block = block_number,
-                        %err,
-                        "Historical state not yet available for inspected pass, skipping block \
-                         (expected during initial pipeline sync)"
-                    );
-                    return Ok(false);
-                }
-            }
-        } else {
-            provider.latest()?
-        };
-
-        let mut normal_db =
-            State::builder().with_database(StateProviderDatabase::new(baseline_state)).build();
-        let mut inspected_db =
-            State::builder().with_database(StateProviderDatabase::new(inspected_state)).build();
         let all_schedules = self.registry.all();
         let execution_schedules = self.registry.execution_schedules();
+        let mut normal_db =
+            State::builder().with_database(StateProviderDatabase::new(baseline_state)).build();
+        let mut inspected_db = if execution_schedules.is_empty() {
+            None
+        } else {
+            let inspected_state = if block_number > 0 {
+                match provider.history_by_block_number(block_number - 1) {
+                    Ok(state) => state,
+                    Err(err) => {
+                        debug!(
+                            target: "exex::research",
+                            block = block_number,
+                            %err,
+                            "Historical state not yet available for inspected pass, skipping block \
+                             (expected during initial pipeline sync)"
+                        );
+                        return Ok(false);
+                    }
+                }
+            } else {
+                provider.latest()?
+            };
+            Some(
+                State::builder().with_database(StateProviderDatabase::new(inspected_state)).build(),
+            )
+        };
         let schedule_metadata: HashMap<String, (Option<String>, Option<String>)> = all_schedules
             .iter()
             .map(|schedule| {
@@ -473,28 +477,33 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             normal_db.commit(normal_result.state);
 
             // --- EXECUTION: Inspected (execution-modifying schedules) ---
-            let mut inspector = MultiScheduleInspector::new(execution_schedules.clone());
-            let mut inspected_evm = self.ctx.evm_config().evm_with_env_and_inspector(
-                &mut inspected_db,
-                evm_env.clone(),
-                &mut inspector,
-            );
-            let inspected_result = match inspected_evm.transact(tx_env.clone()) {
-                Ok(result) => result,
-                Err(e) => {
-                    debug!(
-                        target: "exex::research",
-                        block = block_number,
-                        tx_idx,
-                        error = ?e,
-                        "Inspected execution failed"
+            let (inspector_results, formatted_operation_counts) =
+                if let Some(ref mut inspected_db) = inspected_db {
+                    let mut inspector = MultiScheduleInspector::new(execution_schedules.clone());
+                    let mut inspected_evm = self.ctx.evm_config().evm_with_env_and_inspector(
+                        &mut *inspected_db,
+                        evm_env.clone(),
+                        &mut inspector,
                     );
-                    continue;
-                }
-            };
-            drop(inspected_evm);
-            inspected_db.commit(inspected_result.state);
-            let inspector_results = inspector.results();
+                    let inspected_result = match inspected_evm.transact(tx_env.clone()) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            debug!(
+                                target: "exex::research",
+                                block = block_number,
+                                tx_idx,
+                                error = ?e,
+                                "Inspected execution failed"
+                            );
+                            continue;
+                        }
+                    };
+                    drop(inspected_evm);
+                    inspected_db.commit(inspected_result.state);
+                    (inspector.results(), Some(format!("{:?}", inspector.operation_counts())))
+                } else {
+                    (Vec::new(), None)
+                };
 
             let normal_gas_used = normal_result.result.gas_used();
             let normal_success = normal_result.result.is_success();
@@ -517,12 +526,6 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     )
                 })
                 .collect();
-            let formatted_operation_counts = if execution_schedules.is_empty() {
-                None
-            } else {
-                Some(format!("{:?}", inspector.operation_counts()))
-            };
-
             // --- ANALYZE EACH SCHEDULE ---
             for schedule in &all_schedules {
                 let schedule_name = schedule.name();
