@@ -41,6 +41,7 @@ use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_tracing::tracing::{debug, info, warn};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 enum DbCommand {
     Record(ScheduleDivergence),
@@ -57,6 +58,8 @@ struct ResearchExEx<Node: FullNodeComponents> {
     start_block: u64,
     /// Channel sender for async database writes
     db_tx: Option<mpsc::UnboundedSender<DbCommand>>,
+    /// Handle for async database writer task
+    db_writer_task: Option<JoinHandle<()>>,
     /// Statistics
     blocks_processed: u64,
     divergences_found: u64,
@@ -76,7 +79,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
         start_block: u64,
     ) -> eyre::Result<Self> {
         // Initialize database and async writer
-        let db_tx = if db_path.to_str() != Some(":memory:") {
+        let (db_tx, db_writer_task) = if db_path.to_str() != Some(":memory:") {
             let divergence_db = DivergenceDatabase::open(&db_path)?;
 
             info!(
@@ -102,7 +105,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
 
             // Spawn database writer task
             let (tx, mut rx) = mpsc::unbounded_channel::<DbCommand>();
-            tokio::spawn(async move {
+            let writer_task = tokio::spawn(async move {
                 let mut write_count = 0u64;
                 while let Some(cmd) = rx.recv().await {
                     match cmd {
@@ -163,9 +166,9 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 );
             });
 
-            Some(tx)
+            (Some(tx), Some(writer_task))
         } else {
-            None
+            (None, None)
         };
 
         Ok(Self {
@@ -173,6 +176,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             registry: Arc::new(registry),
             start_block,
             db_tx,
+            db_writer_task,
             blocks_processed: 0,
             divergences_found: 0,
         })
@@ -264,6 +268,18 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         "Chain reverted"
                     );
                 }
+            }
+        }
+
+        // Flush pending DB commands on shutdown.
+        drop(self.db_tx.take());
+        if let Some(task) = self.db_writer_task.take() {
+            if let Err(err) = task.await {
+                warn!(
+                    target: "exex::research",
+                    error = ?err,
+                    "Database writer task join failed during shutdown"
+                );
             }
         }
 
