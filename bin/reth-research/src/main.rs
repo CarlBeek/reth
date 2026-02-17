@@ -63,6 +63,11 @@ struct ResearchExEx<Node: FullNodeComponents> {
 }
 
 impl<Node: FullNodeComponents> ResearchExEx<Node> {
+    fn baseline_intrinsic_gas(tx_context: &TxContext) -> u64 {
+        let base = if tx_context.is_create { 53_000 } else { 21_000 };
+        base + tx_context.calldata_gas()
+    }
+
     /// Create a new research ExEx.
     fn new(
         ctx: ExExContext<Node>,
@@ -417,8 +422,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 let (intrinsic_delta, tx_category) = match schedule.kind() {
                     ScheduleKind::IntrinsicOnly | ScheduleKind::Both => {
                         // For intrinsic-modifying schedules (like EIP-2780), calculate intrinsic
-                        // gas
-                        let baseline_intrinsic = 21000u64;
+                        // gas. Baseline includes create/call base and calldata cost.
+                        let baseline_intrinsic = Self::baseline_intrinsic_gas(&tx_context);
                         let schedule_intrinsic =
                             schedule.intrinsic_gas(&tx_context).unwrap_or(baseline_intrinsic);
                         let delta = schedule_intrinsic as i64 - baseline_intrinsic as i64;
@@ -458,7 +463,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     let divergence_type = if would_oog || schedule_success != normal_success {
                         DivergenceType::Status
                     } else {
-                        DivergenceType::ExecutionTrace
+                        DivergenceType::GasPattern
                     };
 
                     let gas_efficiency_ratio = if normal_gas_used > 0 {
@@ -466,6 +471,10 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     } else {
                         None
                     };
+
+                    let execution_result = inspector_results
+                        .iter()
+                        .find(|r| r.schedule_name == schedule_name.as_str());
 
                     let div = ScheduleDivergence {
                         schedule_name: schedule_name.clone(),
@@ -476,18 +485,32 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         divergence_type,
                         baseline_success: normal_success,
                         baseline_gas_used: normal_gas_used,
-                        baseline_intrinsic_gas: 21000,
+                        baseline_intrinsic_gas: Self::baseline_intrinsic_gas(&tx_context),
                         schedule_success,
                         schedule_gas_used: schedule_gas,
                         schedule_intrinsic_gas: schedule.intrinsic_gas(&tx_context),
                         gas_delta: total_delta,
                         gas_efficiency_ratio,
                         tx_category: tx_category.map(|s| s.to_string()),
-                        affected_opcodes: None,
-                        affected_precompiles: None,
-                        oog_info: None,
-                        divergence_location: None,
-                        operation_counts: None,
+                        affected_opcodes: if schedule.modifies_execution() {
+                            Some(format!("{:?}", schedule.affected_opcodes()))
+                        } else {
+                            None
+                        },
+                        affected_precompiles: if schedule.modifies_execution() {
+                            Some(format!("{:?}", schedule.affected_precompiles()))
+                        } else {
+                            None
+                        },
+                        oog_info: execution_result
+                            .and_then(|r| r.oog_info.as_ref().map(|o| format!("{o:?}"))),
+                        divergence_location: execution_result
+                            .and_then(|r| r.divergence_location.as_ref().map(|l| format!("{l:?}"))),
+                        operation_counts: if schedule.modifies_execution() {
+                            Some(format!("{:?}", inspector.operation_counts()))
+                        } else {
+                            None
+                        },
                     };
 
                     self.record_divergence(div);
