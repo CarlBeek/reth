@@ -54,6 +54,12 @@ struct ResearchExEx<Node: FullNodeComponents> {
     ctx: ExExContext<Node>,
     /// Schedule registry containing all configured experiments
     registry: Arc<ScheduleRegistry>,
+    /// All schedules in deterministic order
+    all_schedules: Vec<Arc<dyn reth_research::schedule::GasSchedule>>,
+    /// Execution-modifying schedules only
+    execution_schedules: Vec<Arc<dyn reth_research::schedule::GasSchedule>>,
+    /// Static formatted schedule metadata reused across blocks
+    schedule_metadata: HashMap<String, (Option<String>, Option<String>)>,
     /// Start block for analysis
     start_block: u64,
     /// Channel sender for async database writes
@@ -78,6 +84,24 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
         db_path: std::path::PathBuf,
         start_block: u64,
     ) -> eyre::Result<Self> {
+        let registry = Arc::new(registry);
+        let all_schedules = registry.all();
+        let execution_schedules = registry.execution_schedules();
+        let schedule_metadata: HashMap<String, (Option<String>, Option<String>)> = all_schedules
+            .iter()
+            .map(|schedule| {
+                let metadata = if schedule.modifies_execution() {
+                    (
+                        Some(format!("{:?}", schedule.affected_opcodes())),
+                        Some(format!("{:?}", schedule.affected_precompiles())),
+                    )
+                } else {
+                    (None, None)
+                };
+                (schedule.name().to_string(), metadata)
+            })
+            .collect();
+
         // Initialize database and async writer
         let (db_tx, db_writer_task) = if db_path.to_str() != Some(":memory:") {
             let divergence_db = DivergenceDatabase::open(&db_path)?;
@@ -173,7 +197,10 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
 
         Ok(Self {
             ctx,
-            registry: Arc::new(registry),
+            registry,
+            all_schedules,
+            execution_schedules,
+            schedule_metadata,
             start_block,
             db_tx,
             db_writer_task,
@@ -370,11 +397,9 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
         } else {
             provider.latest()?
         };
-        let all_schedules = self.registry.all();
-        let execution_schedules = self.registry.execution_schedules();
         let mut normal_db =
             State::builder().with_database(StateProviderDatabase::new(baseline_state)).build();
-        let mut inspected_db = if execution_schedules.is_empty() {
+        let mut inspected_db = if self.execution_schedules.is_empty() {
             None
         } else {
             let inspected_state = if block_number > 0 {
@@ -398,20 +423,6 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 State::builder().with_database(StateProviderDatabase::new(inspected_state)).build(),
             )
         };
-        let schedule_metadata: HashMap<String, (Option<String>, Option<String>)> = all_schedules
-            .iter()
-            .map(|schedule| {
-                let metadata = if schedule.modifies_execution() {
-                    (
-                        Some(format!("{:?}", schedule.affected_opcodes())),
-                        Some(format!("{:?}", schedule.affected_precompiles())),
-                    )
-                } else {
-                    (None, None)
-                };
-                (schedule.name().to_string(), metadata)
-            })
-            .collect();
 
         for (tx_idx, tx) in block.transactions_recovered().enumerate() {
             let tx_env = self.ctx.evm_config().tx_env(tx);
@@ -479,7 +490,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             // --- EXECUTION: Inspected (execution-modifying schedules) ---
             let (inspector_results, formatted_operation_counts) =
                 if let Some(ref mut inspected_db) = inspected_db {
-                    let mut inspector = MultiScheduleInspector::new(execution_schedules.clone());
+                    let mut inspector =
+                        MultiScheduleInspector::new(self.execution_schedules.clone());
                     let mut inspected_evm = self.ctx.evm_config().evm_with_env_and_inspector(
                         &mut *inspected_db,
                         evm_env.clone(),
@@ -527,7 +539,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 })
                 .collect();
             // --- ANALYZE EACH SCHEDULE ---
-            for schedule in &all_schedules {
+            for schedule in &self.all_schedules {
                 let schedule_name = schedule.name();
                 let schedule_kind = schedule.kind();
 
@@ -571,7 +583,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
 
                 let total_delta = intrinsic_delta + execution_delta;
                 let (affected_opcodes, affected_precompiles) =
-                    schedule_metadata.get(schedule_name).cloned().unwrap_or((None, None));
+                    self.schedule_metadata.get(schedule_name).cloned().unwrap_or((None, None));
 
                 // Determine if this would cause a divergence
                 let schedule_gas = (normal_gas_used as i64 + total_delta).max(0) as u64;
