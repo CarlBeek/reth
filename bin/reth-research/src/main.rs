@@ -110,6 +110,8 @@ struct ResearchExEx<Node: FullNodeComponents> {
     all_schedules: Vec<Arc<dyn reth_research::schedule::GasSchedule>>,
     /// Execution-modifying schedules only
     execution_schedules: Arc<[Arc<dyn reth_research::schedule::GasSchedule>]>,
+    /// Lookup index into execution inspector results by schedule name.
+    execution_schedule_indices: HashMap<String, usize>,
     /// Whether any configured schedule modifies intrinsic gas.
     has_intrinsic_schedules: bool,
     /// Static formatted schedule metadata reused across blocks
@@ -142,7 +144,13 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
     ) -> eyre::Result<Self> {
         let registry = Arc::new(registry);
         let all_schedules = registry.all();
-        let execution_schedules = Arc::from(registry.execution_schedules());
+        let execution_schedules: Arc<[Arc<dyn reth_research::schedule::GasSchedule>]> =
+            Arc::from(registry.execution_schedules());
+        let execution_schedule_indices = execution_schedules
+            .iter()
+            .enumerate()
+            .map(|(idx, schedule)| (schedule.name().to_string(), idx))
+            .collect();
         let has_intrinsic_schedules =
             all_schedules.iter().any(|schedule| schedule.modifies_intrinsic());
         let schedule_metadata: HashMap<String, (Option<String>, Option<String>)> = all_schedules
@@ -283,6 +291,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             registry,
             all_schedules,
             execution_schedules,
+            execution_schedule_indices,
             has_intrinsic_schedules,
             schedule_metadata,
             start_block,
@@ -617,10 +626,6 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             let normal_gas_used = normal_result.result.gas_used();
             let normal_success = normal_result.result.is_success();
             let tx_hash = *tx.tx_hash();
-            let execution_metadata_by_name: HashMap<_, _> = inspector_results
-                .iter()
-                .map(|result| (result.schedule_name.as_str(), result))
-                .collect();
             // --- ANALYZE EACH SCHEDULE ---
             for schedule in &self.all_schedules {
                 let schedule_name = schedule.name();
@@ -647,7 +652,10 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     ScheduleKind::None => continue,
                 };
 
-                let execution_result = execution_metadata_by_name.get(schedule_name).copied();
+                let execution_result = self
+                    .execution_schedule_indices
+                    .get(schedule_name)
+                    .and_then(|idx| inspector_results.get(*idx));
                 let (execution_delta, execution_would_oog) = match schedule_kind {
                     ScheduleKind::ExecutionOnly | ScheduleKind::Both => execution_result
                         .map(|result| (result.additional_gas, result.would_oog))
