@@ -130,34 +130,96 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             // Spawn database writer task
             let (tx, mut rx) = mpsc::unbounded_channel::<DbCommand>();
             let writer_task = tokio::spawn(async move {
+                const DB_WRITE_BATCH_SIZE: usize = 256;
                 let mut write_count = 0u64;
+                let mut pending_records = Vec::with_capacity(DB_WRITE_BATCH_SIZE);
                 while let Some(cmd) = rx.recv().await {
                     match cmd {
-                        DbCommand::Record(div) => {
-                            match divergence_db.record_schedule_divergence(&div) {
-                                Ok(_id) => {
-                                    write_count += 1;
-                                    if write_count % 100 == 0 {
-                                        debug!(
+                        DbCommand::Record(divergence) => {
+                            pending_records.push(divergence);
+                            if pending_records.len() >= DB_WRITE_BATCH_SIZE {
+                                match divergence_db
+                                    .record_schedule_divergences_batch(&pending_records)
+                                {
+                                    Ok(written) => {
+                                        write_count += written as u64;
+                                        if write_count % 100 == 0 {
+                                            debug!(
+                                                target: "exex::research::db_writer",
+                                                total_writes = write_count,
+                                                "Database writer progress"
+                                            );
+                                        }
+                                    }
+                                    Err(error) => {
+                                        warn!(
                                             target: "exex::research::db_writer",
-                                            total_writes = write_count,
-                                            "Database writer progress"
+                                            batch_len = pending_records.len(),
+                                            %error,
+                                            "Batch divergence write failed, retrying individually"
                                         );
+                                        for divergence in &pending_records {
+                                            match divergence_db
+                                                .record_schedule_divergence(divergence)
+                                            {
+                                                Ok(_id) => {
+                                                    write_count += 1;
+                                                }
+                                                Err(single_error) => {
+                                                    warn!(
+                                                        target: "exex::research::db_writer",
+                                                        block = divergence.block_number,
+                                                        tx_idx = divergence.tx_index,
+                                                        schedule = divergence.schedule_name,
+                                                        error = %single_error,
+                                                        "Failed to record divergence to database"
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
                                 }
-                                Err(e) => {
-                                    warn!(
-                                        target: "exex::research::db_writer",
-                                        block = div.block_number,
-                                        tx_idx = div.tx_index,
-                                        schedule = div.schedule_name,
-                                        error = %e,
-                                        "Failed to record divergence to database"
-                                    );
-                                }
+                                pending_records.clear();
                             }
                         }
                         DbCommand::DeleteRange { from_block, to_block } => {
+                            if !pending_records.is_empty() {
+                                match divergence_db
+                                    .record_schedule_divergences_batch(&pending_records)
+                                {
+                                    Ok(written) => {
+                                        write_count += written as u64;
+                                    }
+                                    Err(error) => {
+                                        warn!(
+                                            target: "exex::research::db_writer",
+                                            batch_len = pending_records.len(),
+                                            %error,
+                                            "Failed to flush pending divergence batch before delete, retrying individually"
+                                        );
+                                        for divergence in &pending_records {
+                                            match divergence_db
+                                                .record_schedule_divergence(divergence)
+                                            {
+                                                Ok(_id) => {
+                                                    write_count += 1;
+                                                }
+                                                Err(single_error) => {
+                                                    warn!(
+                                                        target: "exex::research::db_writer",
+                                                        block = divergence.block_number,
+                                                        tx_idx = divergence.tx_index,
+                                                        schedule = divergence.schedule_name,
+                                                        error = %single_error,
+                                                        "Failed to record divergence to database"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                pending_records.clear();
+                            }
                             match divergence_db
                                 .delete_schedule_divergences_in_block_range(from_block, to_block)
                             {
@@ -178,6 +240,38 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                                         error = %e,
                                         "Failed to delete non-canonical schedule divergences"
                                     );
+                                }
+                            }
+                        }
+                    }
+                }
+                if !pending_records.is_empty() {
+                    match divergence_db.record_schedule_divergences_batch(&pending_records) {
+                        Ok(written) => {
+                            write_count += written as u64;
+                        }
+                        Err(error) => {
+                            warn!(
+                                target: "exex::research::db_writer",
+                                batch_len = pending_records.len(),
+                                %error,
+                                "Failed to flush pending divergence batch on shutdown, retrying individually"
+                            );
+                            for divergence in &pending_records {
+                                match divergence_db.record_schedule_divergence(divergence) {
+                                    Ok(_id) => {
+                                        write_count += 1;
+                                    }
+                                    Err(single_error) => {
+                                        warn!(
+                                            target: "exex::research::db_writer",
+                                            block = divergence.block_number,
+                                            tx_idx = divergence.tx_index,
+                                            schedule = divergence.schedule_name,
+                                            error = %single_error,
+                                            "Failed to record divergence to database"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -581,10 +675,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     let oog_info = execution_result
                         .and_then(|result| result.oog_info.as_ref().map(|oog| format!("{oog:?}")));
                     let divergence_location = execution_result.and_then(|result| {
-                        result
-                            .divergence_location
-                            .as_ref()
-                            .map(|location| format!("{location:?}"))
+                        result.divergence_location.as_ref().map(|location| format!("{location:?}"))
                     });
 
                     let div = ScheduleDivergence {

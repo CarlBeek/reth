@@ -600,66 +600,68 @@ impl DivergenceDatabase {
         &self,
         divergences: &[ScheduleDivergence],
     ) -> Result<usize, DatabaseError> {
-        let conn = self.conn.lock().unwrap();
-
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare(
+            "INSERT INTO schedule_divergences (
+                schedule_name, block_number, tx_index, tx_hash, timestamp,
+                divergence_type,
+                baseline_success, baseline_gas_used, baseline_intrinsic_gas,
+                schedule_success, schedule_gas_used, schedule_intrinsic_gas,
+                gas_delta, gas_efficiency_ratio,
+                tx_category, affected_opcodes, affected_precompiles,
+                oog_info, divergence_location, operation_counts
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+            )
+            ON CONFLICT(schedule_name, block_number, tx_index, tx_hash) DO UPDATE SET
+                timestamp = excluded.timestamp,
+                divergence_type = excluded.divergence_type,
+                baseline_success = excluded.baseline_success,
+                baseline_gas_used = excluded.baseline_gas_used,
+                baseline_intrinsic_gas = excluded.baseline_intrinsic_gas,
+                schedule_success = excluded.schedule_success,
+                schedule_gas_used = excluded.schedule_gas_used,
+                schedule_intrinsic_gas = excluded.schedule_intrinsic_gas,
+                gas_delta = excluded.gas_delta,
+                gas_efficiency_ratio = excluded.gas_efficiency_ratio,
+                tx_category = excluded.tx_category,
+                affected_opcodes = excluded.affected_opcodes,
+                affected_precompiles = excluded.affected_precompiles,
+                oog_info = excluded.oog_info,
+                divergence_location = excluded.divergence_location,
+                operation_counts = excluded.operation_counts",
+        )?;
         let mut count = 0;
         for divergence in divergences {
-            conn.execute(
-                "INSERT INTO schedule_divergences (
-                    schedule_name, block_number, tx_index, tx_hash, timestamp,
-                    divergence_type,
-                    baseline_success, baseline_gas_used, baseline_intrinsic_gas,
-                    schedule_success, schedule_gas_used, schedule_intrinsic_gas,
-                    gas_delta, gas_efficiency_ratio,
-                    tx_category, affected_opcodes, affected_precompiles,
-                    oog_info, divergence_location, operation_counts
-                ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
-                )
-                ON CONFLICT(schedule_name, block_number, tx_index, tx_hash) DO UPDATE SET
-                    timestamp = excluded.timestamp,
-                    divergence_type = excluded.divergence_type,
-                    baseline_success = excluded.baseline_success,
-                    baseline_gas_used = excluded.baseline_gas_used,
-                    baseline_intrinsic_gas = excluded.baseline_intrinsic_gas,
-                    schedule_success = excluded.schedule_success,
-                    schedule_gas_used = excluded.schedule_gas_used,
-                    schedule_intrinsic_gas = excluded.schedule_intrinsic_gas,
-                    gas_delta = excluded.gas_delta,
-                    gas_efficiency_ratio = excluded.gas_efficiency_ratio,
-                    tx_category = excluded.tx_category,
-                    affected_opcodes = excluded.affected_opcodes,
-                    affected_precompiles = excluded.affected_precompiles,
-                    oog_info = excluded.oog_info,
-                    divergence_location = excluded.divergence_location,
-                    operation_counts = excluded.operation_counts",
-                params![
-                    divergence.schedule_name,
-                    divergence.block_number,
-                    divergence.tx_index,
-                    divergence.tx_hash.as_slice(),
-                    divergence.timestamp,
-                    divergence.divergence_type.to_string(),
-                    divergence.baseline_success,
-                    divergence.baseline_gas_used,
-                    divergence.baseline_intrinsic_gas,
-                    divergence.schedule_success,
-                    divergence.schedule_gas_used,
-                    divergence.schedule_intrinsic_gas,
-                    divergence.gas_delta,
-                    divergence.gas_efficiency_ratio,
-                    divergence.tx_category,
-                    divergence.affected_opcodes,
-                    divergence.affected_precompiles,
-                    divergence.oog_info,
-                    divergence.divergence_location,
-                    divergence.operation_counts,
-                ],
-            )?;
+            stmt.execute(params![
+                divergence.schedule_name,
+                divergence.block_number,
+                divergence.tx_index,
+                divergence.tx_hash.as_slice(),
+                divergence.timestamp,
+                divergence.divergence_type.to_string(),
+                divergence.baseline_success,
+                divergence.baseline_gas_used,
+                divergence.baseline_intrinsic_gas,
+                divergence.schedule_success,
+                divergence.schedule_gas_used,
+                divergence.schedule_intrinsic_gas,
+                divergence.gas_delta,
+                divergence.gas_efficiency_ratio,
+                divergence.tx_category,
+                divergence.affected_opcodes,
+                divergence.affected_precompiles,
+                divergence.oog_info,
+                divergence.divergence_location,
+                divergence.operation_counts,
+            ])?;
             count += 1;
         }
 
+        drop(stmt);
+        tx.commit()?;
         Ok(count)
     }
 
