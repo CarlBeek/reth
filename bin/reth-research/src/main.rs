@@ -17,7 +17,7 @@
 //!   --research.db-path ./divergences.db
 //! ```
 
-use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction};
+use alloy_consensus::{constants::KECCAK_EMPTY, transaction::TxHashRef, BlockHeader, Transaction};
 use alloy_primitives::{Address, Bytes, U256};
 use clap::Parser;
 use futures::TryStreamExt;
@@ -33,11 +33,11 @@ use reth_provider::StateProviderFactory;
 use reth_research::{
     database::DivergenceDatabase,
     divergence::DivergenceType,
-    schedule::{ScheduleKind, ScheduleRegistry, TxContext},
+    schedule::{RecipientInfo, ScheduleKind, ScheduleRegistry, TxContext},
     MultiScheduleInspector, ScheduleDivergence,
 };
-use reth_revm::DatabaseCommit;
 use reth_revm::{database::StateProviderDatabase, db::State};
+use reth_revm::{Database, DatabaseCommit};
 use reth_tracing::tracing::{debug, info, warn};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -369,16 +369,37 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             let value: U256 = tx.value();
             let input: Bytes = tx.input().clone();
             let gas_limit: u64 = tx.gas_limit();
-
-            let tx_context = TxContext {
-                sender,
-                recipient,
-                value,
-                input,
-                gas_limit,
-                is_create,
-                recipient_info: None,
+            let recipient_info = match recipient {
+                Some(recipient_addr) => match normal_db.basic(recipient_addr) {
+                    Ok(Some(account)) => Some(RecipientInfo {
+                        exists: true,
+                        has_code: account.code_hash != KECCAK_EMPTY,
+                        balance: account.balance,
+                        nonce: account.nonce,
+                    }),
+                    Ok(None) => Some(RecipientInfo {
+                        exists: false,
+                        has_code: false,
+                        balance: U256::ZERO,
+                        nonce: 0,
+                    }),
+                    Err(err) => {
+                        debug!(
+                            target: "exex::research",
+                            block = block_number,
+                            tx_idx,
+                            recipient = ?recipient_addr,
+                            %err,
+                            "Failed to fetch recipient account info for transaction classification"
+                        );
+                        None
+                    }
+                },
+                None => None,
             };
+
+            let tx_context =
+                TxContext { sender, recipient, value, input, gas_limit, is_create, recipient_info };
 
             // --- EXECUTION: Baseline ---
             let mut normal_evm =
