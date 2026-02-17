@@ -394,6 +394,20 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             State::builder().with_database(StateProviderDatabase::new(inspected_state)).build();
         let all_schedules = self.registry.all();
         let execution_schedules = self.registry.execution_schedules();
+        let schedule_metadata: HashMap<String, (Option<String>, Option<String>)> = all_schedules
+            .iter()
+            .map(|schedule| {
+                let metadata = if schedule.modifies_execution() {
+                    (
+                        Some(format!("{:?}", schedule.affected_opcodes())),
+                        Some(format!("{:?}", schedule.affected_precompiles())),
+                    )
+                } else {
+                    (None, None)
+                };
+                (schedule.name().to_string(), metadata)
+            })
+            .collect();
 
         for (tx_idx, tx) in block.transactions_recovered().enumerate() {
             let tx_env = self.ctx.evm_config().tx_env(tx);
@@ -486,10 +500,28 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             let normal_success = normal_result.result.is_success();
             let tx_hash = *tx.tx_hash();
             let baseline_intrinsic_gas = Self::baseline_intrinsic_gas(&tx_context);
-            let execution_results_by_name: HashMap<_, _> = inspector_results
+            let execution_metadata_by_name: HashMap<_, _> = inspector_results
                 .iter()
-                .map(|result| (result.schedule_name.as_str(), result))
+                .map(|result| {
+                    (
+                        result.schedule_name.as_str(),
+                        (
+                            result.additional_gas,
+                            result.would_oog,
+                            result.oog_info.as_ref().map(|oog| format!("{oog:?}")),
+                            result
+                                .divergence_location
+                                .as_ref()
+                                .map(|location| format!("{location:?}")),
+                        ),
+                    )
+                })
                 .collect();
+            let formatted_operation_counts = if execution_schedules.is_empty() {
+                None
+            } else {
+                Some(format!("{:?}", inspector.operation_counts()))
+            };
 
             // --- ANALYZE EACH SCHEDULE ---
             for schedule in &all_schedules {
@@ -514,19 +546,29 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     ScheduleKind::None => continue,
                 };
 
-                let execution_result = execution_results_by_name.get(schedule_name).copied();
-                let (execution_delta, execution_would_oog) = match schedule_kind {
-                    ScheduleKind::ExecutionOnly | ScheduleKind::Both => {
-                        if let Some(result) = execution_result {
-                            (result.additional_gas, result.would_oog)
-                        } else {
-                            (0i64, false)
+                let (execution_delta, execution_would_oog, oog_info, divergence_location) =
+                    match schedule_kind {
+                        ScheduleKind::ExecutionOnly | ScheduleKind::Both => {
+                            if let Some((
+                                additional_gas,
+                                would_oog,
+                                oog_info,
+                                divergence_location,
+                            )) = execution_metadata_by_name.get(schedule_name).cloned()
+                            {
+                                (additional_gas, would_oog, oog_info, divergence_location)
+                            } else {
+                                (0i64, false, None, None)
+                            }
                         }
-                    }
-                    ScheduleKind::IntrinsicOnly | ScheduleKind::None => (0i64, false),
-                };
+                        ScheduleKind::IntrinsicOnly | ScheduleKind::None => {
+                            (0i64, false, None, None)
+                        }
+                    };
 
                 let total_delta = intrinsic_delta + execution_delta;
+                let (affected_opcodes, affected_precompiles) =
+                    schedule_metadata.get(schedule_name).cloned().unwrap_or((None, None));
 
                 // Determine if this would cause a divergence
                 let schedule_gas = (normal_gas_used as i64 + total_delta).max(0) as u64;
@@ -563,22 +605,15 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         gas_delta: total_delta,
                         gas_efficiency_ratio,
                         tx_category: tx_category.map(|s| s.to_string()),
-                        affected_opcodes: if schedule.modifies_execution() {
-                            Some(format!("{:?}", schedule.affected_opcodes()))
-                        } else {
-                            None
-                        },
-                        affected_precompiles: if schedule.modifies_execution() {
-                            Some(format!("{:?}", schedule.affected_precompiles()))
-                        } else {
-                            None
-                        },
-                        oog_info: execution_result
-                            .and_then(|r| r.oog_info.as_ref().map(|o| format!("{o:?}"))),
-                        divergence_location: execution_result
-                            .and_then(|r| r.divergence_location.as_ref().map(|l| format!("{l:?}"))),
-                        operation_counts: if schedule.modifies_execution() {
-                            Some(format!("{:?}", inspector.operation_counts()))
+                        affected_opcodes,
+                        affected_precompiles,
+                        oog_info,
+                        divergence_location,
+                        operation_counts: if matches!(
+                            schedule_kind,
+                            ScheduleKind::ExecutionOnly | ScheduleKind::Both
+                        ) {
+                            formatted_operation_counts.clone()
                         } else {
                             None
                         },
