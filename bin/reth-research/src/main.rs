@@ -17,8 +17,9 @@
 //!   --research.db-path ./divergences.db
 //! ```
 
-use alloy_consensus::{BlockHeader, Transaction};
+use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction};
 use alloy_primitives::{Address, Bytes, U256};
+use clap::Parser;
 use futures::TryStreamExt;
 use reth_ethereum::{
     exex::{ExExContext, ExExEvent, ExExNotification},
@@ -26,6 +27,7 @@ use reth_ethereum::{
 };
 use reth_evm::{ConfigureEvm, Evm};
 use reth_node_api::{BlockTy, FullNodeComponents};
+use reth_node_core::args::ResearchArgs;
 use reth_primitives_traits::BlockBody;
 use reth_provider::StateProviderFactory;
 use reth_research::{
@@ -34,7 +36,8 @@ use reth_research::{
     schedule::{ScheduleKind, ScheduleRegistry, TxContext},
     ScheduleDivergence,
 };
-use reth_revm::{database::StateProviderDatabase, db::CacheDB};
+use reth_revm::DatabaseCommit;
+use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_tracing::tracing::{debug, info, warn};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -226,7 +229,6 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
         let block_number = block.number();
         let block_start = std::time::Instant::now();
         let provider = self.ctx.provider();
-        let block_gas_limit = block.header().gas_limit();
         let block_timestamp = block.timestamp();
 
         let evm_env = match self.ctx.evm_config().evm_env(block.header()) {
@@ -264,7 +266,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
         } else {
             provider.latest()?
         };
-        let normal_db = StateProviderDatabase(normal_state);
+        let mut normal_db =
+            State::builder().with_database(StateProviderDatabase::new(normal_state)).build();
 
         for (tx_idx, tx) in block.transactions_recovered().enumerate() {
             let tx_env = self.ctx.evm_config().tx_env(tx);
@@ -290,9 +293,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             };
 
             // --- EXECUTION: Baseline ---
-            let mut normal_cache = CacheDB::new(&normal_db);
             let mut normal_evm =
-                self.ctx.evm_config().evm_with_env(&mut normal_cache, evm_env.clone());
+                self.ctx.evm_config().evm_with_env(&mut normal_db, evm_env.clone());
             let normal_result = match normal_evm.transact(tx_env.clone()) {
                 Ok(result) => result,
                 Err(e) => {
@@ -307,11 +309,11 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 }
             };
             drop(normal_evm);
+            normal_db.commit(normal_result.state);
 
             let normal_gas_used = normal_result.result.gas_used();
             let normal_success = normal_result.result.is_success();
-            // Use a placeholder hash since we can't easily get the real one
-            let tx_hash = alloy_primitives::B256::ZERO;
+            let tx_hash = *tx.tx_hash();
 
             // --- ANALYZE EACH SCHEDULE ---
             for schedule_name in self.registry.names() {
@@ -343,7 +345,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
 
                 // Determine if this would cause a divergence
                 let schedule_gas = (normal_gas_used as i64 + total_delta).max(0) as u64;
-                let would_oog = schedule_gas > block_gas_limit;
+                let would_oog = schedule_gas > gas_limit;
                 let schedule_success = normal_success && !would_oog;
 
                 // Record divergence if there's a gas delta or status change
@@ -450,43 +452,41 @@ async fn research_exex<Node: FullNodeComponents>(
 }
 
 fn main() -> eyre::Result<()> {
-    reth_ethereum::cli::Cli::parse_args().run(|builder, _ext| async move {
-        let node_config = builder.config();
-        let research_args = &node_config.research;
-
+    reth_ethereum::cli::Cli::<reth_ethereum::cli::chainspec::EthereumChainSpecParser, ResearchArgs>::parse()
+        .run(|builder, research_args: ResearchArgs| async move {
         // Check if any schedules are configured
-        if !research_args.has_schedules() {
-            return Err(eyre::eyre!(
-                "No research schedules configured. Use --research.eip2780, --research.csv, or --research.multiplier"
-            ));
-        }
+            if !research_args.has_schedules() {
+                return Err(eyre::eyre!(
+                    "No research schedules configured. Use --research.eip2780, --research.csv, or --research.multiplier"
+                ));
+            }
 
-        // Build the schedule registry from CLI args
-        let registry = research_args.build_registry().map_err(|e| {
-            eyre::eyre!("Failed to build schedule registry: {}", e)
-        })?;
+            // Build the schedule registry from CLI args
+            let registry = research_args
+                .build_registry()
+                .map_err(|e| eyre::eyre!("Failed to build schedule registry: {}", e))?;
 
-        let db_path = research_args.db_path.clone();
-        let start_block = research_args.start_block;
+            let db_path = research_args.db_path.clone();
+            let start_block = research_args.start_block;
 
-        info!(
-            target: "reth::cli",
-            schedules = registry.len(),
-            db_path = ?db_path,
-            start_block,
-            "Starting multi-schedule research mode"
-        );
+            info!(
+                target: "reth::cli",
+                schedules = registry.len(),
+                db_path = ?db_path,
+                start_block,
+                "Starting multi-schedule research mode"
+            );
 
-        let handle = builder
-            .node(EthereumNode::default())
-            .install_exex("research", move |ctx| {
-                let registry = registry.clone();
-                let db_path = db_path.clone();
-                async move { Ok(research_exex(ctx, registry, db_path, start_block)) }
-            })
-            .launch()
-            .await?;
+            let handle = builder
+                .node(EthereumNode::default())
+                .install_exex("research", move |ctx| {
+                    let registry = registry.clone();
+                    let db_path = db_path.clone();
+                    async move { Ok(research_exex(ctx, registry, db_path, start_block)) }
+                })
+                .launch()
+                .await?;
 
-        handle.wait_for_node_exit().await
-    })
+            handle.wait_for_node_exit().await
+        })
 }
