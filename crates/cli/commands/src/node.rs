@@ -10,8 +10,8 @@ use reth_node_builder::NodeBuilder;
 use reth_node_core::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs, MetricArgs,
-        NetworkArgs, PayloadBuilderArgs, PruningArgs, ResearchArgs, RocksDbArgs, RpcServerArgs,
-        StaticFilesArgs, StorageArgs, TxPoolArgs,
+        NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs,
+        TxPoolArgs,
     },
     node_config::NodeConfig,
     version,
@@ -103,10 +103,6 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     #[command(flatten)]
     pub pruning: PruningArgs,
 
-    /// All `RocksDB` table routing arguments
-    #[command(flatten)]
-    pub rocksdb: RocksDbArgs,
-
     /// Engine cli arguments
     #[command(flatten, next_help_heading = "Engine")]
     pub engine: EngineArgs,
@@ -115,16 +111,12 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     #[command(flatten, next_help_heading = "ERA")]
     pub era: EraArgs,
 
-    /// All research related arguments with --research prefix
-    #[command(flatten, next_help_heading = "Research")]
-    pub research: ResearchArgs,
-
     /// All static files related arguments
     #[command(flatten, next_help_heading = "Static Files")]
     pub static_files: StaticFilesArgs,
 
-    /// Storage mode configuration (v2 vs v1/legacy)
-    #[command(flatten)]
+    /// All storage related arguments with --storage prefix
+    #[command(flatten, next_help_heading = "Storage")]
     pub storage: StorageArgs,
 
     /// Additional cli arguments
@@ -179,17 +171,12 @@ where
             db,
             dev,
             pruning,
-            rocksdb,
             engine,
             era,
-            research,
             static_files,
             storage,
             ext,
         } = self;
-
-        // Validate RocksDB arguments
-        rocksdb.validate()?;
 
         // set up node config
         let mut node_config = NodeConfig {
@@ -206,10 +193,8 @@ where
             db,
             dev,
             pruning,
-            rocksdb,
             engine,
             era,
-            research,
             static_files,
             storage,
         };
