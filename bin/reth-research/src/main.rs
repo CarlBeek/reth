@@ -110,6 +110,8 @@ struct ResearchExEx<Node: FullNodeComponents> {
     all_schedules: Vec<Arc<dyn reth_research::schedule::GasSchedule>>,
     /// Execution-modifying schedules only
     execution_schedules: Arc<[Arc<dyn reth_research::schedule::GasSchedule>]>,
+    /// Whether any configured schedule modifies intrinsic gas.
+    has_intrinsic_schedules: bool,
     /// Static formatted schedule metadata reused across blocks
     schedule_metadata: HashMap<String, (Option<String>, Option<String>)>,
     /// Start block for analysis
@@ -124,9 +126,11 @@ struct ResearchExEx<Node: FullNodeComponents> {
 }
 
 impl<Node: FullNodeComponents> ResearchExEx<Node> {
-    fn baseline_intrinsic_gas(tx_context: &TxContext) -> u64 {
-        let base = if tx_context.is_create { 53_000 } else { 21_000 };
-        base + tx_context.calldata_gas()
+    fn baseline_intrinsic_gas_from_parts(is_create: bool, input: &[u8]) -> u64 {
+        let base = if is_create { 53_000 } else { 21_000 };
+        let zero_bytes = input.iter().filter(|&&b| b == 0).count() as u64;
+        let nonzero_bytes = input.len() as u64 - zero_bytes;
+        base + (zero_bytes * 4 + nonzero_bytes * 16)
     }
 
     /// Create a new research ExEx.
@@ -139,6 +143,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
         let registry = Arc::new(registry);
         let all_schedules = registry.all();
         let execution_schedules = Arc::from(registry.execution_schedules());
+        let has_intrinsic_schedules =
+            all_schedules.iter().any(|schedule| schedule.modifies_intrinsic());
         let schedule_metadata: HashMap<String, (Option<String>, Option<String>)> = all_schedules
             .iter()
             .map(|schedule| {
@@ -277,6 +283,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             registry,
             all_schedules,
             execution_schedules,
+            has_intrinsic_schedules,
             schedule_metadata,
             start_block,
             db_tx,
@@ -503,47 +510,60 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
 
         for (tx_idx, tx) in block.transactions_recovered().enumerate() {
             let tx_env = self.ctx.evm_config().tx_env(tx);
-            let sender = tx.signer();
 
             // Extract transaction fields using Transaction trait
             // Use kind() to get TxKind which tells us if it's create or call
             let tx_kind = tx.kind();
             let is_create = tx_kind.is_create();
             let recipient: Option<Address> = tx_kind.to().copied();
-            let value: U256 = tx.value();
-            let input: Bytes = tx.input().clone();
             let gas_limit: u64 = tx.gas_limit();
-            let recipient_info = match recipient {
-                Some(recipient_addr) => match normal_db.basic(recipient_addr) {
-                    Ok(Some(account)) => Some(RecipientInfo {
-                        exists: true,
-                        has_code: account.code_hash != KECCAK_EMPTY,
-                        balance: account.balance,
-                        nonce: account.nonce,
-                    }),
-                    Ok(None) => Some(RecipientInfo {
-                        exists: false,
-                        has_code: false,
-                        balance: U256::ZERO,
-                        nonce: 0,
-                    }),
-                    Err(err) => {
-                        debug!(
-                            target: "exex::research",
-                            block = block_number,
-                            tx_idx,
-                            recipient = ?recipient_addr,
-                            %err,
-                            "Failed to fetch recipient account info for transaction classification"
-                        );
-                        None
-                    }
-                },
-                None => None,
-            };
+            let baseline_intrinsic_gas =
+                Self::baseline_intrinsic_gas_from_parts(is_create, tx.input());
+            let tx_context = if self.has_intrinsic_schedules {
+                let sender = tx.signer();
+                let value: U256 = tx.value();
+                let input: Bytes = tx.input().clone();
+                let recipient_info = match recipient {
+                    Some(recipient_addr) => match normal_db.basic(recipient_addr) {
+                        Ok(Some(account)) => Some(RecipientInfo {
+                            exists: true,
+                            has_code: account.code_hash != KECCAK_EMPTY,
+                            balance: account.balance,
+                            nonce: account.nonce,
+                        }),
+                        Ok(None) => Some(RecipientInfo {
+                            exists: false,
+                            has_code: false,
+                            balance: U256::ZERO,
+                            nonce: 0,
+                        }),
+                        Err(err) => {
+                            debug!(
+                                target: "exex::research",
+                                block = block_number,
+                                tx_idx,
+                                recipient = ?recipient_addr,
+                                %err,
+                                "Failed to fetch recipient account info for transaction classification"
+                            );
+                            None
+                        }
+                    },
+                    None => None,
+                };
 
-            let tx_context =
-                TxContext { sender, recipient, value, input, gas_limit, is_create, recipient_info };
+                Some(TxContext {
+                    sender,
+                    recipient,
+                    value,
+                    input,
+                    gas_limit,
+                    is_create,
+                    recipient_info,
+                })
+            } else {
+                None
+            };
 
             // --- EXECUTION: Baseline ---
             let mut normal_evm =
@@ -597,7 +617,6 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             let normal_gas_used = normal_result.result.gas_used();
             let normal_success = normal_result.result.is_success();
             let tx_hash = *tx.tx_hash();
-            let baseline_intrinsic_gas = Self::baseline_intrinsic_gas(&tx_context);
             let execution_metadata_by_name: HashMap<_, _> = inspector_results
                 .iter()
                 .map(|result| (result.schedule_name.as_str(), result))
@@ -610,6 +629,9 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 // Calculate gas deltas based on schedule kind.
                 let (intrinsic_delta, schedule_intrinsic_gas, tx_category) = match schedule_kind {
                     ScheduleKind::IntrinsicOnly | ScheduleKind::Both => {
+                        let tx_context = tx_context.as_ref().expect(
+                            "intrinsic schedule requires tx context; context must be present",
+                        );
                         // For intrinsic-modifying schedules (like EIP-2780), calculate intrinsic
                         // gas. Baseline includes create/call base and calldata cost.
                         let schedule_intrinsic =
