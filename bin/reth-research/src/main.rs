@@ -39,7 +39,7 @@ use reth_research::{
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_revm::{Database, DatabaseCommit};
 use reth_tracing::tracing::{debug, info, warn};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -392,6 +392,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             State::builder().with_database(StateProviderDatabase::new(baseline_state)).build();
         let mut inspected_db =
             State::builder().with_database(StateProviderDatabase::new(inspected_state)).build();
+        let all_schedules = self.registry.all();
+        let execution_schedules = self.registry.execution_schedules();
 
         for (tx_idx, tx) in block.transactions_recovered().enumerate() {
             let tx_env = self.ctx.evm_config().tx_env(tx);
@@ -457,7 +459,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             normal_db.commit(normal_result.state);
 
             // --- EXECUTION: Inspected (execution-modifying schedules) ---
-            let mut inspector = MultiScheduleInspector::new(self.registry.execution_schedules());
+            let mut inspector = MultiScheduleInspector::new(execution_schedules.clone());
             let mut inspected_evm = self.ctx.evm_config().evm_with_env_and_inspector(
                 &mut inspected_db,
                 evm_env.clone(),
@@ -483,39 +485,39 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             let normal_gas_used = normal_result.result.gas_used();
             let normal_success = normal_result.result.is_success();
             let tx_hash = *tx.tx_hash();
+            let baseline_intrinsic_gas = Self::baseline_intrinsic_gas(&tx_context);
+            let execution_results_by_name: HashMap<_, _> = inspector_results
+                .iter()
+                .map(|result| (result.schedule_name.as_str(), result))
+                .collect();
 
             // --- ANALYZE EACH SCHEDULE ---
-            for schedule_name in self.registry.names() {
-                let schedule = match self.registry.get(&schedule_name) {
-                    Some(s) => s,
-                    None => continue,
-                };
+            for schedule in &all_schedules {
+                let schedule_name = schedule.name();
+                let schedule_kind = schedule.kind();
 
                 // Calculate gas deltas based on schedule kind.
-                let (intrinsic_delta, tx_category) = match schedule.kind() {
+                let (intrinsic_delta, schedule_intrinsic_gas, tx_category) = match schedule_kind {
                     ScheduleKind::IntrinsicOnly | ScheduleKind::Both => {
                         // For intrinsic-modifying schedules (like EIP-2780), calculate intrinsic
                         // gas. Baseline includes create/call base and calldata cost.
-                        let baseline_intrinsic = Self::baseline_intrinsic_gas(&tx_context);
                         let schedule_intrinsic =
-                            schedule.intrinsic_gas(&tx_context).unwrap_or(baseline_intrinsic);
-                        let delta = schedule_intrinsic as i64 - baseline_intrinsic as i64;
+                            schedule.intrinsic_gas(&tx_context).unwrap_or(baseline_intrinsic_gas);
+                        let delta = schedule_intrinsic as i64 - baseline_intrinsic_gas as i64;
                         let category = schedule.tx_category(&tx_context);
-                        (delta, category)
+                        (delta, Some(schedule_intrinsic), category)
                     }
                     ScheduleKind::ExecutionOnly => {
                         // For execution-only schedules, no intrinsic change
-                        (0i64, None)
+                        (0i64, None, None)
                     }
                     ScheduleKind::None => continue,
                 };
 
-                let (execution_delta, execution_would_oog) = match schedule.kind() {
+                let execution_result = execution_results_by_name.get(schedule_name).copied();
+                let (execution_delta, execution_would_oog) = match schedule_kind {
                     ScheduleKind::ExecutionOnly | ScheduleKind::Both => {
-                        if let Some(result) = inspector_results
-                            .iter()
-                            .find(|r| r.schedule_name == schedule_name.as_str())
-                        {
+                        if let Some(result) = execution_result {
                             (result.additional_gas, result.would_oog)
                         } else {
                             (0i64, false)
@@ -545,12 +547,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         None
                     };
 
-                    let execution_result = inspector_results
-                        .iter()
-                        .find(|r| r.schedule_name == schedule_name.as_str());
-
                     let div = ScheduleDivergence {
-                        schedule_name: schedule_name.clone(),
+                        schedule_name: schedule_name.to_string(),
                         block_number,
                         tx_index: tx_idx as u64,
                         tx_hash,
@@ -558,10 +556,10 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         divergence_type,
                         baseline_success: normal_success,
                         baseline_gas_used: normal_gas_used,
-                        baseline_intrinsic_gas: Self::baseline_intrinsic_gas(&tx_context),
+                        baseline_intrinsic_gas,
                         schedule_success,
                         schedule_gas_used: schedule_gas,
-                        schedule_intrinsic_gas: schedule.intrinsic_gas(&tx_context),
+                        schedule_intrinsic_gas,
                         gas_delta: total_delta,
                         gas_efficiency_ratio,
                         tx_category: tx_category.map(|s| s.to_string()),
