@@ -523,20 +523,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             let baseline_intrinsic_gas = Self::baseline_intrinsic_gas(&tx_context);
             let execution_metadata_by_name: HashMap<_, _> = inspector_results
                 .iter()
-                .map(|result| {
-                    (
-                        result.schedule_name.as_str(),
-                        (
-                            result.additional_gas,
-                            result.would_oog,
-                            result.oog_info.as_ref().map(|oog| format!("{oog:?}")),
-                            result
-                                .divergence_location
-                                .as_ref()
-                                .map(|location| format!("{location:?}")),
-                        ),
-                    )
-                })
+                .map(|result| (result.schedule_name.as_str(), result))
                 .collect();
             // --- ANALYZE EACH SCHEDULE ---
             for schedule in &self.all_schedules {
@@ -561,29 +548,15 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     ScheduleKind::None => continue,
                 };
 
-                let (execution_delta, execution_would_oog, oog_info, divergence_location) =
-                    match schedule_kind {
-                        ScheduleKind::ExecutionOnly | ScheduleKind::Both => {
-                            if let Some((
-                                additional_gas,
-                                would_oog,
-                                oog_info,
-                                divergence_location,
-                            )) = execution_metadata_by_name.get(schedule_name).cloned()
-                            {
-                                (additional_gas, would_oog, oog_info, divergence_location)
-                            } else {
-                                (0i64, false, None, None)
-                            }
-                        }
-                        ScheduleKind::IntrinsicOnly | ScheduleKind::None => {
-                            (0i64, false, None, None)
-                        }
-                    };
+                let execution_result = execution_metadata_by_name.get(schedule_name).copied();
+                let (execution_delta, execution_would_oog) = match schedule_kind {
+                    ScheduleKind::ExecutionOnly | ScheduleKind::Both => execution_result
+                        .map(|result| (result.additional_gas, result.would_oog))
+                        .unwrap_or((0i64, false)),
+                    ScheduleKind::IntrinsicOnly | ScheduleKind::None => (0i64, false),
+                };
 
                 let total_delta = intrinsic_delta + execution_delta;
-                let (affected_opcodes, affected_precompiles) =
-                    self.schedule_metadata.get(schedule_name).cloned().unwrap_or((None, None));
 
                 // Determine if this would cause a divergence
                 let schedule_gas = (normal_gas_used as i64 + total_delta).max(0) as u64;
@@ -603,6 +576,16 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     } else {
                         None
                     };
+                    let (affected_opcodes, affected_precompiles) =
+                        self.schedule_metadata.get(schedule_name).cloned().unwrap_or((None, None));
+                    let oog_info = execution_result
+                        .and_then(|result| result.oog_info.as_ref().map(|oog| format!("{oog:?}")));
+                    let divergence_location = execution_result.and_then(|result| {
+                        result
+                            .divergence_location
+                            .as_ref()
+                            .map(|location| format!("{location:?}"))
+                    });
 
                     let div = ScheduleDivergence {
                         schedule_name: schedule_name.to_string(),
