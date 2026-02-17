@@ -34,7 +34,7 @@ use reth_research::{
     database::DivergenceDatabase,
     divergence::DivergenceType,
     schedule::{ScheduleKind, ScheduleRegistry, TxContext},
-    ScheduleDivergence,
+    MultiScheduleInspector, ScheduleDivergence,
 };
 use reth_revm::DatabaseCommit;
 use reth_revm::{database::StateProviderDatabase, db::State};
@@ -291,12 +291,12 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             }
         };
 
-        // Get state for baseline execution once per block (all txs share the same pre-state).
+        // Get state for both baseline and inspected execution once per block.
         // During initial pipeline sync the Finish stage checkpoint lags behind Execution,
         // so history_by_block_number may reject blocks that have been executed but whose
         // checkpoint hasn't been committed yet. Skip the block and let subsequent
         // notifications pick it up once the pipeline run completes.
-        let normal_state = if block_number > 0 {
+        let baseline_state = if block_number > 0 {
             match provider.history_by_block_number(block_number - 1) {
                 Ok(state) => state,
                 Err(err) => {
@@ -313,8 +313,28 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
         } else {
             provider.latest()?
         };
+        let inspected_state = if block_number > 0 {
+            match provider.history_by_block_number(block_number - 1) {
+                Ok(state) => state,
+                Err(err) => {
+                    debug!(
+                        target: "exex::research",
+                        block = block_number,
+                        %err,
+                        "Historical state not yet available for inspected pass, skipping block \
+                         (expected during initial pipeline sync)"
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            provider.latest()?
+        };
+
         let mut normal_db =
-            State::builder().with_database(StateProviderDatabase::new(normal_state)).build();
+            State::builder().with_database(StateProviderDatabase::new(baseline_state)).build();
+        let mut inspected_db =
+            State::builder().with_database(StateProviderDatabase::new(inspected_state)).build();
 
         for (tx_idx, tx) in block.transactions_recovered().enumerate() {
             let tx_env = self.ctx.evm_config().tx_env(tx);
@@ -358,6 +378,30 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             drop(normal_evm);
             normal_db.commit(normal_result.state);
 
+            // --- EXECUTION: Inspected (execution-modifying schedules) ---
+            let mut inspector = MultiScheduleInspector::new(self.registry.execution_schedules());
+            let mut inspected_evm = self.ctx.evm_config().evm_with_env_and_inspector(
+                &mut inspected_db,
+                evm_env.clone(),
+                &mut inspector,
+            );
+            let inspected_result = match inspected_evm.transact(tx_env.clone()) {
+                Ok(result) => result,
+                Err(e) => {
+                    debug!(
+                        target: "exex::research",
+                        block = block_number,
+                        tx_idx,
+                        error = ?e,
+                        "Inspected execution failed"
+                    );
+                    continue;
+                }
+            };
+            drop(inspected_evm);
+            inspected_db.commit(inspected_result.state);
+            let inspector_results = inspector.results();
+
             let normal_gas_used = normal_result.result.gas_used();
             let normal_success = normal_result.result.is_success();
             let tx_hash = *tx.tx_hash();
@@ -369,7 +413,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     None => continue,
                 };
 
-                // Calculate gas deltas based on schedule kind
+                // Calculate gas deltas based on schedule kind.
                 let (intrinsic_delta, tx_category) = match schedule.kind() {
                     ScheduleKind::IntrinsicOnly | ScheduleKind::Both => {
                         // For intrinsic-modifying schedules (like EIP-2780), calculate intrinsic
@@ -388,11 +432,25 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     ScheduleKind::None => continue,
                 };
 
-                let total_delta = intrinsic_delta;
+                let (execution_delta, execution_would_oog) = match schedule.kind() {
+                    ScheduleKind::ExecutionOnly | ScheduleKind::Both => {
+                        if let Some(result) = inspector_results
+                            .iter()
+                            .find(|r| r.schedule_name == schedule_name.as_str())
+                        {
+                            (result.additional_gas, result.would_oog)
+                        } else {
+                            (0i64, false)
+                        }
+                    }
+                    ScheduleKind::IntrinsicOnly | ScheduleKind::None => (0i64, false),
+                };
+
+                let total_delta = intrinsic_delta + execution_delta;
 
                 // Determine if this would cause a divergence
                 let schedule_gas = (normal_gas_used as i64 + total_delta).max(0) as u64;
-                let would_oog = schedule_gas > gas_limit;
+                let would_oog = execution_would_oog || schedule_gas > gas_limit;
                 let schedule_success = normal_success && !would_oog;
 
                 // Record divergence if there's a gas delta or status change
