@@ -57,7 +57,7 @@ struct ResearchExEx<Node: FullNodeComponents> {
     /// All schedules in deterministic order
     all_schedules: Vec<Arc<dyn reth_research::schedule::GasSchedule>>,
     /// Execution-modifying schedules only
-    execution_schedules: Vec<Arc<dyn reth_research::schedule::GasSchedule>>,
+    execution_schedules: Arc<[Arc<dyn reth_research::schedule::GasSchedule>]>,
     /// Static formatted schedule metadata reused across blocks
     schedule_metadata: HashMap<String, (Option<String>, Option<String>)>,
     /// Start block for analysis
@@ -86,7 +86,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
     ) -> eyre::Result<Self> {
         let registry = Arc::new(registry);
         let all_schedules = registry.all();
-        let execution_schedules = registry.execution_schedules();
+        let execution_schedules = Arc::from(registry.execution_schedules());
         let schedule_metadata: HashMap<String, (Option<String>, Option<String>)> = all_schedules
             .iter()
             .map(|schedule| {

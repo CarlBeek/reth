@@ -26,7 +26,7 @@ use std::{collections::VecDeque, sync::Arc};
 #[derive(Debug)]
 pub struct MultiScheduleInspector {
     /// The schedules being tracked
-    schedules: Vec<Arc<dyn GasSchedule>>,
+    schedules: Arc<[Arc<dyn GasSchedule>]>,
 
     /// Per-schedule execution state
     schedule_states: Vec<ScheduleExecutionState>,
@@ -133,7 +133,8 @@ struct GasOpcodeEvent {
 
 impl MultiScheduleInspector {
     /// Create a new multi-schedule inspector.
-    pub fn new(schedules: Vec<Arc<dyn GasSchedule>>) -> Self {
+    pub fn new(schedules: impl Into<Arc<[Arc<dyn GasSchedule>]>>) -> Self {
+        let schedules = schedules.into();
         let schedule_states = schedules
             .iter()
             .map(|s| ScheduleExecutionState::new(s.name().to_string()))
