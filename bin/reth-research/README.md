@@ -115,6 +115,28 @@ cargo run --release -p reth-research -- node --dev --dev.block-time 5s \
   --research.db-path ./divergences.db
 ```
 
+### Xeon Performance Mode
+
+For high-throughput research runs on a dedicated server (for example Xeon Gold 5412U, 128 GB RAM):
+
+```bash
+bin/reth-research/scripts/run_xeon_perf.sh \
+  --datadir /data/reth \
+  --research.eip2780 \
+  --research.db-path /data/research/divergences.db
+```
+
+Notes:
+- The script builds `reth-research` with `--profile maxperf` and `-C target-cpu=native`.
+- It auto-derives worker counts from available CPU cores and sets a large engine cross-block cache from system RAM.
+- Override defaults with environment variables:
+  - `RETH_RESERVED_CPU_CORES`
+  - `RETH_ENGINE_CROSS_BLOCK_CACHE_MB`
+  - `RETH_ENGINE_PREWARMING_THREADS`
+  - `RETH_ENGINE_STORAGE_WORKERS`
+  - `RETH_ENGINE_ACCOUNT_WORKERS`
+  - `RETH_RPC_MAX_CONCURRENT_DB_REQUESTS`
+
 ## Querying Divergences
 
 ### Basic Queries
