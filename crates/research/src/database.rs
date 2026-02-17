@@ -315,6 +315,12 @@ impl DivergenceDatabase {
             [],
         )?;
 
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sched_div_unique
+             ON schedule_divergences(schedule_name, block_number, tx_index, tx_hash)",
+            [],
+        )?;
+
         // Schedule statistics table
         conn.execute(
             "CREATE TABLE IF NOT EXISTS schedule_stats (
@@ -544,7 +550,24 @@ impl DivergenceDatabase {
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
-            )",
+            )
+            ON CONFLICT(schedule_name, block_number, tx_index, tx_hash) DO UPDATE SET
+                timestamp = excluded.timestamp,
+                divergence_type = excluded.divergence_type,
+                baseline_success = excluded.baseline_success,
+                baseline_gas_used = excluded.baseline_gas_used,
+                baseline_intrinsic_gas = excluded.baseline_intrinsic_gas,
+                schedule_success = excluded.schedule_success,
+                schedule_gas_used = excluded.schedule_gas_used,
+                schedule_intrinsic_gas = excluded.schedule_intrinsic_gas,
+                gas_delta = excluded.gas_delta,
+                gas_efficiency_ratio = excluded.gas_efficiency_ratio,
+                tx_category = excluded.tx_category,
+                affected_opcodes = excluded.affected_opcodes,
+                affected_precompiles = excluded.affected_precompiles,
+                oog_info = excluded.oog_info,
+                divergence_location = excluded.divergence_location,
+                operation_counts = excluded.operation_counts",
             params![
                 divergence.schedule_name,
                 divergence.block_number,
@@ -593,7 +616,24 @@ impl DivergenceDatabase {
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
-                )",
+                )
+                ON CONFLICT(schedule_name, block_number, tx_index, tx_hash) DO UPDATE SET
+                    timestamp = excluded.timestamp,
+                    divergence_type = excluded.divergence_type,
+                    baseline_success = excluded.baseline_success,
+                    baseline_gas_used = excluded.baseline_gas_used,
+                    baseline_intrinsic_gas = excluded.baseline_intrinsic_gas,
+                    schedule_success = excluded.schedule_success,
+                    schedule_gas_used = excluded.schedule_gas_used,
+                    schedule_intrinsic_gas = excluded.schedule_intrinsic_gas,
+                    gas_delta = excluded.gas_delta,
+                    gas_efficiency_ratio = excluded.gas_efficiency_ratio,
+                    tx_category = excluded.tx_category,
+                    affected_opcodes = excluded.affected_opcodes,
+                    affected_precompiles = excluded.affected_precompiles,
+                    oog_info = excluded.oog_info,
+                    divergence_location = excluded.divergence_location,
+                    operation_counts = excluded.operation_counts",
                 params![
                     divergence.schedule_name,
                     divergence.block_number,
@@ -1097,5 +1137,42 @@ mod tests {
         let deleted = db.delete_schedule_divergences_in_block_range(100, 102).unwrap();
         assert_eq!(deleted, 3);
         assert_eq!(db.count_by_schedule("test").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_record_schedule_divergence_is_idempotent_for_same_tx() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+
+        let key = (123_u64, 7_u64, B256::repeat_byte(0xAA));
+        let mut divergence = ScheduleDivergence {
+            schedule_name: "idempotent".to_string(),
+            block_number: key.0,
+            tx_index: key.1,
+            tx_hash: key.2,
+            timestamp: 1,
+            divergence_type: DivergenceType::GasPattern,
+            baseline_success: true,
+            baseline_gas_used: 21000,
+            baseline_intrinsic_gas: 21000,
+            schedule_success: true,
+            schedule_gas_used: 22000,
+            schedule_intrinsic_gas: None,
+            gas_delta: 1000,
+            gas_efficiency_ratio: Some(1.047),
+            tx_category: None,
+            affected_opcodes: Some("[4]".to_string()),
+            affected_precompiles: None,
+            oog_info: None,
+            divergence_location: None,
+            operation_counts: None,
+        };
+
+        db.record_schedule_divergence(&divergence).unwrap();
+        divergence.gas_delta = 2000;
+        divergence.timestamp = 2;
+        db.record_schedule_divergence(&divergence).unwrap();
+
+        assert_eq!(db.count_by_schedule("idempotent").unwrap(), 1);
+        assert_eq!(db.total_gas_delta_for_schedule("idempotent").unwrap(), 2000);
     }
 }
