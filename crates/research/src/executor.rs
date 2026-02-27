@@ -15,7 +15,7 @@ use reth_primitives_traits::{
     AlloyBlockHeader, BlockBody, NodePrimitives, RecoveredBlock, SignedTransaction,
 };
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Errors that can occur in the research executor.
 #[derive(Debug, Error)]
@@ -236,27 +236,9 @@ impl<E> ResearchExecutor<E> {
                     event_logs,
                 };
 
-                // Record to database if available
-                if let Some(ref db) = self.divergence_db {
-                    match db.record_divergence(&divergence) {
-                        Ok(id) => {
-                            debug!(
-                                target: "reth::research",
-                                divergence_id = id,
-                                tx_hash = ?divergence.tx_hash,
-                                types = ?divergence.divergence_types,
-                                "Recorded divergence"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                target: "reth::research",
-                                error = %e,
-                                "Failed to record divergence"
-                            );
-                        }
-                    }
-                }
+                // Legacy divergence table has been removed; the multi-schedule
+                // pipeline in reth-research-bin writes to schedule_divergences instead.
+                let _ = &self.divergence_db;
 
                 // Record metrics
                 metrics::record_divergence(&divergence_types, gas_ratio);
