@@ -47,6 +47,7 @@ num_cpus = "1.16"
 [dev-dependencies]
 tempfile = "3.0"
 reth-db = { workspace = true, features = ["test-utils"] }
+revm-database.workspace = true
 
 [features]
 default = []

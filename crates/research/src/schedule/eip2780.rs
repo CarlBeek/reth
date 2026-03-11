@@ -290,7 +290,12 @@ mod tests {
         let ctx = make_tx_ctx(
             false,
             true,
-            Some(RecipientInfo { exists: true, has_code: false, balance: U256::from(100), nonce: 1 }),
+            Some(RecipientInfo {
+                exists: true,
+                has_code: false,
+                balance: U256::from(100),
+                nonce: 1,
+            }),
         );
         assert_eq!(Eip2780Category::classify(&ctx), Eip2780Category::TransferToEoa);
 
@@ -347,14 +352,18 @@ mod tests {
 
     #[test]
     fn test_schedule_category_filter() {
-        let schedule =
-            Eip2780Schedule::with_categories(vec![Eip2780Category::TransferToEoa]);
+        let schedule = Eip2780Schedule::with_categories(vec![Eip2780Category::TransferToEoa]);
 
         // Transfer to EOA should be analyzed
         let ctx = make_tx_ctx(
             false,
             true,
-            Some(RecipientInfo { exists: true, has_code: false, balance: U256::from(100), nonce: 1 }),
+            Some(RecipientInfo {
+                exists: true,
+                has_code: false,
+                balance: U256::from(100),
+                nonce: 1,
+            }),
         );
         assert!(schedule.intrinsic_gas(&ctx).is_some());
 

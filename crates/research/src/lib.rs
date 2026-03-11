@@ -51,7 +51,7 @@
 //!   - [`ExecutionSummaryBuilder`]: Builds execution summaries
 //!
 //! - [`multi_schedule_inspector`]: Execution tracking
-//!   - [`MultiScheduleInspector`]: Tracks gas deltas for all schedules
+//!   - [`ScheduleInspector`]: Applies gas cost modifications during execution
 //!
 //! - [`comparison`]: Result types
 //!   - [`MultiScheduleComparisonResult`]: Full comparison for a transaction
@@ -88,8 +88,8 @@
 //! # Example: EIP-2780 Intrinsic Gas Analysis
 //!
 //! ```rust
-//! use reth_research::schedule::{Eip2780Schedule, GasSchedule, TxContext, RecipientInfo};
 //! use alloy_primitives::{Address, Bytes, U256};
+//! use reth_research::schedule::{Eip2780Schedule, GasSchedule, RecipientInfo, TxContext};
 //!
 //! let schedule = Eip2780Schedule::new();
 //!
@@ -103,7 +103,7 @@
 //!     is_create: false,
 //!     recipient_info: Some(RecipientInfo {
 //!         exists: true,
-//!         has_code: false,  // EOA, not contract
+//!         has_code: false, // EOA, not contract
 //!         balance: U256::from(100),
 //!         nonce: 1,
 //!     }),
@@ -111,7 +111,7 @@
 //!
 //! // EIP-2780 calculates reduced intrinsic gas
 //! let intrinsic = schedule.intrinsic_gas(&ctx).unwrap();
-//! assert_eq!(intrinsic, 6000);  // vs 21000 baseline
+//! assert_eq!(intrinsic, 6000); // vs 21000 baseline
 //!
 //! let category = schedule.tx_category(&ctx).unwrap();
 //! assert_eq!(category, "transfer_to_eoa");
@@ -128,10 +128,8 @@
 //! KECCAK256,msg_size,6,6
 //! "#;
 //!
-//! let schedule = CsvPricingSchedule::from_csv(
-//!     "my-experiment".to_string(),
-//!     csv_data.as_bytes()
-//! ).unwrap();
+//! let schedule =
+//!     CsvPricingSchedule::from_csv("my-experiment".to_string(), csv_data.as_bytes()).unwrap();
 //!
 //! let ctx = OpcodeContext::default();
 //!
@@ -139,7 +137,7 @@
 //! assert_eq!(schedule.opcode_gas_delta(0x04, &ctx), 10);
 //!
 //! // Unaffected opcodes return 0
-//! assert_eq!(schedule.opcode_gas_delta(0x01, &ctx), 0);  // ADD
+//! assert_eq!(schedule.opcode_gas_delta(0x01, &ctx), 0); // ADD
 //! ```
 //!
 //! # CLI Usage Examples
@@ -210,7 +208,7 @@ pub use database::{DivergenceDatabase, ScheduleDivergence};
 pub use divergence::{CallTrees, Divergence, DivergenceType, EventLog, EventLogs, OperationCounts};
 pub use executor::ResearchExecutor;
 pub use inspector::GasResearchInspector;
-pub use multi_schedule_inspector::{MultiScheduleInspector, ScheduleExecutionState, ScheduleResult};
+pub use multi_schedule_inspector::{ScheduleInspector, ScheduleResult};
 pub use tracking_inspector::{EventLogEntry, TrackingInspector};
 
 /// Re-export error types

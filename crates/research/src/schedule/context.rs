@@ -181,10 +181,7 @@ mod tests {
 
     #[test]
     fn test_tx_context_calldata_gas() {
-        let ctx = TxContext {
-            input: Bytes::from(vec![0, 0, 0, 1, 2, 3]),
-            ..Default::default()
-        };
+        let ctx = TxContext { input: Bytes::from(vec![0, 0, 0, 1, 2, 3]), ..Default::default() };
         // 3 zeros * 4 + 3 non-zeros * 16 = 12 + 48 = 60
         assert_eq!(ctx.calldata_gas(), 60);
     }

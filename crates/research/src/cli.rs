@@ -61,9 +61,8 @@ pub struct NamedCsvSchedule {
 impl NamedCsvSchedule {
     /// Parse from a string in "name=path" format.
     pub fn parse(s: &str) -> Result<Self, CliError> {
-        let (name, path) = s
-            .split_once('=')
-            .ok_or_else(|| CliError::InvalidCsvFormat(s.to_string()))?;
+        let (name, path) =
+            s.split_once('=').ok_or_else(|| CliError::InvalidCsvFormat(s.to_string()))?;
 
         let name = name.trim().to_string();
         let path = PathBuf::from(path.trim());
@@ -101,9 +100,8 @@ pub struct NamedMultiplierSchedule {
 impl NamedMultiplierSchedule {
     /// Parse from a string in "name=multiplier" format.
     pub fn parse(s: &str) -> Result<Self, CliError> {
-        let (name, mult_str) = s
-            .split_once('=')
-            .ok_or_else(|| CliError::InvalidMultiplierFormat(s.to_string()))?;
+        let (name, mult_str) =
+            s.split_once('=').ok_or_else(|| CliError::InvalidMultiplierFormat(s.to_string()))?;
 
         let name = name.trim().to_string();
         let multiplier: u64 = mult_str.trim().parse().map_err(|e: std::num::ParseIntError| {
@@ -232,9 +230,9 @@ impl ResearchArgs {
 
     /// Check if any schedules are configured.
     pub fn has_schedules(&self) -> bool {
-        self.eip2780_enabled
-            || !self.csv_schedules.is_empty()
-            || !self.multiplier_schedules.is_empty()
+        self.eip2780_enabled ||
+            !self.csv_schedules.is_empty() ||
+            !self.multiplier_schedules.is_empty()
     }
 
     /// Get the number of configured schedules.
@@ -376,10 +374,7 @@ mod tests {
 
     #[test]
     fn test_research_args_summary() {
-        let args = ResearchArgs::new()
-            .with_eip2780()
-            .with_multiplier("128x", 128)
-            .unwrap();
+        let args = ResearchArgs::new().with_eip2780().with_multiplier("128x", 128).unwrap();
 
         let summary = args.summary();
         assert!(summary.contains("2 schedules"));

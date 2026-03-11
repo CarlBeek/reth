@@ -9761,6 +9761,7 @@ dependencies = [
  "reth-execution-types",
  "reth-primitives-traits",
  "revm",
+ "revm-database",
  "revm-interpreter",
  "rusqlite",
  "serde",

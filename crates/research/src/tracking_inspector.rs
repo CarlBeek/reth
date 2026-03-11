@@ -132,11 +132,7 @@ where
         }
     }
 
-    fn call(
-        &mut self,
-        _context: &mut CTX,
-        inputs: &mut CallInputs,
-    ) -> Option<CallOutcome> {
+    fn call(&mut self, _context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
         let call_index = self.call_frames.len();
         let depth = self.call_stack.len();
 
@@ -162,12 +158,7 @@ where
         None
     }
 
-    fn call_end(
-        &mut self,
-        _context: &mut CTX,
-        inputs: &CallInputs,
-        outcome: &mut CallOutcome,
-    ) {
+    fn call_end(&mut self, _context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
         if let Some(entry) = self.call_stack.pop() {
             // Extract input bytes based on CallInput enum
             let input_bytes = match &inputs.input {
@@ -193,11 +184,7 @@ where
         }
     }
 
-    fn create(
-        &mut self,
-        _context: &mut CTX,
-        inputs: &mut CreateInputs,
-    ) -> Option<CreateOutcome> {
+    fn create(&mut self, _context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
         let call_index = self.call_frames.len();
         let depth = self.call_stack.len();
 
@@ -245,11 +232,7 @@ where
         }
     }
 
-    fn log(
-        &mut self,
-        _context: &mut CTX,
-        log: alloy_primitives::Log,
-    ) {
+    fn log(&mut self, _context: &mut CTX, log: alloy_primitives::Log) {
         self.event_logs.push(EventLogEntry {
             log_index: self.event_logs.len(),
             address: log.address,

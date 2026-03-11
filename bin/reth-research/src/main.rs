@@ -25,7 +25,7 @@ use reth_ethereum::{
     exex::{ExExContext, ExExEvent, ExExNotification},
     node::EthereumNode,
 };
-use reth_evm::{ConfigureEvm, Evm};
+use reth_evm::{ConfigureEvm, Evm, TransactionEnv};
 use reth_node_api::{BlockTy, FullNodeComponents};
 use reth_node_core::args::ResearchArgs;
 use reth_primitives_traits::BlockBody;
@@ -33,16 +33,17 @@ use reth_provider::StateProviderFactory;
 use reth_research::{
     database::DivergenceDatabase,
     divergence::DivergenceType,
-    schedule::{RecipientInfo, ScheduleKind, ScheduleRegistry, TxContext},
-    MultiScheduleInspector, ScheduleDivergence,
+    schedule::{GasSchedule, RecipientInfo, ScheduleKind, ScheduleRegistry, TxContext},
+    ScheduleDivergence, ScheduleInspector,
 };
-use reth_revm::{database::StateProviderDatabase, db::State};
-use reth_revm::{Database, DatabaseCommit};
+use reth_revm::{database::StateProviderDatabase, db::State, Database, DatabaseCommit};
 use reth_tracing::tracing::{debug, info, warn};
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio::time::{self, Duration, MissedTickBehavior};
+use tokio::{
+    sync::mpsc,
+    task::JoinHandle,
+    time::{self, Duration, MissedTickBehavior},
+};
 
 enum DbCommand {
     Record(ScheduleDivergence),
@@ -109,8 +110,8 @@ struct ResearchExEx<Node: FullNodeComponents> {
     /// All schedules in deterministic order
     all_schedules: Vec<Arc<dyn reth_research::schedule::GasSchedule>>,
     /// Execution-modifying schedules only
-    execution_schedules: Arc<[Arc<dyn reth_research::schedule::GasSchedule>]>,
-    /// Lookup index into execution inspector results by schedule name.
+    execution_schedules: Vec<Arc<dyn GasSchedule>>,
+    /// Lookup index into execution schedule results by schedule name.
     execution_schedule_indices: HashMap<String, usize>,
     /// Whether any configured schedule modifies intrinsic gas.
     has_intrinsic_schedules: bool,
@@ -144,9 +145,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
     ) -> eyre::Result<Self> {
         let registry = Arc::new(registry);
         let all_schedules = registry.all();
-        let execution_schedules: Arc<[Arc<dyn reth_research::schedule::GasSchedule>]> =
-            Arc::from(registry.execution_schedules());
-        let execution_schedule_indices = execution_schedules
+        let execution_schedules = registry.execution_schedules();
+        let execution_schedule_indices: HashMap<String, usize> = execution_schedules
             .iter()
             .enumerate()
             .map(|(idx, schedule)| (schedule.name().to_string(), idx))
@@ -492,29 +492,41 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
         };
         let mut normal_db =
             State::builder().with_database(StateProviderDatabase::new(baseline_state)).build();
-        let mut inspected_db = if self.execution_schedules.is_empty() {
-            None
-        } else {
-            let inspected_state = if block_number > 0 {
-                match provider.history_by_block_number(block_number - 1) {
-                    Ok(state) => state,
-                    Err(err) => {
-                        debug!(
-                            target: "exex::research",
-                            block = block_number,
-                            %err,
-                            "Historical state not yet available for inspected pass, skipping block \
-                             (expected during initial pipeline sync)"
-                        );
-                        return Ok(false);
+        // Create one DB per execution-modifying schedule so each gets its own
+        // state that tracks cumulative changes across transactions in the block.
+        //
+        // State drift is intentional: if tx N OOGs under a schedule (changing
+        // state), tx N+1 starts from that diverged state, modeling cascading
+        // effects accurately. The reported deltas for later transactions thus
+        // include second-order state differences, not just opcode cost changes.
+        //
+        // Each schedule needs its own `StateProvider` because the provider is
+        // consumed when building the `State`. We call `history_by_block_number`
+        // N times — one per schedule — which may hit disk each time.
+        let mut schedule_dbs = {
+            let n = self.execution_schedules.len();
+            let mut dbs = Vec::with_capacity(n);
+            for _ in 0..n {
+                let state = if block_number > 0 {
+                    match provider.history_by_block_number(block_number - 1) {
+                        Ok(state) => state,
+                        Err(err) => {
+                            debug!(
+                                target: "exex::research",
+                                block = block_number,
+                                %err,
+                                "Historical state not yet available for schedule execution, \
+                                 skipping block (expected during initial pipeline sync)"
+                            );
+                            return Ok(false);
+                        }
                     }
-                }
-            } else {
-                provider.latest()?
-            };
-            Some(
-                State::builder().with_database(StateProviderDatabase::new(inspected_state)).build(),
-            )
+                } else {
+                    provider.latest()?
+                };
+                dbs.push(State::builder().with_database(StateProviderDatabase::new(state)).build());
+            }
+            dbs
         };
 
         for (tx_idx, tx) in block.transactions_recovered().enumerate() {
@@ -593,85 +605,213 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             drop(normal_evm);
             normal_db.commit(normal_result.state);
 
-            // --- EXECUTION: Inspected (execution-modifying schedules) ---
-            let (inspector_results, formatted_operation_counts) =
-                if let Some(ref mut inspected_db) = inspected_db {
-                    let mut inspector =
-                        MultiScheduleInspector::new(self.execution_schedules.clone());
-                    let mut inspected_evm = self.ctx.evm_config().evm_with_env_and_inspector(
-                        &mut *inspected_db,
-                        evm_env.clone(),
-                        &mut inspector,
-                    );
-                    let inspected_result = match inspected_evm.transact(tx_env.clone()) {
-                        Ok(result) => result,
-                        Err(e) => {
-                            debug!(
-                                target: "exex::research",
-                                block = block_number,
-                                tx_idx,
-                                error = ?e,
-                                "Inspected execution failed"
-                            );
-                            continue;
+            // --- EXECUTION: Per-schedule re-execution with gas modifications ---
+            // Each execution-modifying schedule gets its own full execution pass
+            // so gas changes propagate naturally through subcalls.
+            struct PerScheduleResult {
+                success: bool,
+                gas_used: u64,
+                operation_counts: String,
+                oog_info: Option<String>,
+                divergence_location: Option<String>,
+            }
+
+            // Indexed parallel to self.execution_schedules — accessed by schedule
+            // name lookup during the analysis phase below.
+            let mut schedule_results: Vec<PerScheduleResult> =
+                Vec::with_capacity(self.execution_schedules.len());
+
+            for (sched_idx, schedule) in self.execution_schedules.iter().enumerate() {
+                // For "Both" schedules (intrinsic + execution), adjust gas_limit
+                // so execution gets the correct gas budget under the new intrinsic.
+                // The EVM always deducts baseline intrinsic, so we offset gas_limit
+                // to compensate: if schedule intrinsic is higher, execution gets less
+                // gas (and vice versa).
+                //
+                // When the schedule lowers intrinsic (negative delta), the adjusted
+                // gas_limit would exceed the original. We cap at gas_limit to avoid
+                // InsufficientFunds failures (the sender only had balance for the
+                // original gas_limit * gas_price). This means the extra execution
+                // budget from cheaper intrinsic is not modeled.
+                //
+                // **Impact**: a "Both" schedule that lowers intrinsic may produce
+                // false OOGs in the execution pass. Since the execution portion
+                // doesn't get the extra budget freed by cheaper intrinsic, opcodes
+                // that would have succeeded with the full budget may OOG. The
+                // reported result is conservative (may report failures that wouldn't
+                // actually occur). This trade-off is acceptable because
+                // InsufficientFunds from exceeding gas_limit would produce a more
+                // confusing false failure. Gas total reconstruction (below) is still
+                // correct: it replaces baseline intrinsic with schedule intrinsic in
+                // the reported total, so the gas delta accounts for the intrinsic
+                // difference even though the execution portion was capped.
+                //
+                // If `intrinsic_delta` is large enough to drive `adjusted` below the
+                // EVM's baseline intrinsic cost, `transact()` will fail (the EVM
+                // rejects the tx before execution begins). This is caught below and
+                // recorded as a definitive schedule-induced failure.
+                let mut sched_tx_env = tx_env.clone();
+                if schedule.modifies_intrinsic() {
+                    if let Some(ref ctx) = tx_context {
+                        if let Some(schedule_intrinsic) = schedule.intrinsic_gas(ctx) {
+                            let intrinsic_delta =
+                                schedule_intrinsic as i64 - baseline_intrinsic_gas as i64;
+                            let raw_adjusted = gas_limit as i64 - intrinsic_delta;
+                            let adjusted = raw_adjusted.clamp(0, gas_limit as i64) as u64;
+                            if raw_adjusted < 0 || raw_adjusted > gas_limit as i64 {
+                                debug!(
+                                    target: "exex::research",
+                                    block = block_number,
+                                    tx_idx,
+                                    schedule = schedule.name(),
+                                    %intrinsic_delta,
+                                    %gas_limit,
+                                    %adjusted,
+                                    "Gas limit clamped for 'Both' schedule — execution \
+                                     budget may be conservative"
+                                );
+                            }
+                            sched_tx_env.set_gas_limit(adjusted);
                         }
-                    };
-                    drop(inspected_evm);
-                    inspected_db.commit(inspected_result.state);
-                    (inspector.results(), Some(format!("{:?}", inspector.operation_counts())))
-                } else {
-                    (Vec::new(), None)
+                    }
+                }
+
+                let db = &mut schedule_dbs[sched_idx];
+                let mut inspector = ScheduleInspector::new(schedule.clone());
+                let mut evm = self.ctx.evm_config().evm_with_env_and_inspector(
+                    &mut *db,
+                    evm_env.clone(),
+                    &mut inspector,
+                );
+                let result = match evm.transact(sched_tx_env) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        debug!(
+                            target: "exex::research",
+                            block = block_number,
+                            tx_idx,
+                            schedule = schedule.name(),
+                            error = ?e,
+                            "Schedule execution failed"
+                        );
+                        drop(evm);
+                        // Record as definitive failure — the schedule's gas changes
+                        // (e.g., adjusted gas_limit falling below baseline intrinsic)
+                        // caused the EVM to reject the transaction entirely.
+                        schedule_results.push(PerScheduleResult {
+                            success: false,
+                            gas_used: gas_limit,
+                            operation_counts: String::new(),
+                            oog_info: Some(format!("EVM transact failed: {e:?}")),
+                            divergence_location: None,
+                        });
+                        continue;
+                    }
                 };
+                drop(evm);
+
+                let sched_success = result.result.is_success();
+                let sched_gas_used = result.result.gas_used();
+                let op_counts = format!("{:?}", inspector.operation_counts());
+                let insp_result = inspector.result();
+
+                db.commit(result.state);
+
+                schedule_results.push(PerScheduleResult {
+                    success: sched_success,
+                    gas_used: sched_gas_used,
+                    operation_counts: op_counts,
+                    oog_info: insp_result.oog_info.as_ref().map(|oog| format!("{oog:?}")),
+                    divergence_location: insp_result
+                        .divergence_location
+                        .as_ref()
+                        .map(|loc| format!("{loc:?}")),
+                });
+            }
 
             let normal_gas_used = normal_result.result.gas_used();
             let normal_success = normal_result.result.is_success();
             let tx_hash = *tx.tx_hash();
+
             // --- ANALYZE EACH SCHEDULE ---
             for schedule in &self.all_schedules {
                 let schedule_name = schedule.name();
                 let schedule_kind = schedule.kind();
 
-                // Calculate gas deltas based on schedule kind.
+                // Calculate intrinsic gas for intrinsic-modifying schedules
                 let (intrinsic_delta, schedule_intrinsic_gas, tx_category) = match schedule_kind {
                     ScheduleKind::IntrinsicOnly | ScheduleKind::Both => {
                         let tx_context = tx_context.as_ref().expect(
                             "intrinsic schedule requires tx context; context must be present",
                         );
-                        // For intrinsic-modifying schedules (like EIP-2780), calculate intrinsic
-                        // gas. Baseline includes create/call base and calldata cost.
                         let schedule_intrinsic =
-                            schedule.intrinsic_gas(&tx_context).unwrap_or(baseline_intrinsic_gas);
+                            schedule.intrinsic_gas(tx_context).unwrap_or(baseline_intrinsic_gas);
                         let delta = schedule_intrinsic as i64 - baseline_intrinsic_gas as i64;
-                        let category = schedule.tx_category(&tx_context);
+                        let category = schedule.tx_category(tx_context);
                         (delta, Some(schedule_intrinsic), category)
                     }
-                    ScheduleKind::ExecutionOnly => {
-                        // For execution-only schedules, no intrinsic change
-                        (0i64, None, None)
-                    }
+                    ScheduleKind::ExecutionOnly => (0i64, None, None),
                     ScheduleKind::None => continue,
                 };
 
-                let execution_result = self
+                // Look up the re-execution result for this schedule.
+                // For Both schedules the execution ran with an adjusted gas_limit
+                // so the EVM had the correct execution gas budget. The reported
+                // gas_used includes baseline intrinsic, so we add intrinsic_delta
+                // to get the true schedule gas_used (with schedule intrinsic).
+                let exec_result = self
                     .execution_schedule_indices
                     .get(schedule_name)
-                    .and_then(|idx| inspector_results.get(*idx));
-                let (execution_delta, execution_would_oog) = match schedule_kind {
-                    ScheduleKind::ExecutionOnly | ScheduleKind::Both => execution_result
-                        .map(|result| (result.additional_gas, result.would_oog))
-                        .unwrap_or((0i64, false)),
-                    ScheduleKind::IntrinsicOnly | ScheduleKind::None => (0i64, false),
+                    .and_then(|&idx| schedule_results.get(idx));
+                let (
+                    schedule_gas,
+                    schedule_success,
+                    formatted_op_counts,
+                    oog_info,
+                    divergence_location,
+                ) = match exec_result {
+                    Some(r) => {
+                        // EVM reports gas_used including baseline intrinsic.
+                        // Replace baseline intrinsic with schedule intrinsic to
+                        // get the true schedule total:
+                        //   gas_used - baseline_intrinsic + schedule_intrinsic
+                        //   = gas_used + intrinsic_delta
+                        //
+                        // For "Both" schedules where gas_limit was clamped
+                        // (negative intrinsic_delta), the execution portion may
+                        // be inaccurate (see clamping comment above), but the
+                        // intrinsic substitution is still correct.
+                        let gas = if intrinsic_delta != 0 {
+                            (r.gas_used as i64 + intrinsic_delta).max(0) as u64
+                        } else {
+                            r.gas_used
+                        };
+                        let success = r.success && gas <= gas_limit;
+                        (
+                            gas,
+                            success,
+                            Some(r.operation_counts.clone()),
+                            r.oog_info.clone(),
+                            r.divergence_location.clone(),
+                        )
+                    }
+                    None => {
+                        // Intrinsic-only schedule: estimate from baseline
+                        let gas = (normal_gas_used as i64 + intrinsic_delta).max(0) as u64;
+                        let success = normal_success && gas <= gas_limit;
+                        (gas, success, None, None, None)
+                    }
                 };
 
-                let total_delta = intrinsic_delta + execution_delta;
-
-                // Determine if this would cause a divergence
-                let schedule_gas = (normal_gas_used as i64 + total_delta).max(0) as u64;
-                let would_oog = execution_would_oog || schedule_gas > gas_limit;
-                let schedule_success = normal_success && !would_oog;
+                // Use the actual gas difference as the total delta rather than
+                // the inspector's cumulative opcode deltas, since cascading
+                // effects (different execution paths) make the true difference
+                // diverge from the sum of per-opcode adjustments.
+                let total_delta = schedule_gas as i64 - normal_gas_used as i64;
+                let would_oog = !schedule_success && normal_success;
 
                 // Record divergence if there's a gas delta or status change
-                if total_delta != 0 || would_oog {
+                if total_delta != 0 || would_oog || schedule_success != normal_success {
                     let divergence_type = if would_oog || schedule_success != normal_success {
                         DivergenceType::Status
                     } else {
@@ -685,11 +825,6 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     };
                     let (affected_opcodes, affected_precompiles) =
                         self.schedule_metadata.get(schedule_name).cloned().unwrap_or((None, None));
-                    let oog_info = execution_result
-                        .and_then(|result| result.oog_info.as_ref().map(|oog| format!("{oog:?}")));
-                    let divergence_location = execution_result.and_then(|result| {
-                        result.divergence_location.as_ref().map(|location| format!("{location:?}"))
-                    });
 
                     let div = ScheduleDivergence {
                         schedule_name: schedule_name.to_string(),
@@ -711,14 +846,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         affected_precompiles,
                         oog_info,
                         divergence_location,
-                        operation_counts: if matches!(
-                            schedule_kind,
-                            ScheduleKind::ExecutionOnly | ScheduleKind::Both
-                        ) {
-                            formatted_operation_counts.clone()
-                        } else {
-                            None
-                        },
+                        operation_counts: formatted_op_counts,
                     };
 
                     self.record_divergence(div);

@@ -49,18 +49,17 @@ pub struct OperationPricing {
 impl OperationPricing {
     /// Calculate the gas delta (new - current) for a given number of variable units.
     pub fn gas_delta(&self, variable_units: u64) -> i64 {
-        let current_total = self.current_constant
-            + self.current_variable.map(|v| v.saturating_mul(variable_units)).unwrap_or(0);
-        let new_total = self.new_constant
-            + self.new_variable.map(|v| v.saturating_mul(variable_units)).unwrap_or(0);
+        let current_total = self.current_constant +
+            self.current_variable.map(|v| v.saturating_mul(variable_units)).unwrap_or(0);
+        let new_total = self.new_constant +
+            self.new_variable.map(|v| v.saturating_mul(variable_units)).unwrap_or(0);
 
         new_total as i64 - current_total as i64
     }
 
     /// Get the new total gas cost.
     pub fn new_total_gas(&self, variable_units: u64) -> u64 {
-        self.new_constant
-            + self.new_variable.map(|v| v.saturating_mul(variable_units)).unwrap_or(0)
+        self.new_constant + self.new_variable.map(|v| v.saturating_mul(variable_units)).unwrap_or(0)
     }
 }
 
@@ -180,25 +179,25 @@ impl GasPricingTable {
 fn is_precompile_name(name: &str) -> bool {
     matches!(
         name,
-        "ECRECOVER"
-            | "SHA256"
-            | "RIPEMD160"
-            | "IDENTITY"
-            | "MODEXP"
-            | "ECADD"
-            | "ECMUL"
-            | "ECPAIRING"
-            | "BLAKE2F"
-            | "POINT_EVALUATION"
-            | "BLS12_G1ADD"
-            | "BLS12_G1MUL"
-            | "BLS12_G1MSM"
-            | "BLS12_G2ADD"
-            | "BLS12_G2MUL"
-            | "BLS12_G2MSM"
-            | "BLS12_PAIRING"
-            | "BLS12_MAP_FP_TO_G1"
-            | "BLS12_MAP_FP2_TO_G2"
+        "ECRECOVER" |
+            "SHA256" |
+            "RIPEMD160" |
+            "IDENTITY" |
+            "MODEXP" |
+            "ECADD" |
+            "ECMUL" |
+            "ECPAIRING" |
+            "BLAKE2F" |
+            "POINT_EVALUATION" |
+            "BLS12_G1ADD" |
+            "BLS12_G1MUL" |
+            "BLS12_G1MSM" |
+            "BLS12_G2ADD" |
+            "BLS12_G2MUL" |
+            "BLS12_G2MSM" |
+            "BLS12_PAIRING" |
+            "BLS12_MAP_FP_TO_G1" |
+            "BLS12_MAP_FP2_TO_G2"
     )
 }
 
@@ -322,6 +321,9 @@ fn precompile_name_to_address(name: &str) -> Option<Address> {
 /// KECCAK256 opcode byte.
 const OPCODE_KECCAK256: u8 = 0x20;
 
+/// EXP opcode byte.
+const OPCODE_EXP: u8 = 0x0A;
+
 /// CSV-based gas pricing schedule.
 #[derive(Debug, Clone)]
 pub struct CsvPricingSchedule {
@@ -357,6 +359,11 @@ impl CsvPricingSchedule {
     /// Get variable units for KECCAK256.
     fn get_keccak_units(ctx: &OpcodeContext) -> u64 {
         ctx.keccak_words()
+    }
+
+    /// Get variable units for EXP (exponent byte size).
+    fn get_exp_units(ctx: &OpcodeContext) -> u64 {
+        ctx.exp_byte_size.unwrap_or(0) as u64
     }
 
     /// Get variable units for precompile calls.
@@ -400,6 +407,8 @@ impl GasSchedule for CsvPricingSchedule {
 
         let variable_units = if opcode == OPCODE_KECCAK256 {
             Self::get_keccak_units(ctx)
+        } else if opcode == OPCODE_EXP {
+            Self::get_exp_units(ctx)
         } else {
             0
         };
@@ -470,7 +479,8 @@ BLAKE2F,num_rounds,1,2
     fn test_precompile_pricing() {
         let table = GasPricingTable::from_csv(TEST_CSV.as_bytes()).unwrap();
 
-        let ecpairing_addr = Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08]);
+        let ecpairing_addr =
+            Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08]);
         let pricing = table.get_precompile(&ecpairing_addr).unwrap();
 
         // 3 pairs: current = 45000 + 3*34000 = 147000, new = 45000 + 3*34103 = 147309
@@ -496,7 +506,8 @@ BLAKE2F,num_rounds,1,2
         let schedule =
             CsvPricingSchedule::from_csv("test".to_string(), TEST_CSV.as_bytes()).unwrap();
 
-        let ecpairing_addr = Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08]);
+        let ecpairing_addr =
+            Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08]);
 
         // 3 pairs = 576 bytes
         let input = vec![0u8; 576];

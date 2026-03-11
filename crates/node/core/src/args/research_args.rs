@@ -154,8 +154,7 @@ mod tests {
 
     #[test]
     fn test_parse_research_args_eip2780() {
-        let args =
-            CommandParser::<ResearchArgs>::parse_from(["reth", "--research.eip2780"]).args;
+        let args = CommandParser::<ResearchArgs>::parse_from(["reth", "--research.eip2780"]).args;
         assert!(args.eip2780);
         assert!(args.has_schedules());
         assert_eq!(args.schedule_count(), 1);

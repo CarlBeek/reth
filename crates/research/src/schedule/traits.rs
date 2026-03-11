@@ -60,10 +60,23 @@ pub trait GasSchedule: Send + Sync + Debug {
         None
     }
 
-    /// Get additional gas to charge for an opcode.
+    /// Get the additional gas to charge for an opcode beyond the EVM's own cost.
     ///
-    /// Returns the additional gas delta (can be positive or negative).
-    /// Returns 0 if this opcode is unaffected by this schedule.
+    /// Returns the gas delta (`new_cost - current_cost`) to apply on top of the
+    /// EVM's built-in charge. Positive values increase cost, negative values
+    /// decrease cost. Returns 0 if this opcode is unaffected by this schedule.
+    ///
+    /// # Important: deltas are additive, not replacements
+    ///
+    /// The EVM charges its own base cost for every opcode. This method returns
+    /// the *additional* adjustment. For example, if SLOAD currently costs 2100
+    /// and the schedule prices it at 2600, return +500 — not 2600.
+    ///
+    /// For CALL/CREATE opcodes specifically, the inspector applies this delta
+    /// *before* the EVM executes the opcode, so it affects the 63/64 gas
+    /// forwarding rule for subcalls. Schedule authors should still return only
+    /// the delta (not the total cost), since the EVM will charge its own base
+    /// cost separately.
     ///
     /// # Arguments
     /// * `opcode` - The opcode byte (0x00-0xFF)

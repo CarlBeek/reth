@@ -5,16 +5,14 @@
 
 use crate::{
     comparison::{
-        ExecutionComparison, ExecutionSummary, IntrinsicComparison, MultiScheduleComparisonResult,
+        ExecutionSummary, IntrinsicComparison, MultiScheduleComparisonResult,
         ScheduleComparisonResult,
     },
     database::{DivergenceDatabase, ScheduleDivergence},
     divergence::{DivergenceType, OperationCounts},
-    multi_schedule_inspector::{MultiScheduleInspector, ScheduleResult},
-    schedule::{GasSchedule, ScheduleRegistry, TxContext},
+    schedule::{ScheduleRegistry, TxContext},
 };
 use alloy_primitives::B256;
-use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -94,32 +92,16 @@ impl MultiScheduleAnalyzer {
         &self.stats
     }
 
-    /// Create an inspector for a transaction.
+    /// Analyze intrinsic gas for a transaction across all configured schedules.
     ///
-    /// The inspector tracks gas deltas for all execution-modifying schedules.
-    pub fn create_inspector(&self) -> MultiScheduleInspector {
-        let schedules: Vec<Arc<dyn GasSchedule>> = self
-            .registry
-            .all()
-            .into_iter()
-            .filter(|s| s.modifies_execution())
-            .collect();
-
-        MultiScheduleInspector::new(schedules)
-    }
-
-    /// Analyze a transaction after execution.
+    /// This handles **intrinsic gas comparison only**. Execution gas comparison
+    /// (opcode-level deltas, subcall propagation, OOG detection) is performed by
+    /// the ExEx in `main.rs` via per-schedule re-execution with [`ScheduleInspector`].
+    /// The split exists because execution comparison requires actual EVM re-execution
+    /// (one pass per schedule), which the analyzer cannot perform without a database
+    /// and EVM environment.
     ///
-    /// This compares the baseline execution against all configured schedules.
-    ///
-    /// # Arguments
-    /// * `block_number` - The block containing this transaction
-    /// * `tx_index` - Transaction index within the block
-    /// * `tx_hash` - Transaction hash
-    /// * `timestamp` - Block timestamp
-    /// * `baseline` - Baseline execution summary
-    /// * `tx_context` - Transaction context (for intrinsic gas calculation)
-    /// * `inspector_results` - Results from the multi-schedule inspector
+    /// [`ScheduleInspector`]: crate::multi_schedule_inspector::ScheduleInspector
     pub fn analyze_transaction(
         &mut self,
         block_number: u64,
@@ -128,77 +110,36 @@ impl MultiScheduleAnalyzer {
         timestamp: u64,
         baseline: ExecutionSummary,
         tx_context: Option<&TxContext>,
-        inspector_results: &[ScheduleResult],
     ) -> Result<MultiScheduleComparisonResult, AnalyzerError> {
-        let mut result =
-            MultiScheduleComparisonResult::new(block_number, tx_index, tx_hash, timestamp, baseline.clone());
+        let mut result = MultiScheduleComparisonResult::new(
+            block_number,
+            tx_index,
+            tx_hash,
+            timestamp,
+            baseline.clone(),
+        );
 
-        // Analyze each schedule
+        // Analyze intrinsic gas for each schedule
         for schedule in self.registry.all() {
             let schedule_name = schedule.name().to_string();
             let mut comparison = ScheduleComparisonResult::new(schedule_name.clone());
 
-            // Check intrinsic gas for intrinsic-modifying schedules
             if schedule.modifies_intrinsic() {
                 if let Some(ctx) = tx_context {
                     if let Some(schedule_intrinsic) = schedule.intrinsic_gas(ctx) {
-                        let intrinsic_comp = IntrinsicComparison::new(
-                            baseline.intrinsic_gas,
-                            schedule_intrinsic,
-                        );
+                        let intrinsic_comp =
+                            IntrinsicComparison::new(baseline.intrinsic_gas, schedule_intrinsic);
 
-                        // Add category if available
                         let intrinsic_comp = if let Some(category) = schedule.tx_category(ctx) {
                             intrinsic_comp.with_category(category)
                         } else {
                             intrinsic_comp
                         };
 
-                        // Check if intrinsic gas change would cause failure
-                        // (tx would fail if schedule_intrinsic > gas_limit)
                         if intrinsic_comp.delta != 0 {
                             comparison = comparison.with_intrinsic(intrinsic_comp);
                             comparison.has_divergence = true;
                             comparison.divergence_type = Some(DivergenceType::GasPattern);
-                        }
-                    }
-                }
-            }
-
-            // Check execution gas for execution-modifying schedules
-            if schedule.modifies_execution() {
-                if let Some(insp_result) = inspector_results.iter().find(|r| r.schedule_name == schedule_name) {
-                    let schedule_success = !insp_result.would_oog && baseline.success;
-
-                    let exec_comp = ExecutionComparison::new(
-                        insp_result.additional_gas,
-                        baseline.success,
-                        schedule_success,
-                        baseline.gas_used,
-                    )
-                    .with_affected_opcodes(schedule.affected_opcodes())
-                    .with_affected_precompiles(schedule.affected_precompiles());
-
-                    // Check for divergence
-                    if insp_result.would_oog || insp_result.additional_gas != 0 {
-                        comparison = comparison.with_execution(exec_comp);
-                        comparison.has_divergence = true;
-
-                        if insp_result.would_oog {
-                            comparison.divergence_type = Some(DivergenceType::Status);
-
-                            // Record OOG stats
-                            *self.stats.oog_by_schedule.entry(schedule_name.clone()).or_insert(0) += 1;
-                        } else {
-                            comparison.divergence_type = Some(DivergenceType::GasPattern);
-                        }
-
-                        // Add OOG info and divergence location
-                        if let Some(ref oog_info) = insp_result.oog_info {
-                            comparison = comparison.with_oog(oog_info.clone());
-                        }
-                        if let Some(ref location) = insp_result.divergence_location {
-                            comparison = comparison.with_location(location.clone());
                         }
                     }
                 }
@@ -215,7 +156,6 @@ impl MultiScheduleAnalyzer {
                     &comparison,
                 )?;
 
-                // Update stats
                 *self.stats.divergences_by_schedule.entry(schedule_name).or_insert(0) += 1;
                 self.stats.divergences_found += 1;
             }
@@ -289,10 +229,7 @@ impl MultiScheduleAnalyzer {
                 .execution_comparison
                 .as_ref()
                 .and_then(|e| serde_json::to_string(&e.affected_precompiles).ok()),
-            oog_info: comparison
-                .oog_info
-                .as_ref()
-                .and_then(|o| serde_json::to_string(o).ok()),
+            oog_info: comparison.oog_info.as_ref().and_then(|o| serde_json::to_string(o).ok()),
             divergence_location: comparison
                 .divergence_location
                 .as_ref()
@@ -405,17 +342,6 @@ mod tests {
     }
 
     #[test]
-    fn test_create_inspector() {
-        let registry = create_test_registry();
-        let analyzer = MultiScheduleAnalyzer::new(registry).unwrap();
-
-        let inspector = analyzer.create_inspector();
-        // Multiplier schedule modifies execution, but returns 0 delta
-        // so it may or may not be included depending on implementation
-        assert!(inspector.results().len() >= 1);
-    }
-
-    #[test]
     fn test_analyzer_stats_default() {
         let stats = AnalyzerStats::default();
         assert_eq!(stats.transactions_analyzed, 0);
@@ -440,15 +366,7 @@ mod tests {
 
         let baseline = ExecutionSummary::new(true, 50000, 21000);
         let result = analyzer
-            .analyze_transaction(
-                1000000,
-                0,
-                B256::ZERO,
-                1234567890,
-                baseline,
-                None,
-                &[],
-            )
+            .analyze_transaction(1000000, 0, B256::ZERO, 1234567890, baseline, None)
             .unwrap();
 
         assert_eq!(result.block_number, 1000000);

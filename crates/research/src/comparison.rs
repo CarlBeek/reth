@@ -62,7 +62,11 @@ impl MultiScheduleComparisonResult {
 
     /// Get total gas delta across all schedules.
     pub fn total_gas_delta(&self) -> i64 {
-        self.schedule_results.iter().filter_map(|r| r.execution_comparison.as_ref()).map(|e| e.gas_delta).sum()
+        self.schedule_results
+            .iter()
+            .filter_map(|r| r.execution_comparison.as_ref())
+            .map(|e| e.gas_delta)
+            .sum()
     }
 }
 
@@ -327,7 +331,8 @@ mod tests {
 
     #[test]
     fn test_intrinsic_comparison_with_category() {
-        let comp = IntrinsicComparison::new(21000, 6000).with_category("transfer_to_eoa".to_string());
+        let comp =
+            IntrinsicComparison::new(21000, 6000).with_category("transfer_to_eoa".to_string());
         assert_eq!(comp.tx_category, Some("transfer_to_eoa".to_string()));
     }
 
@@ -358,13 +363,8 @@ mod tests {
     #[test]
     fn test_multi_schedule_comparison() {
         let baseline = ExecutionSummary::new(true, 50000, 21000);
-        let mut result = MultiScheduleComparisonResult::new(
-            1000000,
-            0,
-            B256::ZERO,
-            1234567890,
-            baseline,
-        );
+        let mut result =
+            MultiScheduleComparisonResult::new(1000000, 0, B256::ZERO, 1234567890, baseline);
 
         result.add_schedule_result(
             ScheduleComparisonResult::new("eip-2780".to_string())
