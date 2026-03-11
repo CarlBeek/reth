@@ -73,29 +73,26 @@ pub struct EnvironmentArgs<C: ChainSpecParser> {
 }
 
 impl<C: ChainSpecParser> EnvironmentArgs<C> {
-    /// Returns the effective storage settings derived from `--storage.v2`.
+    /// Returns the storage settings for new database initialization.
     ///
-    /// The base storage mode is determined by `--storage.v2`:
-    /// - When `--storage.v2` is set: uses [`StorageSettings::v2()`] defaults
-    /// - Otherwise: uses [`StorageSettings::base()`] defaults
+    /// Always returns [`StorageSettings::v2()`] — v2 is the default for all new
+    /// databases. Existing databases use the settings persisted in their metadata.
     pub fn storage_settings(&self) -> StorageSettings {
-        if self.storage.v2 {
-            StorageSettings::v2()
-        } else {
-            StorageSettings::base()
-        }
+        StorageSettings::v2()
     }
 
     /// Initializes environment according to [`AccessRights`] and returns an instance of
     /// [`Environment`].
     ///
-    /// Internally builds a [`reth_tasks::Runtime`] attached to the current tokio handle for
-    /// parallel storage I/O.
-    pub fn init<N: CliNodeTypes>(&self, access: AccessRights) -> eyre::Result<Environment<N>>
+    /// The provided `runtime` is used for parallel storage I/O.
+    pub fn init<N: CliNodeTypes>(
+        &self,
+        access: AccessRights,
+        runtime: reth_tasks::Runtime,
+    ) -> eyre::Result<Environment<N>>
     where
         C: ChainSpecParser<ChainSpec = N::ChainSpec>,
     {
-        let runtime = reth_tasks::Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
         let data_dir = self.datadir.clone().resolve_datadir(self.chain.chain());
         let db_path = data_dir.db();
         let sf_path = data_dir.static_files();
@@ -144,11 +141,24 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
                 })
             }
         };
-        let rocksdb_provider = RocksDBProvider::builder(data_dir.rocksdb())
-            .with_default_tables()
-            .with_database_log_level(self.db.log_level)
-            .with_read_only(!access.is_read_write())
-            .build()?;
+        let rocksdb_provider = if !access.is_read_write() && !RocksDBProvider::exists(&rocksdb_path)
+        {
+            // RocksDB database doesn't exist yet (e.g. datadir restored from a snapshot
+            // or created before RocksDB storage). Create an empty one so read-only
+            // commands can proceed.
+            debug!(target: "reth::cli", ?rocksdb_path, "RocksDB not found, initializing empty database");
+            reth_fs_util::create_dir_all(&rocksdb_path)?;
+            RocksDBProvider::builder(data_dir.rocksdb())
+                .with_default_tables()
+                .with_database_log_level(self.db.log_level)
+                .build()?
+        } else {
+            RocksDBProvider::builder(data_dir.rocksdb())
+                .with_default_tables()
+                .with_database_log_level(self.db.log_level)
+                .with_read_only(!access.is_read_write())
+                .build()?
+        };
 
         let provider_factory =
             self.create_provider_factory(&config, db, sfp, rocksdb_provider, access, runtime)?;

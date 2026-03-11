@@ -30,9 +30,12 @@ use tokio::{
 };
 use tracing::debug;
 
+pub mod lazy;
 pub mod metrics;
 pub mod runtime;
 pub mod shutdown;
+pub mod utils;
+pub(crate) mod worker_map;
 
 #[cfg(feature = "rayon")]
 pub mod pool;
@@ -45,6 +48,7 @@ pub mod for_each_ordered;
 #[cfg(feature = "rayon")]
 pub use for_each_ordered::ForEachOrdered;
 
+pub use lazy::LazyHandle;
 #[cfg(feature = "rayon")]
 pub use runtime::RayonConfig;
 pub use runtime::{Runtime, RuntimeBuildError, RuntimeBuilder, RuntimeConfig, TokioConfig};
@@ -236,13 +240,12 @@ mod tests {
 
     #[test]
     fn test_critical() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let rt = Runtime::with_existing_handle(runtime.handle().clone()).unwrap();
+        let rt = Runtime::test();
         let handle = rt.take_task_manager_handle().unwrap();
 
         rt.spawn_critical_task("this is a critical task", async { panic!("intentionally panic") });
 
-        runtime.block_on(async move {
+        rt.handle().block_on(async move {
             let err_result = handle.await.unwrap();
             assert!(err_result.is_err(), "Expected TaskManager to return an error due to panic");
             let panicked_err = err_result.unwrap_err();
@@ -254,8 +257,7 @@ mod tests {
 
     #[test]
     fn test_manager_shutdown_critical() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let rt = Runtime::with_existing_handle(runtime.handle().clone()).unwrap();
+        let rt = Runtime::test();
 
         let (signal, shutdown) = signal();
 
@@ -266,34 +268,32 @@ mod tests {
 
         rt.graceful_shutdown();
 
-        runtime.block_on(shutdown);
+        rt.handle().block_on(shutdown);
     }
 
     #[test]
     fn test_manager_shutdown() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let rt = Runtime::with_existing_handle(runtime.handle().clone()).unwrap();
+        let rt = Runtime::test();
 
         let (signal, shutdown) = signal();
 
-        rt.spawn_task(Box::pin(async move {
+        rt.spawn_task(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
             drop(signal);
-        }));
+        });
 
         rt.graceful_shutdown();
 
-        runtime.block_on(shutdown);
+        rt.handle().block_on(shutdown);
     }
 
     #[test]
     fn test_manager_graceful_shutdown() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let rt = Runtime::with_existing_handle(runtime.handle().clone()).unwrap();
+        let rt = Runtime::test();
 
         let val = Arc::new(AtomicBool::new(false));
         let c = val.clone();
-        rt.spawn_critical_with_graceful_shutdown_signal("grace", |shutdown| async move {
+        rt.spawn_critical_with_graceful_shutdown_signal("grace", async move |shutdown| {
             let _guard = shutdown.await;
             tokio::time::sleep(Duration::from_millis(200)).await;
             c.store(true, Ordering::Relaxed);
@@ -305,14 +305,13 @@ mod tests {
 
     #[test]
     fn test_manager_graceful_shutdown_many() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let rt = Runtime::with_existing_handle(runtime.handle().clone()).unwrap();
+        let rt = Runtime::test();
 
         let counter = Arc::new(AtomicUsize::new(0));
         let num = 10;
         for _ in 0..num {
             let c = counter.clone();
-            rt.spawn_critical_with_graceful_shutdown_signal("grace", move |shutdown| async move {
+            rt.spawn_critical_with_graceful_shutdown_signal("grace", async move |shutdown| {
                 let _guard = shutdown.await;
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 c.fetch_add(1, Ordering::SeqCst);
@@ -325,13 +324,12 @@ mod tests {
 
     #[test]
     fn test_manager_graceful_shutdown_timeout() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let rt = Runtime::with_existing_handle(runtime.handle().clone()).unwrap();
+        let rt = Runtime::test();
 
         let timeout = Duration::from_millis(500);
         let val = Arc::new(AtomicBool::new(false));
         let val2 = val.clone();
-        rt.spawn_critical_with_graceful_shutdown_signal("grace", |shutdown| async move {
+        rt.spawn_critical_with_graceful_shutdown_signal("grace", async move |shutdown| {
             let _guard = shutdown.await;
             tokio::time::sleep(timeout * 3).await;
             val2.store(true, Ordering::Relaxed);
@@ -344,21 +342,19 @@ mod tests {
 
     #[test]
     fn can_build_runtime() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let rt = Runtime::with_existing_handle(runtime.handle().clone()).unwrap();
+        let rt = Runtime::test();
         let _handle = rt.handle();
     }
 
     #[test]
     fn test_graceful_shutdown_triggered_by_executor() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let rt = Runtime::with_existing_handle(runtime.handle().clone()).unwrap();
+        let rt = Runtime::test();
         let task_manager_handle = rt.take_task_manager_handle().unwrap();
 
         let task_did_shutdown_flag = Arc::new(AtomicBool::new(false));
         let flag_clone = task_did_shutdown_flag.clone();
 
-        let spawned_task_handle = rt.spawn_with_signal(|shutdown_signal| async move {
+        let spawned_task_handle = rt.spawn_with_signal(async move |shutdown_signal| {
             shutdown_signal.await;
             flag_clone.store(true, Ordering::SeqCst);
         });
@@ -366,11 +362,11 @@ mod tests {
         let send_result = rt.initiate_graceful_shutdown();
         assert!(send_result.is_ok());
 
-        let manager_final_result = runtime.block_on(task_manager_handle);
+        let manager_final_result = rt.handle().block_on(task_manager_handle);
         assert!(manager_final_result.is_ok(), "TaskManager task should not panic");
         assert_eq!(manager_final_result.unwrap(), Ok(()));
 
-        let task_join_result = runtime.block_on(spawned_task_handle);
+        let task_join_result = rt.handle().block_on(spawned_task_handle);
         assert!(task_join_result.is_ok());
 
         assert!(task_did_shutdown_flag.load(Ordering::Relaxed));

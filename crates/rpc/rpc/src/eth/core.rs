@@ -21,8 +21,8 @@ use reth_rpc_eth_api::{
     EthApiTypes, RpcNodeCore,
 };
 use reth_rpc_eth_types::{
-    builder::config::PendingBlockKind, receipt::EthReceiptConverter, tx_forward::ForwardConfig,
-    EthApiError, EthStateCache, FeeHistoryCache, GasCap, GasPriceOracle, PendingBlock,
+    builder::config::PendingBlockKind, receipt::EthReceiptConverter, EthApiError, EthStateCache,
+    FeeHistoryCache, GasCap, GasPriceOracle, PendingBlock,
 };
 use reth_storage_api::{noop::NoopProvider, BlockReaderIdExt, ProviderHeader};
 use reth_tasks::{
@@ -129,60 +129,6 @@ impl
             RpcNodeCore<Provider: ChainSpecProvider<ChainSpec = ChainSpec>, Evm = EvmConfig>,
     {
         EthApiBuilder::new(provider, pool, network, evm_config)
-    }
-}
-
-impl<N, Rpc> EthApi<N, Rpc>
-where
-    N: RpcNodeCore,
-    Rpc: RpcConvert,
-    (): PendingEnvBuilder<N::Evm>,
-{
-    /// Creates a new, shareable instance using the default tokio task spawner.
-    #[expect(clippy::too_many_arguments)]
-    pub fn new(
-        components: N,
-        eth_cache: EthStateCache<N::Primitives>,
-        gas_oracle: GasPriceOracle<N::Provider>,
-        gas_cap: impl Into<GasCap>,
-        max_simulate_blocks: u64,
-        eth_proof_window: u64,
-        blocking_task_pool: BlockingTaskPool,
-        fee_history_cache: FeeHistoryCache<ProviderHeader<N::Provider>>,
-        proof_permits: usize,
-        rpc_converter: Rpc,
-        max_batch_size: usize,
-        max_blocking_io_requests: usize,
-        pending_block_kind: PendingBlockKind,
-        raw_tx_forwarder: ForwardConfig,
-        send_raw_transaction_sync_timeout: Duration,
-        evm_memory_limit: u64,
-        force_blob_sidecar_upcasting: bool,
-    ) -> Self {
-        let inner = EthApiInner::new(
-            components,
-            eth_cache,
-            gas_oracle,
-            gas_cap,
-            max_simulate_blocks,
-            eth_proof_window,
-            blocking_task_pool,
-            fee_history_cache,
-            Runtime::with_existing_handle(tokio::runtime::Handle::current())
-                .expect("called outside tokio runtime"),
-            proof_permits,
-            rpc_converter,
-            (),
-            max_batch_size,
-            max_blocking_io_requests,
-            pending_block_kind,
-            raw_tx_forwarder.forwarder_client(),
-            send_raw_transaction_sync_timeout,
-            evm_memory_limit,
-            force_blob_sidecar_upcasting,
-        );
-
-        Self { inner: Arc::new(inner) }
     }
 }
 
@@ -620,6 +566,7 @@ mod tests {
     use alloy_eips::BlockNumberOrTag;
     use alloy_primitives::{Signature, B256, U64};
     use alloy_rpc_types::FeeHistory;
+    use alloy_rpc_types_eth::{Bundle, TransactionRequest};
     use jsonrpsee_types::error::INVALID_PARAMS_CODE;
     use rand::Rng;
     use reth_chain_state::CanonStateSubscriptions;
@@ -815,6 +762,53 @@ mod tests {
         assert!(response.is_err());
         let error_object = response.unwrap_err();
         assert_eq!(error_object.code(), INVALID_PARAMS_CODE);
+    }
+
+    #[tokio::test]
+    async fn test_call_many_maps_provider_block_lookup_error_with_eth_api_conversion() {
+        let eth_api = build_test_eth_api(MockEthProvider::default());
+        let bundles = vec![Bundle {
+            transactions: vec![TransactionRequest::default()],
+            block_override: None,
+        }];
+
+        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::call_many(
+            &eth_api, bundles, None, None,
+        )
+        .await;
+
+        let err = response.expect_err("call_many should fail when latest block lookup errors");
+        let message = err.message().to_ascii_lowercase();
+        assert!(
+            message.contains("block not found"),
+            "best block lookup should map via EthApiError::from(ProviderError): {message}"
+        );
+        assert!(
+            !message.contains("best block does not exist"),
+            "provider implementation detail should not leak from converted error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_call_many_keeps_header_not_found_when_block_hash_absent() {
+        let eth_api = build_test_eth_api(NoopProvider::default());
+        let bundles = vec![Bundle {
+            transactions: vec![TransactionRequest::default()],
+            block_override: None,
+        }];
+
+        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::call_many(
+            &eth_api, bundles, None, None,
+        )
+        .await;
+
+        let err =
+            response.expect_err("call_many should fail when latest block hash is unavailable");
+        let message = err.message().to_ascii_lowercase();
+        assert!(
+            message.contains("block not found"),
+            "missing block hash should still map to block-not-found: {message}"
+        );
     }
 
     #[tokio::test]
