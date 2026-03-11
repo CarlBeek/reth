@@ -248,9 +248,9 @@ fn existing_columns(conn: &Connection, table: &str) -> Result<HashSet<String>, D
 }
 
 fn initialize_schema_on_connection(conn: &Connection) -> Result<(), DatabaseError> {
-        // Multi-schedule divergences table
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS schedule_divergences (
+    // Multi-schedule divergences table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schedule_divergences (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 schedule_name TEXT NOT NULL,
                 block_number INTEGER NOT NULL,
@@ -328,63 +328,63 @@ fn initialize_schema_on_connection(conn: &Connection) -> Result<(), DatabaseErro
 
                 created_at INTEGER DEFAULT (strftime('%s', 'now'))
             )",
-            [],
-        )?;
+        [],
+    )?;
 
-        let existing_divergence_columns = existing_columns(conn, "schedule_divergences")?;
-        for column_def in [
-            "schedule_kind TEXT NOT NULL DEFAULT 'unknown'",
-            "schedule_description TEXT NOT NULL DEFAULT ''",
-            "schedule_config_hash TEXT NOT NULL DEFAULT ''",
-            "block_hash BLOB NOT NULL DEFAULT X''",
-            "parent_hash BLOB NOT NULL DEFAULT X''",
-            "baseline_call_frames TEXT",
-            "schedule_call_frames TEXT",
-            "baseline_event_logs TEXT",
-            "schedule_event_logs TEXT",
-            "baseline_call_frames_hash TEXT",
-            "schedule_call_frames_hash TEXT",
-            "baseline_event_logs_hash TEXT",
-            "schedule_event_logs_hash TEXT",
-            "status_changed BOOLEAN NOT NULL DEFAULT 0",
-            "gas_changed BOOLEAN NOT NULL DEFAULT 0",
-            "call_tree_changed BOOLEAN NOT NULL DEFAULT 0",
-            "event_logs_changed BOOLEAN NOT NULL DEFAULT 0",
-            "output_changed BOOLEAN NOT NULL DEFAULT 0",
-            "created_address_changed BOOLEAN NOT NULL DEFAULT 0",
-            "logs_bloom_changed BOOLEAN NOT NULL DEFAULT 0",
-            "sender TEXT NOT NULL DEFAULT ''",
-            "recipient TEXT",
-            "value_wei TEXT NOT NULL DEFAULT '0'",
-            "input_len INTEGER NOT NULL DEFAULT 0",
-            "input_zero_bytes INTEGER NOT NULL DEFAULT 0",
-            "input_nonzero_bytes INTEGER NOT NULL DEFAULT 0",
-            "tx_gas_limit INTEGER NOT NULL DEFAULT 0",
-            "access_list_accounts INTEGER NOT NULL DEFAULT 0",
-            "access_list_storage_slots INTEGER NOT NULL DEFAULT 0",
-            "authorization_count INTEGER NOT NULL DEFAULT 0",
-            "is_create BOOLEAN NOT NULL DEFAULT 0",
-            "baseline_output_len INTEGER",
-            "schedule_output_len INTEGER",
-            "baseline_output_hash TEXT",
-            "schedule_output_hash TEXT",
-            "baseline_created_address TEXT",
-            "schedule_created_address TEXT",
-            "baseline_log_count INTEGER NOT NULL DEFAULT 0",
-            "schedule_log_count INTEGER NOT NULL DEFAULT 0",
-            "baseline_logs_bloom TEXT NOT NULL DEFAULT ''",
-            "schedule_logs_bloom TEXT NOT NULL DEFAULT ''",
-        ] {
-            let Some(column_name) = column_def.split_whitespace().next() else {
-                continue;
-            };
-            if !existing_divergence_columns.contains(column_name) {
-                conn.execute(&format!("ALTER TABLE schedule_divergences ADD COLUMN {column_def}"), [])?;
-            }
+    let existing_divergence_columns = existing_columns(conn, "schedule_divergences")?;
+    for column_def in [
+        "schedule_kind TEXT NOT NULL DEFAULT 'unknown'",
+        "schedule_description TEXT NOT NULL DEFAULT ''",
+        "schedule_config_hash TEXT NOT NULL DEFAULT ''",
+        "block_hash BLOB NOT NULL DEFAULT X''",
+        "parent_hash BLOB NOT NULL DEFAULT X''",
+        "baseline_call_frames TEXT",
+        "schedule_call_frames TEXT",
+        "baseline_event_logs TEXT",
+        "schedule_event_logs TEXT",
+        "baseline_call_frames_hash TEXT",
+        "schedule_call_frames_hash TEXT",
+        "baseline_event_logs_hash TEXT",
+        "schedule_event_logs_hash TEXT",
+        "status_changed BOOLEAN NOT NULL DEFAULT 0",
+        "gas_changed BOOLEAN NOT NULL DEFAULT 0",
+        "call_tree_changed BOOLEAN NOT NULL DEFAULT 0",
+        "event_logs_changed BOOLEAN NOT NULL DEFAULT 0",
+        "output_changed BOOLEAN NOT NULL DEFAULT 0",
+        "created_address_changed BOOLEAN NOT NULL DEFAULT 0",
+        "logs_bloom_changed BOOLEAN NOT NULL DEFAULT 0",
+        "sender TEXT NOT NULL DEFAULT ''",
+        "recipient TEXT",
+        "value_wei TEXT NOT NULL DEFAULT '0'",
+        "input_len INTEGER NOT NULL DEFAULT 0",
+        "input_zero_bytes INTEGER NOT NULL DEFAULT 0",
+        "input_nonzero_bytes INTEGER NOT NULL DEFAULT 0",
+        "tx_gas_limit INTEGER NOT NULL DEFAULT 0",
+        "access_list_accounts INTEGER NOT NULL DEFAULT 0",
+        "access_list_storage_slots INTEGER NOT NULL DEFAULT 0",
+        "authorization_count INTEGER NOT NULL DEFAULT 0",
+        "is_create BOOLEAN NOT NULL DEFAULT 0",
+        "baseline_output_len INTEGER",
+        "schedule_output_len INTEGER",
+        "baseline_output_hash TEXT",
+        "schedule_output_hash TEXT",
+        "baseline_created_address TEXT",
+        "schedule_created_address TEXT",
+        "baseline_log_count INTEGER NOT NULL DEFAULT 0",
+        "schedule_log_count INTEGER NOT NULL DEFAULT 0",
+        "baseline_logs_bloom TEXT NOT NULL DEFAULT ''",
+        "schedule_logs_bloom TEXT NOT NULL DEFAULT ''",
+    ] {
+        let Some(column_name) = column_def.split_whitespace().next() else {
+            continue;
+        };
+        if !existing_divergence_columns.contains(column_name) {
+            conn.execute(&format!("ALTER TABLE schedule_divergences ADD COLUMN {column_def}"), [])?;
         }
+    }
 
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS schedule_block_coverage (
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schedule_block_coverage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 schedule_name TEXT NOT NULL,
                 schedule_kind TEXT NOT NULL,
@@ -408,96 +408,96 @@ fn initialize_schema_on_connection(conn: &Connection) -> Result<(), DatabaseErro
                 created_at INTEGER DEFAULT (strftime('%s', 'now')),
                 UNIQUE(schedule_name, block_number, block_hash)
             )",
-            [],
-        )?;
+        [],
+    )?;
 
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS export_change_log (
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS export_change_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 schedule_name TEXT NOT NULL,
                 source_table TEXT NOT NULL,
                 operation TEXT NOT NULL,
                 changed_at INTEGER DEFAULT (strftime('%s', 'now'))
             )",
-            [],
-        )?;
+        [],
+    )?;
 
-        for trigger in [
-            "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_divergences_insert
+    for trigger in [
+        "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_divergences_insert
              AFTER INSERT ON schedule_divergences
              BEGIN
                  INSERT INTO export_change_log (schedule_name, source_table, operation)
                  VALUES (NEW.schedule_name, 'schedule_divergences', 'insert');
              END",
-            "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_divergences_update
+        "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_divergences_update
              AFTER UPDATE ON schedule_divergences
              BEGIN
                  INSERT INTO export_change_log (schedule_name, source_table, operation)
                  VALUES (NEW.schedule_name, 'schedule_divergences', 'update');
              END",
-            "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_divergences_delete
+        "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_divergences_delete
              AFTER DELETE ON schedule_divergences
              BEGIN
                  INSERT INTO export_change_log (schedule_name, source_table, operation)
                  VALUES (OLD.schedule_name, 'schedule_divergences', 'delete');
              END",
-            "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_block_coverage_insert
+        "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_block_coverage_insert
              AFTER INSERT ON schedule_block_coverage
              BEGIN
                  INSERT INTO export_change_log (schedule_name, source_table, operation)
                  VALUES (NEW.schedule_name, 'schedule_block_coverage', 'insert');
              END",
-            "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_block_coverage_update
+        "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_block_coverage_update
              AFTER UPDATE ON schedule_block_coverage
              BEGIN
                  INSERT INTO export_change_log (schedule_name, source_table, operation)
                  VALUES (NEW.schedule_name, 'schedule_block_coverage', 'update');
              END",
-            "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_block_coverage_delete
+        "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_block_coverage_delete
              AFTER DELETE ON schedule_block_coverage
              BEGIN
                  INSERT INTO export_change_log (schedule_name, source_table, operation)
                  VALUES (OLD.schedule_name, 'schedule_block_coverage', 'delete');
              END",
-        ] {
-            conn.execute(trigger, [])?;
-        }
+    ] {
+        conn.execute(trigger, [])?;
+    }
 
-        // Indexes for multi-schedule divergences
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sched_div_schedule ON schedule_divergences(schedule_name)",
-            [],
-        )?;
+    // Indexes for multi-schedule divergences
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sched_div_schedule ON schedule_divergences(schedule_name)",
+        [],
+    )?;
 
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sched_div_block ON schedule_divergences(block_number)",
-            [],
-        )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sched_div_block ON schedule_divergences(block_number)",
+        [],
+    )?;
 
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sched_div_type ON schedule_divergences(divergence_type)",
-            [],
-        )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sched_div_type ON schedule_divergences(divergence_type)",
+        [],
+    )?;
 
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sched_div_category ON schedule_divergences(tx_category)",
-            [],
-        )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sched_div_category ON schedule_divergences(tx_category)",
+        [],
+    )?;
 
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sched_div_tx ON schedule_divergences(tx_hash)",
-            [],
-        )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sched_div_tx ON schedule_divergences(tx_hash)",
+        [],
+    )?;
 
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sched_div_unique
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sched_div_unique
              ON schedule_divergences(schedule_name, block_number, tx_index, tx_hash)",
-            [],
-        )?;
+        [],
+    )?;
 
-        // Schedule statistics table
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS schedule_stats (
+    // Schedule statistics table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schedule_stats (
                 schedule_name TEXT PRIMARY KEY,
                 total_transactions INTEGER NOT NULL DEFAULT 0,
                 total_divergences INTEGER NOT NULL DEFAULT 0,
@@ -507,11 +507,11 @@ fn initialize_schema_on_connection(conn: &Connection) -> Result<(), DatabaseErro
                 last_block_processed INTEGER,
                 updated_at INTEGER
             )",
-            [],
-        )?;
+        [],
+    )?;
 
-        Ok(())
-    }
+    Ok(())
+}
 impl DivergenceDatabase {
     /// Record a schedule-specific divergence.
     pub fn record_schedule_divergence(
@@ -610,7 +610,65 @@ impl DivergenceDatabase {
                 baseline_log_count = excluded.baseline_log_count,
                 schedule_log_count = excluded.schedule_log_count,
                 baseline_logs_bloom = excluded.baseline_logs_bloom,
-                schedule_logs_bloom = excluded.schedule_logs_bloom",
+                schedule_logs_bloom = excluded.schedule_logs_bloom
+            WHERE
+                timestamp IS NOT excluded.timestamp OR
+                schedule_kind IS NOT excluded.schedule_kind OR
+                schedule_description IS NOT excluded.schedule_description OR
+                schedule_config_hash IS NOT excluded.schedule_config_hash OR
+                block_hash IS NOT excluded.block_hash OR
+                parent_hash IS NOT excluded.parent_hash OR
+                divergence_type IS NOT excluded.divergence_type OR
+                baseline_success IS NOT excluded.baseline_success OR
+                baseline_gas_used IS NOT excluded.baseline_gas_used OR
+                baseline_intrinsic_gas IS NOT excluded.baseline_intrinsic_gas OR
+                schedule_success IS NOT excluded.schedule_success OR
+                schedule_gas_used IS NOT excluded.schedule_gas_used OR
+                schedule_intrinsic_gas IS NOT excluded.schedule_intrinsic_gas OR
+                gas_delta IS NOT excluded.gas_delta OR
+                gas_efficiency_ratio IS NOT excluded.gas_efficiency_ratio OR
+                tx_category IS NOT excluded.tx_category OR
+                affected_opcodes IS NOT excluded.affected_opcodes OR
+                affected_precompiles IS NOT excluded.affected_precompiles OR
+                oog_info IS NOT excluded.oog_info OR
+                divergence_location IS NOT excluded.divergence_location OR
+                operation_counts IS NOT excluded.operation_counts OR
+                baseline_call_frames IS NOT excluded.baseline_call_frames OR
+                schedule_call_frames IS NOT excluded.schedule_call_frames OR
+                baseline_event_logs IS NOT excluded.baseline_event_logs OR
+                schedule_event_logs IS NOT excluded.schedule_event_logs OR
+                baseline_call_frames_hash IS NOT excluded.baseline_call_frames_hash OR
+                schedule_call_frames_hash IS NOT excluded.schedule_call_frames_hash OR
+                baseline_event_logs_hash IS NOT excluded.baseline_event_logs_hash OR
+                schedule_event_logs_hash IS NOT excluded.schedule_event_logs_hash OR
+                status_changed IS NOT excluded.status_changed OR
+                gas_changed IS NOT excluded.gas_changed OR
+                call_tree_changed IS NOT excluded.call_tree_changed OR
+                event_logs_changed IS NOT excluded.event_logs_changed OR
+                output_changed IS NOT excluded.output_changed OR
+                created_address_changed IS NOT excluded.created_address_changed OR
+                logs_bloom_changed IS NOT excluded.logs_bloom_changed OR
+                sender IS NOT excluded.sender OR
+                recipient IS NOT excluded.recipient OR
+                value_wei IS NOT excluded.value_wei OR
+                input_len IS NOT excluded.input_len OR
+                input_zero_bytes IS NOT excluded.input_zero_bytes OR
+                input_nonzero_bytes IS NOT excluded.input_nonzero_bytes OR
+                tx_gas_limit IS NOT excluded.tx_gas_limit OR
+                access_list_accounts IS NOT excluded.access_list_accounts OR
+                access_list_storage_slots IS NOT excluded.access_list_storage_slots OR
+                authorization_count IS NOT excluded.authorization_count OR
+                is_create IS NOT excluded.is_create OR
+                baseline_output_len IS NOT excluded.baseline_output_len OR
+                schedule_output_len IS NOT excluded.schedule_output_len OR
+                baseline_output_hash IS NOT excluded.baseline_output_hash OR
+                schedule_output_hash IS NOT excluded.schedule_output_hash OR
+                baseline_created_address IS NOT excluded.baseline_created_address OR
+                schedule_created_address IS NOT excluded.schedule_created_address OR
+                baseline_log_count IS NOT excluded.baseline_log_count OR
+                schedule_log_count IS NOT excluded.schedule_log_count OR
+                baseline_logs_bloom IS NOT excluded.baseline_logs_bloom OR
+                schedule_logs_bloom IS NOT excluded.schedule_logs_bloom",
             params![
                 divergence.schedule_name,
                 divergence.block_number,
@@ -676,7 +734,18 @@ impl DivergenceDatabase {
             ],
         )?;
 
-        Ok(conn.last_insert_rowid())
+        conn.query_row(
+            "SELECT id FROM schedule_divergences
+             WHERE schedule_name = ?1 AND block_number = ?2 AND tx_index = ?3 AND tx_hash = ?4",
+            params![
+                divergence.schedule_name,
+                divergence.block_number,
+                divergence.tx_index,
+                divergence.tx_hash.as_slice(),
+            ],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
     }
 
     /// Record multiple schedule divergences in a batch.
@@ -776,7 +845,65 @@ impl DivergenceDatabase {
                 baseline_log_count = excluded.baseline_log_count,
                 schedule_log_count = excluded.schedule_log_count,
                 baseline_logs_bloom = excluded.baseline_logs_bloom,
-                schedule_logs_bloom = excluded.schedule_logs_bloom",
+                schedule_logs_bloom = excluded.schedule_logs_bloom
+            WHERE
+                timestamp IS NOT excluded.timestamp OR
+                schedule_kind IS NOT excluded.schedule_kind OR
+                schedule_description IS NOT excluded.schedule_description OR
+                schedule_config_hash IS NOT excluded.schedule_config_hash OR
+                block_hash IS NOT excluded.block_hash OR
+                parent_hash IS NOT excluded.parent_hash OR
+                divergence_type IS NOT excluded.divergence_type OR
+                baseline_success IS NOT excluded.baseline_success OR
+                baseline_gas_used IS NOT excluded.baseline_gas_used OR
+                baseline_intrinsic_gas IS NOT excluded.baseline_intrinsic_gas OR
+                schedule_success IS NOT excluded.schedule_success OR
+                schedule_gas_used IS NOT excluded.schedule_gas_used OR
+                schedule_intrinsic_gas IS NOT excluded.schedule_intrinsic_gas OR
+                gas_delta IS NOT excluded.gas_delta OR
+                gas_efficiency_ratio IS NOT excluded.gas_efficiency_ratio OR
+                tx_category IS NOT excluded.tx_category OR
+                affected_opcodes IS NOT excluded.affected_opcodes OR
+                affected_precompiles IS NOT excluded.affected_precompiles OR
+                oog_info IS NOT excluded.oog_info OR
+                divergence_location IS NOT excluded.divergence_location OR
+                operation_counts IS NOT excluded.operation_counts OR
+                baseline_call_frames IS NOT excluded.baseline_call_frames OR
+                schedule_call_frames IS NOT excluded.schedule_call_frames OR
+                baseline_event_logs IS NOT excluded.baseline_event_logs OR
+                schedule_event_logs IS NOT excluded.schedule_event_logs OR
+                baseline_call_frames_hash IS NOT excluded.baseline_call_frames_hash OR
+                schedule_call_frames_hash IS NOT excluded.schedule_call_frames_hash OR
+                baseline_event_logs_hash IS NOT excluded.baseline_event_logs_hash OR
+                schedule_event_logs_hash IS NOT excluded.schedule_event_logs_hash OR
+                status_changed IS NOT excluded.status_changed OR
+                gas_changed IS NOT excluded.gas_changed OR
+                call_tree_changed IS NOT excluded.call_tree_changed OR
+                event_logs_changed IS NOT excluded.event_logs_changed OR
+                output_changed IS NOT excluded.output_changed OR
+                created_address_changed IS NOT excluded.created_address_changed OR
+                logs_bloom_changed IS NOT excluded.logs_bloom_changed OR
+                sender IS NOT excluded.sender OR
+                recipient IS NOT excluded.recipient OR
+                value_wei IS NOT excluded.value_wei OR
+                input_len IS NOT excluded.input_len OR
+                input_zero_bytes IS NOT excluded.input_zero_bytes OR
+                input_nonzero_bytes IS NOT excluded.input_nonzero_bytes OR
+                tx_gas_limit IS NOT excluded.tx_gas_limit OR
+                access_list_accounts IS NOT excluded.access_list_accounts OR
+                access_list_storage_slots IS NOT excluded.access_list_storage_slots OR
+                authorization_count IS NOT excluded.authorization_count OR
+                is_create IS NOT excluded.is_create OR
+                baseline_output_len IS NOT excluded.baseline_output_len OR
+                schedule_output_len IS NOT excluded.schedule_output_len OR
+                baseline_output_hash IS NOT excluded.baseline_output_hash OR
+                schedule_output_hash IS NOT excluded.schedule_output_hash OR
+                baseline_created_address IS NOT excluded.baseline_created_address OR
+                schedule_created_address IS NOT excluded.schedule_created_address OR
+                baseline_log_count IS NOT excluded.baseline_log_count OR
+                schedule_log_count IS NOT excluded.schedule_log_count OR
+                baseline_logs_bloom IS NOT excluded.baseline_logs_bloom OR
+                schedule_logs_bloom IS NOT excluded.schedule_logs_bloom",
         )?;
         let mut count = 0;
         for divergence in divergences {
@@ -928,7 +1055,24 @@ impl DivergenceDatabase {
                 logs_bloom_divergence_count = excluded.logs_bloom_divergence_count,
                 total_baseline_gas_used = excluded.total_baseline_gas_used,
                 total_schedule_gas_used = excluded.total_schedule_gas_used,
-                total_gas_delta = excluded.total_gas_delta",
+                total_gas_delta = excluded.total_gas_delta
+            WHERE
+                schedule_kind IS NOT excluded.schedule_kind OR
+                schedule_config_hash IS NOT excluded.schedule_config_hash OR
+                parent_hash IS NOT excluded.parent_hash OR
+                timestamp IS NOT excluded.timestamp OR
+                tx_count IS NOT excluded.tx_count OR
+                divergence_count IS NOT excluded.divergence_count OR
+                status_divergence_count IS NOT excluded.status_divergence_count OR
+                gas_divergence_count IS NOT excluded.gas_divergence_count OR
+                call_tree_divergence_count IS NOT excluded.call_tree_divergence_count OR
+                event_log_divergence_count IS NOT excluded.event_log_divergence_count OR
+                output_divergence_count IS NOT excluded.output_divergence_count OR
+                created_address_divergence_count IS NOT excluded.created_address_divergence_count OR
+                logs_bloom_divergence_count IS NOT excluded.logs_bloom_divergence_count OR
+                total_baseline_gas_used IS NOT excluded.total_baseline_gas_used OR
+                total_schedule_gas_used IS NOT excluded.total_schedule_gas_used OR
+                total_gas_delta IS NOT excluded.total_gas_delta",
             params![
                 coverage.schedule_name,
                 coverage.schedule_kind,
@@ -951,7 +1095,13 @@ impl DivergenceDatabase {
                 coverage.total_gas_delta,
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        conn.query_row(
+            "SELECT id FROM schedule_block_coverage
+             WHERE schedule_name = ?1 AND block_number = ?2 AND block_hash = ?3",
+            params![coverage.schedule_name, coverage.block_number, coverage.block_hash.as_slice(),],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
     }
 
     /// Delete coverage summaries in an inclusive block range.

@@ -1,10 +1,10 @@
 //! Export research SQLite data to Parquet datasets optimized for analytics.
 
+use crate::database::{open_initialized_connection, DatabaseError};
 use arrow_array::{
     ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
-use crate::database::{open_initialized_connection, DatabaseError};
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -532,8 +532,7 @@ fn current_link_path(out_dir: &Path) -> PathBuf {
 fn current_generation_dir(out_dir: &Path) -> Result<Option<PathBuf>, ExportError> {
     match fs::read_link(current_link_path(out_dir)) {
         Ok(target) => {
-            let resolved =
-                if target.is_absolute() { target } else { out_dir.join(target) };
+            let resolved = if target.is_absolute() { target } else { out_dir.join(target) };
             Ok(Some(resolved))
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -573,8 +572,7 @@ fn load_checkpoint(out_dir: &Path) -> Result<ExportCheckpoint, ExportError> {
 
 #[cfg(unix)]
 fn sync_parent_dir(path: &Path) -> Result<(), ExportError> {
-    let parent =
-        path.parent().ok_or(ExportError::InvalidConfiguration("path must have parent"))?;
+    let parent = path.parent().ok_or(ExportError::InvalidConfiguration("path must have parent"))?;
     File::open(parent)?.sync_all()?;
     Ok(())
 }
@@ -585,8 +583,7 @@ fn sync_parent_dir(_path: &Path) -> Result<(), ExportError> {
 }
 
 fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), ExportError> {
-    let parent =
-        path.parent().ok_or(ExportError::InvalidConfiguration("path must have parent"))?;
+    let parent = path.parent().ok_or(ExportError::InvalidConfiguration("path must have parent"))?;
     fs::create_dir_all(parent)?;
 
     let temp_path = parent.join(format!(
@@ -1026,9 +1023,8 @@ fn atomic_replace_symlink(
     is_dir: bool,
     replace_existing: bool,
 ) -> Result<(), ExportError> {
-    let parent = link
-        .parent()
-        .ok_or(ExportError::InvalidConfiguration("symlink path must have parent"))?;
+    let parent =
+        link.parent().ok_or(ExportError::InvalidConfiguration("symlink path must have parent"))?;
     fs::create_dir_all(parent)?;
 
     let temp_link = parent.join(format!(
@@ -1071,7 +1067,6 @@ fn seed_generation_from_snapshot(
     generation_root: &Path,
     changed_schedules: &[String],
     active_schedules: &[String],
-    link_unchanged: bool,
 ) -> Result<(), ExportError> {
     let changed: std::collections::HashSet<_> = changed_schedules
         .iter()
@@ -1100,7 +1095,9 @@ fn seed_generation_from_snapshot(
             if !schedule_dir_name.starts_with("schedule_name=") {
                 continue;
             }
-            if changed.contains(schedule_dir_name.as_str()) || !active.contains(schedule_dir_name.as_str()) {
+            if changed.contains(schedule_dir_name.as_str())
+                || !active.contains(schedule_dir_name.as_str())
+            {
                 continue;
             }
 
@@ -1108,11 +1105,7 @@ fn seed_generation_from_snapshot(
             if let Some(parent) = target_dir.parent() {
                 fs::create_dir_all(parent)?;
             }
-            if link_unchanged {
-                create_dir_symlink(&entry.path(), &target_dir)?;
-            } else {
-                copy_dir_recursive(&entry.path(), &target_dir)?;
-            }
+            copy_dir_recursive(&entry.path(), &target_dir)?;
         }
     }
 
@@ -1181,18 +1174,13 @@ pub fn export_sqlite_to_parquet(
         return Err(ExportError::InvalidConfiguration("row_group_size must be greater than 0"));
     }
     if block_bucket_size == 0 {
-        return Err(ExportError::InvalidConfiguration(
-            "block_bucket_size must be greater than 0",
-        ));
+        return Err(ExportError::InvalidConfiguration("block_bucket_size must be greater than 0"));
     }
 
     let db_path = db_path.as_ref().to_path_buf();
     let out_dir = out_dir.as_ref().to_path_buf();
-    let checkpoint = if incremental {
-        load_checkpoint(&out_dir)?
-    } else {
-        ExportCheckpoint::default()
-    };
+    let checkpoint =
+        if incremental { load_checkpoint(&out_dir)? } else { ExportCheckpoint::default() };
 
     fs::create_dir_all(&out_dir)?;
     fs::create_dir_all(exports_root(&out_dir))?;
@@ -1223,13 +1211,11 @@ pub fn export_sqlite_to_parquet(
     let export_result = (|| -> Result<ExportStats, ExportError> {
         if incremental {
             if let Some(snapshot_root) = current_snapshot.as_ref() {
-                let link_unchanged = snapshot_root != &out_dir;
                 seed_generation_from_snapshot(
                     snapshot_root,
                     &generation_root,
                     &changed_schedules,
                     &schedules,
-                    link_unchanged,
                 )?;
             }
         }
@@ -1321,7 +1307,10 @@ pub fn export_sqlite_to_parquet(
 mod tests {
     use super::*;
     use crate::{
-        database::{open_initialized_connection, DivergenceDatabase, ScheduleBlockCoverage, ScheduleDivergence},
+        database::{
+            open_initialized_connection, DivergenceDatabase, ScheduleBlockCoverage,
+            ScheduleDivergence,
+        },
         divergence::DivergenceType,
     };
     use alloy_primitives::B256;
@@ -1593,11 +1582,26 @@ mod tests {
         export_sqlite_to_parquet(&db_path, &out_dir, 1000, 100_000, false).unwrap();
 
         assert!(fs::symlink_metadata(out_dir.join(".current")).unwrap().file_type().is_symlink());
-        assert!(fs::symlink_metadata(out_dir.join("block_coverage")).unwrap().file_type().is_symlink());
-        assert!(fs::symlink_metadata(out_dir.join("divergences_hot")).unwrap().file_type().is_symlink());
-        assert!(fs::symlink_metadata(out_dir.join("divergence_artifacts")).unwrap().file_type().is_symlink());
-        assert!(fs::symlink_metadata(out_dir.join("_manifest.json")).unwrap().file_type().is_symlink());
-        assert!(fs::symlink_metadata(out_dir.join("_checkpoint.json")).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(out_dir.join("block_coverage"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(fs::symlink_metadata(out_dir.join("divergences_hot"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(fs::symlink_metadata(out_dir.join("divergence_artifacts"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(fs::symlink_metadata(out_dir.join("_manifest.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(fs::symlink_metadata(out_dir.join("_checkpoint.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]
@@ -1659,6 +1663,35 @@ mod tests {
     }
 
     #[test]
+    fn test_incremental_export_ignores_replayed_identical_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let out_dir = tmp.path().join("parquet_out");
+
+        let db = DivergenceDatabase::open(&db_path).unwrap();
+        let divergence = sample_divergence("4x", 100, 0);
+        let coverage = sample_coverage("4x", 100);
+        db.record_schedule_divergence(&divergence).unwrap();
+        db.record_schedule_block_coverage(&coverage).unwrap();
+        drop(db);
+
+        export_sqlite_to_parquet(&db_path, &out_dir, 1000, 100_000, true).unwrap();
+
+        let db = DivergenceDatabase::open(&db_path).unwrap();
+        db.record_schedule_divergence(&divergence).unwrap();
+        db.record_schedule_block_coverage(&coverage).unwrap();
+        drop(db);
+
+        let stats = export_sqlite_to_parquet(&db_path, &out_dir, 1000, 100_000, true).unwrap();
+
+        assert_eq!(stats.hot_rows, 0);
+        assert_eq!(stats.coverage_rows, 0);
+        assert_eq!(stats.artifact_rows, 0);
+        assert_eq!(count_parquet_rows_recursive(&out_dir.join("divergences_hot")), 1);
+        assert_eq!(count_parquet_rows_recursive(&out_dir.join("block_coverage")), 1);
+    }
+
+    #[test]
     fn test_incremental_export_rewrites_only_changed_schedules() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("test.db");
@@ -1673,8 +1706,10 @@ mod tests {
 
         export_sqlite_to_parquet(&db_path, &out_dir, 1000, 100_000, true).unwrap();
 
-        let hot_4x_before = parquet_files_recursive(&out_dir.join("divergences_hot/schedule_name=4x"));
-        let hot_8x_before = parquet_files_recursive(&out_dir.join("divergences_hot/schedule_name=8x"));
+        let hot_4x_before =
+            parquet_files_recursive(&out_dir.join("divergences_hot/schedule_name=4x"));
+        let hot_8x_before =
+            parquet_files_recursive(&out_dir.join("divergences_hot/schedule_name=8x"));
 
         let db = DivergenceDatabase::open(&db_path).unwrap();
         db.record_schedule_divergence(&sample_divergence("8x", 200, 0)).unwrap();
@@ -1683,15 +1718,29 @@ mod tests {
 
         let stats = export_sqlite_to_parquet(&db_path, &out_dir, 1000, 100_000, true).unwrap();
 
-        let hot_4x_after = parquet_files_recursive(&out_dir.join("divergences_hot/schedule_name=4x"));
-        let hot_8x_after = parquet_files_recursive(&out_dir.join("divergences_hot/schedule_name=8x"));
+        let hot_4x_after =
+            parquet_files_recursive(&out_dir.join("divergences_hot/schedule_name=4x"));
+        let hot_8x_after =
+            parquet_files_recursive(&out_dir.join("divergences_hot/schedule_name=8x"));
 
         assert_eq!(stats.hot_rows, 2);
         assert_eq!(stats.coverage_rows, 2);
         assert_eq!(hot_4x_before, hot_4x_after);
         assert_ne!(hot_8x_before, hot_8x_after);
-        assert_eq!(count_parquet_rows_recursive(&out_dir.join("divergences_hot/schedule_name=4x")), 1);
-        assert_eq!(count_parquet_rows_recursive(&out_dir.join("divergences_hot/schedule_name=8x")), 2);
+        assert_eq!(
+            count_parquet_rows_recursive(&out_dir.join("divergences_hot/schedule_name=4x")),
+            1
+        );
+        assert_eq!(
+            count_parquet_rows_recursive(&out_dir.join("divergences_hot/schedule_name=8x")),
+            2
+        );
+
+        let current = current_generation_dir(&out_dir).unwrap().unwrap();
+        assert!(!fs::symlink_metadata(current.join("divergences_hot/schedule_name=4x"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]
@@ -1737,8 +1786,14 @@ mod tests {
 
         assert_eq!(stats.hot_rows, 2);
         assert_eq!(stats.coverage_rows, 2);
-        assert_eq!(count_parquet_rows_recursive(&out_dir.join("divergences_hot/schedule_name=4x")), 1);
-        assert_eq!(count_parquet_rows_recursive(&out_dir.join("divergences_hot/schedule_name=8x")), 2);
+        assert_eq!(
+            count_parquet_rows_recursive(&out_dir.join("divergences_hot/schedule_name=4x")),
+            1
+        );
+        assert_eq!(
+            count_parquet_rows_recursive(&out_dir.join("divergences_hot/schedule_name=8x")),
+            2
+        );
         assert!(fs::symlink_metadata(out_dir.join(".current")).unwrap().file_type().is_symlink());
     }
 
