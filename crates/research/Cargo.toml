@@ -27,6 +27,11 @@ alloy-consensus.workspace = true
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# Columnar export
+arrow-array = "54.2"
+arrow-schema = "54.2"
+parquet = { version = "54.2", default-features = false, features = ["arrow", "zstd"] }
+
 # CSV parsing
 csv = "1.3"
 

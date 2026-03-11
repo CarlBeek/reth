@@ -9,6 +9,10 @@ license.workspace = true
 name = "reth-research"
 path = "src/main.rs"
 
+[[bin]]
+name = "reth-research-export-parquet"
+path = "src/bin/export_parquet.rs"
+
 [dependencies]
 # reth
 reth-ethereum = { workspace = true, features = ["full", "cli"] }
