@@ -4,6 +4,7 @@ use arrow_array::{
     ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
+use crate::database::{open_initialized_connection, DatabaseError};
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -19,6 +20,12 @@ use thiserror::Error;
 /// Errors that can occur while exporting research data to Parquet.
 #[derive(Debug, Error)]
 pub enum ExportError {
+    /// Invalid export configuration.
+    #[error("Invalid export configuration: {0}")]
+    InvalidConfiguration(&'static str),
+    /// Schema initialization or migration failure before export.
+    #[error("Database initialization error: {0}")]
+    DatabaseInitialization(#[from] DatabaseError),
     /// SQLite read/query failure.
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
@@ -115,6 +122,8 @@ struct HotRow {
     gas_delta: i64,
     gas_efficiency_ratio: Option<f64>,
     tx_category: Option<String>,
+    affected_opcodes: Option<String>,
+    affected_precompiles: Option<String>,
     status_changed: bool,
     gas_changed: bool,
     call_tree_changed: bool,
@@ -302,6 +311,8 @@ fn hot_schema() -> Arc<Schema> {
         Field::new("gas_delta", DataType::Int64, false),
         Field::new("gas_efficiency_ratio", DataType::Float64, true),
         Field::new("tx_category", DataType::Utf8, true),
+        Field::new("affected_opcodes", DataType::Utf8, true),
+        Field::new("affected_precompiles", DataType::Utf8, true),
         Field::new("status_changed", DataType::Boolean, false),
         Field::new("gas_changed", DataType::Boolean, false),
         Field::new("call_tree_changed", DataType::Boolean, false),
@@ -406,6 +417,8 @@ fn hot_batch(rows: &[HotRow]) -> Result<RecordBatch, ExportError> {
             i64_array(rows.iter().map(|r| r.gas_delta).collect()),
             opt_f64_array(rows.iter().map(|r| r.gas_efficiency_ratio).collect()),
             opt_string_array(rows.iter().map(|r| r.tx_category.clone()).collect()),
+            opt_string_array(rows.iter().map(|r| r.affected_opcodes.clone()).collect()),
+            opt_string_array(rows.iter().map(|r| r.affected_precompiles.clone()).collect()),
             bool_array(rows.iter().map(|r| r.status_changed).collect()),
             bool_array(rows.iter().map(|r| r.gas_changed).collect()),
             bool_array(rows.iter().map(|r| r.call_tree_changed).collect()),
@@ -686,8 +699,9 @@ fn export_hot_for_schedule(
                 block_number, tx_index, tx_hash, block_hash, parent_hash, timestamp,
                 divergence_type, baseline_success, schedule_success, baseline_gas_used,
                 schedule_gas_used, baseline_intrinsic_gas, schedule_intrinsic_gas,
-                gas_delta, gas_efficiency_ratio, tx_category, status_changed, gas_changed,
-                call_tree_changed, event_logs_changed, output_changed,
+                gas_delta, gas_efficiency_ratio, tx_category, affected_opcodes,
+                affected_precompiles, status_changed, gas_changed, call_tree_changed,
+                event_logs_changed, output_changed,
                 created_address_changed, logs_bloom_changed, sender, recipient, value_wei,
                 input_len, input_zero_bytes, input_nonzero_bytes, tx_gas_limit,
                 access_list_accounts, access_list_storage_slots, authorization_count, is_create,
@@ -737,38 +751,40 @@ fn export_hot_for_schedule(
             gas_delta: row.get(18)?,
             gas_efficiency_ratio: row.get(19)?,
             tx_category: row.get(20)?,
-            status_changed: row.get(21)?,
-            gas_changed: row.get(22)?,
-            call_tree_changed: row.get(23)?,
-            event_logs_changed: row.get(24)?,
-            output_changed: row.get(25)?,
-            created_address_changed: row.get(26)?,
-            logs_bloom_changed: row.get(27)?,
-            sender: row.get(28)?,
-            recipient: row.get(29)?,
-            value_wei: row.get(30)?,
-            input_len: row.get(31)?,
-            input_zero_bytes: row.get(32)?,
-            input_nonzero_bytes: row.get(33)?,
-            tx_gas_limit: row.get(34)?,
-            access_list_accounts: row.get(35)?,
-            access_list_storage_slots: row.get(36)?,
-            authorization_count: row.get(37)?,
-            is_create: row.get(38)?,
-            baseline_output_len: row.get(39)?,
-            schedule_output_len: row.get(40)?,
-            baseline_output_hash: row.get(41)?,
-            schedule_output_hash: row.get(42)?,
-            baseline_created_address: row.get(43)?,
-            schedule_created_address: row.get(44)?,
-            baseline_log_count: row.get(45)?,
-            schedule_log_count: row.get(46)?,
-            baseline_logs_bloom: row.get(47)?,
-            schedule_logs_bloom: row.get(48)?,
-            baseline_call_frames_hash: row.get(49)?,
-            schedule_call_frames_hash: row.get(50)?,
-            baseline_event_logs_hash: row.get(51)?,
-            schedule_event_logs_hash: row.get(52)?,
+            affected_opcodes: row.get(21)?,
+            affected_precompiles: row.get(22)?,
+            status_changed: row.get(23)?,
+            gas_changed: row.get(24)?,
+            call_tree_changed: row.get(25)?,
+            event_logs_changed: row.get(26)?,
+            output_changed: row.get(27)?,
+            created_address_changed: row.get(28)?,
+            logs_bloom_changed: row.get(29)?,
+            sender: row.get(30)?,
+            recipient: row.get(31)?,
+            value_wei: row.get(32)?,
+            input_len: row.get(33)?,
+            input_zero_bytes: row.get(34)?,
+            input_nonzero_bytes: row.get(35)?,
+            tx_gas_limit: row.get(36)?,
+            access_list_accounts: row.get(37)?,
+            access_list_storage_slots: row.get(38)?,
+            authorization_count: row.get(39)?,
+            is_create: row.get(40)?,
+            baseline_output_len: row.get(41)?,
+            schedule_output_len: row.get(42)?,
+            baseline_output_hash: row.get(43)?,
+            schedule_output_hash: row.get(44)?,
+            baseline_created_address: row.get(45)?,
+            schedule_created_address: row.get(46)?,
+            baseline_log_count: row.get(47)?,
+            schedule_log_count: row.get(48)?,
+            baseline_logs_bloom: row.get(49)?,
+            schedule_logs_bloom: row.get(50)?,
+            baseline_call_frames_hash: row.get(51)?,
+            schedule_call_frames_hash: row.get(52)?,
+            baseline_event_logs_hash: row.get(53)?,
+            schedule_event_logs_hash: row.get(54)?,
         };
         max_id = max_id.max(divergence_id);
         sink.push(block_number, hot)?;
@@ -898,6 +914,15 @@ pub fn export_sqlite_to_parquet(
     block_bucket_size: u64,
     incremental: bool,
 ) -> Result<ExportStats, ExportError> {
+    if row_group_size == 0 {
+        return Err(ExportError::InvalidConfiguration("row_group_size must be greater than 0"));
+    }
+    if block_bucket_size == 0 {
+        return Err(ExportError::InvalidConfiguration(
+            "block_bucket_size must be greater than 0",
+        ));
+    }
+
     let db_path = db_path.as_ref().to_path_buf();
     let out_dir = out_dir.as_ref().to_path_buf();
 
@@ -915,7 +940,8 @@ pub fn export_sqlite_to_parquet(
     }
 
     fs::create_dir_all(&out_dir)?;
-    let conn = Connection::open(&db_path)?;
+    let conn = open_initialized_connection(&db_path)?;
+    conn.execute_batch("BEGIN TRANSACTION")?;
     let schedules = collect_schedules(&conn)?;
     let export_id = export_run_id();
 
@@ -981,6 +1007,7 @@ pub fn export_sqlite_to_parquet(
         last_divergence_id,
         last_coverage_id,
     };
+    conn.execute_batch("COMMIT")?;
     save_checkpoint(&out_dir, &ExportCheckpoint { last_divergence_id, last_coverage_id })?;
     let manifest_path = out_dir.join("_manifest.json");
     fs::write(manifest_path, serde_json::to_vec_pretty(&stats)?)?;
@@ -991,11 +1018,11 @@ pub fn export_sqlite_to_parquet(
 mod tests {
     use super::*;
     use crate::{
-        database::{DivergenceDatabase, ScheduleBlockCoverage, ScheduleDivergence},
+        database::{open_initialized_connection, DivergenceDatabase, ScheduleBlockCoverage, ScheduleDivergence},
         divergence::DivergenceType,
     };
     use alloy_primitives::B256;
-    use arrow_array::{Int64Array, UInt64Array};
+    use arrow_array::{Array, Int64Array, StringArray, UInt64Array};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     fn sample_divergence(schedule: &str, block: u64, tx_idx: u64) -> ScheduleDivergence {
@@ -1133,6 +1160,34 @@ mod tests {
                     .downcast_ref::<UInt64Array>()
                     .unwrap();
                 values.extend((0..column.len()).map(|idx| column.value(idx)));
+            }
+        }
+        values
+    }
+
+    fn parquet_optional_string_values_recursive(dir: &Path, column: &str) -> Vec<Option<String>> {
+        let mut values = Vec::new();
+        for path in walkdir(dir) {
+            if path.extension().is_none_or(|e| e != "parquet") {
+                continue;
+            }
+            let file = File::open(path).unwrap();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let column = batch
+                    .column_by_name(column)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                values.extend((0..column.len()).map(|idx| {
+                    if column.is_null(idx) {
+                        None
+                    } else {
+                        Some(column.value(idx).to_string())
+                    }
+                }));
             }
         }
         values
@@ -1402,5 +1457,229 @@ mod tests {
         assert!(out_dir.join("divergences_hot/schedule_name=foo~2Fbar").exists());
         assert!(out_dir.join("divergences_hot/schedule_name=foo_bar").exists());
         assert_eq!(count_parquet_rows_recursive(&out_dir.join("divergences_hot")), 2);
+    }
+
+    #[test]
+    fn test_export_preserves_opcode_and_precompile_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let out_dir = tmp.path().join("parquet_out");
+
+        let db = DivergenceDatabase::open(&db_path).unwrap();
+        let mut divergence = sample_divergence("4x", 100, 0);
+        divergence.affected_opcodes = Some(r#"["ADD"]"#.to_string());
+        divergence.affected_precompiles = Some(r#"[1]"#.to_string());
+        db.record_schedule_divergence(&divergence).unwrap();
+        drop(db);
+
+        export_sqlite_to_parquet(&db_path, &out_dir, 1000, 100_000, false).unwrap();
+
+        let hot_dir = out_dir.join("divergences_hot");
+        assert_eq!(
+            parquet_optional_string_values_recursive(&hot_dir, "affected_opcodes"),
+            vec![Some(r#"["ADD"]"#.to_string())]
+        );
+        assert_eq!(
+            parquet_optional_string_values_recursive(&hot_dir, "affected_precompiles"),
+            vec![Some(r#"[1]"#.to_string())]
+        );
+    }
+
+    #[test]
+    fn test_export_validates_non_zero_partition_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let out_dir = tmp.path().join("parquet_out");
+
+        let _db = DivergenceDatabase::open(&db_path).unwrap();
+
+        let err = export_sqlite_to_parquet(&db_path, &out_dir, 0, 100_000, false).unwrap_err();
+        assert!(matches!(
+            err,
+            ExportError::InvalidConfiguration("row_group_size must be greater than 0")
+        ));
+
+        let err = export_sqlite_to_parquet(&db_path, &out_dir, 1000, 0, false).unwrap_err();
+        assert!(matches!(
+            err,
+            ExportError::InvalidConfiguration("block_bucket_size must be greater than 0")
+        ));
+    }
+
+    #[test]
+    fn test_export_initializes_existing_database_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("legacy.db");
+        let out_dir = tmp.path().join("parquet_out");
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE schedule_divergences (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                schedule_name TEXT NOT NULL,
+                block_number INTEGER NOT NULL,
+                tx_index INTEGER NOT NULL,
+                tx_hash BLOB NOT NULL,
+                timestamp INTEGER NOT NULL,
+                divergence_type TEXT NOT NULL,
+                baseline_success BOOLEAN NOT NULL,
+                baseline_gas_used INTEGER NOT NULL,
+                baseline_intrinsic_gas INTEGER NOT NULL,
+                schedule_success BOOLEAN NOT NULL,
+                schedule_gas_used INTEGER NOT NULL,
+                schedule_intrinsic_gas INTEGER,
+                gas_delta INTEGER NOT NULL,
+                gas_efficiency_ratio REAL,
+                tx_category TEXT,
+                affected_opcodes TEXT,
+                affected_precompiles TEXT,
+                oog_info TEXT,
+                divergence_location TEXT,
+                operation_counts TEXT,
+                created_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE schedule_block_coverage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                schedule_name TEXT NOT NULL,
+                schedule_kind TEXT NOT NULL,
+                schedule_config_hash TEXT NOT NULL,
+                block_number INTEGER NOT NULL,
+                block_hash BLOB NOT NULL,
+                parent_hash BLOB NOT NULL,
+                timestamp INTEGER NOT NULL,
+                tx_count INTEGER NOT NULL,
+                divergence_count INTEGER NOT NULL,
+                status_divergence_count INTEGER NOT NULL,
+                gas_divergence_count INTEGER NOT NULL,
+                call_tree_divergence_count INTEGER NOT NULL,
+                event_log_divergence_count INTEGER NOT NULL,
+                output_divergence_count INTEGER NOT NULL,
+                created_address_divergence_count INTEGER NOT NULL,
+                logs_bloom_divergence_count INTEGER NOT NULL,
+                total_baseline_gas_used INTEGER NOT NULL,
+                total_schedule_gas_used INTEGER NOT NULL,
+                total_gas_delta INTEGER NOT NULL,
+                created_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open_initialized_connection(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO schedule_divergences (
+                schedule_name, block_number, tx_index, tx_hash, timestamp, divergence_type,
+                baseline_success, baseline_gas_used, baseline_intrinsic_gas,
+                schedule_success, schedule_gas_used, schedule_intrinsic_gas,
+                gas_delta, gas_efficiency_ratio, tx_category, affected_opcodes,
+                affected_precompiles, oog_info, divergence_location, operation_counts,
+                schedule_kind, schedule_description, schedule_config_hash, block_hash, parent_hash,
+                sender, recipient, value_wei, input_len, input_zero_bytes, input_nonzero_bytes,
+                tx_gas_limit, access_list_accounts, access_list_storage_slots, authorization_count,
+                is_create, baseline_log_count, schedule_log_count, baseline_logs_bloom,
+                schedule_logs_bloom
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6,
+                ?7, ?8, ?9,
+                ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16,
+                ?17, ?18, ?19, ?20,
+                ?21, ?22, ?23, ?24, ?25,
+                ?26, ?27, ?28, ?29, ?30, ?31,
+                ?32, ?33, ?34, ?35,
+                ?36, ?37, ?38, ?39,
+                ?40
+            )",
+            params![
+                "legacy",
+                100u64,
+                0u64,
+                B256::ZERO.as_slice(),
+                1_700_000_000u64,
+                "gas",
+                true,
+                21_000u64,
+                21_000u64,
+                true,
+                20_000u64,
+                20_000u64,
+                1_000i64,
+                Option::<f64>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                "test",
+                "legacy row",
+                "abc123",
+                B256::ZERO.as_slice(),
+                B256::ZERO.as_slice(),
+                "0x0000000000000000000000000000000000000001",
+                Option::<String>::None,
+                "0",
+                0u64,
+                0u64,
+                0u64,
+                21_000u64,
+                0u64,
+                0u64,
+                0u64,
+                false,
+                0u64,
+                0u64,
+                "",
+                "",
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schedule_block_coverage (
+                schedule_name, schedule_kind, schedule_config_hash, block_number, block_hash,
+                parent_hash, timestamp, tx_count, divergence_count, status_divergence_count,
+                gas_divergence_count, call_tree_divergence_count, event_log_divergence_count,
+                output_divergence_count, created_address_divergence_count,
+                logs_bloom_divergence_count, total_baseline_gas_used, total_schedule_gas_used,
+                total_gas_delta
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5,
+                ?6, ?7, ?8, ?9, ?10,
+                ?11, ?12, ?13, ?14, ?15,
+                ?16, ?17, ?18, ?19
+            )",
+            params![
+                "legacy",
+                "test",
+                "abc123",
+                100u64,
+                B256::ZERO.as_slice(),
+                B256::ZERO.as_slice(),
+                1_700_000_000u64,
+                1u64,
+                1u64,
+                0u64,
+                1u64,
+                0u64,
+                0u64,
+                0u64,
+                0u64,
+                0u64,
+                21_000u64,
+                20_000u64,
+                1_000i64,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let stats = export_sqlite_to_parquet(&db_path, &out_dir, 1000, 100_000, false).unwrap();
+        assert_eq!(stats.hot_rows, 1);
+        assert_eq!(stats.coverage_rows, 1);
     }
 }

@@ -4,6 +4,7 @@ use crate::divergence::DivergenceType;
 use alloy_primitives::B256;
 use rusqlite::{params, Connection};
 use std::{
+    collections::HashSet,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -213,9 +214,8 @@ pub struct DivergenceDatabase {
 impl DivergenceDatabase {
     /// Open or create a database at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, DatabaseError> {
-        let conn = Connection::open(path)?;
+        let conn = open_initialized_connection(path)?;
         let db = Self { conn: Arc::new(Mutex::new(conn)) };
-        db.initialize_schema()?;
         Ok(db)
     }
 
@@ -223,15 +223,31 @@ impl DivergenceDatabase {
     #[cfg(test)]
     pub fn in_memory() -> Result<Self, DatabaseError> {
         let conn = Connection::open_in_memory()?;
+        initialize_schema_on_connection(&conn)?;
         let db = Self { conn: Arc::new(Mutex::new(conn)) };
-        db.initialize_schema()?;
         Ok(db)
     }
+}
 
-    /// Initialize the database schema.
-    fn initialize_schema(&self) -> Result<(), DatabaseError> {
-        let conn = self.conn.lock().unwrap();
+pub(crate) fn open_initialized_connection<P: AsRef<Path>>(
+    path: P,
+) -> Result<Connection, DatabaseError> {
+    let conn = Connection::open(path)?;
+    initialize_schema_on_connection(&conn)?;
+    Ok(conn)
+}
 
+fn existing_columns(conn: &Connection, table: &str) -> Result<HashSet<String>, DatabaseError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut names = HashSet::new();
+    for row in rows {
+        names.insert(row?);
+    }
+    Ok(names)
+}
+
+fn initialize_schema_on_connection(conn: &Connection) -> Result<(), DatabaseError> {
         // Multi-schedule divergences table
         conn.execute(
             "CREATE TABLE IF NOT EXISTS schedule_divergences (
@@ -315,6 +331,7 @@ impl DivergenceDatabase {
             [],
         )?;
 
+        let existing_divergence_columns = existing_columns(conn, "schedule_divergences")?;
         for column_def in [
             "schedule_kind TEXT NOT NULL DEFAULT 'unknown'",
             "schedule_description TEXT NOT NULL DEFAULT ''",
@@ -358,13 +375,11 @@ impl DivergenceDatabase {
             "baseline_logs_bloom TEXT NOT NULL DEFAULT ''",
             "schedule_logs_bloom TEXT NOT NULL DEFAULT ''",
         ] {
-            match conn
-                .execute(&format!("ALTER TABLE schedule_divergences ADD COLUMN {column_def}"), [])
-            {
-                Ok(_) => {}
-                Err(rusqlite::Error::ExecuteReturnedResults) => {}
-                Err(e) if e.to_string().contains("duplicate column") => {}
-                Err(e) => return Err(e.into()),
+            let Some(column_name) = column_def.split_whitespace().next() else {
+                continue;
+            };
+            if !existing_divergence_columns.contains(column_name) {
+                conn.execute(&format!("ALTER TABLE schedule_divergences ADD COLUMN {column_def}"), [])?;
             }
         }
 
@@ -445,7 +460,7 @@ impl DivergenceDatabase {
 
         Ok(())
     }
-
+impl DivergenceDatabase {
     /// Record a schedule-specific divergence.
     pub fn record_schedule_divergence(
         &self,
