@@ -10,7 +10,7 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::{
     fs::{self, File},
-    io,
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -513,6 +513,56 @@ fn checkpoint_path(out_dir: &Path) -> PathBuf {
     out_dir.join("_checkpoint.json")
 }
 
+fn manifest_path(out_dir: &Path) -> PathBuf {
+    out_dir.join("_manifest.json")
+}
+
+fn exports_root(out_dir: &Path) -> PathBuf {
+    out_dir.join(".exports")
+}
+
+fn generation_dir(out_dir: &Path, export_id: u128) -> PathBuf {
+    exports_root(out_dir).join(format!("export-{export_id:020}"))
+}
+
+fn current_link_path(out_dir: &Path) -> PathBuf {
+    out_dir.join(".current")
+}
+
+fn current_generation_dir(out_dir: &Path) -> Result<Option<PathBuf>, ExportError> {
+    match fs::read_link(current_link_path(out_dir)) {
+        Ok(target) => {
+            let resolved =
+                if target.is_absolute() { target } else { out_dir.join(target) };
+            Ok(Some(resolved))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn legacy_snapshot_exists(out_dir: &Path) -> bool {
+    [
+        dataset_dir(out_dir, "block_coverage"),
+        dataset_dir(out_dir, "divergences_hot"),
+        dataset_dir(out_dir, "divergence_artifacts"),
+        checkpoint_path(out_dir),
+        manifest_path(out_dir),
+    ]
+    .iter()
+    .any(|path| path.exists())
+}
+
+fn current_snapshot_root(out_dir: &Path) -> Result<Option<PathBuf>, ExportError> {
+    if let Some(current) = current_generation_dir(out_dir)? {
+        return Ok(Some(current));
+    }
+    if legacy_snapshot_exists(out_dir) {
+        return Ok(Some(out_dir.to_path_buf()));
+    }
+    Ok(None)
+}
+
 fn load_checkpoint(out_dir: &Path) -> Result<ExportCheckpoint, ExportError> {
     match fs::read(checkpoint_path(out_dir)) {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
@@ -521,8 +571,43 @@ fn load_checkpoint(out_dir: &Path) -> Result<ExportCheckpoint, ExportError> {
     }
 }
 
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<(), ExportError> {
+    let parent =
+        path.parent().ok_or(ExportError::InvalidConfiguration("path must have parent"))?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<(), ExportError> {
+    Ok(())
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), ExportError> {
+    let parent =
+        path.parent().ok_or(ExportError::InvalidConfiguration("path must have parent"))?;
+    fs::create_dir_all(parent)?;
+
+    let temp_path = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name().and_then(|name| name.to_str()).unwrap_or("write"),
+        export_run_id()
+    ));
+    remove_path_if_exists(&temp_path)?;
+
+    let mut file = File::create(&temp_path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+
+    fs::rename(&temp_path, path)?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
 fn save_checkpoint(out_dir: &Path, checkpoint: &ExportCheckpoint) -> Result<(), ExportError> {
-    fs::write(checkpoint_path(out_dir), serde_json::to_vec_pretty(checkpoint)?)?;
+    atomic_write_bytes(&checkpoint_path(out_dir), &serde_json::to_vec_pretty(checkpoint)?)?;
     Ok(())
 }
 
@@ -873,36 +958,6 @@ fn remove_dir_if_exists(path: &Path) -> Result<(), ExportError> {
     }
 }
 
-fn remove_stale_schedule_dirs(
-    out_dir: &Path,
-    dataset: &str,
-    schedules: &[String],
-) -> Result<(), ExportError> {
-    let dataset_path = dataset_dir(out_dir, dataset);
-    if !dataset_path.exists() {
-        return Ok(());
-    }
-
-    let expected: std::collections::HashSet<_> = schedules
-        .iter()
-        .map(|schedule| format!("schedule_name={}", encode_partition_value(schedule)))
-        .collect();
-
-    for entry in fs::read_dir(&dataset_path)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
-        if file_name.starts_with("schedule_name=") && !expected.contains(file_name.as_ref()) {
-            fs::remove_dir_all(entry.path())?;
-        }
-    }
-
-    Ok(())
-}
-
 fn latest_change_id(conn: &Connection) -> Result<i64, ExportError> {
     Ok(conn.query_row("SELECT COALESCE(MAX(id), 0) FROM export_change_log", [], |row| row.get(0))?)
 }
@@ -930,26 +985,174 @@ fn changed_schedules_since(
     Ok(schedules)
 }
 
-fn swap_schedule_partition(stage_root: &Path, out_dir: &Path, dataset: &str, schedule_name: &str) -> Result<(), ExportError> {
-    let staged_dir = schedule_dir(stage_root, dataset, schedule_name);
-    let final_dir = schedule_dir(out_dir, dataset, schedule_name);
-    remove_dir_if_exists(&final_dir)?;
-    if staged_dir.exists() {
-        if let Some(parent) = final_dir.parent() {
-            fs::create_dir_all(parent)?;
+fn remove_path_if_exists(path: &Path) -> Result<(), ExportError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_dir() {
+                fs::remove_dir_all(path)?;
+            } else {
+                fs::remove_file(path)?;
+            }
+            Ok(())
         }
-        fs::rename(staged_dir, final_dir)?;
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+#[cfg(unix)]
+fn create_dir_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_dir_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
+#[cfg(unix)]
+fn create_file_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_file_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+fn atomic_replace_symlink(
+    link: &Path,
+    target: &Path,
+    is_dir: bool,
+    replace_existing: bool,
+) -> Result<(), ExportError> {
+    let parent = link
+        .parent()
+        .ok_or(ExportError::InvalidConfiguration("symlink path must have parent"))?;
+    fs::create_dir_all(parent)?;
+
+    let temp_link = parent.join(format!(
+        ".{}.tmp-{}",
+        link.file_name().and_then(|name| name.to_str()).unwrap_or("link"),
+        export_run_id()
+    ));
+    remove_path_if_exists(&temp_link)?;
+    if is_dir {
+        create_dir_symlink(target, &temp_link)?;
+    } else {
+        create_file_symlink(target, &temp_link)?;
+    }
+
+    if replace_existing {
+        #[cfg(unix)]
+        {
+            fs::rename(&temp_link, link)?;
+            return Ok(());
+        }
+    }
+
+    remove_path_if_exists(link)?;
+    fs::rename(&temp_link, link)?;
+    Ok(())
+}
+
+fn ensure_frontend_link(link: &Path, target: &Path, is_dir: bool) -> Result<(), ExportError> {
+    match fs::read_link(link) {
+        Ok(existing) if existing == target => return Ok(()),
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
+    atomic_replace_symlink(link, target, is_dir, false)
+}
+
+fn seed_generation_from_snapshot(
+    snapshot_root: &Path,
+    generation_root: &Path,
+    changed_schedules: &[String],
+    active_schedules: &[String],
+    link_unchanged: bool,
+) -> Result<(), ExportError> {
+    let changed: std::collections::HashSet<_> = changed_schedules
+        .iter()
+        .map(|schedule| format!("schedule_name={}", encode_partition_value(schedule)))
+        .collect();
+    let active: std::collections::HashSet<_> = active_schedules
+        .iter()
+        .map(|schedule| format!("schedule_name={}", encode_partition_value(schedule)))
+        .collect();
+
+    for dataset in ["block_coverage", "divergences_hot", "divergence_artifacts"] {
+        let source_dataset = dataset_dir(snapshot_root, dataset);
+        if !source_dataset.exists() {
+            continue;
+        }
+
+        for entry in fs::read_dir(&source_dataset)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !file_type.is_dir() && !file_type.is_symlink() {
+                continue;
+            }
+
+            let schedule_dir_name = entry.file_name();
+            let schedule_dir_name = schedule_dir_name.to_string_lossy().to_string();
+            if !schedule_dir_name.starts_with("schedule_name=") {
+                continue;
+            }
+            if changed.contains(schedule_dir_name.as_str()) || !active.contains(schedule_dir_name.as_str()) {
+                continue;
+            }
+
+            let target_dir = dataset_dir(generation_root, dataset).join(&schedule_dir_name);
+            if let Some(parent) = target_dir.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if link_unchanged {
+                create_dir_symlink(&entry.path(), &target_dir)?;
+            } else {
+                copy_dir_recursive(&entry.path(), &target_dir)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), ExportError> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&source_path, &target_path)?;
+        } else {
+            fs::copy(&source_path, &target_path)?;
+        }
     }
     Ok(())
 }
 
-fn swap_dataset_root(stage_root: &Path, out_dir: &Path, dataset: &str) -> Result<(), ExportError> {
-    let staged_dir = dataset_dir(stage_root, dataset);
-    let final_dir = dataset_dir(out_dir, dataset);
-    remove_dir_if_exists(&final_dir)?;
-    if staged_dir.exists() {
-        fs::rename(staged_dir, final_dir)?;
+fn ensure_frontend_links(out_dir: &Path) -> Result<(), ExportError> {
+    let current_dataset_root = Path::new(".current");
+    for dataset in ["block_coverage", "divergences_hot", "divergence_artifacts"] {
+        ensure_frontend_link(
+            &dataset_dir(out_dir, dataset),
+            &current_dataset_root.join(dataset),
+            true,
+        )?;
     }
+    ensure_frontend_link(
+        &manifest_path(out_dir),
+        &current_dataset_root.join("_manifest.json"),
+        false,
+    )?;
+    ensure_frontend_link(
+        &checkpoint_path(out_dir),
+        &current_dataset_root.join("_checkpoint.json"),
+        false,
+    )?;
     Ok(())
 }
 
@@ -990,20 +1193,13 @@ pub fn export_sqlite_to_parquet(
     } else {
         ExportCheckpoint::default()
     };
-    let stage_root = out_dir.join(format!(".export-staging-{}", export_run_id()));
-
-    if !incremental {
-        // Clean dataset directories to avoid stale part files from prior runs.
-        // Also remove old checkpoint/manifest so we start clean.
-        let _ = fs::remove_file(checkpoint_path(&out_dir));
-        let _ = fs::remove_file(out_dir.join("_manifest.json"));
-    }
 
     fs::create_dir_all(&out_dir)?;
+    fs::create_dir_all(exports_root(&out_dir))?;
     let conn = open_initialized_connection(&db_path)?;
     conn.execute_batch("BEGIN TRANSACTION")?;
     let schedules = collect_schedules(&conn)?;
-    let active_schedules: std::collections::HashSet<_> = schedules.iter().cloned().collect();
+    let current_snapshot = current_snapshot_root(&out_dir)?;
     let changed_schedules = if incremental {
         if checkpoint.last_change_id == 0 {
             schedules.clone()
@@ -1014,7 +1210,9 @@ pub fn export_sqlite_to_parquet(
         schedules.clone()
     };
     let export_id = export_run_id();
+    let generation_root = generation_dir(&out_dir, export_id);
     let current_change_id = latest_change_id(&conn)?;
+    fs::create_dir_all(&generation_root)?;
 
     let mut coverage_rows = 0usize;
     let mut hot_rows = 0usize;
@@ -1022,52 +1220,27 @@ pub fn export_sqlite_to_parquet(
     let mut last_divergence_id = latest_source_id(&conn, "schedule_divergences")?;
     let mut last_coverage_id = latest_source_id(&conn, "schedule_block_coverage")?;
 
-    if incremental {
-        for schedule in &changed_schedules {
-            if active_schedules.contains(schedule) {
-                let (coverage_written, coverage_max_id) = export_coverage_for_schedule(
-                    &conn,
-                    &stage_root,
-                    schedule,
-                    block_bucket_size,
-                    row_group_size,
-                    export_id,
+    let export_result = (|| -> Result<ExportStats, ExportError> {
+        if incremental {
+            if let Some(snapshot_root) = current_snapshot.as_ref() {
+                let link_unchanged = snapshot_root != &out_dir;
+                seed_generation_from_snapshot(
+                    snapshot_root,
+                    &generation_root,
+                    &changed_schedules,
+                    &schedules,
+                    link_unchanged,
                 )?;
-                coverage_rows += coverage_written;
-                last_coverage_id = last_coverage_id.max(coverage_max_id);
-
-                let (hot_written, divergence_max_id) = export_hot_for_schedule(
-                    &conn,
-                    &stage_root,
-                    schedule,
-                    block_bucket_size,
-                    row_group_size,
-                    export_id,
-                )?;
-                hot_rows += hot_written;
-                last_divergence_id = last_divergence_id.max(divergence_max_id);
-
-                let (artifact_written, artifact_max_id) = export_artifacts_for_schedule(
-                    &conn,
-                    &stage_root,
-                    schedule,
-                    block_bucket_size,
-                    row_group_size,
-                    export_id,
-                )?;
-                artifact_rows += artifact_written;
-                last_divergence_id = last_divergence_id.max(artifact_max_id);
-            }
-
-            for dataset in &["block_coverage", "divergences_hot", "divergence_artifacts"] {
-                swap_schedule_partition(&stage_root, &out_dir, dataset, schedule)?;
             }
         }
-    } else {
-        for schedule in &schedules {
+
+        for schedule in &changed_schedules {
+            if !schedules.contains(schedule) {
+                continue;
+            }
             let (coverage_written, coverage_max_id) = export_coverage_for_schedule(
                 &conn,
-                &stage_root,
+                &generation_root,
                 schedule,
                 block_bucket_size,
                 row_group_size,
@@ -1078,7 +1251,7 @@ pub fn export_sqlite_to_parquet(
 
             let (hot_written, divergence_max_id) = export_hot_for_schedule(
                 &conn,
-                &stage_root,
+                &generation_root,
                 schedule,
                 block_bucket_size,
                 row_group_size,
@@ -1089,7 +1262,7 @@ pub fn export_sqlite_to_parquet(
 
             let (artifact_written, artifact_max_id) = export_artifacts_for_schedule(
                 &conn,
-                &stage_root,
+                &generation_root,
                 schedule,
                 block_bucket_size,
                 row_group_size,
@@ -1099,38 +1272,49 @@ pub fn export_sqlite_to_parquet(
             last_divergence_id = last_divergence_id.max(artifact_max_id);
         }
 
-        for dataset in &["block_coverage", "divergences_hot", "divergence_artifacts"] {
-            swap_dataset_root(&stage_root, &out_dir, dataset)?;
-            remove_stale_schedule_dirs(&out_dir, dataset, &schedules)?;
-        }
-    }
-
-    let stats = ExportStats {
-        db_path: db_path.clone(),
-        output_dir: out_dir.clone(),
-        row_group_size,
-        block_bucket_size,
-        incremental,
-        coverage_rows,
-        hot_rows,
-        artifact_rows,
-        schedules,
-        last_divergence_id,
-        last_coverage_id,
-    };
-    conn.execute_batch("COMMIT")?;
-    let _ = remove_dir_if_exists(&stage_root);
-    save_checkpoint(
-        &out_dir,
-        &ExportCheckpoint {
+        let stats = ExportStats {
+            db_path: db_path.clone(),
+            output_dir: out_dir.clone(),
+            row_group_size,
+            block_bucket_size,
+            incremental,
+            coverage_rows,
+            hot_rows,
+            artifact_rows,
+            schedules: schedules.clone(),
             last_divergence_id,
             last_coverage_id,
-            last_change_id: current_change_id,
-        },
-    )?;
-    let manifest_path = out_dir.join("_manifest.json");
-    fs::write(manifest_path, serde_json::to_vec_pretty(&stats)?)?;
-    Ok(stats)
+        };
+        save_checkpoint(
+            &generation_root,
+            &ExportCheckpoint {
+                last_divergence_id,
+                last_coverage_id,
+                last_change_id: current_change_id,
+            },
+        )?;
+        atomic_write_bytes(&manifest_path(&generation_root), &serde_json::to_vec_pretty(&stats)?)?;
+        Ok(stats)
+    })();
+
+    match export_result {
+        Ok(stats) => {
+            conn.execute_batch("COMMIT")?;
+            atomic_replace_symlink(
+                &current_link_path(&out_dir),
+                Path::new(".exports").join(format!("export-{export_id:020}")).as_path(),
+                true,
+                true,
+            )?;
+            ensure_frontend_links(&out_dir)?;
+            Ok(stats)
+        }
+        Err(err) => {
+            conn.execute_batch("ROLLBACK")?;
+            let _ = remove_dir_if_exists(&generation_root);
+            Err(err)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1396,6 +1580,27 @@ mod tests {
     }
 
     #[test]
+    fn test_export_publishes_via_frontend_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let out_dir = tmp.path().join("parquet_out");
+
+        let db = DivergenceDatabase::open(&db_path).unwrap();
+        db.record_schedule_divergence(&sample_divergence("4x", 100, 0)).unwrap();
+        db.record_schedule_block_coverage(&sample_coverage("4x", 100)).unwrap();
+        drop(db);
+
+        export_sqlite_to_parquet(&db_path, &out_dir, 1000, 100_000, false).unwrap();
+
+        assert!(fs::symlink_metadata(out_dir.join(".current")).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(out_dir.join("block_coverage")).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(out_dir.join("divergences_hot")).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(out_dir.join("divergence_artifacts")).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(out_dir.join("_manifest.json")).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(out_dir.join("_checkpoint.json")).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
     fn test_incremental_export() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("test.db");
@@ -1487,6 +1692,54 @@ mod tests {
         assert_ne!(hot_8x_before, hot_8x_after);
         assert_eq!(count_parquet_rows_recursive(&out_dir.join("divergences_hot/schedule_name=4x")), 1);
         assert_eq!(count_parquet_rows_recursive(&out_dir.join("divergences_hot/schedule_name=8x")), 2);
+    }
+
+    #[test]
+    fn test_incremental_export_migrates_legacy_snapshot_without_dropping_unchanged_schedules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let out_dir = tmp.path().join("parquet_out");
+
+        let db = DivergenceDatabase::open(&db_path).unwrap();
+        db.record_schedule_divergence(&sample_divergence("4x", 100, 0)).unwrap();
+        db.record_schedule_divergence(&sample_divergence("8x", 100, 0)).unwrap();
+        db.record_schedule_block_coverage(&sample_coverage("4x", 100)).unwrap();
+        db.record_schedule_block_coverage(&sample_coverage("8x", 100)).unwrap();
+        drop(db);
+
+        export_sqlite_to_parquet(&db_path, &out_dir, 1000, 100_000, false).unwrap();
+
+        let current = current_generation_dir(&out_dir).unwrap().unwrap();
+        for path in [
+            out_dir.join("block_coverage"),
+            out_dir.join("divergences_hot"),
+            out_dir.join("divergence_artifacts"),
+            out_dir.join("_manifest.json"),
+            out_dir.join("_checkpoint.json"),
+        ] {
+            remove_path_if_exists(&path).unwrap();
+        }
+        fs::rename(current.join("block_coverage"), out_dir.join("block_coverage")).unwrap();
+        fs::rename(current.join("divergences_hot"), out_dir.join("divergences_hot")).unwrap();
+        fs::rename(current.join("divergence_artifacts"), out_dir.join("divergence_artifacts"))
+            .unwrap();
+        fs::rename(current.join("_manifest.json"), out_dir.join("_manifest.json")).unwrap();
+        fs::rename(current.join("_checkpoint.json"), out_dir.join("_checkpoint.json")).unwrap();
+        remove_path_if_exists(&out_dir.join(".current")).unwrap();
+        remove_path_if_exists(&exports_root(&out_dir)).unwrap();
+
+        let db = DivergenceDatabase::open(&db_path).unwrap();
+        db.record_schedule_divergence(&sample_divergence("8x", 200, 0)).unwrap();
+        db.record_schedule_block_coverage(&sample_coverage("8x", 200)).unwrap();
+        drop(db);
+
+        let stats = export_sqlite_to_parquet(&db_path, &out_dir, 1000, 100_000, true).unwrap();
+
+        assert_eq!(stats.hot_rows, 2);
+        assert_eq!(stats.coverage_rows, 2);
+        assert_eq!(count_parquet_rows_recursive(&out_dir.join("divergences_hot/schedule_name=4x")), 1);
+        assert_eq!(count_parquet_rows_recursive(&out_dir.join("divergences_hot/schedule_name=8x")), 2);
+        assert!(fs::symlink_metadata(out_dir.join(".current")).unwrap().file_type().is_symlink());
     }
 
     #[test]
