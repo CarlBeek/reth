@@ -95,6 +95,7 @@
 //!
 //! // Simple ETH transfer to an existing EOA
 //! let ctx = TxContext {
+//!     baseline_intrinsic_gas: 21000,
 //!     sender: Address::repeat_byte(0x01),
 //!     recipient: Some(Address::repeat_byte(0x02)),
 //!     value: U256::from(1000),
@@ -204,7 +205,7 @@ pub use comparison::{
     ScheduleComparisonResult,
 };
 pub use config::{ResearchConfig, TraceDetail};
-pub use database::{DivergenceDatabase, ScheduleDivergence};
+pub use database::{DivergenceDatabase, ScheduleBlockCoverage, ScheduleDivergence};
 pub use divergence::{CallTrees, Divergence, DivergenceType, EventLog, EventLogs, OperationCounts};
 pub use executor::ResearchExecutor;
 pub use inspector::GasResearchInspector;

@@ -93,7 +93,8 @@
 
 use crate::{
     divergence::{
-        CallFrame, CallType, DivergenceLocation, OogPattern, OperationCounts, OutOfGasInfo,
+        CallFrame, CallType, DivergenceLocation, EventLog, OogPattern, OperationCounts,
+        OutOfGasInfo,
     },
     schedule::{GasSchedule, OpcodeContext},
 };
@@ -120,12 +121,12 @@ use std::{collections::VecDeque, sync::Arc};
 fn is_oog_error(result: InstructionResult) -> bool {
     matches!(
         result,
-        InstructionResult::OutOfGas |
-            InstructionResult::MemoryOOG |
-            InstructionResult::MemoryLimitOOG |
-            InstructionResult::PrecompileOOG |
-            InstructionResult::InvalidOperandOOG |
-            InstructionResult::ReentrancySentryOOG
+        InstructionResult::OutOfGas
+            | InstructionResult::MemoryOOG
+            | InstructionResult::MemoryLimitOOG
+            | InstructionResult::PrecompileOOG
+            | InstructionResult::InvalidOperandOOG
+            | InstructionResult::ReentrancySentryOOG
     )
 }
 
@@ -165,6 +166,9 @@ pub struct ScheduleInspector {
 
     /// Recorded call frames
     call_frames: Vec<CallFrame>,
+
+    /// Event logs captured during execution.
+    event_logs: Vec<EventLog>,
 
     /// Cumulative additional gas charged (for reporting)
     additional_gas_charged: i64,
@@ -289,6 +293,7 @@ impl ScheduleInspector {
             cached_exp_byte_size: None,
             call_stack: Vec::new(),
             call_frames: Vec::new(),
+            event_logs: Vec::new(),
             additional_gas_charged: 0,
             any_positive_delta_applied: false,
             oog_occurred: false,
@@ -315,6 +320,11 @@ impl ScheduleInspector {
     /// Get the call frames.
     pub fn call_frames(&self) -> &[CallFrame] {
         &self.call_frames
+    }
+
+    /// Get the event logs captured during execution.
+    pub fn event_logs(&self) -> &[EventLog] {
+        &self.event_logs
     }
 
     /// Get the schedule name.
@@ -499,6 +509,20 @@ impl ScheduleInspector {
         true
     }
 
+    /// Compute the gas delta implied by a uniform multiplier over the EVM's
+    /// observed native gas cost for the current opcode.
+    fn multiplier_gas_delta(&self, actual_gas_cost: u64) -> i64 {
+        let Some(multiplier) = self.schedule.execution_gas_multiplier() else {
+            return 0;
+        };
+
+        if multiplier <= 1 {
+            return 0;
+        }
+
+        actual_gas_cost.saturating_mul(multiplier - 1) as i64
+    }
+
     /// Track GAS opcode usage for loop detection.
     fn track_gas_opcode(
         &mut self,
@@ -607,18 +631,22 @@ where
             return;
         }
 
-        // CALL/CREATE deltas were already applied in step() so they propagate
-        // into subcall gas forwarding. step_end() fires for the CALL opcode
-        // in the same loop iteration (before the subcall frame is created),
-        // so the flag is still valid here.
-        if self.call_delta_pre_applied {
-            return;
-        }
-
         let current_opcode = self.current_opcode;
+        let gas_before = self.gas_before_step.expect("checked above");
+        let actual_gas_cost = gas_before.saturating_sub(interp.gas.remaining());
 
         let opcode_ctx = self.build_opcode_context(interp);
-        let gas_delta = self.schedule.opcode_gas_delta(current_opcode, &opcode_ctx);
+        let explicit_gas_delta = if self.call_delta_pre_applied {
+            0
+        } else {
+            self.schedule.opcode_gas_delta(current_opcode, &opcode_ctx)
+        };
+        // Uniform multipliers are derived from the EVM's observed native cost
+        // after the opcode has executed. That makes them work for the live
+        // schedule path, but unlike explicit additive deltas they do not feed
+        // into CALL/CREATE gas forwarding before dispatch.
+        let multiplier_gas_delta = self.multiplier_gas_delta(actual_gas_cost);
+        let gas_delta = explicit_gas_delta.saturating_add(multiplier_gas_delta);
 
         if gas_delta != 0 {
             self.apply_gas_delta(interp, gas_delta, current_opcode);
@@ -675,9 +703,13 @@ where
                 };
                 let precompile_delta =
                     self.schedule.precompile_gas_delta(&inputs.bytecode_address, input_bytes);
-                if precompile_delta != 0 {
-                    self.additional_gas_charged += precompile_delta;
-                    if precompile_delta > 0 {
+                let multiplier_delta = self.multiplier_gas_delta(
+                    inputs.gas_limit.saturating_sub(outcome.result.gas.remaining()),
+                );
+                let total_delta = precompile_delta.saturating_add(multiplier_delta);
+                if total_delta != 0 {
+                    self.additional_gas_charged += total_delta;
+                    if total_delta > 0 {
                         self.any_positive_delta_applied = true;
                         if let Some(parent) = self.call_stack.last_mut() {
                             parent.any_positive_delta_in_subtree = true;
@@ -686,7 +718,7 @@ where
                         // OOG. The precompile already ran with the original cost, so
                         // we check if the delta exceeds the remaining gas headroom.
                         let gas_after_precompile = outcome.result.gas.remaining();
-                        if (precompile_delta as u64) > gas_after_precompile {
+                        if (total_delta as u64) > gas_after_precompile {
                             if !self.oog_occurred {
                                 self.oog_occurred = true;
                                 self.oog_info = Some(OutOfGasInfo {
@@ -703,11 +735,11 @@ where
                             // Charge the extra gas from the precompile frame's budget.
                             // We already checked above that remaining >= delta, so this
                             // cannot fail.
-                            let _ = outcome.result.gas.record_cost(precompile_delta as u64);
+                            let _ = outcome.result.gas.record_cost(total_delta as u64);
                         }
                     } else {
                         // Refund gas (precompile is cheaper under this schedule)
-                        let refund = (-precompile_delta) as u64;
+                        let refund = (-total_delta) as u64;
                         let headroom = outcome
                             .result
                             .gas
@@ -752,9 +784,9 @@ where
             // Uses per-frame `any_positive_delta_in_subtree` rather than the global
             // `any_positive_delta_applied` to avoid false positives where a positive
             // delta at depth 0 is unrelated to a natural OOG at depth 3.
-            if is_oog_error(outcome.result.result) &&
-                !self.oog_occurred &&
-                entry.any_positive_delta_in_subtree
+            if is_oog_error(outcome.result.result)
+                && !self.oog_occurred
+                && entry.any_positive_delta_in_subtree
             {
                 self.oog_occurred = true;
                 if self.oog_info.is_none() {
@@ -775,8 +807,8 @@ where
     fn create(&mut self, _context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
         let (call_type, opcode) = match inputs.scheme() {
             revm::context_interface::CreateScheme::Create => (CallType::Create, 0xF0u8),
-            revm::context_interface::CreateScheme::Create2 { .. } |
-            revm::context_interface::CreateScheme::Custom { .. } => (CallType::Create2, 0xF5),
+            revm::context_interface::CreateScheme::Create2 { .. }
+            | revm::context_interface::CreateScheme::Custom { .. } => (CallType::Create2, 0xF5),
         };
 
         let parent_has_positive_delta =
@@ -827,9 +859,9 @@ where
             }
 
             // Indirect OOG detection for CREATE (same per-subtree logic as call_end).
-            if is_oog_error(outcome.result.result) &&
-                !self.oog_occurred &&
-                entry.any_positive_delta_in_subtree
+            if is_oog_error(outcome.result.result)
+                && !self.oog_occurred
+                && entry.any_positive_delta_in_subtree
             {
                 self.oog_occurred = true;
                 if self.oog_info.is_none() {
@@ -845,6 +877,15 @@ where
                 }
             }
         }
+    }
+
+    fn log(&mut self, _context: &mut CTX, log: alloy_primitives::Log) {
+        self.event_logs.push(EventLog {
+            log_index: self.event_logs.len(),
+            address: log.address,
+            topics: log.topics().to_vec(),
+            data: log.data.data.clone(),
+        });
     }
 }
 

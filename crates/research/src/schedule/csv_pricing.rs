@@ -49,10 +49,10 @@ pub struct OperationPricing {
 impl OperationPricing {
     /// Calculate the gas delta (new - current) for a given number of variable units.
     pub fn gas_delta(&self, variable_units: u64) -> i64 {
-        let current_total = self.current_constant +
-            self.current_variable.map(|v| v.saturating_mul(variable_units)).unwrap_or(0);
-        let new_total = self.new_constant +
-            self.new_variable.map(|v| v.saturating_mul(variable_units)).unwrap_or(0);
+        let current_total = self.current_constant
+            + self.current_variable.map(|v| v.saturating_mul(variable_units)).unwrap_or(0);
+        let new_total = self.new_constant
+            + self.new_variable.map(|v| v.saturating_mul(variable_units)).unwrap_or(0);
 
         new_total as i64 - current_total as i64
     }
@@ -179,25 +179,25 @@ impl GasPricingTable {
 fn is_precompile_name(name: &str) -> bool {
     matches!(
         name,
-        "ECRECOVER" |
-            "SHA256" |
-            "RIPEMD160" |
-            "IDENTITY" |
-            "MODEXP" |
-            "ECADD" |
-            "ECMUL" |
-            "ECPAIRING" |
-            "BLAKE2F" |
-            "POINT_EVALUATION" |
-            "BLS12_G1ADD" |
-            "BLS12_G1MUL" |
-            "BLS12_G1MSM" |
-            "BLS12_G2ADD" |
-            "BLS12_G2MUL" |
-            "BLS12_G2MSM" |
-            "BLS12_PAIRING" |
-            "BLS12_MAP_FP_TO_G1" |
-            "BLS12_MAP_FP2_TO_G2"
+        "ECRECOVER"
+            | "SHA256"
+            | "RIPEMD160"
+            | "IDENTITY"
+            | "MODEXP"
+            | "ECADD"
+            | "ECMUL"
+            | "ECPAIRING"
+            | "BLAKE2F"
+            | "POINT_EVALUATION"
+            | "BLS12_G1ADD"
+            | "BLS12_G1MUL"
+            | "BLS12_G1MSM"
+            | "BLS12_G2ADD"
+            | "BLS12_G2MUL"
+            | "BLS12_G2MSM"
+            | "BLS12_PAIRING"
+            | "BLS12_MAP_FP_TO_G1"
+            | "BLS12_MAP_FP2_TO_G2"
     )
 }
 

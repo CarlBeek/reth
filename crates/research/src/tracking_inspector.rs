@@ -1,7 +1,7 @@
 //! Simple inspector that only tracks operations without modifying execution.
 
-use crate::divergence::{CallFrame, CallType, OperationCounts};
-use alloy_primitives::{Address, Bytes};
+use crate::divergence::{CallFrame, CallType, EventLog, OperationCounts};
+use alloy_primitives::Address;
 use revm::{
     context_interface::ContextTr,
     interpreter::{CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter},
@@ -25,7 +25,7 @@ pub struct TrackingInspector {
     call_frames: Vec<CallFrame>,
 
     /// Event logs captured
-    event_logs: Vec<EventLogEntry>,
+    event_logs: Vec<EventLog>,
 }
 
 /// Entry in the call stack.
@@ -42,17 +42,7 @@ struct CallStackEntry {
 }
 
 /// Captured event log.
-#[derive(Debug, Clone)]
-pub struct EventLogEntry {
-    /// Index of the log in the transaction
-    pub log_index: usize,
-    /// Contract address that emitted the log
-    pub address: Address,
-    /// Log topics (indexed parameters)
-    pub topics: Vec<alloy_primitives::B256>,
-    /// Log data (non-indexed parameters)
-    pub data: Bytes,
-}
+pub type EventLogEntry = EventLog;
 
 impl TrackingInspector {
     /// Create a new tracking inspector.
@@ -76,7 +66,7 @@ impl TrackingInspector {
     }
 
     /// Get the event logs.
-    pub fn event_logs(&self) -> &[EventLogEntry] {
+    pub fn event_logs(&self) -> &[EventLog] {
         &self.event_logs
     }
 
@@ -190,8 +180,8 @@ where
 
         let call_type = match inputs.scheme() {
             revm::context_interface::CreateScheme::Create => CallType::Create,
-            revm::context_interface::CreateScheme::Create2 { .. } |
-            revm::context_interface::CreateScheme::Custom { .. } => CallType::Create2,
+            revm::context_interface::CreateScheme::Create2 { .. }
+            | revm::context_interface::CreateScheme::Custom { .. } => CallType::Create2,
         };
 
         self.call_stack.push(CallStackEntry {
@@ -233,7 +223,7 @@ where
     }
 
     fn log(&mut self, _context: &mut CTX, log: alloy_primitives::Log) {
-        self.event_logs.push(EventLogEntry {
+        self.event_logs.push(EventLog {
             log_index: self.event_logs.len(),
             address: log.address,
             topics: log.topics().to_vec(),

@@ -228,7 +228,7 @@ pub struct CallTrees {
 }
 
 /// A single call frame in the call tree.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CallFrame {
     /// Index in the call tree
     pub call_index: usize,
@@ -303,7 +303,7 @@ pub struct EventLogs {
 }
 
 /// A single event log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EventLog {
     /// Log index
     pub log_index: usize,

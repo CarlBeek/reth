@@ -235,11 +235,14 @@ impl GasSchedule for Eip2780Schedule {
             return None;
         }
 
-        // Calculate EIP-2780 intrinsic gas: base + calldata
-        let base_gas = category.base_intrinsic_gas();
-        let calldata_gas = ctx.calldata_gas();
-
-        Some(base_gas + calldata_gas)
+        // Preserve all fork-specific ancillary intrinsic charges (access list,
+        // initcode metering, authorization list, calldata repricing, etc.) and
+        // only swap out the transaction's base intrinsic component.
+        Some(
+            ctx.baseline_intrinsic_gas
+                .saturating_sub(category.current_intrinsic_gas())
+                .saturating_add(category.base_intrinsic_gas()),
+        )
     }
 
     fn tx_category(&self, ctx: &TxContext) -> Option<String> {
@@ -262,6 +265,11 @@ mod tests {
         let recipient = if is_create { None } else { Some(Address::repeat_byte(0x02)) };
 
         TxContext {
+            baseline_intrinsic_gas: if is_create {
+                Eip2780Constants::CURRENT_CREATE_COST
+            } else {
+                Eip2780Constants::CURRENT_BASE_COST
+            },
             sender,
             recipient,
             value: if has_value { U256::from(1000) } else { U256::ZERO },
@@ -331,6 +339,7 @@ mod tests {
 
         // Transfer to EOA with 100 bytes of calldata (all non-zero)
         let ctx = TxContext {
+            baseline_intrinsic_gas: 22_600,
             sender: Address::repeat_byte(0x01),
             recipient: Some(Address::repeat_byte(0x02)),
             value: U256::from(1000),
@@ -374,6 +383,29 @@ mod tests {
             Some(RecipientInfo { exists: true, has_code: true, balance: U256::ZERO, nonce: 1 }),
         );
         assert!(schedule.intrinsic_gas(&ctx).is_none());
+    }
+
+    #[test]
+    fn test_schedule_preserves_non_base_intrinsic_charges() {
+        let schedule = Eip2780Schedule::new();
+
+        let ctx = TxContext {
+            baseline_intrinsic_gas: 24_000,
+            sender: Address::repeat_byte(0x01),
+            recipient: Some(Address::repeat_byte(0x02)),
+            value: U256::from(1000),
+            input: Bytes::new(),
+            gas_limit: 100_000,
+            is_create: false,
+            recipient_info: Some(RecipientInfo {
+                exists: true,
+                has_code: false,
+                balance: U256::from(100),
+                nonce: 1,
+            }),
+        };
+
+        assert_eq!(schedule.intrinsic_gas(&ctx), Some(9_000));
     }
 
     #[test]

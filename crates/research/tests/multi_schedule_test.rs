@@ -111,6 +111,7 @@ fn test_eip2780_transfer_to_eoa() {
     let schedule = Eip2780Schedule::new();
 
     let ctx = TxContext {
+        baseline_intrinsic_gas: 21_000,
         sender: Address::repeat_byte(0x01),
         recipient: Some(Address::repeat_byte(0x02)),
         value: U256::from(1000),
@@ -141,6 +142,7 @@ fn test_eip2780_call_to_contract() {
     let schedule = Eip2780Schedule::new();
 
     let ctx = TxContext {
+        baseline_intrinsic_gas: 21_064,
         sender: Address::repeat_byte(0x01),
         recipient: Some(Address::repeat_byte(0x02)),
         value: U256::ZERO,
@@ -171,6 +173,7 @@ fn test_eip2780_nop_to_self() {
     let self_addr = Address::repeat_byte(0x01);
 
     let ctx = TxContext {
+        baseline_intrinsic_gas: 21_000,
         sender: self_addr,
         recipient: Some(self_addr),
         value: U256::ZERO,
@@ -199,6 +202,7 @@ fn test_eip2780_contract_creation() {
     let schedule = Eip2780Schedule::new();
 
     let ctx = TxContext {
+        baseline_intrinsic_gas: 53_020,
         sender: Address::repeat_byte(0x01),
         recipient: None,
         value: U256::ZERO,
@@ -273,6 +277,7 @@ fn test_analyzer_with_eip2780_schedule() {
 
     // Create a simple transfer transaction context
     let tx_context = TxContext {
+        baseline_intrinsic_gas: 21_000,
         sender: Address::repeat_byte(0x01),
         recipient: Some(Address::repeat_byte(0x02)),
         value: U256::from(1000),
@@ -339,6 +344,7 @@ fn test_analyzer_with_database() {
     let mut analyzer = MultiScheduleAnalyzer::new(registry).unwrap().with_database(db.clone());
 
     let tx_context = TxContext {
+        baseline_intrinsic_gas: 21_000,
         sender: Address::repeat_byte(0x01),
         recipient: Some(Address::repeat_byte(0x02)),
         value: U256::from(1000),
@@ -394,6 +400,11 @@ fn test_database_schedule_divergence_workflow() {
         tx_hash: B256::repeat_byte(0x01),
         timestamp: 1234567890,
         divergence_type: DivergenceType::GasPattern,
+        schedule_kind: "IntrinsicOnly".to_string(),
+        schedule_description: "test".to_string(),
+        schedule_config_hash: "cfg".to_string(),
+        block_hash: B256::repeat_byte(0x10),
+        parent_hash: B256::repeat_byte(0x11),
         baseline_success: true,
         baseline_gas_used: 21000,
         baseline_intrinsic_gas: 21000,
@@ -408,6 +419,42 @@ fn test_database_schedule_divergence_workflow() {
         oog_info: None,
         divergence_location: None,
         operation_counts: None,
+        baseline_call_frames: None,
+        schedule_call_frames: None,
+        baseline_event_logs: None,
+        schedule_event_logs: None,
+        baseline_call_frames_hash: None,
+        schedule_call_frames_hash: None,
+        baseline_event_logs_hash: None,
+        schedule_event_logs_hash: None,
+        status_changed: false,
+        gas_changed: true,
+        call_tree_changed: false,
+        event_logs_changed: false,
+        output_changed: false,
+        created_address_changed: false,
+        logs_bloom_changed: false,
+        sender: "0x0000000000000000000000000000000000000001".to_string(),
+        recipient: Some("0x0000000000000000000000000000000000000002".to_string()),
+        value_wei: "0".to_string(),
+        input_len: 0,
+        input_zero_bytes: 0,
+        input_nonzero_bytes: 0,
+        tx_gas_limit: 21000,
+        access_list_accounts: 0,
+        access_list_storage_slots: 0,
+        authorization_count: 0,
+        is_create: false,
+        baseline_output_len: None,
+        schedule_output_len: None,
+        baseline_output_hash: None,
+        schedule_output_hash: None,
+        baseline_created_address: None,
+        schedule_created_address: None,
+        baseline_log_count: 0,
+        schedule_log_count: 0,
+        baseline_logs_bloom: String::new(),
+        schedule_logs_bloom: String::new(),
     };
 
     let div2 = ScheduleDivergence {
@@ -417,6 +464,11 @@ fn test_database_schedule_divergence_workflow() {
         tx_hash: B256::repeat_byte(0x02),
         timestamp: 1234567890,
         divergence_type: DivergenceType::Status,
+        schedule_kind: "ExecutionOnly".to_string(),
+        schedule_description: "test".to_string(),
+        schedule_config_hash: "cfg".to_string(),
+        block_hash: B256::repeat_byte(0x20),
+        parent_hash: B256::repeat_byte(0x21),
         baseline_success: true,
         baseline_gas_used: 50000,
         baseline_intrinsic_gas: 21000,
@@ -431,6 +483,42 @@ fn test_database_schedule_divergence_workflow() {
         oog_info: Some(r#"{"opcode": 4}"#.to_string()),
         divergence_location: None,
         operation_counts: None,
+        baseline_call_frames: None,
+        schedule_call_frames: None,
+        baseline_event_logs: None,
+        schedule_event_logs: None,
+        baseline_call_frames_hash: None,
+        schedule_call_frames_hash: None,
+        baseline_event_logs_hash: None,
+        schedule_event_logs_hash: None,
+        status_changed: true,
+        gas_changed: true,
+        call_tree_changed: false,
+        event_logs_changed: false,
+        output_changed: false,
+        created_address_changed: false,
+        logs_bloom_changed: false,
+        sender: "0x0000000000000000000000000000000000000001".to_string(),
+        recipient: Some("0x0000000000000000000000000000000000000002".to_string()),
+        value_wei: "0".to_string(),
+        input_len: 0,
+        input_zero_bytes: 0,
+        input_nonzero_bytes: 0,
+        tx_gas_limit: 50000,
+        access_list_accounts: 0,
+        access_list_storage_slots: 0,
+        authorization_count: 0,
+        is_create: false,
+        baseline_output_len: None,
+        schedule_output_len: None,
+        baseline_output_hash: None,
+        schedule_output_hash: None,
+        baseline_created_address: None,
+        schedule_created_address: None,
+        baseline_log_count: 0,
+        schedule_log_count: 0,
+        baseline_logs_bloom: String::new(),
+        schedule_logs_bloom: String::new(),
     };
 
     db.record_schedule_divergence(&div1).unwrap();
@@ -478,6 +566,7 @@ fn test_full_workflow_cli_to_analysis() {
     // Step 5: Simulate transaction analysis (intrinsic gas only — execution
     // comparison is handled by the ExEx via per-schedule re-execution)
     let tx_context = TxContext {
+        baseline_intrinsic_gas: 21_000,
         sender: Address::repeat_byte(0x01),
         recipient: Some(Address::repeat_byte(0x02)),
         value: U256::from(1000),
@@ -849,6 +938,78 @@ DIV,constant,5,1
     );
     // 5 DIVs * -4 = -20
     assert_eq!(insp_result.additional_gas, -20, "expected -20 gas delta from 5 DIVs * -4");
+}
+
+/// Verify that multiplier schedules materially affect execution in the live
+/// generic inspector path instead of acting as a no-op configuration object.
+#[test]
+fn test_multiplier_schedule_changes_execution_gas() {
+    use revm::primitives::hardfork::SpecId;
+
+    let sender = Address::new([0x01; 20]);
+    let caller_addr = Address::new([0x11; 20]);
+
+    // Simple contract: 5 DIVs then STOP (no subcalls, no storage)
+    let mut code = Vec::new();
+    for _ in 0..5 {
+        code.push(0x60); // PUSH1
+        code.push(0x02);
+        code.push(0x60); // PUSH1
+        code.push(0x0A);
+        code.push(0x04); // DIV
+        code.push(0x50); // POP
+    }
+    code.push(0x00); // STOP
+    let caller_code = Bytes::from(code);
+
+    let tx = TxEnv::builder()
+        .caller(sender)
+        .gas_limit(100_000)
+        .gas_price(0)
+        .kind(alloy_primitives::TxKind::Call(caller_addr))
+        .value(U256::ZERO)
+        .data(Bytes::new())
+        .nonce(0)
+        .build_fill();
+
+    let db = setup_evm_db(caller_addr, Address::ZERO, sender, caller_code.clone(), Bytes::new());
+    let ctx = Context::mainnet().with_db(db).modify_cfg_chained(|cfg: &mut CfgEnv| {
+        *cfg = CfgEnv::new_with_spec(SpecId::CANCUN);
+        cfg.disable_nonce_check = true;
+    });
+    let mut baseline_evm = ctx.build_mainnet();
+    let baseline_result = baseline_evm.transact(tx.clone()).expect("baseline should succeed");
+    assert!(baseline_result.result.is_success(), "baseline tx should succeed");
+    let baseline_gas = baseline_result.result.gas_used();
+
+    let db2 = setup_evm_db(caller_addr, Address::ZERO, sender, caller_code, Bytes::new());
+    let mut inspector =
+        ScheduleInspector::new(Arc::new(MultiplierSchedule::new("4x".to_string(), 4)));
+    let ctx2 = Context::mainnet().with_db(db2).modify_cfg_chained(|cfg: &mut CfgEnv| {
+        *cfg = CfgEnv::new_with_spec(SpecId::CANCUN);
+        cfg.disable_nonce_check = true;
+    });
+    let mut evm2 = ctx2.build_mainnet_with_inspector(&mut inspector);
+    let schedule_result = evm2.inspect_tx(tx).expect("multiplier execution should succeed");
+    assert!(schedule_result.result.is_success(), "multiplier tx should still succeed");
+
+    let schedule_gas = schedule_result.result.gas_used();
+    let insp_result = inspector.result();
+
+    assert!(
+        schedule_gas > baseline_gas,
+        "multiplier schedule should increase gas: baseline={baseline_gas}, schedule={schedule_gas}"
+    );
+    assert!(
+        insp_result.additional_gas > 0,
+        "multiplier schedule should charge additional gas; got {}",
+        insp_result.additional_gas
+    );
+    assert_eq!(
+        schedule_gas - baseline_gas,
+        insp_result.additional_gas as u64,
+        "for a simple no-subcall execution, reported additional gas should match gas_used delta"
+    );
 }
 
 /// Prove that increased gas costs in a caller cause the callee to OOG when it

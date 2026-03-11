@@ -401,8 +401,8 @@ where
             contract: Address::ZERO, // Will be filled in create_end
             call_type: match inputs.scheme() {
                 revm::context_interface::CreateScheme::Create => CallType::Create,
-                revm::context_interface::CreateScheme::Create2 { .. } |
-                revm::context_interface::CreateScheme::Custom { .. } => CallType::Create2,
+                revm::context_interface::CreateScheme::Create2 { .. }
+                | revm::context_interface::CreateScheme::Custom { .. } => CallType::Create2,
             },
             gas_at_start: self.simulated_gas_used,
             function_selector: None, // CREATE operations don't have function selectors

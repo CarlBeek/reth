@@ -56,32 +56,20 @@ impl GasSchedule for MultiplierSchedule {
     }
 
     fn opcode_gas_delta(&self, _opcode: u8, _ctx: &OpcodeContext) -> i64 {
-        // The multiplier approach charges (multiplier - 1) * base_cost as additional gas.
-        // However, we don't know the base cost here - we just know the multiplier.
-        //
-        // In the original implementation, the inspector would:
-        // 1. Record gas before step
-        // 2. Record gas after step
-        // 3. Calculate actual_cost = before - after
-        // 4. Charge additional = actual_cost * (multiplier - 1)
-        //
-        // Since we can't know the actual cost here, this schedule works differently
-        // from the per-opcode approach. It's meant to be used with an inspector
-        // that applies the multiplier during execution.
-        //
-        // For now, we return 0 and the inspector will handle the multiplication.
-        // This schedule is mainly for backwards compatibility and configuration.
+        // Multiplier semantics are implemented through
+        // `GasSchedule::execution_gas_multiplier()`, not per-opcode additive deltas.
         0
     }
 
     fn precompile_gas_delta(&self, _address: &Address, _input: &[u8]) -> i64 {
-        // Same as opcode_gas_delta - handled by inspector
         0
     }
 
+    fn execution_gas_multiplier(&self) -> Option<u64> {
+        Some(self.multiplier)
+    }
+
     fn modifies_execution(&self) -> bool {
-        // Even though opcode_gas_delta returns 0, this schedule does modify
-        // execution through the inspector multiplier mechanism.
         true
     }
 }

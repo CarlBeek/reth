@@ -1,8 +1,42 @@
-use alloy_consensus::TxType;
-pub use alloy_consensus::{EthereumReceipt, TxTy};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_primitives::B256;
-use reth_primitives_traits::proofs::ordered_trie_root_with_encoder;
+use core::{fmt::Debug, mem::size_of};
+
+use alloc::vec::Vec;
+use alloy_consensus::{
+    Eip2718DecodableReceipt, Eip2718EncodableReceipt, Eip658Value, ReceiptEnvelope,
+    ReceiptWithBloom, RlpDecodableReceipt, RlpEncodableReceipt, TxReceipt, TxType, Typed2718,
+};
+use alloy_eips::eip2718::{Eip2718Error, Eip2718Result, Encodable2718, IsTyped2718};
+use alloy_primitives::{Bloom, Log, B256};
+use alloy_rlp::{BufMut, Decodable, Encodable, Header, RlpDecodable, RlpEncodable};
+use reth_primitives_traits::{proofs::ordered_trie_root_with_encoder, InMemorySize};
+
+/// Helper trait alias with requirements for transaction type generic to be used within [`Receipt`].
+pub trait TxTy:
+    Debug
+    + Copy
+    + Eq
+    + Send
+    + Sync
+    + InMemorySize
+    + Typed2718
+    + TryFrom<u8, Error = Eip2718Error>
+    + Decodable
+    + 'static
+{
+}
+impl<T> TxTy for T where
+    T: Debug
+        + Copy
+        + Eq
+        + Send
+        + Sync
+        + InMemorySize
+        + Typed2718
+        + TryFrom<u8, Error = Eip2718Error>
+        + Decodable
+        + 'static
+{
+}
 
 /// Raw ethereum receipt.
 pub type Receipt<T = TxType> = EthereumReceipt<T>;
@@ -10,6 +44,44 @@ pub type Receipt<T = TxType> = EthereumReceipt<T>;
 #[cfg(feature = "rpc")]
 /// Receipt representation for RPC.
 pub type RpcReceipt<T = TxType> = EthereumReceipt<T, alloy_rpc_types_eth::Log>;
+
+/// Typed ethereum transaction receipt.
+/// Receipt containing result of transaction execution.
+#[derive(Clone, Debug, PartialEq, Eq, Default, RlpEncodable, RlpDecodable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "reth-codec", reth_codecs::add_arbitrary_tests(compact, rlp))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+pub struct EthereumReceipt<T = TxType, L = Log> {
+    /// Receipt type.
+    #[cfg_attr(feature = "serde", serde(rename = "type"))]
+    pub tx_type: T,
+    /// If transaction is executed successfully.
+    ///
+    /// This is the `statusCode`
+    #[cfg_attr(feature = "serde", serde(with = "alloy_serde::quantity", rename = "status"))]
+    pub success: bool,
+    /// Gas used
+    #[cfg_attr(feature = "serde", serde(with = "alloy_serde::quantity"))]
+    pub cumulative_gas_used: u64,
+    /// Log send from contracts.
+    pub logs: Vec<L>,
+}
+
+impl<T, L> EthereumReceipt<T, L> {
+    /// Converts the receipt's log type by applying a function to each log.
+    ///
+    /// Returns the receipt with the new log type.
+    pub fn map_logs<U>(self, f: impl FnMut(L) -> U) -> EthereumReceipt<T, U> {
+        let Self { tx_type, success, cumulative_gas_used, logs } = self;
+        EthereumReceipt {
+            tx_type,
+            success,
+            cumulative_gas_used,
+            logs: logs.into_iter().map(f).collect(),
+        }
+    }
+}
 
 /// Calculates the receipt root for a header for the reference type of [`Receipt`].
 ///
@@ -37,10 +109,10 @@ impl<T> Receipt<T> {
 impl<T: TxTy> Receipt<T> {
     /// Returns length of RLP-encoded receipt fields with the given [`Bloom`] without an RLP header.
     pub fn rlp_encoded_fields_length(&self, bloom: &Bloom) -> usize {
-        self.success.length() +
-            self.cumulative_gas_used.length() +
-            bloom.length() +
-            self.logs.length()
+        self.success.length()
+            + self.cumulative_gas_used.length()
+            + bloom.length()
+            + self.logs.length()
     }
 
     /// RLP-encodes receipt fields with the given [`Bloom`] without an RLP header.
@@ -146,7 +218,7 @@ impl<T: TxTy> RlpDecodableReceipt for Receipt<T> {
 
         // Legacy receipt, reuse initial buffer without advancing
         if header.list {
-            return Self::rlp_decode_inner(buf, T::try_from(0)?)
+            return Self::rlp_decode_inner(buf, T::try_from(0)?);
         }
 
         // Otherwise, advance the buffer and try decoding type flag followed by receipt
@@ -398,8 +470,8 @@ pub(super) mod serde_bincode_compat {
 mod compact {
     use super::*;
     use reth_codecs::{
-        __private::{modular_bitfield::prelude::*, Buf},
         Compact,
+        __private::{modular_bitfield::prelude::*, Buf},
     };
 
     impl Receipt {

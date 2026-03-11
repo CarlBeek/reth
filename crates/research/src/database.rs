@@ -44,6 +44,16 @@ pub struct ScheduleDivergence {
     pub timestamp: u64,
     /// Type of divergence
     pub divergence_type: DivergenceType,
+    /// What kind of schedule produced this row
+    pub schedule_kind: String,
+    /// Human-readable schedule description
+    pub schedule_description: String,
+    /// Stable hash of the schedule configuration and metadata
+    pub schedule_config_hash: String,
+    /// Block hash
+    pub block_hash: B256,
+    /// Parent block hash
+    pub parent_hash: B256,
 
     /// Baseline execution succeeded
     pub baseline_success: bool,
@@ -77,6 +87,121 @@ pub struct ScheduleDivergence {
     pub divergence_location: Option<String>,
     /// Operation counts (JSON)
     pub operation_counts: Option<String>,
+    /// Baseline call frames (JSON)
+    pub baseline_call_frames: Option<String>,
+    /// Schedule call frames (JSON)
+    pub schedule_call_frames: Option<String>,
+    /// Baseline event logs (JSON)
+    pub baseline_event_logs: Option<String>,
+    /// Schedule event logs (JSON)
+    pub schedule_event_logs: Option<String>,
+    /// Baseline call frame hash
+    pub baseline_call_frames_hash: Option<String>,
+    /// Schedule call frame hash
+    pub schedule_call_frames_hash: Option<String>,
+    /// Baseline event log hash
+    pub baseline_event_logs_hash: Option<String>,
+    /// Schedule event log hash
+    pub schedule_event_logs_hash: Option<String>,
+    /// Whether success status changed
+    pub status_changed: bool,
+    /// Whether total gas used changed
+    pub gas_changed: bool,
+    /// Whether the call tree changed
+    pub call_tree_changed: bool,
+    /// Whether the emitted logs changed
+    pub event_logs_changed: bool,
+    /// Whether output / returndata changed
+    pub output_changed: bool,
+    /// Whether the created contract address changed
+    pub created_address_changed: bool,
+    /// Whether receipt log bloom changed
+    pub logs_bloom_changed: bool,
+    /// Sender address
+    pub sender: String,
+    /// Recipient address, if any
+    pub recipient: Option<String>,
+    /// Value transferred in wei
+    pub value_wei: String,
+    /// Total calldata / initcode length
+    pub input_len: u64,
+    /// Zero bytes in calldata / initcode
+    pub input_zero_bytes: u64,
+    /// Non-zero bytes in calldata / initcode
+    pub input_nonzero_bytes: u64,
+    /// Transaction gas limit
+    pub tx_gas_limit: u64,
+    /// Access-list account count
+    pub access_list_accounts: u64,
+    /// Access-list storage slot count
+    pub access_list_storage_slots: u64,
+    /// Authorization list size (EIP-7702)
+    pub authorization_count: u64,
+    /// Whether the tx is a create
+    pub is_create: bool,
+    /// Baseline output byte length, if any
+    pub baseline_output_len: Option<u64>,
+    /// Schedule output byte length, if any
+    pub schedule_output_len: Option<u64>,
+    /// Baseline output hash
+    pub baseline_output_hash: Option<String>,
+    /// Schedule output hash
+    pub schedule_output_hash: Option<String>,
+    /// Baseline created address
+    pub baseline_created_address: Option<String>,
+    /// Schedule created address
+    pub schedule_created_address: Option<String>,
+    /// Baseline log count
+    pub baseline_log_count: u64,
+    /// Schedule log count
+    pub schedule_log_count: u64,
+    /// Baseline logs bloom
+    pub baseline_logs_bloom: String,
+    /// Schedule logs bloom
+    pub schedule_logs_bloom: String,
+}
+
+/// Per-block, per-schedule coverage summary.
+#[derive(Debug, Clone)]
+pub struct ScheduleBlockCoverage {
+    /// Name of the gas schedule
+    pub schedule_name: String,
+    /// What kind of schedule produced this row
+    pub schedule_kind: String,
+    /// Stable hash of the schedule configuration and metadata
+    pub schedule_config_hash: String,
+    /// Block number
+    pub block_number: u64,
+    /// Block hash
+    pub block_hash: B256,
+    /// Parent block hash
+    pub parent_hash: B256,
+    /// Block timestamp
+    pub timestamp: u64,
+    /// Transactions analyzed under this schedule in the block
+    pub tx_count: u64,
+    /// Divergent transactions in the block
+    pub divergence_count: u64,
+    /// Transactions with status change
+    pub status_divergence_count: u64,
+    /// Transactions with gas change
+    pub gas_divergence_count: u64,
+    /// Transactions with call-tree change
+    pub call_tree_divergence_count: u64,
+    /// Transactions with event-log change
+    pub event_log_divergence_count: u64,
+    /// Transactions with output change
+    pub output_divergence_count: u64,
+    /// Transactions with created-address change
+    pub created_address_divergence_count: u64,
+    /// Transactions with logs-bloom change
+    pub logs_bloom_divergence_count: u64,
+    /// Aggregate baseline gas used for the block under replay
+    pub total_baseline_gas_used: u64,
+    /// Aggregate schedule gas used for the block under replay
+    pub total_schedule_gas_used: u64,
+    /// Aggregate gas delta for the block
+    pub total_gas_delta: i64,
 }
 
 /// Database for storing divergence data.
@@ -116,6 +241,11 @@ impl DivergenceDatabase {
                 tx_index INTEGER NOT NULL,
                 tx_hash BLOB NOT NULL,
                 timestamp INTEGER NOT NULL,
+                schedule_kind TEXT NOT NULL,
+                schedule_description TEXT NOT NULL,
+                schedule_config_hash TEXT NOT NULL,
+                block_hash BLOB NOT NULL,
+                parent_hash BLOB NOT NULL,
 
                 -- Divergence classification
                 divergence_type TEXT NOT NULL,
@@ -143,8 +273,121 @@ impl DivergenceDatabase {
                 oog_info TEXT,
                 divergence_location TEXT,
                 operation_counts TEXT,
+                baseline_call_frames TEXT,
+                schedule_call_frames TEXT,
+                baseline_event_logs TEXT,
+                schedule_event_logs TEXT,
+                baseline_call_frames_hash TEXT,
+                schedule_call_frames_hash TEXT,
+                baseline_event_logs_hash TEXT,
+                schedule_event_logs_hash TEXT,
+                status_changed BOOLEAN NOT NULL DEFAULT 0,
+                gas_changed BOOLEAN NOT NULL DEFAULT 0,
+                call_tree_changed BOOLEAN NOT NULL DEFAULT 0,
+                event_logs_changed BOOLEAN NOT NULL DEFAULT 0,
+                output_changed BOOLEAN NOT NULL DEFAULT 0,
+                created_address_changed BOOLEAN NOT NULL DEFAULT 0,
+                logs_bloom_changed BOOLEAN NOT NULL DEFAULT 0,
+                sender TEXT NOT NULL DEFAULT '',
+                recipient TEXT,
+                value_wei TEXT NOT NULL DEFAULT '0',
+                input_len INTEGER NOT NULL DEFAULT 0,
+                input_zero_bytes INTEGER NOT NULL DEFAULT 0,
+                input_nonzero_bytes INTEGER NOT NULL DEFAULT 0,
+                tx_gas_limit INTEGER NOT NULL DEFAULT 0,
+                access_list_accounts INTEGER NOT NULL DEFAULT 0,
+                access_list_storage_slots INTEGER NOT NULL DEFAULT 0,
+                authorization_count INTEGER NOT NULL DEFAULT 0,
+                is_create BOOLEAN NOT NULL DEFAULT 0,
+                baseline_output_len INTEGER,
+                schedule_output_len INTEGER,
+                baseline_output_hash TEXT,
+                schedule_output_hash TEXT,
+                baseline_created_address TEXT,
+                schedule_created_address TEXT,
+                baseline_log_count INTEGER NOT NULL DEFAULT 0,
+                schedule_log_count INTEGER NOT NULL DEFAULT 0,
+                baseline_logs_bloom TEXT NOT NULL DEFAULT '',
+                schedule_logs_bloom TEXT NOT NULL DEFAULT '',
 
                 created_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )?;
+
+        for column_def in [
+            "schedule_kind TEXT NOT NULL DEFAULT 'unknown'",
+            "schedule_description TEXT NOT NULL DEFAULT ''",
+            "schedule_config_hash TEXT NOT NULL DEFAULT ''",
+            "block_hash BLOB NOT NULL DEFAULT X''",
+            "parent_hash BLOB NOT NULL DEFAULT X''",
+            "baseline_call_frames TEXT",
+            "schedule_call_frames TEXT",
+            "baseline_event_logs TEXT",
+            "schedule_event_logs TEXT",
+            "baseline_call_frames_hash TEXT",
+            "schedule_call_frames_hash TEXT",
+            "baseline_event_logs_hash TEXT",
+            "schedule_event_logs_hash TEXT",
+            "status_changed BOOLEAN NOT NULL DEFAULT 0",
+            "gas_changed BOOLEAN NOT NULL DEFAULT 0",
+            "call_tree_changed BOOLEAN NOT NULL DEFAULT 0",
+            "event_logs_changed BOOLEAN NOT NULL DEFAULT 0",
+            "output_changed BOOLEAN NOT NULL DEFAULT 0",
+            "created_address_changed BOOLEAN NOT NULL DEFAULT 0",
+            "logs_bloom_changed BOOLEAN NOT NULL DEFAULT 0",
+            "sender TEXT NOT NULL DEFAULT ''",
+            "recipient TEXT",
+            "value_wei TEXT NOT NULL DEFAULT '0'",
+            "input_len INTEGER NOT NULL DEFAULT 0",
+            "input_zero_bytes INTEGER NOT NULL DEFAULT 0",
+            "input_nonzero_bytes INTEGER NOT NULL DEFAULT 0",
+            "tx_gas_limit INTEGER NOT NULL DEFAULT 0",
+            "access_list_accounts INTEGER NOT NULL DEFAULT 0",
+            "access_list_storage_slots INTEGER NOT NULL DEFAULT 0",
+            "authorization_count INTEGER NOT NULL DEFAULT 0",
+            "is_create BOOLEAN NOT NULL DEFAULT 0",
+            "baseline_output_len INTEGER",
+            "schedule_output_len INTEGER",
+            "baseline_output_hash TEXT",
+            "schedule_output_hash TEXT",
+            "baseline_created_address TEXT",
+            "schedule_created_address TEXT",
+            "baseline_log_count INTEGER NOT NULL DEFAULT 0",
+            "schedule_log_count INTEGER NOT NULL DEFAULT 0",
+            "baseline_logs_bloom TEXT NOT NULL DEFAULT ''",
+            "schedule_logs_bloom TEXT NOT NULL DEFAULT ''",
+        ] {
+            conn.execute(
+                &format!("ALTER TABLE schedule_divergences ADD COLUMN IF NOT EXISTS {column_def}"),
+                [],
+            )?;
+        }
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schedule_block_coverage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                schedule_name TEXT NOT NULL,
+                schedule_kind TEXT NOT NULL,
+                schedule_config_hash TEXT NOT NULL,
+                block_number INTEGER NOT NULL,
+                block_hash BLOB NOT NULL,
+                parent_hash BLOB NOT NULL,
+                timestamp INTEGER NOT NULL,
+                tx_count INTEGER NOT NULL,
+                divergence_count INTEGER NOT NULL,
+                status_divergence_count INTEGER NOT NULL,
+                gas_divergence_count INTEGER NOT NULL,
+                call_tree_divergence_count INTEGER NOT NULL,
+                event_log_divergence_count INTEGER NOT NULL,
+                output_divergence_count INTEGER NOT NULL,
+                created_address_divergence_count INTEGER NOT NULL,
+                logs_bloom_divergence_count INTEGER NOT NULL,
+                total_baseline_gas_used INTEGER NOT NULL,
+                total_schedule_gas_used INTEGER NOT NULL,
+                total_gas_delta INTEGER NOT NULL,
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                UNIQUE(schedule_name, block_number, block_hash)
             )",
             [],
         )?;
@@ -209,18 +452,42 @@ impl DivergenceDatabase {
         conn.execute(
             "INSERT INTO schedule_divergences (
                 schedule_name, block_number, tx_index, tx_hash, timestamp,
+                schedule_kind, schedule_description, schedule_config_hash, block_hash, parent_hash,
                 divergence_type,
                 baseline_success, baseline_gas_used, baseline_intrinsic_gas,
                 schedule_success, schedule_gas_used, schedule_intrinsic_gas,
                 gas_delta, gas_efficiency_ratio,
                 tx_category, affected_opcodes, affected_precompiles,
-                oog_info, divergence_location, operation_counts
+                oog_info, divergence_location, operation_counts,
+                baseline_call_frames, schedule_call_frames,
+                baseline_event_logs, schedule_event_logs,
+                baseline_call_frames_hash, schedule_call_frames_hash,
+                baseline_event_logs_hash, schedule_event_logs_hash,
+                status_changed, gas_changed, call_tree_changed, event_logs_changed,
+                output_changed, created_address_changed, logs_bloom_changed,
+                sender, recipient, value_wei,
+                input_len, input_zero_bytes, input_nonzero_bytes,
+                tx_gas_limit, access_list_accounts, access_list_storage_slots, authorization_count,
+                is_create, baseline_output_len, schedule_output_len,
+                baseline_output_hash, schedule_output_hash,
+                baseline_created_address, schedule_created_address,
+                baseline_log_count, schedule_log_count,
+                baseline_logs_bloom, schedule_logs_bloom
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
+                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
+                ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50,
+                ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60
             )
             ON CONFLICT(schedule_name, block_number, tx_index, tx_hash) DO UPDATE SET
                 timestamp = excluded.timestamp,
+                schedule_kind = excluded.schedule_kind,
+                schedule_description = excluded.schedule_description,
+                schedule_config_hash = excluded.schedule_config_hash,
+                block_hash = excluded.block_hash,
+                parent_hash = excluded.parent_hash,
                 divergence_type = excluded.divergence_type,
                 baseline_success = excluded.baseline_success,
                 baseline_gas_used = excluded.baseline_gas_used,
@@ -235,13 +502,54 @@ impl DivergenceDatabase {
                 affected_precompiles = excluded.affected_precompiles,
                 oog_info = excluded.oog_info,
                 divergence_location = excluded.divergence_location,
-                operation_counts = excluded.operation_counts",
+                operation_counts = excluded.operation_counts,
+                baseline_call_frames = excluded.baseline_call_frames,
+                schedule_call_frames = excluded.schedule_call_frames,
+                baseline_event_logs = excluded.baseline_event_logs,
+                schedule_event_logs = excluded.schedule_event_logs,
+                baseline_call_frames_hash = excluded.baseline_call_frames_hash,
+                schedule_call_frames_hash = excluded.schedule_call_frames_hash,
+                baseline_event_logs_hash = excluded.baseline_event_logs_hash,
+                schedule_event_logs_hash = excluded.schedule_event_logs_hash,
+                status_changed = excluded.status_changed,
+                gas_changed = excluded.gas_changed,
+                call_tree_changed = excluded.call_tree_changed,
+                event_logs_changed = excluded.event_logs_changed,
+                output_changed = excluded.output_changed,
+                created_address_changed = excluded.created_address_changed,
+                logs_bloom_changed = excluded.logs_bloom_changed,
+                sender = excluded.sender,
+                recipient = excluded.recipient,
+                value_wei = excluded.value_wei,
+                input_len = excluded.input_len,
+                input_zero_bytes = excluded.input_zero_bytes,
+                input_nonzero_bytes = excluded.input_nonzero_bytes,
+                tx_gas_limit = excluded.tx_gas_limit,
+                access_list_accounts = excluded.access_list_accounts,
+                access_list_storage_slots = excluded.access_list_storage_slots,
+                authorization_count = excluded.authorization_count,
+                is_create = excluded.is_create,
+                baseline_output_len = excluded.baseline_output_len,
+                schedule_output_len = excluded.schedule_output_len,
+                baseline_output_hash = excluded.baseline_output_hash,
+                schedule_output_hash = excluded.schedule_output_hash,
+                baseline_created_address = excluded.baseline_created_address,
+                schedule_created_address = excluded.schedule_created_address,
+                baseline_log_count = excluded.baseline_log_count,
+                schedule_log_count = excluded.schedule_log_count,
+                baseline_logs_bloom = excluded.baseline_logs_bloom,
+                schedule_logs_bloom = excluded.schedule_logs_bloom",
             params![
                 divergence.schedule_name,
                 divergence.block_number,
                 divergence.tx_index,
                 divergence.tx_hash.as_slice(),
                 divergence.timestamp,
+                divergence.schedule_kind,
+                divergence.schedule_description,
+                divergence.schedule_config_hash,
+                divergence.block_hash.as_slice(),
+                divergence.parent_hash.as_slice(),
                 divergence.divergence_type.to_string(),
                 divergence.baseline_success,
                 divergence.baseline_gas_used,
@@ -257,6 +565,42 @@ impl DivergenceDatabase {
                 divergence.oog_info,
                 divergence.divergence_location,
                 divergence.operation_counts,
+                divergence.baseline_call_frames,
+                divergence.schedule_call_frames,
+                divergence.baseline_event_logs,
+                divergence.schedule_event_logs,
+                divergence.baseline_call_frames_hash,
+                divergence.schedule_call_frames_hash,
+                divergence.baseline_event_logs_hash,
+                divergence.schedule_event_logs_hash,
+                divergence.status_changed,
+                divergence.gas_changed,
+                divergence.call_tree_changed,
+                divergence.event_logs_changed,
+                divergence.output_changed,
+                divergence.created_address_changed,
+                divergence.logs_bloom_changed,
+                divergence.sender,
+                divergence.recipient,
+                divergence.value_wei,
+                divergence.input_len,
+                divergence.input_zero_bytes,
+                divergence.input_nonzero_bytes,
+                divergence.tx_gas_limit,
+                divergence.access_list_accounts,
+                divergence.access_list_storage_slots,
+                divergence.authorization_count,
+                divergence.is_create,
+                divergence.baseline_output_len,
+                divergence.schedule_output_len,
+                divergence.baseline_output_hash,
+                divergence.schedule_output_hash,
+                divergence.baseline_created_address,
+                divergence.schedule_created_address,
+                divergence.baseline_log_count,
+                divergence.schedule_log_count,
+                divergence.baseline_logs_bloom,
+                divergence.schedule_logs_bloom,
             ],
         )?;
 
@@ -273,18 +617,42 @@ impl DivergenceDatabase {
         let mut stmt = tx.prepare(
             "INSERT INTO schedule_divergences (
                 schedule_name, block_number, tx_index, tx_hash, timestamp,
+                schedule_kind, schedule_description, schedule_config_hash, block_hash, parent_hash,
                 divergence_type,
                 baseline_success, baseline_gas_used, baseline_intrinsic_gas,
                 schedule_success, schedule_gas_used, schedule_intrinsic_gas,
                 gas_delta, gas_efficiency_ratio,
                 tx_category, affected_opcodes, affected_precompiles,
-                oog_info, divergence_location, operation_counts
+                oog_info, divergence_location, operation_counts,
+                baseline_call_frames, schedule_call_frames,
+                baseline_event_logs, schedule_event_logs,
+                baseline_call_frames_hash, schedule_call_frames_hash,
+                baseline_event_logs_hash, schedule_event_logs_hash,
+                status_changed, gas_changed, call_tree_changed, event_logs_changed,
+                output_changed, created_address_changed, logs_bloom_changed,
+                sender, recipient, value_wei,
+                input_len, input_zero_bytes, input_nonzero_bytes,
+                tx_gas_limit, access_list_accounts, access_list_storage_slots, authorization_count,
+                is_create, baseline_output_len, schedule_output_len,
+                baseline_output_hash, schedule_output_hash,
+                baseline_created_address, schedule_created_address,
+                baseline_log_count, schedule_log_count,
+                baseline_logs_bloom, schedule_logs_bloom
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
+                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
+                ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50,
+                ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60
             )
             ON CONFLICT(schedule_name, block_number, tx_index, tx_hash) DO UPDATE SET
                 timestamp = excluded.timestamp,
+                schedule_kind = excluded.schedule_kind,
+                schedule_description = excluded.schedule_description,
+                schedule_config_hash = excluded.schedule_config_hash,
+                block_hash = excluded.block_hash,
+                parent_hash = excluded.parent_hash,
                 divergence_type = excluded.divergence_type,
                 baseline_success = excluded.baseline_success,
                 baseline_gas_used = excluded.baseline_gas_used,
@@ -299,7 +667,43 @@ impl DivergenceDatabase {
                 affected_precompiles = excluded.affected_precompiles,
                 oog_info = excluded.oog_info,
                 divergence_location = excluded.divergence_location,
-                operation_counts = excluded.operation_counts",
+                operation_counts = excluded.operation_counts,
+                baseline_call_frames = excluded.baseline_call_frames,
+                schedule_call_frames = excluded.schedule_call_frames,
+                baseline_event_logs = excluded.baseline_event_logs,
+                schedule_event_logs = excluded.schedule_event_logs,
+                baseline_call_frames_hash = excluded.baseline_call_frames_hash,
+                schedule_call_frames_hash = excluded.schedule_call_frames_hash,
+                baseline_event_logs_hash = excluded.baseline_event_logs_hash,
+                schedule_event_logs_hash = excluded.schedule_event_logs_hash,
+                status_changed = excluded.status_changed,
+                gas_changed = excluded.gas_changed,
+                call_tree_changed = excluded.call_tree_changed,
+                event_logs_changed = excluded.event_logs_changed,
+                output_changed = excluded.output_changed,
+                created_address_changed = excluded.created_address_changed,
+                logs_bloom_changed = excluded.logs_bloom_changed,
+                sender = excluded.sender,
+                recipient = excluded.recipient,
+                value_wei = excluded.value_wei,
+                input_len = excluded.input_len,
+                input_zero_bytes = excluded.input_zero_bytes,
+                input_nonzero_bytes = excluded.input_nonzero_bytes,
+                tx_gas_limit = excluded.tx_gas_limit,
+                access_list_accounts = excluded.access_list_accounts,
+                access_list_storage_slots = excluded.access_list_storage_slots,
+                authorization_count = excluded.authorization_count,
+                is_create = excluded.is_create,
+                baseline_output_len = excluded.baseline_output_len,
+                schedule_output_len = excluded.schedule_output_len,
+                baseline_output_hash = excluded.baseline_output_hash,
+                schedule_output_hash = excluded.schedule_output_hash,
+                baseline_created_address = excluded.baseline_created_address,
+                schedule_created_address = excluded.schedule_created_address,
+                baseline_log_count = excluded.baseline_log_count,
+                schedule_log_count = excluded.schedule_log_count,
+                baseline_logs_bloom = excluded.baseline_logs_bloom,
+                schedule_logs_bloom = excluded.schedule_logs_bloom",
         )?;
         let mut count = 0;
         for divergence in divergences {
@@ -309,6 +713,11 @@ impl DivergenceDatabase {
                 divergence.tx_index,
                 divergence.tx_hash.as_slice(),
                 divergence.timestamp,
+                divergence.schedule_kind,
+                divergence.schedule_description,
+                divergence.schedule_config_hash,
+                divergence.block_hash.as_slice(),
+                divergence.parent_hash.as_slice(),
                 divergence.divergence_type.to_string(),
                 divergence.baseline_success,
                 divergence.baseline_gas_used,
@@ -324,6 +733,42 @@ impl DivergenceDatabase {
                 divergence.oog_info,
                 divergence.divergence_location,
                 divergence.operation_counts,
+                divergence.baseline_call_frames,
+                divergence.schedule_call_frames,
+                divergence.baseline_event_logs,
+                divergence.schedule_event_logs,
+                divergence.baseline_call_frames_hash,
+                divergence.schedule_call_frames_hash,
+                divergence.baseline_event_logs_hash,
+                divergence.schedule_event_logs_hash,
+                divergence.status_changed,
+                divergence.gas_changed,
+                divergence.call_tree_changed,
+                divergence.event_logs_changed,
+                divergence.output_changed,
+                divergence.created_address_changed,
+                divergence.logs_bloom_changed,
+                divergence.sender,
+                divergence.recipient,
+                divergence.value_wei,
+                divergence.input_len,
+                divergence.input_zero_bytes,
+                divergence.input_nonzero_bytes,
+                divergence.tx_gas_limit,
+                divergence.access_list_accounts,
+                divergence.access_list_storage_slots,
+                divergence.authorization_count,
+                divergence.is_create,
+                divergence.baseline_output_len,
+                divergence.schedule_output_len,
+                divergence.baseline_output_hash,
+                divergence.schedule_output_hash,
+                divergence.baseline_created_address,
+                divergence.schedule_created_address,
+                divergence.baseline_log_count,
+                divergence.schedule_log_count,
+                divergence.baseline_logs_bloom,
+                divergence.schedule_logs_bloom,
             ])?;
             count += 1;
         }
@@ -370,6 +815,81 @@ impl DivergenceDatabase {
         let conn = self.conn.lock().unwrap();
         let deleted = conn.execute(
             "DELETE FROM schedule_divergences WHERE block_number >= ?1 AND block_number <= ?2",
+            params![from_block, to_block],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Record a per-block coverage summary for a schedule.
+    pub fn record_schedule_block_coverage(
+        &self,
+        coverage: &ScheduleBlockCoverage,
+    ) -> Result<i64, DatabaseError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO schedule_block_coverage (
+                schedule_name, schedule_kind, schedule_config_hash,
+                block_number, block_hash, parent_hash, timestamp,
+                tx_count, divergence_count, status_divergence_count, gas_divergence_count,
+                call_tree_divergence_count, event_log_divergence_count,
+                output_divergence_count, created_address_divergence_count,
+                logs_bloom_divergence_count, total_baseline_gas_used,
+                total_schedule_gas_used, total_gas_delta
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+            )
+            ON CONFLICT(schedule_name, block_number, block_hash) DO UPDATE SET
+                schedule_kind = excluded.schedule_kind,
+                schedule_config_hash = excluded.schedule_config_hash,
+                parent_hash = excluded.parent_hash,
+                timestamp = excluded.timestamp,
+                tx_count = excluded.tx_count,
+                divergence_count = excluded.divergence_count,
+                status_divergence_count = excluded.status_divergence_count,
+                gas_divergence_count = excluded.gas_divergence_count,
+                call_tree_divergence_count = excluded.call_tree_divergence_count,
+                event_log_divergence_count = excluded.event_log_divergence_count,
+                output_divergence_count = excluded.output_divergence_count,
+                created_address_divergence_count = excluded.created_address_divergence_count,
+                logs_bloom_divergence_count = excluded.logs_bloom_divergence_count,
+                total_baseline_gas_used = excluded.total_baseline_gas_used,
+                total_schedule_gas_used = excluded.total_schedule_gas_used,
+                total_gas_delta = excluded.total_gas_delta",
+            params![
+                coverage.schedule_name,
+                coverage.schedule_kind,
+                coverage.schedule_config_hash,
+                coverage.block_number,
+                coverage.block_hash.as_slice(),
+                coverage.parent_hash.as_slice(),
+                coverage.timestamp,
+                coverage.tx_count,
+                coverage.divergence_count,
+                coverage.status_divergence_count,
+                coverage.gas_divergence_count,
+                coverage.call_tree_divergence_count,
+                coverage.event_log_divergence_count,
+                coverage.output_divergence_count,
+                coverage.created_address_divergence_count,
+                coverage.logs_bloom_divergence_count,
+                coverage.total_baseline_gas_used,
+                coverage.total_schedule_gas_used,
+                coverage.total_gas_delta,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Delete coverage summaries in an inclusive block range.
+    pub fn delete_schedule_block_coverage_in_block_range(
+        &self,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<usize, DatabaseError> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM schedule_block_coverage WHERE block_number >= ?1 AND block_number <= ?2",
             params![from_block, to_block],
         )?;
         Ok(deleted)
@@ -581,6 +1101,11 @@ mod tests {
             tx_hash: B256::ZERO,
             timestamp: 1234567890,
             divergence_type: DivergenceType::Status,
+            schedule_kind: "IntrinsicOnly".to_string(),
+            schedule_description: "test".to_string(),
+            schedule_config_hash: "cfg".to_string(),
+            block_hash: B256::repeat_byte(0x10),
+            parent_hash: B256::repeat_byte(0x11),
             baseline_success: true,
             baseline_gas_used: 21000,
             baseline_intrinsic_gas: 21000,
@@ -595,6 +1120,42 @@ mod tests {
             oog_info: None,
             divergence_location: None,
             operation_counts: None,
+            baseline_call_frames: None,
+            schedule_call_frames: None,
+            baseline_event_logs: None,
+            schedule_event_logs: None,
+            baseline_call_frames_hash: None,
+            schedule_call_frames_hash: None,
+            baseline_event_logs_hash: None,
+            schedule_event_logs_hash: None,
+            status_changed: true,
+            gas_changed: true,
+            call_tree_changed: false,
+            event_logs_changed: false,
+            output_changed: false,
+            created_address_changed: false,
+            logs_bloom_changed: false,
+            sender: "0x0000000000000000000000000000000000000001".to_string(),
+            recipient: Some("0x0000000000000000000000000000000000000002".to_string()),
+            value_wei: "0".to_string(),
+            input_len: 0,
+            input_zero_bytes: 0,
+            input_nonzero_bytes: 0,
+            tx_gas_limit: 21000,
+            access_list_accounts: 0,
+            access_list_storage_slots: 0,
+            authorization_count: 0,
+            is_create: false,
+            baseline_output_len: None,
+            schedule_output_len: None,
+            baseline_output_hash: None,
+            schedule_output_hash: None,
+            baseline_created_address: None,
+            schedule_created_address: None,
+            baseline_log_count: 0,
+            schedule_log_count: 0,
+            baseline_logs_bloom: String::new(),
+            schedule_logs_bloom: String::new(),
         };
 
         let id = db.record_schedule_divergence(&divergence).unwrap();
@@ -618,6 +1179,11 @@ mod tests {
                     tx_hash: B256::repeat_byte(i as u8),
                     timestamp: 1234567890,
                     divergence_type: DivergenceType::Status,
+                    schedule_kind: "ExecutionOnly".to_string(),
+                    schedule_description: "test".to_string(),
+                    schedule_config_hash: "cfg".to_string(),
+                    block_hash: B256::repeat_byte(0x20),
+                    parent_hash: B256::repeat_byte(0x21),
                     baseline_success: true,
                     baseline_gas_used: 21000,
                     baseline_intrinsic_gas: 21000,
@@ -632,6 +1198,42 @@ mod tests {
                     oog_info: None,
                     divergence_location: None,
                     operation_counts: None,
+                    baseline_call_frames: None,
+                    schedule_call_frames: None,
+                    baseline_event_logs: None,
+                    schedule_event_logs: None,
+                    baseline_call_frames_hash: None,
+                    schedule_call_frames_hash: None,
+                    baseline_event_logs_hash: None,
+                    schedule_event_logs_hash: None,
+                    status_changed: true,
+                    gas_changed: true,
+                    call_tree_changed: false,
+                    event_logs_changed: false,
+                    output_changed: false,
+                    created_address_changed: false,
+                    logs_bloom_changed: false,
+                    sender: "0x0000000000000000000000000000000000000001".to_string(),
+                    recipient: Some("0x0000000000000000000000000000000000000002".to_string()),
+                    value_wei: "0".to_string(),
+                    input_len: 0,
+                    input_zero_bytes: 0,
+                    input_nonzero_bytes: 0,
+                    tx_gas_limit: 21000,
+                    access_list_accounts: 0,
+                    access_list_storage_slots: 0,
+                    authorization_count: 0,
+                    is_create: false,
+                    baseline_output_len: None,
+                    schedule_output_len: None,
+                    baseline_output_hash: None,
+                    schedule_output_hash: None,
+                    baseline_created_address: None,
+                    schedule_created_address: None,
+                    baseline_log_count: 0,
+                    schedule_log_count: 0,
+                    baseline_logs_bloom: String::new(),
+                    schedule_logs_bloom: String::new(),
                 };
                 db.record_schedule_divergence(&divergence).unwrap();
             }
@@ -682,6 +1284,11 @@ mod tests {
                 tx_hash: B256::repeat_byte(i as u8),
                 timestamp: 1234567890,
                 divergence_type: DivergenceType::GasPattern,
+                schedule_kind: "IntrinsicOnly".to_string(),
+                schedule_description: "test".to_string(),
+                schedule_config_hash: "cfg".to_string(),
+                block_hash: B256::repeat_byte(0x30),
+                parent_hash: B256::repeat_byte(0x31),
                 baseline_success: true,
                 baseline_gas_used: 21000,
                 baseline_intrinsic_gas: 21000,
@@ -696,6 +1303,42 @@ mod tests {
                 oog_info: None,
                 divergence_location: None,
                 operation_counts: None,
+                baseline_call_frames: None,
+                schedule_call_frames: None,
+                baseline_event_logs: None,
+                schedule_event_logs: None,
+                baseline_call_frames_hash: None,
+                schedule_call_frames_hash: None,
+                baseline_event_logs_hash: None,
+                schedule_event_logs_hash: None,
+                status_changed: false,
+                gas_changed: true,
+                call_tree_changed: false,
+                event_logs_changed: false,
+                output_changed: false,
+                created_address_changed: false,
+                logs_bloom_changed: false,
+                sender: "0x0000000000000000000000000000000000000001".to_string(),
+                recipient: Some("0x0000000000000000000000000000000000000002".to_string()),
+                value_wei: "0".to_string(),
+                input_len: 0,
+                input_zero_bytes: 0,
+                input_nonzero_bytes: 0,
+                tx_gas_limit: 21000,
+                access_list_accounts: 0,
+                access_list_storage_slots: 0,
+                authorization_count: 0,
+                is_create: false,
+                baseline_output_len: None,
+                schedule_output_len: None,
+                baseline_output_hash: None,
+                schedule_output_hash: None,
+                baseline_created_address: None,
+                schedule_created_address: None,
+                baseline_log_count: 0,
+                schedule_log_count: 0,
+                baseline_logs_bloom: String::new(),
+                schedule_logs_bloom: String::new(),
             };
             db.record_schedule_divergence(&divergence).unwrap();
         }
@@ -720,6 +1363,11 @@ mod tests {
                 tx_hash: B256::repeat_byte(i as u8),
                 timestamp: 1234567890,
                 divergence_type: DivergenceType::GasPattern,
+                schedule_kind: "ExecutionOnly".to_string(),
+                schedule_description: "test".to_string(),
+                schedule_config_hash: "cfg".to_string(),
+                block_hash: B256::repeat_byte(0x40),
+                parent_hash: B256::repeat_byte(0x41),
                 baseline_success: true,
                 baseline_gas_used: 21000,
                 baseline_intrinsic_gas: 21000,
@@ -734,6 +1382,42 @@ mod tests {
                 oog_info: None,
                 divergence_location: None,
                 operation_counts: None,
+                baseline_call_frames: None,
+                schedule_call_frames: None,
+                baseline_event_logs: None,
+                schedule_event_logs: None,
+                baseline_call_frames_hash: None,
+                schedule_call_frames_hash: None,
+                baseline_event_logs_hash: None,
+                schedule_event_logs_hash: None,
+                status_changed: false,
+                gas_changed: *delta != 0,
+                call_tree_changed: false,
+                event_logs_changed: false,
+                output_changed: false,
+                created_address_changed: false,
+                logs_bloom_changed: false,
+                sender: "0x0000000000000000000000000000000000000001".to_string(),
+                recipient: Some("0x0000000000000000000000000000000000000002".to_string()),
+                value_wei: "0".to_string(),
+                input_len: 0,
+                input_zero_bytes: 0,
+                input_nonzero_bytes: 0,
+                tx_gas_limit: 21000,
+                access_list_accounts: 0,
+                access_list_storage_slots: 0,
+                authorization_count: 0,
+                is_create: false,
+                baseline_output_len: None,
+                schedule_output_len: None,
+                baseline_output_hash: None,
+                schedule_output_hash: None,
+                baseline_created_address: None,
+                schedule_created_address: None,
+                baseline_log_count: 0,
+                schedule_log_count: 0,
+                baseline_logs_bloom: String::new(),
+                schedule_logs_bloom: String::new(),
             };
             db.record_schedule_divergence(&divergence).unwrap();
         }
@@ -755,6 +1439,11 @@ mod tests {
                 tx_hash: B256::repeat_byte(block as u8),
                 timestamp: 1234567890,
                 divergence_type: DivergenceType::GasPattern,
+                schedule_kind: "ExecutionOnly".to_string(),
+                schedule_description: "test".to_string(),
+                schedule_config_hash: "cfg".to_string(),
+                block_hash: B256::repeat_byte(0x50),
+                parent_hash: B256::repeat_byte(0x51),
                 baseline_success: true,
                 baseline_gas_used: 21000,
                 baseline_intrinsic_gas: 21000,
@@ -769,6 +1458,42 @@ mod tests {
                 oog_info: None,
                 divergence_location: None,
                 operation_counts: None,
+                baseline_call_frames: None,
+                schedule_call_frames: None,
+                baseline_event_logs: None,
+                schedule_event_logs: None,
+                baseline_call_frames_hash: None,
+                schedule_call_frames_hash: None,
+                baseline_event_logs_hash: None,
+                schedule_event_logs_hash: None,
+                status_changed: false,
+                gas_changed: false,
+                call_tree_changed: false,
+                event_logs_changed: false,
+                output_changed: false,
+                created_address_changed: false,
+                logs_bloom_changed: false,
+                sender: "0x0000000000000000000000000000000000000001".to_string(),
+                recipient: Some("0x0000000000000000000000000000000000000002".to_string()),
+                value_wei: "0".to_string(),
+                input_len: 0,
+                input_zero_bytes: 0,
+                input_nonzero_bytes: 0,
+                tx_gas_limit: 21000,
+                access_list_accounts: 0,
+                access_list_storage_slots: 0,
+                authorization_count: 0,
+                is_create: false,
+                baseline_output_len: None,
+                schedule_output_len: None,
+                baseline_output_hash: None,
+                schedule_output_hash: None,
+                baseline_created_address: None,
+                schedule_created_address: None,
+                baseline_log_count: 0,
+                schedule_log_count: 0,
+                baseline_logs_bloom: String::new(),
+                schedule_logs_bloom: String::new(),
             };
             db.record_schedule_divergence(&divergence).unwrap();
         }
@@ -790,6 +1515,11 @@ mod tests {
             tx_hash: key.2,
             timestamp: 1,
             divergence_type: DivergenceType::GasPattern,
+            schedule_kind: "ExecutionOnly".to_string(),
+            schedule_description: "test".to_string(),
+            schedule_config_hash: "cfg".to_string(),
+            block_hash: B256::repeat_byte(0x60),
+            parent_hash: B256::repeat_byte(0x61),
             baseline_success: true,
             baseline_gas_used: 21000,
             baseline_intrinsic_gas: 21000,
@@ -804,6 +1534,42 @@ mod tests {
             oog_info: None,
             divergence_location: None,
             operation_counts: None,
+            baseline_call_frames: None,
+            schedule_call_frames: None,
+            baseline_event_logs: None,
+            schedule_event_logs: None,
+            baseline_call_frames_hash: None,
+            schedule_call_frames_hash: None,
+            baseline_event_logs_hash: None,
+            schedule_event_logs_hash: None,
+            status_changed: false,
+            gas_changed: true,
+            call_tree_changed: false,
+            event_logs_changed: false,
+            output_changed: false,
+            created_address_changed: false,
+            logs_bloom_changed: false,
+            sender: "0x0000000000000000000000000000000000000001".to_string(),
+            recipient: Some("0x0000000000000000000000000000000000000002".to_string()),
+            value_wei: "0".to_string(),
+            input_len: 0,
+            input_zero_bytes: 0,
+            input_nonzero_bytes: 0,
+            tx_gas_limit: 21000,
+            access_list_accounts: 0,
+            access_list_storage_slots: 0,
+            authorization_count: 0,
+            is_create: false,
+            baseline_output_len: None,
+            schedule_output_len: None,
+            baseline_output_hash: None,
+            schedule_output_hash: None,
+            baseline_created_address: None,
+            schedule_created_address: None,
+            baseline_log_count: 0,
+            schedule_log_count: 0,
+            baseline_logs_bloom: String::new(),
+            schedule_logs_bloom: String::new(),
         };
 
         db.record_schedule_divergence(&divergence).unwrap();
@@ -813,5 +1579,37 @@ mod tests {
 
         assert_eq!(db.count_by_schedule("idempotent").unwrap(), 1);
         assert_eq!(db.total_gas_delta_for_schedule("idempotent").unwrap(), 2000);
+    }
+
+    #[test]
+    fn test_record_schedule_block_coverage() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        let coverage = ScheduleBlockCoverage {
+            schedule_name: "test".to_string(),
+            schedule_kind: "ExecutionOnly".to_string(),
+            schedule_config_hash: "cfg".to_string(),
+            block_number: 100,
+            block_hash: B256::repeat_byte(0x70),
+            parent_hash: B256::repeat_byte(0x71),
+            timestamp: 1234567890,
+            tx_count: 10,
+            divergence_count: 2,
+            status_divergence_count: 1,
+            gas_divergence_count: 2,
+            call_tree_divergence_count: 1,
+            event_log_divergence_count: 0,
+            output_divergence_count: 0,
+            created_address_divergence_count: 0,
+            logs_bloom_divergence_count: 0,
+            total_baseline_gas_used: 100_000,
+            total_schedule_gas_used: 120_000,
+            total_gas_delta: 20_000,
+        };
+
+        let id = db.record_schedule_block_coverage(&coverage).unwrap();
+        assert!(id > 0);
+
+        let deleted = db.delete_schedule_block_coverage_in_block_range(100, 100).unwrap();
+        assert_eq!(deleted, 1);
     }
 }

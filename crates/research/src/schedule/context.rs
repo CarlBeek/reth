@@ -8,6 +8,9 @@ use alloy_primitives::{Address, Bytes, U256};
 /// calculate its intrinsic gas under different schedules.
 #[derive(Debug, Clone, Default)]
 pub struct TxContext {
+    /// Canonical intrinsic gas under the active fork rules.
+    pub baseline_intrinsic_gas: u64,
+
     /// Transaction sender address
     pub sender: Address,
 
@@ -66,6 +69,7 @@ impl RecipientInfo {
 impl TxContext {
     /// Create a new transaction context.
     pub fn new(
+        baseline_intrinsic_gas: u64,
         sender: Address,
         recipient: Option<Address>,
         value: U256,
@@ -73,7 +77,16 @@ impl TxContext {
         gas_limit: u64,
         is_create: bool,
     ) -> Self {
-        Self { sender, recipient, value, input, gas_limit, is_create, recipient_info: None }
+        Self {
+            baseline_intrinsic_gas,
+            sender,
+            recipient,
+            value,
+            input,
+            gas_limit,
+            is_create,
+            recipient_info: None,
+        }
     }
 
     /// Add recipient account info to the context.

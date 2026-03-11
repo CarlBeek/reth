@@ -99,6 +99,18 @@ pub trait GasSchedule: Send + Sync + Debug {
         0
     }
 
+    /// Multiply the EVM's observed execution gas for each opcode/precompile.
+    ///
+    /// This is intended for schedules that scale all execution gas uniformly
+    /// after the EVM has computed the opcode/precompile's native cost.
+    ///
+    /// Returns `Some(multiplier)` for schedules such as `128x`, or `None` for
+    /// schedules that only use explicit additive repricing via
+    /// [`GasSchedule::opcode_gas_delta`] / [`GasSchedule::precompile_gas_delta`].
+    fn execution_gas_multiplier(&self) -> Option<u64> {
+        None
+    }
+
     /// Whether this schedule modifies intrinsic gas.
     fn modifies_intrinsic(&self) -> bool {
         matches!(self.kind(), ScheduleKind::IntrinsicOnly | ScheduleKind::Both)
@@ -157,6 +169,10 @@ impl GasSchedule for Box<dyn GasSchedule> {
 
     fn precompile_gas_delta(&self, address: &Address, input: &[u8]) -> i64 {
         (**self).precompile_gas_delta(address, input)
+    }
+
+    fn execution_gas_multiplier(&self) -> Option<u64> {
+        (**self).execution_gas_multiplier()
     }
 
     fn tx_category(&self, ctx: &TxContext) -> Option<String> {

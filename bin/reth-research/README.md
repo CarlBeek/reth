@@ -1,200 +1,67 @@
-# Research Mode ExEx
+# `reth-research` ExEx
 
-**Status: Production Ready ✅**
+This binary runs an execution extension that replays committed canonical blocks under one or more
+alternate gas schedules and writes schedule divergences to SQLite.
 
-This ExEx performs dual execution analysis to detect divergences caused by modified gas costs.
-It processes committed blocks in real-time, executing each transaction twice (normal and experimental)
-and recording any divergences to a SQLite database.
+## Status
 
-## Overview
+Experimental. The ExEx is usable for historical replay research, but it is not production-ready
+evidence for Ethereum EIP ship decisions.
 
-The research mode ExEx:
-1. Subscribes to committed blocks from the execution pipeline via ExEx notifications
-2. Executes each transaction twice for every committed block:
-   - Once with normal gas costs using `TrackingInspector` (baseline)
-   - Once with multiplied gas costs using `GasResearchInspector` (experimental)
-3. Compares execution results across multiple dimensions
-4. Records divergences asynchronously to a SQLite database
-5. Exports metrics for monitoring
+## How It Works
 
-## Divergence Types Detected
+For each committed block at or above `--research.start-block`:
 
-- **Status**: Success/failure differs between executions
-- **Gas Pattern**: Structural differences in gas usage (>5% deviation from expected ratio)
-- **State Root**: Different post-execution state (account balances, storage, nonces)
-- **Event Logs**: Different logs emitted (count, topics, data, or addresses differ)
-- **Out of Gas (OOG)**: Experimental execution runs out of gas while normal succeeds
+1. Build the block EVM environment.
+2. Load historical state at `block - 1`.
+3. Execute each transaction once under baseline pricing with `TrackingInspector`.
+4. Re-execute the same transaction once per configured execution schedule with
+   `ScheduleInspector`.
+5. Record any divergence in gas, status, call tree, or emitted logs.
 
-## Features
+Each execution-modifying schedule gets its own state view for the block, so schedule-induced
+failures can affect later transactions under that same schedule.
 
-✅ **Real-time Analysis**: Processes blocks as they're committed, no re-sync needed
-✅ **Async Database Writes**: Non-blocking SQLite writes with dedicated task
-✅ **Reorg Handling**: Automatically processes new chain after reorgs
-✅ **Detailed Tracing**: Optional call tree and event log recording
-✅ **Metrics Export**: Prometheus-compatible metrics for monitoring
-✅ **Configurable Start Block**: Skip early blocks with `--research.start-block`
-✅ **OOG Detection**: Identifies when experimental execution hits gas limits
-✅ **Operation Counting**: Tracks opcodes executed in both normal and experimental runs
+## Supported Flags
 
-## Configuration
+- `--research.eip2780`
+- `--research.csv NAME=PATH`
+- `--research.multiplier NAME=MULT`
+- `--research.db-path PATH`
+- `--research.start-block BLOCK`
 
-Research mode supports the following CLI arguments:
+At least one schedule flag is required.
+
+## Example
 
 ```bash
---research.enabled                    # Enable research mode (required)
---research.gas-multiplier <N>         # Multiply gas costs by N (default: 128)
---research.start-block <BLOCK>        # Start analyzing from this block (default: 0)
---research.db-path <PATH>             # SQLite database path (default: ./divergence.db)
---research.refund-multiplier <N>      # Multiply gas refunds (default: 128.0)
---research.stipend-multiplier <N>     # Multiply gas stipends (default: 128.0)
-```
-
-## Database Schema
-
-Divergences are stored in SQLite with the following structure:
-
-```sql
-CREATE TABLE divergences (
-    id INTEGER PRIMARY KEY,
-    block_number INTEGER,
-    tx_index INTEGER,
-    tx_hash TEXT,
-    timestamp INTEGER,
-    divergence_types TEXT,  -- JSON array
-    normal_gas_used INTEGER,
-    experimental_gas_used INTEGER,
-    gas_efficiency_ratio REAL,
-    divergence_data TEXT    -- JSON with full details
-);
-```
-
-## Running
-
-### On an Already-Synced Node (Recommended)
-
-For analyzing blocks as your node processes them (no re-sync required):
-
-```bash
-# Build the research binary
-cargo build --release -p reth-research
-
-# Run with research mode enabled
-./target/release/reth-research node \
-  --research.enabled \
-  --research.gas-multiplier 128 \
-  --research.start-block 18000000 \
-  --research.db-path ./divergences.db
-```
-
-The ExEx will start analyzing committed blocks from your current tip (or `--research.start-block` if higher).
-
-### For Re-analyzing Historical Blocks
-
-To re-execute a specific block range:
-
-```bash
-# Unwind execution stage to start block
-reth stage unwind execution --to 18000000
-
-# Re-run execution with research mode
-reth stage run execution --to 18500000 \
-  --research.enabled \
-  --research.start-block 18000000 \
-  --research.gas-multiplier 128 \
-  --research.db-path ./divergences.db
-```
-
-### Development Mode
-
-For testing on a dev chain:
-
-```bash
-cargo run --release -p reth-research -- node --dev --dev.block-time 5s \
-  --research.enabled \
-  --research.gas-multiplier 128 \
-  --research.db-path ./divergences.db
-```
-
-### Xeon Performance Mode
-
-For high-throughput research runs on a dedicated server (for example Xeon Gold 5412U, 128 GB RAM):
-
-```bash
-bin/reth-research/scripts/run_xeon_perf.sh \
-  --datadir /data/reth \
+cargo run --release -p reth-research -- node \
   --research.eip2780 \
-  --research.db-path /data/research/divergences.db
+  --research.csv 7904-prelim=./schedules/7904_prelim.csv \
+  --research.multiplier 4x=4 \
+  --research.db-path ./divergences.db \
+  --research.start-block 18000000
 ```
 
-Notes:
-- The script builds `reth-research` with `--profile maxperf` and `-C target-cpu=native`.
-- It auto-derives worker counts from available CPU cores and sets a large engine cross-block cache from system RAM.
-- Override defaults with environment variables:
-  - `RETH_RESERVED_CPU_CORES`
-  - `RETH_ENGINE_CROSS_BLOCK_CACHE_MB`
-  - `RETH_ENGINE_PREWARMING_THREADS`
-  - `RETH_ENGINE_STORAGE_WORKERS`
-  - `RETH_ENGINE_ACCOUNT_WORKERS`
-  - `RETH_RPC_MAX_CONCURRENT_DB_REQUESTS`
+## What Gets Stored
 
-## Querying Divergences
+The SQLite `schedule_divergences` table stores, per schedule and transaction:
 
-### Basic Queries
+- baseline and schedule success
+- baseline and schedule gas used
+- intrinsic gas data
+- gas delta and gas efficiency ratio
+- tx category for intrinsic schedules
+- affected opcode / precompile metadata
+- OOG and first-divergence metadata
+- serialized call frames when the call tree diverges
+- serialized event logs when emitted logs diverge
 
-```bash
-# Count total divergences
-sqlite3 divergences.db "SELECT COUNT(*) FROM divergences;"
+## Important Limits
 
-# View recent divergences
-sqlite3 divergences.db "SELECT block_number, tx_index, divergence_types FROM divergences ORDER BY block_number DESC LIMIT 10;"
-
-# Find status divergences (critical)
-sqlite3 divergences.db "SELECT * FROM divergences WHERE divergence_types LIKE '%Status%' LIMIT 10;"
-
-# Find high gas efficiency changes
-sqlite3 divergences.db "SELECT block_number, tx_hash, gas_efficiency_ratio FROM divergences WHERE ABS(gas_efficiency_ratio - 1.0) > 0.1 ORDER BY ABS(gas_efficiency_ratio - 1.0) DESC LIMIT 20;"
-```
-
-## Architecture
-
-The ExEx operates as a separate task that:
-
-1. **Subscribes to Block Notifications**: Receives `ChainCommitted` events with finalized blocks
-2. **Dual Execution Pipeline**:
-   - Creates two independent EVM instances per transaction
-   - Normal execution with `TrackingInspector` for baseline
-   - Experimental execution with `GasResearchInspector` applying gas multipliers
-3. **Divergence Detection**: Compares execution results across:
-   - Success/failure status
-   - Gas consumption patterns
-   - State changes (account info, storage)
-   - Event logs emitted
-4. **Async Database Writer**: Queues divergences for non-blocking SQLite writes
-5. **Metrics Export**: Publishes Prometheus metrics for monitoring
-
-## Metrics
-
-The ExEx exports the following metrics:
-
-- `research_blocks_processed`: Total blocks analyzed
-- `research_divergences_total`: Count by divergence type
-- `research_gas_efficiency_ratio`: Distribution of gas efficiency changes
-- `research_oog_events`: Out-of-gas occurrences by pattern
-- `research_block_processing_time`: Per-block analysis duration
-
-## Performance Considerations
-
-- **CPU**: Dual execution approximately doubles CPU usage during block processing
-- **Memory**: Maintains two separate EVM caches per transaction (typically <100MB extra)
-- **Disk I/O**: Async SQLite writes minimize impact on block processing
-- **State Access**: Re-fetches historical state for each execution to ensure isolation
-
-## Related Files
-
-- `bin/reth-research/src/main.rs` - ExEx entry point and dual execution logic
-- `crates/research/` - Core research mode implementation
-  - `src/inspector.rs` - Gas multiplier inspector
-  - `src/tracking_inspector.rs` - Baseline tracking inspector
-  - `src/divergence.rs` - Divergence types and analysis
-  - `src/database.rs` - SQLite persistence layer
-- `crates/stages/stages/src/stages/execution.rs` - Stage-based research integration (alternative approach)
+- This is canonical historical replay, not a simulation of how users or builders would adapt.
+- State-root comparison is not yet persisted in the live ExEx path.
+- A schedule that lowers intrinsic gas can still be conservatively modeled in the execution replay
+  because the baseline EVM transaction pipeline is being reused.
+- Full verification is currently blocked by unrelated workspace compile failures in
+  [`receipt.rs`](/Users/carl/projects/reth/crates/ethereum/primitives/src/receipt.rs).

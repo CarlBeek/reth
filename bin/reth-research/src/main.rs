@@ -18,7 +18,7 @@
 //! ```
 
 use alloy_consensus::{constants::KECCAK_EMPTY, transaction::TxHashRef, BlockHeader, Transaction};
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{keccak256, logs_bloom, Address, Bloom, Bytes, U256};
 use clap::Parser;
 use futures::TryStreamExt;
 use reth_ethereum::{
@@ -31,13 +31,14 @@ use reth_node_core::args::ResearchArgs;
 use reth_primitives_traits::BlockBody;
 use reth_provider::StateProviderFactory;
 use reth_research::{
-    database::DivergenceDatabase,
-    divergence::DivergenceType,
+    database::{DivergenceDatabase, ScheduleBlockCoverage},
+    divergence::{CallFrame, DivergenceType, EventLog},
     schedule::{GasSchedule, RecipientInfo, ScheduleKind, ScheduleRegistry, TxContext},
-    ScheduleDivergence, ScheduleInspector,
+    ScheduleDivergence, ScheduleInspector, TrackingInspector,
 };
 use reth_revm::{database::StateProviderDatabase, db::State, Database, DatabaseCommit};
 use reth_tracing::tracing::{debug, info, warn};
+use revm_interpreter::gas::calculate_initial_tx_gas;
 use std::{collections::HashMap, sync::Arc};
 use tokio::{
     sync::mpsc,
@@ -47,7 +48,33 @@ use tokio::{
 
 enum DbCommand {
     Record(ScheduleDivergence),
+    RecordCoverage(ScheduleBlockCoverage),
     DeleteRange { from_block: u64, to_block: u64 },
+}
+
+#[derive(Clone)]
+struct ScheduleMetadata {
+    kind: String,
+    description: String,
+    config_hash: String,
+    affected_opcodes: Option<String>,
+    affected_precompiles: Option<String>,
+}
+
+#[derive(Default)]
+struct BlockCoverageAccumulator {
+    tx_count: u64,
+    divergence_count: u64,
+    status_divergence_count: u64,
+    gas_divergence_count: u64,
+    call_tree_divergence_count: u64,
+    event_log_divergence_count: u64,
+    output_divergence_count: u64,
+    created_address_divergence_count: u64,
+    logs_bloom_divergence_count: u64,
+    total_baseline_gas_used: u64,
+    total_schedule_gas_used: u64,
+    total_gas_delta: i64,
 }
 
 fn flush_pending_divergence_batch(
@@ -116,7 +143,7 @@ struct ResearchExEx<Node: FullNodeComponents> {
     /// Whether any configured schedule modifies intrinsic gas.
     has_intrinsic_schedules: bool,
     /// Static formatted schedule metadata reused across blocks
-    schedule_metadata: HashMap<String, (Option<String>, Option<String>)>,
+    schedule_metadata: HashMap<String, ScheduleMetadata>,
     /// Start block for analysis
     start_block: u64,
     /// Channel sender for async database writes
@@ -129,11 +156,61 @@ struct ResearchExEx<Node: FullNodeComponents> {
 }
 
 impl<Node: FullNodeComponents> ResearchExEx<Node> {
-    fn baseline_intrinsic_gas_from_parts(is_create: bool, input: &[u8]) -> u64 {
-        let base = if is_create { 53_000 } else { 21_000 };
-        let zero_bytes = input.iter().filter(|&&b| b == 0).count() as u64;
-        let nonzero_bytes = input.len() as u64 - zero_bytes;
-        base + (zero_bytes * 4 + nonzero_bytes * 16)
+    fn serialize_trace<T: serde::Serialize>(value: &T) -> Option<String> {
+        serde_json::to_string(value).ok()
+    }
+
+    fn hash_bytes(bytes: &[u8]) -> String {
+        format!("{:#x}", keccak256(bytes))
+    }
+
+    fn hash_serialized<T: serde::Serialize>(value: &T) -> Option<String> {
+        Self::serialize_trace(value).map(|json| Self::hash_bytes(json.as_bytes()))
+    }
+
+    fn hex_address(address: Address) -> String {
+        format!("{address:#x}")
+    }
+
+    fn hex_bloom(bloom: Bloom) -> String {
+        format!("{bloom:#x}")
+    }
+
+    fn output_hash_and_len<HR>(
+        result: &revm::context_interface::result::ExecutionResult<HR>,
+    ) -> (Option<String>, Option<u64>) {
+        result
+            .output()
+            .map(|output| (Some(Self::hash_bytes(output.as_ref())), Some(output.len() as u64)))
+            .unwrap_or((None, None))
+    }
+
+    fn logs_bloom_hex<HR>(result: &revm::context_interface::result::ExecutionResult<HR>) -> String {
+        Self::hex_bloom(logs_bloom(result.logs().iter()))
+    }
+
+    fn count_input_bytes(input: &Bytes) -> (u64, u64) {
+        let zero = input.iter().filter(|&&byte| byte == 0).count() as u64;
+        (zero, input.len() as u64 - zero)
+    }
+
+    fn baseline_intrinsic_gas(
+        input: &Bytes,
+        is_create: bool,
+        access_list_accounts: u64,
+        access_list_storage_slots: u64,
+        authorization_list_num: u64,
+        spec_id: impl Into<revm_primitives::hardfork::SpecId>,
+    ) -> u64 {
+        calculate_initial_tx_gas(
+            spec_id.into(),
+            input,
+            is_create,
+            access_list_accounts,
+            access_list_storage_slots,
+            authorization_list_num,
+        )
+        .initial_gas
     }
 
     /// Create a new research ExEx.
@@ -153,18 +230,42 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             .collect();
         let has_intrinsic_schedules =
             all_schedules.iter().any(|schedule| schedule.modifies_intrinsic());
-        let schedule_metadata: HashMap<String, (Option<String>, Option<String>)> = all_schedules
+        let schedule_metadata: HashMap<String, ScheduleMetadata> = all_schedules
             .iter()
             .map(|schedule| {
-                let metadata = if schedule.modifies_execution() {
-                    (
-                        Some(format!("{:?}", schedule.affected_opcodes())),
-                        Some(format!("{:?}", schedule.affected_precompiles())),
-                    )
+                let affected_opcodes = if schedule.modifies_execution() {
+                    Some(format!("{:?}", schedule.affected_opcodes()))
                 } else {
-                    (None, None)
+                    None
                 };
-                (schedule.name().to_string(), metadata)
+                let affected_precompiles = if schedule.modifies_execution() {
+                    Some(format!("{:?}", schedule.affected_precompiles()))
+                } else {
+                    None
+                };
+                let kind = format!("{:?}", schedule.kind());
+                let description = schedule.description().to_string();
+                let config_hash = Self::hash_bytes(
+                    format!(
+                        "{}|{}|{}|{:?}|{:?}",
+                        schedule.name(),
+                        description,
+                        kind,
+                        schedule.affected_opcodes(),
+                        schedule.affected_precompiles()
+                    )
+                    .as_bytes(),
+                );
+                (
+                    schedule.name().to_string(),
+                    ScheduleMetadata {
+                        kind,
+                        description,
+                        config_hash,
+                        affected_opcodes,
+                        affected_precompiles,
+                    },
+                )
             })
             .collect();
 
@@ -236,6 +337,19 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                                 );
                             }
                         }
+                        DbCommand::RecordCoverage(coverage) => {
+                            if let Err(error) =
+                                divergence_db.record_schedule_block_coverage(&coverage)
+                            {
+                                warn!(
+                                    target: "exex::research::db_writer",
+                                    block = coverage.block_number,
+                                    schedule = coverage.schedule_name,
+                                    %error,
+                                    "Failed to record schedule block coverage"
+                                );
+                            }
+                        }
                         DbCommand::DeleteRange { from_block, to_block } => {
                             flush_pending_divergence_batch(
                                 &divergence_db,
@@ -262,6 +376,28 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                                         to_block,
                                         error = %e,
                                         "Failed to delete non-canonical schedule divergences"
+                                    );
+                                }
+                            }
+                            match divergence_db
+                                .delete_schedule_block_coverage_in_block_range(from_block, to_block)
+                            {
+                                Ok(deleted) => {
+                                    info!(
+                                        target: "exex::research::db_writer",
+                                        from_block,
+                                        to_block,
+                                        deleted,
+                                        "Deleted schedule coverage rows for non-canonical block range"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        target: "exex::research::db_writer",
+                                        from_block,
+                                        to_block,
+                                        error = %e,
+                                        "Failed to delete non-canonical schedule coverage"
                                     );
                                 }
                             }
@@ -451,6 +587,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
         Node::Evm: ConfigureEvm,
     {
         let block_number = block.number();
+        let block_hash = block.hash();
+        let parent_hash = block.parent_hash();
         let block_start = std::time::Instant::now();
         let provider = self.ctx.provider();
         let block_timestamp = block.timestamp();
@@ -467,6 +605,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 return Err(e.into());
             }
         };
+        let spec_id = evm_env.cfg_env.spec;
 
         // Get state for both baseline and inspected execution once per block.
         // During initial pipeline sync the Finish stage checkpoint lags behind Execution,
@@ -528,6 +667,11 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             }
             dbs
         };
+        let mut block_coverage: HashMap<String, BlockCoverageAccumulator> = self
+            .all_schedules
+            .iter()
+            .map(|schedule| (schedule.name().to_string(), BlockCoverageAccumulator::default()))
+            .collect();
 
         for (tx_idx, tx) in block.transactions_recovered().enumerate() {
             let tx_env = self.ctx.evm_config().tx_env(tx);
@@ -538,12 +682,24 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             let is_create = tx_kind.is_create();
             let recipient: Option<Address> = tx_kind.to().copied();
             let gas_limit: u64 = tx.gas_limit();
-            let baseline_intrinsic_gas =
-                Self::baseline_intrinsic_gas_from_parts(is_create, tx.input());
+            let sender = tx.signer();
+            let value: U256 = tx.value();
+            let input: Bytes = tx.input().clone();
+            let access_list_accounts =
+                tx.access_list().map(|list| list.len()).unwrap_or_default() as u64;
+            let access_list_storage_slots =
+                tx.access_list().map(|list| list.storage_keys_count()).unwrap_or_default() as u64;
+            let authorization_count = tx.authorization_count().unwrap_or_default();
+            let baseline_intrinsic_gas = Self::baseline_intrinsic_gas(
+                &input,
+                is_create,
+                access_list_accounts,
+                access_list_storage_slots,
+                authorization_count,
+                spec_id,
+            );
+            let (input_zero_bytes, input_nonzero_bytes) = Self::count_input_bytes(&input);
             let tx_context = if self.has_intrinsic_schedules {
-                let sender = tx.signer();
-                let value: U256 = tx.value();
-                let input: Bytes = tx.input().clone();
                 let recipient_info = match recipient {
                     Some(recipient_addr) => match normal_db.basic(recipient_addr) {
                         Ok(Some(account)) => Some(RecipientInfo {
@@ -574,10 +730,11 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 };
 
                 Some(TxContext {
+                    baseline_intrinsic_gas,
                     sender,
                     recipient,
                     value,
-                    input,
+                    input: input.clone(),
                     gas_limit,
                     is_create,
                     recipient_info,
@@ -587,8 +744,12 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             };
 
             // --- EXECUTION: Baseline ---
-            let mut normal_evm =
-                self.ctx.evm_config().evm_with_env(&mut normal_db, evm_env.clone());
+            let mut baseline_inspector = TrackingInspector::new();
+            let mut normal_evm = self.ctx.evm_config().evm_with_env_and_inspector(
+                &mut normal_db,
+                evm_env.clone(),
+                &mut baseline_inspector,
+            );
             let normal_result = match normal_evm.transact(tx_env.clone()) {
                 Ok(result) => result,
                 Err(e) => {
@@ -603,6 +764,16 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 }
             };
             drop(normal_evm);
+            let baseline_call_frames = baseline_inspector.call_frames().to_vec();
+            let baseline_event_logs = baseline_inspector.event_logs().to_vec();
+            let (baseline_output_hash, baseline_output_len) =
+                Self::output_hash_and_len(&normal_result.result);
+            let baseline_created_address =
+                normal_result.result.created_address().map(Self::hex_address);
+            let baseline_log_count = normal_result.result.logs().len() as u64;
+            let baseline_logs_bloom = Self::logs_bloom_hex(&normal_result.result);
+            let baseline_call_frames_hash = Self::hash_serialized(&baseline_call_frames);
+            let baseline_event_logs_hash = Self::hash_serialized(&baseline_event_logs);
             normal_db.commit(normal_result.state);
 
             // --- EXECUTION: Per-schedule re-execution with gas modifications ---
@@ -611,9 +782,18 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             struct PerScheduleResult {
                 success: bool,
                 gas_used: u64,
-                operation_counts: String,
+                operation_counts: Option<String>,
                 oog_info: Option<String>,
                 divergence_location: Option<String>,
+                call_frames: Vec<CallFrame>,
+                event_logs: Vec<EventLog>,
+                output_hash: Option<String>,
+                output_len: Option<u64>,
+                created_address: Option<String>,
+                log_count: u64,
+                logs_bloom: String,
+                call_frames_hash: Option<String>,
+                event_logs_hash: Option<String>,
             }
 
             // Indexed parallel to self.execution_schedules — accessed by schedule
@@ -701,9 +881,18 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         schedule_results.push(PerScheduleResult {
                             success: false,
                             gas_used: gas_limit,
-                            operation_counts: String::new(),
+                            operation_counts: None,
                             oog_info: Some(format!("EVM transact failed: {e:?}")),
                             divergence_location: None,
+                            call_frames: Vec::new(),
+                            event_logs: Vec::new(),
+                            output_hash: None,
+                            output_len: None,
+                            created_address: None,
+                            log_count: 0,
+                            logs_bloom: Self::hex_bloom(Bloom::ZERO),
+                            call_frames_hash: None,
+                            event_logs_hash: None,
                         });
                         continue;
                     }
@@ -712,8 +901,14 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
 
                 let sched_success = result.result.is_success();
                 let sched_gas_used = result.result.gas_used();
-                let op_counts = format!("{:?}", inspector.operation_counts());
+                let op_counts = Self::serialize_trace(inspector.operation_counts());
                 let insp_result = inspector.result();
+                let (output_hash, output_len) = Self::output_hash_and_len(&result.result);
+                let created_address = result.result.created_address().map(Self::hex_address);
+                let log_count = result.result.logs().len() as u64;
+                let logs_bloom = Self::logs_bloom_hex(&result.result);
+                let call_frames = inspector.call_frames().to_vec();
+                let event_logs = inspector.event_logs().to_vec();
 
                 db.commit(result.state);
 
@@ -726,6 +921,15 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         .divergence_location
                         .as_ref()
                         .map(|loc| format!("{loc:?}")),
+                    call_frames_hash: Self::hash_serialized(&call_frames),
+                    event_logs_hash: Self::hash_serialized(&event_logs),
+                    call_frames,
+                    event_logs,
+                    output_hash,
+                    output_len,
+                    created_address,
+                    log_count,
+                    logs_bloom,
                 });
             }
 
@@ -769,6 +973,24 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     formatted_op_counts,
                     oog_info,
                     divergence_location,
+                    call_tree_diverged,
+                    event_logs_diverged,
+                    baseline_call_frames_json,
+                    schedule_call_frames_json,
+                    baseline_event_logs_json,
+                    schedule_event_logs_json,
+                    baseline_call_frames_hash_row,
+                    schedule_call_frames_hash_row,
+                    baseline_event_logs_hash_row,
+                    schedule_event_logs_hash_row,
+                    schedule_output_hash,
+                    schedule_output_len,
+                    schedule_created_address,
+                    schedule_log_count,
+                    schedule_logs_bloom,
+                    output_changed,
+                    created_address_changed,
+                    logs_bloom_changed,
                 ) = match exec_result {
                     Some(r) => {
                         // EVM reports gas_used including baseline intrinsic.
@@ -787,19 +1009,75 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                             r.gas_used
                         };
                         let success = r.success && gas <= gas_limit;
+                        let call_tree_diverged = r.call_frames != baseline_call_frames;
+                        let event_logs_diverged = r.event_logs != baseline_event_logs;
+                        let output_changed = r.output_hash != baseline_output_hash
+                            || r.output_len != baseline_output_len;
+                        let created_address_changed = r.created_address != baseline_created_address;
+                        let logs_bloom_changed = r.logs_bloom != baseline_logs_bloom;
                         (
                             gas,
                             success,
-                            Some(r.operation_counts.clone()),
+                            r.operation_counts.clone(),
                             r.oog_info.clone(),
                             r.divergence_location.clone(),
+                            call_tree_diverged,
+                            event_logs_diverged,
+                            call_tree_diverged
+                                .then(|| Self::serialize_trace(&baseline_call_frames))
+                                .flatten(),
+                            call_tree_diverged
+                                .then(|| Self::serialize_trace(&r.call_frames))
+                                .flatten(),
+                            event_logs_diverged
+                                .then(|| Self::serialize_trace(&baseline_event_logs))
+                                .flatten(),
+                            event_logs_diverged
+                                .then(|| Self::serialize_trace(&r.event_logs))
+                                .flatten(),
+                            baseline_call_frames_hash.clone(),
+                            r.call_frames_hash.clone(),
+                            baseline_event_logs_hash.clone(),
+                            r.event_logs_hash.clone(),
+                            r.output_hash.clone(),
+                            r.output_len,
+                            r.created_address.clone(),
+                            r.log_count,
+                            r.logs_bloom.clone(),
+                            output_changed,
+                            created_address_changed,
+                            logs_bloom_changed,
                         )
                     }
                     None => {
                         // Intrinsic-only schedule: estimate from baseline
                         let gas = (normal_gas_used as i64 + intrinsic_delta).max(0) as u64;
                         let success = normal_success && gas <= gas_limit;
-                        (gas, success, None, None, None)
+                        (
+                            gas,
+                            success,
+                            None,
+                            None,
+                            None,
+                            false,
+                            false,
+                            None,
+                            None,
+                            None,
+                            None,
+                            baseline_call_frames_hash.clone(),
+                            baseline_call_frames_hash.clone(),
+                            baseline_event_logs_hash.clone(),
+                            baseline_event_logs_hash.clone(),
+                            baseline_output_hash.clone(),
+                            baseline_output_len,
+                            baseline_created_address.clone(),
+                            baseline_log_count,
+                            baseline_logs_bloom.clone(),
+                            false,
+                            false,
+                            false,
+                        )
                     }
                 };
 
@@ -811,9 +1089,23 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 let would_oog = !schedule_success && normal_success;
 
                 // Record divergence if there's a gas delta or status change
-                if total_delta != 0 || would_oog || schedule_success != normal_success {
+                let status_changed = schedule_success != normal_success;
+                let gas_changed = total_delta != 0;
+                if gas_changed
+                    || would_oog
+                    || status_changed
+                    || call_tree_diverged
+                    || event_logs_diverged
+                    || output_changed
+                    || created_address_changed
+                    || logs_bloom_changed
+                {
                     let divergence_type = if would_oog || schedule_success != normal_success {
                         DivergenceType::Status
+                    } else if event_logs_diverged {
+                        DivergenceType::EventLogs
+                    } else if call_tree_diverged {
+                        DivergenceType::CallTree
                     } else {
                         DivergenceType::GasPattern
                     };
@@ -823,8 +1115,11 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     } else {
                         None
                     };
-                    let (affected_opcodes, affected_precompiles) =
-                        self.schedule_metadata.get(schedule_name).cloned().unwrap_or((None, None));
+                    let metadata = self
+                        .schedule_metadata
+                        .get(schedule_name)
+                        .cloned()
+                        .expect("all schedules should have static metadata");
 
                     let div = ScheduleDivergence {
                         schedule_name: schedule_name.to_string(),
@@ -833,6 +1128,11 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         tx_hash,
                         timestamp: block_timestamp,
                         divergence_type,
+                        schedule_kind: metadata.kind.clone(),
+                        schedule_description: metadata.description.clone(),
+                        schedule_config_hash: metadata.config_hash.clone(),
+                        block_hash,
+                        parent_hash,
                         baseline_success: normal_success,
                         baseline_gas_used: normal_gas_used,
                         baseline_intrinsic_gas,
@@ -842,16 +1142,122 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         gas_delta: total_delta,
                         gas_efficiency_ratio,
                         tx_category: tx_category.map(|s| s.to_string()),
-                        affected_opcodes,
-                        affected_precompiles,
+                        affected_opcodes: metadata.affected_opcodes.clone(),
+                        affected_precompiles: metadata.affected_precompiles.clone(),
                         oog_info,
                         divergence_location,
                         operation_counts: formatted_op_counts,
+                        baseline_call_frames: baseline_call_frames_json,
+                        schedule_call_frames: schedule_call_frames_json,
+                        baseline_event_logs: baseline_event_logs_json,
+                        schedule_event_logs: schedule_event_logs_json,
+                        baseline_call_frames_hash: baseline_call_frames_hash_row,
+                        schedule_call_frames_hash: schedule_call_frames_hash_row,
+                        baseline_event_logs_hash: baseline_event_logs_hash_row,
+                        schedule_event_logs_hash: schedule_event_logs_hash_row,
+                        status_changed,
+                        gas_changed,
+                        call_tree_changed: call_tree_diverged,
+                        event_logs_changed: event_logs_diverged,
+                        output_changed,
+                        created_address_changed,
+                        logs_bloom_changed,
+                        sender: Self::hex_address(sender),
+                        recipient: recipient.map(Self::hex_address),
+                        value_wei: value.to_string(),
+                        input_len: input.len() as u64,
+                        input_zero_bytes,
+                        input_nonzero_bytes,
+                        tx_gas_limit: gas_limit,
+                        access_list_accounts,
+                        access_list_storage_slots,
+                        authorization_count,
+                        is_create,
+                        baseline_output_len,
+                        schedule_output_len,
+                        baseline_output_hash: baseline_output_hash.clone(),
+                        schedule_output_hash,
+                        baseline_created_address: baseline_created_address.clone(),
+                        schedule_created_address,
+                        baseline_log_count,
+                        schedule_log_count,
+                        baseline_logs_bloom: baseline_logs_bloom.clone(),
+                        schedule_logs_bloom,
                     };
 
                     self.record_divergence(div);
                     self.divergences_found += 1;
                 }
+
+                let coverage = block_coverage
+                    .get_mut(schedule_name)
+                    .expect("every schedule should have a coverage accumulator");
+                coverage.tx_count += 1;
+                coverage.total_baseline_gas_used += normal_gas_used;
+                coverage.total_schedule_gas_used += schedule_gas;
+                coverage.total_gas_delta += total_delta;
+                if gas_changed
+                    || would_oog
+                    || status_changed
+                    || call_tree_diverged
+                    || event_logs_diverged
+                    || output_changed
+                    || created_address_changed
+                    || logs_bloom_changed
+                {
+                    coverage.divergence_count += 1;
+                }
+                if status_changed || would_oog {
+                    coverage.status_divergence_count += 1;
+                }
+                if gas_changed {
+                    coverage.gas_divergence_count += 1;
+                }
+                if call_tree_diverged {
+                    coverage.call_tree_divergence_count += 1;
+                }
+                if event_logs_diverged {
+                    coverage.event_log_divergence_count += 1;
+                }
+                if output_changed {
+                    coverage.output_divergence_count += 1;
+                }
+                if created_address_changed {
+                    coverage.created_address_divergence_count += 1;
+                }
+                if logs_bloom_changed {
+                    coverage.logs_bloom_divergence_count += 1;
+                }
+            }
+        }
+
+        for schedule in &self.all_schedules {
+            if let Some(coverage) = block_coverage.remove(schedule.name()) {
+                let metadata = self
+                    .schedule_metadata
+                    .get(schedule.name())
+                    .expect("all schedules should have static metadata");
+                self.record_block_coverage(ScheduleBlockCoverage {
+                    schedule_name: schedule.name().to_string(),
+                    schedule_kind: metadata.kind.clone(),
+                    schedule_config_hash: metadata.config_hash.clone(),
+                    block_number,
+                    block_hash,
+                    parent_hash,
+                    timestamp: block_timestamp,
+                    tx_count: coverage.tx_count,
+                    divergence_count: coverage.divergence_count,
+                    status_divergence_count: coverage.status_divergence_count,
+                    gas_divergence_count: coverage.gas_divergence_count,
+                    call_tree_divergence_count: coverage.call_tree_divergence_count,
+                    event_log_divergence_count: coverage.event_log_divergence_count,
+                    output_divergence_count: coverage.output_divergence_count,
+                    created_address_divergence_count: coverage.created_address_divergence_count,
+                    logs_bloom_divergence_count: coverage.logs_bloom_divergence_count,
+                    total_baseline_gas_used: coverage.total_baseline_gas_used,
+                    total_schedule_gas_used: coverage.total_schedule_gas_used,
+                    total_gas_delta: coverage.total_gas_delta,
+                });
             }
         }
 
@@ -929,6 +1335,18 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     from_block,
                     to_block,
                     "Queued non-canonical divergence cleanup"
+                );
+            }
+        }
+    }
+
+    fn record_block_coverage(&self, coverage: ScheduleBlockCoverage) {
+        if let Some(ref tx) = self.db_tx {
+            if let Err(e) = tx.send(DbCommand::RecordCoverage(coverage)) {
+                warn!(
+                    target: "exex::research",
+                    error = %e,
+                    "Failed to queue schedule coverage for database writer"
                 );
             }
         }

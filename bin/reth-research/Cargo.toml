@@ -29,6 +29,8 @@ alloy-primitives.workspace = true
 
 # Revm
 revm.workspace = true
+revm-interpreter.workspace = true
+revm-primitives.workspace = true
 
 # Standard
 eyre.workspace = true
@@ -36,3 +38,5 @@ futures.workspace = true
 clap = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["sync"] }
 rayon.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
