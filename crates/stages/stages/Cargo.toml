@@ -44,7 +44,6 @@ reth-trie = { workspace = true, features = ["metrics"] }
 reth-trie-db = { workspace = true, features = ["metrics"] }
 
 reth-testing-utils = { workspace = true, optional = true }
-reth-research = { path = "../../research", optional = true }
 
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
@@ -99,7 +98,6 @@ paste.workspace = true
 tempfile.workspace = true
 
 [features]
-research = ["dep:reth-research"]
 test-utils = [
     "reth-network-p2p/test-utils",
     "reth-db/test-utils",

@@ -1,0 +1,25 @@
+name: research
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo +nightly fmt --all --check
+
+      - name: clippy (research crate)
+        run: cargo +nightly clippy -p reth-research --all-features -- -D warnings
+
+      - name: test (research crate)
+        run: cargo test -p reth-research

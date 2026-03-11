@@ -94,12 +94,6 @@ where
     exex_manager_handle: ExExManagerHandle<E::Primitives>,
     /// Executor metrics.
     metrics: ExecutorMetrics,
-    /// Research mode configuration (optional)
-    #[cfg(feature = "research")]
-    research_config: Option<reth_research::config::ResearchConfig>,
-    /// Research mode divergence database (optional)
-    #[cfg(feature = "research")]
-    research_db: Option<reth_research::database::DivergenceDatabase>,
 }
 
 impl<E> ExecutionStage<E>
@@ -123,23 +117,7 @@ where
             post_unwind_commit_input: None,
             exex_manager_handle,
             metrics: ExecutorMetrics::default(),
-            #[cfg(feature = "research")]
-            research_config: None,
-            #[cfg(feature = "research")]
-            research_db: None,
         }
-    }
-
-    /// Set research mode configuration.
-    #[cfg(feature = "research")]
-    pub fn with_research_mode(
-        mut self,
-        config: reth_research::config::ResearchConfig,
-        db: reth_research::database::DivergenceDatabase,
-    ) -> Self {
-        self.research_config = Some(config);
-        self.research_db = Some(db);
-        self
     }
 
     /// Create an execution stage with the provided executor.
@@ -280,30 +258,6 @@ where
         Ok(())
     }
 
-    /// Analyze a block by replaying its transactions with the research inspector.
-    /// TODO: Update to new EVM API - currently disabled due to API changes
-    #[cfg(feature = "research")]
-    #[allow(dead_code)]
-    fn analyze_block_with_replay<Provider>(
-        &self,
-        _provider: &Provider,
-        block: &reth_primitives_traits::RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
-        _normal_result: &reth_execution_types::BlockExecutionResult<
-            <E::Primitives as NodePrimitives>::Receipt,
-        >,
-    ) -> Result<(), StageError>
-    where
-        Provider: HeaderProvider + reth_provider::StateProviderFactory,
-    {
-        // TODO: Reimplement with updated EVM API
-        // The EVM transact API has changed - this function needs to be updated
-        warn!(
-            target: "sync::stages::execution::research",
-            block = block.number(),
-            "Research mode analysis skipped - awaiting EVM API update"
-        );
-        Ok(())
-    }
 }
 
 impl<E, Provider> Stage<Provider> for ExecutionStage<E>
