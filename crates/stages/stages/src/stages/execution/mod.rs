@@ -193,8 +193,8 @@ where
     ) -> Result<bool, StageError> {
         // We can only prune changesets if we're not executing MerkleStage from scratch (by
         // threshold or first-sync)
-        Ok(max_block - start_block > self.external_clean_threshold ||
-            provider.count_entries::<tables::AccountsTrie>()?.is_zero())
+        Ok(max_block - start_block > self.external_clean_threshold
+            || provider.count_entries::<tables::AccountsTrie>()?.is_zero())
     }
 
     /// Performs consistency check on static files.
@@ -221,7 +221,7 @@ where
         // On old nodes, if there's any receipts pruning configured, receipts are written directly
         // to database and inconsistencies are expected.
         if EitherWriter::receipts_destination(provider).is_database() {
-            return Ok(())
+            return Ok(());
         }
 
         // Get next expected receipt number
@@ -260,10 +260,10 @@ where
             Ordering::Less => {
                 // If we are already in the process of unwind, this might be fine because we will
                 // fix the inconsistency right away.
-                if let Some(unwind_to) = unwind_to &&
-                    unwind_to <= static_file_block_num
+                if let Some(unwind_to) = unwind_to
+                    && unwind_to <= static_file_block_num
                 {
-                    return Ok(())
+                    return Ok(());
                 }
 
                 // Otherwise, this is a real inconsistency - database has more blocks than static
@@ -273,7 +273,7 @@ where
                     &static_file_provider,
                     provider,
                     StaticFileSegment::Receipts,
-                )?)
+                )?);
             }
         }
 
@@ -341,7 +341,7 @@ where
     /// Execute the stage
     fn execute(&mut self, provider: &Provider, input: ExecInput) -> Result<ExecOutput, StageError> {
         if input.target_reached() {
-            return Ok(ExecOutput::done(input.checkpoint()))
+            return Ok(ExecOutput::done(input.checkpoint()));
         }
 
         let start_block = input.next_block();
@@ -409,7 +409,7 @@ where
                 return Err(StageError::Block {
                     block: Box::new(block.block_with_parent()),
                     error: BlockErrorKind::Validation(err),
-                })
+                });
             }
 
             // Research mode analysis: Cannot call analyze_block_with_replay here because
@@ -452,7 +452,7 @@ where
                 cumulative_gas,
                 batch_start.elapsed(),
             ) {
-                break
+                break;
             }
         }
 
@@ -490,7 +490,7 @@ where
                 // means that we didn't send the notification to ExExes
                 return Err(StageError::PostExecuteCommit(
                     "Previous post execute commit input wasn't processed",
-                ))
+                ));
             }
         }
 
@@ -504,15 +504,15 @@ where
                 let Some(reverts) =
                     state.bundle.reverts.get_mut((block_number - start_block) as usize)
                 else {
-                    break
+                    break;
                 };
 
                 // If both account history and storage history pruning is configured, clear reverts
                 // for this block.
                 if prune_modes
                     .account_history
-                    .is_some_and(|m| m.should_prune(block_number, max_block)) &&
-                    prune_modes
+                    .is_some_and(|m| m.should_prune(block_number, max_block))
+                    && prune_modes
                         .storage_history
                         .is_some_and(|m| m.should_prune(block_number, max_block))
                 {
@@ -593,7 +593,7 @@ where
         if range.is_empty() {
             return Ok(UnwindOutput {
                 checkpoint: input.checkpoint.with_block_number(input.unwind_to),
-            })
+            });
         }
 
         reject_cancun_boundary_unwind(provider, input.checkpoint.block_number, unwind_to)?;
@@ -685,7 +685,7 @@ where
                 unwind_to_header.timestamp()
             ))
             .into(),
-        ))
+        ));
     }
 
     Ok(())
@@ -757,8 +757,8 @@ where
                 block_range: CheckpointBlockRange { from: start_block, to: max_block },
                 progress: EntitiesCheckpoint {
                     processed,
-                    total: processed +
-                        calculate_gas_used_from_headers(provider, start_block..=max_block)?,
+                    total: processed
+                        + calculate_gas_used_from_headers(provider, start_block..=max_block)?,
                 },
             }
         }
