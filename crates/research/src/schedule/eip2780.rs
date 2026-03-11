@@ -224,6 +224,19 @@ impl GasSchedule for Eip2780Schedule {
         "EIP-2780: Reduced intrinsic gas based on transaction category"
     }
 
+    fn config_fingerprint(&self) -> String {
+        let categories = self
+            .categories_filter
+            .as_ref()
+            .map(|categories| {
+                let mut labels: Vec<_> = categories.iter().map(ToString::to_string).collect();
+                labels.sort();
+                labels.join(",")
+            })
+            .unwrap_or_else(|| "all".to_string());
+        format!("description={}|categories={categories}", self.description())
+    }
+
     fn kind(&self) -> ScheduleKind {
         ScheduleKind::IntrinsicOnly
     }

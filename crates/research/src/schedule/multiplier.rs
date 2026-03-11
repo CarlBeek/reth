@@ -51,6 +51,10 @@ impl GasSchedule for MultiplierSchedule {
         "Uniform gas cost multiplier"
     }
 
+    fn config_fingerprint(&self) -> String {
+        format!("description={}|multiplier={}", self.description(), self.multiplier)
+    }
+
     fn kind(&self) -> ScheduleKind {
         ScheduleKind::ExecutionOnly
     }

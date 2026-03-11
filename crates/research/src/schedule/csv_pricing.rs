@@ -166,12 +166,49 @@ impl GasPricingTable {
 
     /// Get all affected opcode bytes.
     pub fn affected_opcodes(&self) -> Vec<u8> {
-        self.opcodes.keys().copied().collect()
+        let mut opcodes: Vec<_> = self.opcodes.keys().copied().collect();
+        opcodes.sort_unstable();
+        opcodes
     }
 
     /// Get all affected precompile addresses.
     pub fn affected_precompiles(&self) -> Vec<Address> {
-        self.precompiles.keys().copied().collect()
+        let mut precompiles: Vec<_> = self.precompiles.keys().copied().collect();
+        precompiles.sort_unstable();
+        precompiles
+    }
+
+    /// Returns stable fingerprint material for the pricing table.
+    pub fn config_fingerprint(&self) -> String {
+        let mut rows = Vec::with_capacity(self.opcodes.len() + self.precompiles.len());
+
+        for opcode in self.affected_opcodes() {
+            if let Some(pricing) = self.opcodes.get(&opcode) {
+                rows.push(format!(
+                    "opcode:{opcode:#04x}:{}:{}:{:?}:{:?}:{:?}",
+                    pricing.current_constant,
+                    pricing.new_constant,
+                    pricing.current_variable,
+                    pricing.new_variable,
+                    pricing.variable_type,
+                ));
+            }
+        }
+
+        for address in self.affected_precompiles() {
+            if let Some(pricing) = self.precompiles.get(&address) {
+                rows.push(format!(
+                    "precompile:{address:#x}:{}:{}:{:?}:{:?}:{:?}",
+                    pricing.current_constant,
+                    pricing.new_constant,
+                    pricing.current_variable,
+                    pricing.new_variable,
+                    pricing.variable_type,
+                ));
+            }
+        }
+
+        rows.join("|")
     }
 }
 
@@ -394,6 +431,14 @@ impl GasSchedule for CsvPricingSchedule {
 
     fn description(&self) -> &str {
         "CSV-based per-opcode/precompile gas pricing"
+    }
+
+    fn config_fingerprint(&self) -> String {
+        format!(
+            "{}|pricing={}",
+            <Self as GasSchedule>::description(self),
+            self.pricing_table.config_fingerprint()
+        )
     }
 
     fn kind(&self) -> ScheduleKind {

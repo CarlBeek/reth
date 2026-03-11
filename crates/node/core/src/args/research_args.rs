@@ -38,6 +38,14 @@ pub struct ResearchArgs {
     /// Block number to start research analysis.
     #[arg(long = "research.start-block", default_value_t = 0, help_heading = "Research")]
     pub start_block: u64,
+
+    /// Maximum divergence rows to persist per block.
+    #[arg(
+        long = "research.max-divergences-per-block",
+        value_name = "COUNT",
+        help_heading = "Research"
+    )]
+    pub max_divergences_per_block: Option<usize>,
 }
 
 impl Default for ResearchArgs {
@@ -48,6 +56,7 @@ impl Default for ResearchArgs {
             multiplier_schedules: Vec::new(),
             db_path: PathBuf::from("./divergence.db"),
             start_block: 0,
+            max_divergences_per_block: None,
         }
     }
 }
@@ -82,6 +91,10 @@ impl ResearchArgs {
             .with_db_path(self.db_path.clone())
             .with_start_block(self.start_block);
 
+        if let Some(max) = self.max_divergences_per_block {
+            args = args.with_max_divergences_per_block(max);
+        }
+
         if self.eip2780 {
             args = args.with_eip2780();
         }
@@ -114,6 +127,10 @@ impl ResearchArgs {
         let mut args = reth_research::ResearchArgs::new()
             .with_db_path(self.db_path.clone())
             .with_start_block(self.start_block);
+
+        if let Some(max) = self.max_divergences_per_block {
+            args = args.with_max_divergences_per_block(max);
+        }
 
         if self.eip2780 {
             args = args.with_eip2780();
@@ -212,6 +229,8 @@ mod tests {
             "./results.db",
             "--research.start-block",
             "18000000",
+            "--research.max-divergences-per-block",
+            "25",
         ])
         .args;
         assert!(args.eip2780);
@@ -219,6 +238,7 @@ mod tests {
         assert_eq!(args.multiplier_schedules, vec!["128x=128"]);
         assert_eq!(args.db_path, PathBuf::from("./results.db"));
         assert_eq!(args.start_block, 18000000);
+        assert_eq!(args.max_divergences_per_block, Some(25));
         assert_eq!(args.schedule_count(), 3);
     }
 }

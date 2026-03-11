@@ -228,6 +228,12 @@ impl ResearchArgs {
         self
     }
 
+    /// Set the maximum divergences to persist per block.
+    pub fn with_max_divergences_per_block(mut self, count: usize) -> Self {
+        self.max_divergences_per_block = Some(count);
+        self
+    }
+
     /// Check if any schedules are configured.
     pub fn has_schedules(&self) -> bool {
         self.eip2780_enabled

@@ -39,12 +39,14 @@ use reth_research::{
 use reth_revm::{database::StateProviderDatabase, db::State, Database, DatabaseCommit};
 use reth_tracing::tracing::{debug, info, warn};
 use revm_interpreter::gas::calculate_initial_tx_gas;
-use std::{collections::HashMap, sync::Arc};
-use tokio::{
-    sync::mpsc,
-    task::JoinHandle,
-    time::{self, Duration, MissedTickBehavior},
+use std::{
+    collections::HashMap,
+    sync::{mpsc, Arc},
+    thread::JoinHandle,
 };
+use tokio::time::Duration;
+
+const DB_COMMAND_BUFFER_SIZE: usize = 1024;
 
 enum DbCommand {
     Record(ScheduleDivergence),
@@ -146,8 +148,10 @@ struct ResearchExEx<Node: FullNodeComponents> {
     schedule_metadata: HashMap<String, ScheduleMetadata>,
     /// Start block for analysis
     start_block: u64,
+    /// Maximum divergence rows to persist per block.
+    max_divergences_per_block: Option<usize>,
     /// Channel sender for async database writes
-    db_tx: Option<mpsc::UnboundedSender<DbCommand>>,
+    db_tx: Option<mpsc::SyncSender<DbCommand>>,
     /// Handle for async database writer task
     db_writer_task: Option<JoinHandle<()>>,
     /// Statistics
@@ -174,6 +178,22 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
 
     fn hex_bloom(bloom: Bloom) -> String {
         format!("{bloom:#x}")
+    }
+
+    fn format_affected_opcodes(schedule: &dyn GasSchedule) -> Option<String> {
+        let mut opcodes = schedule.affected_opcodes();
+        opcodes.sort_unstable();
+        (!opcodes.is_empty()).then(|| format!("{opcodes:?}"))
+    }
+
+    fn format_affected_precompiles(schedule: &dyn GasSchedule) -> Option<String> {
+        let mut addresses: Vec<_> = schedule
+            .affected_precompiles()
+            .into_iter()
+            .map(|address| format!("{address:#x}"))
+            .collect();
+        addresses.sort();
+        (!addresses.is_empty()).then(|| format!("{addresses:?}"))
     }
 
     fn output_hash_and_len<HR>(
@@ -219,6 +239,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
         registry: ScheduleRegistry,
         db_path: std::path::PathBuf,
         start_block: u64,
+        max_divergences_per_block: Option<usize>,
     ) -> eyre::Result<Self> {
         let registry = Arc::new(registry);
         let all_schedules = registry.all();
@@ -233,29 +254,11 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
         let schedule_metadata: HashMap<String, ScheduleMetadata> = all_schedules
             .iter()
             .map(|schedule| {
-                let affected_opcodes = if schedule.modifies_execution() {
-                    Some(format!("{:?}", schedule.affected_opcodes()))
-                } else {
-                    None
-                };
-                let affected_precompiles = if schedule.modifies_execution() {
-                    Some(format!("{:?}", schedule.affected_precompiles()))
-                } else {
-                    None
-                };
+                let affected_opcodes = Self::format_affected_opcodes(schedule.as_ref());
+                let affected_precompiles = Self::format_affected_precompiles(schedule.as_ref());
                 let kind = format!("{:?}", schedule.kind());
                 let description = schedule.description().to_string();
-                let config_hash = Self::hash_bytes(
-                    format!(
-                        "{}|{}|{}|{:?}|{:?}",
-                        schedule.name(),
-                        description,
-                        kind,
-                        schedule.affected_opcodes(),
-                        schedule.affected_precompiles()
-                    )
-                    .as_bytes(),
-                );
+                let config_hash = Self::hash_bytes(schedule.config_fingerprint().as_bytes());
                 (
                     schedule.name().to_string(),
                     ScheduleMetadata {
@@ -295,112 +298,105 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             }
 
             // Spawn database writer task
-            let (tx, mut rx) = mpsc::unbounded_channel::<DbCommand>();
-            let writer_task = tokio::spawn(async move {
+            let (tx, rx) = mpsc::sync_channel::<DbCommand>(DB_COMMAND_BUFFER_SIZE);
+            let writer_task = std::thread::Builder::new()
+                .name("reth-research-db-writer".to_string())
+                .spawn(move || {
                 const DB_WRITE_BATCH_SIZE: usize = 256;
                 const DB_WRITE_FLUSH_INTERVAL_MS: u64 = 50;
                 let mut write_count = 0u64;
                 let mut pending_records = Vec::with_capacity(DB_WRITE_BATCH_SIZE);
-                let mut flush_tick =
-                    time::interval(Duration::from_millis(DB_WRITE_FLUSH_INTERVAL_MS));
-                flush_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
                 let mut rx_closed = false;
                 while !rx_closed {
-                    let cmd = tokio::select! {
-                        cmd = rx.recv(), if !rx_closed => cmd,
-                        _ = flush_tick.tick() => {
+                    match rx.recv_timeout(Duration::from_millis(DB_WRITE_FLUSH_INTERVAL_MS)) {
+                        Ok(cmd) => match cmd {
+                            DbCommand::Record(divergence) => {
+                                pending_records.push(divergence);
+                                if pending_records.len() >= DB_WRITE_BATCH_SIZE {
+                                    flush_pending_divergence_batch(
+                                        &divergence_db,
+                                        &mut pending_records,
+                                        &mut write_count,
+                                        "Batch divergence write failed, retrying individually",
+                                    );
+                                }
+                            }
+                            DbCommand::RecordCoverage(coverage) => {
+                                if let Err(error) =
+                                    divergence_db.record_schedule_block_coverage(&coverage)
+                                {
+                                    warn!(
+                                        target: "exex::research::db_writer",
+                                        block = coverage.block_number,
+                                        schedule = coverage.schedule_name,
+                                        %error,
+                                        "Failed to record schedule block coverage"
+                                    );
+                                }
+                            }
+                            DbCommand::DeleteRange { from_block, to_block } => {
+                                flush_pending_divergence_batch(
+                                    &divergence_db,
+                                    &mut pending_records,
+                                    &mut write_count,
+                                    "Failed to flush pending divergence batch before delete, retrying individually",
+                                );
+                                match divergence_db
+                                    .delete_schedule_divergences_in_block_range(from_block, to_block)
+                                {
+                                    Ok(deleted) => {
+                                        info!(
+                                            target: "exex::research::db_writer",
+                                            from_block,
+                                            to_block,
+                                            deleted,
+                                            "Deleted schedule divergences for non-canonical block range"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            target: "exex::research::db_writer",
+                                            from_block,
+                                            to_block,
+                                            error = %e,
+                                            "Failed to delete non-canonical schedule divergences"
+                                        );
+                                    }
+                                }
+                                match divergence_db
+                                    .delete_schedule_block_coverage_in_block_range(from_block, to_block)
+                                {
+                                    Ok(deleted) => {
+                                        info!(
+                                            target: "exex::research::db_writer",
+                                            from_block,
+                                            to_block,
+                                            deleted,
+                                            "Deleted schedule coverage rows for non-canonical block range"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            target: "exex::research::db_writer",
+                                            from_block,
+                                            to_block,
+                                            error = %e,
+                                            "Failed to delete non-canonical schedule coverage"
+                                        );
+                                    }
+                                }
+                            }
+                        },
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
                             flush_pending_divergence_batch(
                                 &divergence_db,
                                 &mut pending_records,
                                 &mut write_count,
                                 "Timed batch divergence flush failed, retrying individually",
                             );
-                            continue;
                         }
-                    };
-
-                    let Some(cmd) = cmd else {
-                        rx_closed = true;
-                        continue;
-                    };
-
-                    match cmd {
-                        DbCommand::Record(divergence) => {
-                            pending_records.push(divergence);
-                            if pending_records.len() >= DB_WRITE_BATCH_SIZE {
-                                flush_pending_divergence_batch(
-                                    &divergence_db,
-                                    &mut pending_records,
-                                    &mut write_count,
-                                    "Batch divergence write failed, retrying individually",
-                                );
-                            }
-                        }
-                        DbCommand::RecordCoverage(coverage) => {
-                            if let Err(error) =
-                                divergence_db.record_schedule_block_coverage(&coverage)
-                            {
-                                warn!(
-                                    target: "exex::research::db_writer",
-                                    block = coverage.block_number,
-                                    schedule = coverage.schedule_name,
-                                    %error,
-                                    "Failed to record schedule block coverage"
-                                );
-                            }
-                        }
-                        DbCommand::DeleteRange { from_block, to_block } => {
-                            flush_pending_divergence_batch(
-                                &divergence_db,
-                                &mut pending_records,
-                                &mut write_count,
-                                "Failed to flush pending divergence batch before delete, retrying individually",
-                            );
-                            match divergence_db
-                                .delete_schedule_divergences_in_block_range(from_block, to_block)
-                            {
-                                Ok(deleted) => {
-                                    info!(
-                                        target: "exex::research::db_writer",
-                                        from_block,
-                                        to_block,
-                                        deleted,
-                                        "Deleted schedule divergences for non-canonical block range"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        target: "exex::research::db_writer",
-                                        from_block,
-                                        to_block,
-                                        error = %e,
-                                        "Failed to delete non-canonical schedule divergences"
-                                    );
-                                }
-                            }
-                            match divergence_db
-                                .delete_schedule_block_coverage_in_block_range(from_block, to_block)
-                            {
-                                Ok(deleted) => {
-                                    info!(
-                                        target: "exex::research::db_writer",
-                                        from_block,
-                                        to_block,
-                                        deleted,
-                                        "Deleted schedule coverage rows for non-canonical block range"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        target: "exex::research::db_writer",
-                                        from_block,
-                                        to_block,
-                                        error = %e,
-                                        "Failed to delete non-canonical schedule coverage"
-                                    );
-                                }
-                            }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            rx_closed = true;
                         }
                     }
                 }
@@ -415,7 +411,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     total_writes = write_count,
                     "Database writer task exiting"
                 );
-            });
+            })
+            .map_err(|err| eyre::eyre!("failed to spawn db writer thread: {err}"))?;
 
             (Some(tx), Some(writer_task))
         } else {
@@ -431,6 +428,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             has_intrinsic_schedules,
             schedule_metadata,
             start_block,
+            max_divergences_per_block,
             db_tx,
             db_writer_task,
             blocks_processed: 0,
@@ -566,12 +564,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
         // Flush pending DB commands on shutdown.
         drop(self.db_tx.take());
         if let Some(task) = self.db_writer_task.take() {
-            if let Err(err) = task.await {
-                warn!(
-                    target: "exex::research",
-                    error = ?err,
-                    "Database writer task join failed during shutdown"
-                );
+            if let Err(err) = task.join() {
+                warn!(target: "exex::research", error = ?err, "Database writer task join failed during shutdown");
             }
         }
 
@@ -672,6 +666,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             .iter()
             .map(|schedule| (schedule.name().to_string(), BlockCoverageAccumulator::default()))
             .collect();
+        let mut recorded_divergences = 0usize;
 
         for (tx_idx, tx) in block.transactions_recovered().enumerate() {
             let tx_env = self.ctx.evm_config().tx_env(tx);
@@ -1185,8 +1180,27 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         schedule_logs_bloom,
                     };
 
-                    self.record_divergence(div);
-                    self.divergences_found += 1;
+                    let should_record = self
+                        .max_divergences_per_block
+                        .map(|max| recorded_divergences < max)
+                        .unwrap_or(true);
+                    if should_record {
+                        self.record_divergence(div);
+                        self.divergences_found += 1;
+                        recorded_divergences += 1;
+                    } else if recorded_divergences
+                        == self.max_divergences_per_block.unwrap_or_default()
+                    {
+                        warn!(
+                            target: "exex::research",
+                            block = block_number,
+                            max_divergences_per_block = self.max_divergences_per_block,
+                            "Reached divergence persistence limit for block; additional divergences will be counted in coverage only"
+                        );
+                        recorded_divergences += 1;
+                    } else {
+                        recorded_divergences += 1;
+                    }
                 }
 
                 let coverage = block_coverage
@@ -1358,8 +1372,9 @@ async fn research_exex<Node: FullNodeComponents>(
     registry: ScheduleRegistry,
     db_path: std::path::PathBuf,
     start_block: u64,
+    max_divergences_per_block: Option<usize>,
 ) -> eyre::Result<()> {
-    ResearchExEx::new(ctx, registry, db_path, start_block)?.run().await
+    ResearchExEx::new(ctx, registry, db_path, start_block, max_divergences_per_block)?.run().await
 }
 
 fn main() -> eyre::Result<()> {
@@ -1379,12 +1394,14 @@ fn main() -> eyre::Result<()> {
 
             let db_path = research_args.db_path.clone();
             let start_block = research_args.start_block;
+            let max_divergences_per_block = research_args.max_divergences_per_block;
 
             info!(
                 target: "reth::cli",
                 schedules = registry.len(),
                 db_path = ?db_path,
                 start_block,
+                max_divergences_per_block,
                 "Starting multi-schedule research mode"
             );
 
@@ -1393,7 +1410,15 @@ fn main() -> eyre::Result<()> {
                 .install_exex("research", move |ctx| {
                     let registry = registry.clone();
                     let db_path = db_path.clone();
-                    async move { Ok(research_exex(ctx, registry, db_path, start_block)) }
+                    async move {
+                        Ok(research_exex(
+                            ctx,
+                            registry,
+                            db_path,
+                            start_block,
+                            max_divergences_per_block,
+                        ))
+                    }
                 })
                 .launch()
                 .await?;

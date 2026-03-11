@@ -48,6 +48,29 @@ pub trait GasSchedule: Send + Sync + Debug {
     /// What kind of modifications this schedule makes.
     fn kind(&self) -> ScheduleKind;
 
+    /// Stable, configuration-specific fingerprint material for this schedule.
+    ///
+    /// This should include any parameters that materially change execution so
+    /// persisted datasets can distinguish different schedule configurations.
+    fn config_fingerprint(&self) -> String {
+        let mut affected_opcodes = self.affected_opcodes();
+        affected_opcodes.sort_unstable();
+
+        let mut affected_precompiles: Vec<String> = self
+            .affected_precompiles()
+            .into_iter()
+            .map(|address| format!("{address:#x}"))
+            .collect();
+        affected_precompiles.sort();
+
+        format!(
+            "name={}|description={}|kind={:?}|opcodes={affected_opcodes:?}|precompiles={affected_precompiles:?}",
+            self.name(),
+            self.description(),
+            self.kind(),
+        )
+    }
+
     /// Calculate intrinsic gas for a transaction.
     ///
     /// Returns `Some(gas)` if this schedule overrides intrinsic gas,
@@ -175,6 +198,10 @@ impl GasSchedule for Box<dyn GasSchedule> {
         (**self).execution_gas_multiplier()
     }
 
+    fn config_fingerprint(&self) -> String {
+        (**self).config_fingerprint()
+    }
+
     fn tx_category(&self, ctx: &TxContext) -> Option<String> {
         (**self).tx_category(ctx)
     }
@@ -239,5 +266,14 @@ mod tests {
         let schedule: Box<dyn GasSchedule> = Box::new(TestSchedule);
         assert_eq!(schedule.name(), "test");
         assert!(schedule.modifies_execution());
+    }
+
+    #[test]
+    fn test_default_config_fingerprint_stable() {
+        let schedule = TestSchedule;
+        assert_eq!(
+            schedule.config_fingerprint(),
+            "name=test|description=Test schedule|kind=ExecutionOnly|opcodes=[]|precompiles=[]"
+        );
     }
 }
