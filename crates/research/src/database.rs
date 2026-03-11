@@ -411,6 +411,58 @@ fn initialize_schema_on_connection(conn: &Connection) -> Result<(), DatabaseErro
             [],
         )?;
 
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS export_change_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                schedule_name TEXT NOT NULL,
+                source_table TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                changed_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )?;
+
+        for trigger in [
+            "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_divergences_insert
+             AFTER INSERT ON schedule_divergences
+             BEGIN
+                 INSERT INTO export_change_log (schedule_name, source_table, operation)
+                 VALUES (NEW.schedule_name, 'schedule_divergences', 'insert');
+             END",
+            "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_divergences_update
+             AFTER UPDATE ON schedule_divergences
+             BEGIN
+                 INSERT INTO export_change_log (schedule_name, source_table, operation)
+                 VALUES (NEW.schedule_name, 'schedule_divergences', 'update');
+             END",
+            "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_divergences_delete
+             AFTER DELETE ON schedule_divergences
+             BEGIN
+                 INSERT INTO export_change_log (schedule_name, source_table, operation)
+                 VALUES (OLD.schedule_name, 'schedule_divergences', 'delete');
+             END",
+            "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_block_coverage_insert
+             AFTER INSERT ON schedule_block_coverage
+             BEGIN
+                 INSERT INTO export_change_log (schedule_name, source_table, operation)
+                 VALUES (NEW.schedule_name, 'schedule_block_coverage', 'insert');
+             END",
+            "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_block_coverage_update
+             AFTER UPDATE ON schedule_block_coverage
+             BEGIN
+                 INSERT INTO export_change_log (schedule_name, source_table, operation)
+                 VALUES (NEW.schedule_name, 'schedule_block_coverage', 'update');
+             END",
+            "CREATE TRIGGER IF NOT EXISTS trg_export_change_log_schedule_block_coverage_delete
+             AFTER DELETE ON schedule_block_coverage
+             BEGIN
+                 INSERT INTO export_change_log (schedule_name, source_table, operation)
+                 VALUES (OLD.schedule_name, 'schedule_block_coverage', 'delete');
+             END",
+        ] {
+            conn.execute(trigger, [])?;
+        }
+
         // Indexes for multi-schedule divergences
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sched_div_schedule ON schedule_divergences(schedule_name)",

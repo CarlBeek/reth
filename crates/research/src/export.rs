@@ -74,6 +74,8 @@ pub struct ExportStats {
 struct ExportCheckpoint {
     last_divergence_id: i64,
     last_coverage_id: i64,
+    #[serde(default)]
+    last_change_id: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -511,6 +513,14 @@ fn checkpoint_path(out_dir: &Path) -> PathBuf {
     out_dir.join("_checkpoint.json")
 }
 
+fn load_checkpoint(out_dir: &Path) -> Result<ExportCheckpoint, ExportError> {
+    match fs::read(checkpoint_path(out_dir)) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(ExportCheckpoint::default()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn save_checkpoint(out_dir: &Path, checkpoint: &ExportCheckpoint) -> Result<(), ExportError> {
     fs::write(checkpoint_path(out_dir), serde_json::to_vec_pretty(checkpoint)?)?;
     Ok(())
@@ -893,6 +903,56 @@ fn remove_stale_schedule_dirs(
     Ok(())
 }
 
+fn latest_change_id(conn: &Connection) -> Result<i64, ExportError> {
+    Ok(conn.query_row("SELECT COALESCE(MAX(id), 0) FROM export_change_log", [], |row| row.get(0))?)
+}
+
+fn latest_source_id(conn: &Connection, table: &str) -> Result<i64, ExportError> {
+    let sql = format!("SELECT COALESCE(MAX(id), 0) FROM {table}");
+    Ok(conn.query_row(&sql, [], |row| row.get(0))?)
+}
+
+fn changed_schedules_since(
+    conn: &Connection,
+    last_change_id: i64,
+) -> Result<Vec<String>, ExportError> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT schedule_name
+         FROM export_change_log
+         WHERE id > ?1
+         ORDER BY schedule_name",
+    )?;
+    let rows = stmt.query_map(params![last_change_id], |row| row.get::<_, String>(0))?;
+    let mut schedules = Vec::new();
+    for row in rows {
+        schedules.push(row?);
+    }
+    Ok(schedules)
+}
+
+fn swap_schedule_partition(stage_root: &Path, out_dir: &Path, dataset: &str, schedule_name: &str) -> Result<(), ExportError> {
+    let staged_dir = schedule_dir(stage_root, dataset, schedule_name);
+    let final_dir = schedule_dir(out_dir, dataset, schedule_name);
+    remove_dir_if_exists(&final_dir)?;
+    if staged_dir.exists() {
+        if let Some(parent) = final_dir.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(staged_dir, final_dir)?;
+    }
+    Ok(())
+}
+
+fn swap_dataset_root(stage_root: &Path, out_dir: &Path, dataset: &str) -> Result<(), ExportError> {
+    let staged_dir = dataset_dir(stage_root, dataset);
+    let final_dir = dataset_dir(out_dir, dataset);
+    remove_dir_if_exists(&final_dir)?;
+    if staged_dir.exists() {
+        fs::rename(staged_dir, final_dir)?;
+    }
+    Ok(())
+}
+
 /// Export the research SQLite database into Parquet datasets optimized for analytics.
 ///
 /// The export preserves all currently stored rows while splitting them into:
@@ -925,15 +985,15 @@ pub fn export_sqlite_to_parquet(
 
     let db_path = db_path.as_ref().to_path_buf();
     let out_dir = out_dir.as_ref().to_path_buf();
+    let checkpoint = if incremental {
+        load_checkpoint(&out_dir)?
+    } else {
+        ExportCheckpoint::default()
+    };
+    let stage_root = out_dir.join(format!(".export-staging-{}", export_run_id()));
 
     if !incremental {
         // Clean dataset directories to avoid stale part files from prior runs.
-        for dataset in &["block_coverage", "divergences_hot", "divergence_artifacts"] {
-            let dir = out_dir.join(dataset);
-            if dir.exists() {
-                fs::remove_dir_all(&dir)?;
-            }
-        }
         // Also remove old checkpoint/manifest so we start clean.
         let _ = fs::remove_file(checkpoint_path(&out_dir));
         let _ = fs::remove_file(out_dir.join("_manifest.json"));
@@ -943,55 +1003,106 @@ pub fn export_sqlite_to_parquet(
     let conn = open_initialized_connection(&db_path)?;
     conn.execute_batch("BEGIN TRANSACTION")?;
     let schedules = collect_schedules(&conn)?;
+    let active_schedules: std::collections::HashSet<_> = schedules.iter().cloned().collect();
+    let changed_schedules = if incremental {
+        if checkpoint.last_change_id == 0 {
+            schedules.clone()
+        } else {
+            changed_schedules_since(&conn, checkpoint.last_change_id)?
+        }
+    } else {
+        schedules.clone()
+    };
     let export_id = export_run_id();
+    let current_change_id = latest_change_id(&conn)?;
 
     let mut coverage_rows = 0usize;
     let mut hot_rows = 0usize;
     let mut artifact_rows = 0usize;
-    let mut last_divergence_id = 0;
-    let mut last_coverage_id = 0;
+    let mut last_divergence_id = latest_source_id(&conn, "schedule_divergences")?;
+    let mut last_coverage_id = latest_source_id(&conn, "schedule_block_coverage")?;
 
-    for dataset in &["block_coverage", "divergences_hot", "divergence_artifacts"] {
-        remove_stale_schedule_dirs(&out_dir, dataset, &schedules)?;
-    }
+    if incremental {
+        for schedule in &changed_schedules {
+            if active_schedules.contains(schedule) {
+                let (coverage_written, coverage_max_id) = export_coverage_for_schedule(
+                    &conn,
+                    &stage_root,
+                    schedule,
+                    block_bucket_size,
+                    row_group_size,
+                    export_id,
+                )?;
+                coverage_rows += coverage_written;
+                last_coverage_id = last_coverage_id.max(coverage_max_id);
 
-    for schedule in &schedules {
-        for dataset in &["block_coverage", "divergences_hot", "divergence_artifacts"] {
-            remove_dir_if_exists(&schedule_dir(&out_dir, dataset, schedule))?;
+                let (hot_written, divergence_max_id) = export_hot_for_schedule(
+                    &conn,
+                    &stage_root,
+                    schedule,
+                    block_bucket_size,
+                    row_group_size,
+                    export_id,
+                )?;
+                hot_rows += hot_written;
+                last_divergence_id = last_divergence_id.max(divergence_max_id);
+
+                let (artifact_written, artifact_max_id) = export_artifacts_for_schedule(
+                    &conn,
+                    &stage_root,
+                    schedule,
+                    block_bucket_size,
+                    row_group_size,
+                    export_id,
+                )?;
+                artifact_rows += artifact_written;
+                last_divergence_id = last_divergence_id.max(artifact_max_id);
+            }
+
+            for dataset in &["block_coverage", "divergences_hot", "divergence_artifacts"] {
+                swap_schedule_partition(&stage_root, &out_dir, dataset, schedule)?;
+            }
+        }
+    } else {
+        for schedule in &schedules {
+            let (coverage_written, coverage_max_id) = export_coverage_for_schedule(
+                &conn,
+                &stage_root,
+                schedule,
+                block_bucket_size,
+                row_group_size,
+                export_id,
+            )?;
+            coverage_rows += coverage_written;
+            last_coverage_id = last_coverage_id.max(coverage_max_id);
+
+            let (hot_written, divergence_max_id) = export_hot_for_schedule(
+                &conn,
+                &stage_root,
+                schedule,
+                block_bucket_size,
+                row_group_size,
+                export_id,
+            )?;
+            hot_rows += hot_written;
+            last_divergence_id = last_divergence_id.max(divergence_max_id);
+
+            let (artifact_written, artifact_max_id) = export_artifacts_for_schedule(
+                &conn,
+                &stage_root,
+                schedule,
+                block_bucket_size,
+                row_group_size,
+                export_id,
+            )?;
+            artifact_rows += artifact_written;
+            last_divergence_id = last_divergence_id.max(artifact_max_id);
         }
 
-        let (coverage_written, coverage_max_id) = export_coverage_for_schedule(
-            &conn,
-            &out_dir,
-            schedule,
-            block_bucket_size,
-            row_group_size,
-            export_id,
-        )?;
-        coverage_rows += coverage_written;
-        last_coverage_id = last_coverage_id.max(coverage_max_id);
-
-        let (hot_written, divergence_max_id) = export_hot_for_schedule(
-            &conn,
-            &out_dir,
-            schedule,
-            block_bucket_size,
-            row_group_size,
-            export_id,
-        )?;
-        hot_rows += hot_written;
-        last_divergence_id = last_divergence_id.max(divergence_max_id);
-
-        let (artifact_written, artifact_max_id) = export_artifacts_for_schedule(
-            &conn,
-            &out_dir,
-            schedule,
-            block_bucket_size,
-            row_group_size,
-            export_id,
-        )?;
-        artifact_rows += artifact_written;
-        last_divergence_id = last_divergence_id.max(artifact_max_id);
+        for dataset in &["block_coverage", "divergences_hot", "divergence_artifacts"] {
+            swap_dataset_root(&stage_root, &out_dir, dataset)?;
+            remove_stale_schedule_dirs(&out_dir, dataset, &schedules)?;
+        }
     }
 
     let stats = ExportStats {
@@ -1008,7 +1119,15 @@ pub fn export_sqlite_to_parquet(
         last_coverage_id,
     };
     conn.execute_batch("COMMIT")?;
-    save_checkpoint(&out_dir, &ExportCheckpoint { last_divergence_id, last_coverage_id })?;
+    let _ = remove_dir_if_exists(&stage_root);
+    save_checkpoint(
+        &out_dir,
+        &ExportCheckpoint {
+            last_divergence_id,
+            last_coverage_id,
+            last_change_id: current_change_id,
+        },
+    )?;
     let manifest_path = out_dir.join("_manifest.json");
     fs::write(manifest_path, serde_json::to_vec_pretty(&stats)?)?;
     Ok(stats)
@@ -1206,6 +1325,15 @@ mod tests {
         total
     }
 
+    fn parquet_files_recursive(dir: &Path) -> Vec<PathBuf> {
+        let mut files = walkdir(dir)
+            .into_iter()
+            .filter(|path| path.extension().is_some_and(|e| e == "parquet"))
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
     fn walkdir(dir: &Path) -> Vec<PathBuf> {
         let mut result = Vec::new();
         if let Ok(entries) = fs::read_dir(dir) {
@@ -1298,6 +1426,67 @@ mod tests {
         // Total Parquet rows should match the current SQLite snapshot.
         let hot_count = count_parquet_rows_recursive(&out_dir.join("divergences_hot"));
         assert_eq!(hot_count, 2);
+    }
+
+    #[test]
+    fn test_incremental_export_skips_unchanged_schedules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let out_dir = tmp.path().join("parquet_out");
+
+        let db = DivergenceDatabase::open(&db_path).unwrap();
+        db.record_schedule_divergence(&sample_divergence("4x", 100, 0)).unwrap();
+        db.record_schedule_block_coverage(&sample_coverage("4x", 100)).unwrap();
+        drop(db);
+
+        export_sqlite_to_parquet(&db_path, &out_dir, 1000, 100_000, true).unwrap();
+        let before = parquet_files_recursive(&out_dir.join("divergences_hot"));
+
+        let stats = export_sqlite_to_parquet(&db_path, &out_dir, 1000, 100_000, true).unwrap();
+        let after = parquet_files_recursive(&out_dir.join("divergences_hot"));
+
+        assert_eq!(stats.hot_rows, 0);
+        assert_eq!(stats.coverage_rows, 0);
+        assert_eq!(stats.artifact_rows, 0);
+        assert_eq!(before, after);
+        assert!(stats.last_divergence_id > 0);
+        assert!(stats.last_coverage_id > 0);
+    }
+
+    #[test]
+    fn test_incremental_export_rewrites_only_changed_schedules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let out_dir = tmp.path().join("parquet_out");
+
+        let db = DivergenceDatabase::open(&db_path).unwrap();
+        db.record_schedule_divergence(&sample_divergence("4x", 100, 0)).unwrap();
+        db.record_schedule_divergence(&sample_divergence("8x", 100, 0)).unwrap();
+        db.record_schedule_block_coverage(&sample_coverage("4x", 100)).unwrap();
+        db.record_schedule_block_coverage(&sample_coverage("8x", 100)).unwrap();
+        drop(db);
+
+        export_sqlite_to_parquet(&db_path, &out_dir, 1000, 100_000, true).unwrap();
+
+        let hot_4x_before = parquet_files_recursive(&out_dir.join("divergences_hot/schedule_name=4x"));
+        let hot_8x_before = parquet_files_recursive(&out_dir.join("divergences_hot/schedule_name=8x"));
+
+        let db = DivergenceDatabase::open(&db_path).unwrap();
+        db.record_schedule_divergence(&sample_divergence("8x", 200, 0)).unwrap();
+        db.record_schedule_block_coverage(&sample_coverage("8x", 200)).unwrap();
+        drop(db);
+
+        let stats = export_sqlite_to_parquet(&db_path, &out_dir, 1000, 100_000, true).unwrap();
+
+        let hot_4x_after = parquet_files_recursive(&out_dir.join("divergences_hot/schedule_name=4x"));
+        let hot_8x_after = parquet_files_recursive(&out_dir.join("divergences_hot/schedule_name=8x"));
+
+        assert_eq!(stats.hot_rows, 2);
+        assert_eq!(stats.coverage_rows, 2);
+        assert_eq!(hot_4x_before, hot_4x_after);
+        assert_ne!(hot_8x_before, hot_8x_after);
+        assert_eq!(count_parquet_rows_recursive(&out_dir.join("divergences_hot/schedule_name=4x")), 1);
+        assert_eq!(count_parquet_rows_recursive(&out_dir.join("divergences_hot/schedule_name=8x")), 2);
     }
 
     #[test]
