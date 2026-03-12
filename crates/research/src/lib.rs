@@ -208,7 +208,6 @@ pub use comparison::{
 pub use config::{ResearchConfig, TraceDetail};
 pub use database::{DivergenceDatabase, ScheduleBlockCoverage, ScheduleDivergence};
 pub use divergence::{CallTrees, Divergence, DivergenceType, EventLog, EventLogs, OperationCounts};
-pub use executor::ResearchExecutor;
 pub use export::{export_sqlite_to_parquet, ExportError, ExportStats};
 pub use inspector::GasResearchInspector;
 pub use multi_schedule_inspector::{ScheduleInspector, ScheduleResult};

@@ -46,9 +46,14 @@ This crate is still research infrastructure, not decision-grade Ethereum analysi
   packing under alternate gas prices.
 - Intrinsic repricing is chain-accurate for the transaction envelope, but live replay still relies
   on the EVM's normal transaction pipeline rather than a forked protocol implementation.
+- Schedule-specific state drift is preserved within a block, but the live ExEx resets from
+  canonical parent state at the start of each new block. It is therefore not a cross-block forked
+  chain simulation.
 - State-root or full state-diff persistence is not yet implemented in the live ExEx path.
-- Workspace-wide compilation is currently blocked by unrelated errors in
-  [`crates/ethereum/primitives/src/receipt.rs`](/Users/carl/projects/reth/crates/ethereum/primitives/src/receipt.rs).
+- The crate-level `ResearchExecutor` remains as a legacy API surface and does not implement the
+  full multi-schedule analysis path. Use the `reth-research` ExEx instead.
+- `cargo check -p reth-research-bin` is expected to pass; broader workspace health should be
+  validated separately from research-specific checks.
 
 ## Recommended Use
 

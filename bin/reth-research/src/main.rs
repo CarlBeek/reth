@@ -39,14 +39,8 @@ use reth_research::{
 use reth_revm::{database::StateProviderDatabase, db::State, Database, DatabaseCommit};
 use reth_tracing::tracing::{debug, info, warn};
 use revm_interpreter::gas::calculate_initial_tx_gas;
-use std::{
-    collections::HashMap,
-    sync::{mpsc, Arc},
-    thread::JoinHandle,
-};
-use tokio::time::Duration;
-
-const DB_COMMAND_BUFFER_SIZE: usize = 1024;
+use std::{collections::HashMap, sync::Arc, thread::JoinHandle};
+use tokio::sync::mpsc;
 
 enum DbCommand {
     Record(ScheduleDivergence),
@@ -151,7 +145,7 @@ struct ResearchExEx<Node: FullNodeComponents> {
     /// Maximum divergence rows to persist per block.
     max_divergences_per_block: Option<usize>,
     /// Channel sender for async database writes
-    db_tx: Option<mpsc::SyncSender<DbCommand>>,
+    db_tx: Option<mpsc::UnboundedSender<DbCommand>>,
     /// Handle for async database writer task
     db_writer_task: Option<JoinHandle<()>>,
     /// Statistics
@@ -298,18 +292,15 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             }
 
             // Spawn database writer task
-            let (tx, rx) = mpsc::sync_channel::<DbCommand>(DB_COMMAND_BUFFER_SIZE);
+            let (tx, mut rx) = mpsc::unbounded_channel::<DbCommand>();
             let writer_task = std::thread::Builder::new()
                 .name("reth-research-db-writer".to_string())
                 .spawn(move || {
                 const DB_WRITE_BATCH_SIZE: usize = 256;
-                const DB_WRITE_FLUSH_INTERVAL_MS: u64 = 50;
                 let mut write_count = 0u64;
                 let mut pending_records = Vec::with_capacity(DB_WRITE_BATCH_SIZE);
-                let mut rx_closed = false;
-                while !rx_closed {
-                    match rx.recv_timeout(Duration::from_millis(DB_WRITE_FLUSH_INTERVAL_MS)) {
-                        Ok(cmd) => match cmd {
+                while let Some(cmd) = rx.blocking_recv() {
+                    match cmd {
                             DbCommand::Record(divergence) => {
                                 pending_records.push(divergence);
                                 if pending_records.len() >= DB_WRITE_BATCH_SIZE {
@@ -321,7 +312,13 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                                     );
                                 }
                             }
-                            DbCommand::RecordCoverage(coverage) => {
+                        DbCommand::RecordCoverage(coverage) => {
+                            flush_pending_divergence_batch(
+                                &divergence_db,
+                                &mut pending_records,
+                                &mut write_count,
+                                "Failed to flush pending divergence batch before coverage write, retrying individually",
+                            );
                                 if let Err(error) =
                                     divergence_db.record_schedule_block_coverage(&coverage)
                                 {
@@ -334,7 +331,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                                     );
                                 }
                             }
-                            DbCommand::DeleteRange { from_block, to_block } => {
+                        DbCommand::DeleteRange { from_block, to_block } => {
                                 flush_pending_divergence_batch(
                                     &divergence_db,
                                     &mut pending_records,
@@ -386,18 +383,6 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                                     }
                                 }
                             }
-                        },
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            flush_pending_divergence_batch(
-                                &divergence_db,
-                                &mut pending_records,
-                                &mut write_count,
-                                "Timed batch divergence flush failed, retrying individually",
-                            );
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            rx_closed = true;
-                        }
                     }
                 }
                 flush_pending_divergence_batch(

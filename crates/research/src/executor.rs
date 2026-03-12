@@ -1,4 +1,8 @@
-//! Research executor that performs dual execution and divergence detection.
+//! Legacy executor wrapper for early research experiments.
+//!
+//! The actively maintained integration surface for this crate is the
+//! `reth-research` ExEx binary. This executor wrapper still compiles, but it
+//! does not perform the full multi-schedule replay or persistence pipeline.
 
 use crate::{
     config::ResearchConfig,
@@ -37,10 +41,11 @@ pub enum ResearchError<E = std::convert::Infallible> {
     NotEnabled(u64),
 }
 
-/// Executor wrapper that performs execution analysis and divergence detection.
+/// Legacy executor wrapper retained for compatibility with earlier experiments.
 ///
-/// This executor wraps an existing executor and uses an inspector to simulate
-/// high gas costs during normal execution, then detects divergences.
+/// This wrapper executes blocks through the inner executor but does not perform
+/// the full multi-schedule replay path used by the ExEx integration. Prefer
+/// the `reth-research` ExEx binary for current research runs.
 #[derive(Debug)]
 pub struct ResearchExecutor<E> {
     /// The underlying executor

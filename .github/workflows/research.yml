@@ -21,5 +21,11 @@ jobs:
       - name: clippy (research crate)
         run: cargo +nightly clippy -p reth-research --all-features -- -D warnings
 
+      - name: check (research binary)
+        run: cargo check -p reth-research-bin
+
+      - name: check (node core research feature)
+        run: cargo check -p reth-node-core --features research
+
       - name: test (research crate)
         run: cargo test -p reth-research
