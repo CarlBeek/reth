@@ -610,42 +610,6 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
         };
         let mut normal_db =
             State::builder().with_database(StateProviderDatabase::new(baseline_state)).build();
-        // Create one DB per execution-modifying schedule so each gets its own
-        // state that tracks cumulative changes across transactions in the block.
-        //
-        // State drift is intentional: if tx N OOGs under a schedule (changing
-        // state), tx N+1 starts from that diverged state, modeling cascading
-        // effects accurately. The reported deltas for later transactions thus
-        // include second-order state differences, not just opcode cost changes.
-        //
-        // Each schedule needs its own `StateProvider` because the provider is
-        // consumed when building the `State`. We call `history_by_block_number`
-        // N times — one per schedule — which may hit disk each time.
-        let mut schedule_dbs = {
-            let n = self.execution_schedules.len();
-            let mut dbs = Vec::with_capacity(n);
-            for _ in 0..n {
-                let state = if block_number > 0 {
-                    match provider.history_by_block_number(block_number - 1) {
-                        Ok(state) => state,
-                        Err(err) => {
-                            debug!(
-                                target: "exex::research",
-                                block = block_number,
-                                %err,
-                                "Historical state not yet available for schedule execution, \
-                                 skipping block (expected during initial pipeline sync)"
-                            );
-                            return Ok(false);
-                        }
-                    }
-                } else {
-                    provider.latest()?
-                };
-                dbs.push(State::builder().with_database(StateProviderDatabase::new(state)).build());
-            }
-            dbs
-        };
         let mut block_coverage: HashMap<String, BlockCoverageAccumulator> = self
             .all_schedules
             .iter()
@@ -781,7 +745,12 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             let mut schedule_results: Vec<PerScheduleResult> =
                 Vec::with_capacity(self.execution_schedules.len());
 
-            for (sched_idx, schedule) in self.execution_schedules.iter().enumerate() {
+            // Each schedule executes against the baseline state (normal_db)
+            // after the baseline transaction has been committed. We do NOT
+            // commit schedule results — each transaction is evaluated
+            // independently against the true chain state, so schedule-induced
+            // state drift from tx N never contaminates tx N+1's analysis.
+            for schedule in self.execution_schedules.iter() {
                 // For "Both" schedules (intrinsic + execution), adjust gas_limit
                 // so execution gets the correct gas budget under the new intrinsic.
                 // The EVM always deducts baseline intrinsic, so we offset gas_limit
@@ -836,10 +805,9 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     }
                 }
 
-                let db = &mut schedule_dbs[sched_idx];
                 let mut inspector = ScheduleInspector::new(schedule.clone());
                 let mut evm = self.ctx.evm_config().evm_with_env_and_inspector(
-                    &mut *db,
+                    &mut normal_db,
                     evm_env.clone(),
                     &mut inspector,
                 );
@@ -889,8 +857,6 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 let logs_bloom = Self::logs_bloom_hex(&result.result);
                 let call_frames = inspector.call_frames().to_vec();
                 let event_logs = inspector.event_logs().to_vec();
-
-                db.commit(result.state);
 
                 schedule_results.push(PerScheduleResult {
                     success: sched_success,
@@ -991,8 +957,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         let success = r.success && gas <= gas_limit;
                         let call_tree_diverged = r.call_frames != baseline_call_frames;
                         let event_logs_diverged = r.event_logs != baseline_event_logs;
-                        let output_changed = r.output_hash != baseline_output_hash
-                            || r.output_len != baseline_output_len;
+                        let output_changed = r.output_hash != baseline_output_hash ||
+                            r.output_len != baseline_output_len;
                         let created_address_changed = r.created_address != baseline_created_address;
                         let logs_bloom_changed = r.logs_bloom != baseline_logs_bloom;
                         (
@@ -1071,14 +1037,14 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 // Record divergence if there's a gas delta or status change
                 let status_changed = schedule_success != normal_success;
                 let gas_changed = total_delta != 0;
-                if gas_changed
-                    || would_oog
-                    || status_changed
-                    || call_tree_diverged
-                    || event_logs_diverged
-                    || output_changed
-                    || created_address_changed
-                    || logs_bloom_changed
+                if gas_changed ||
+                    would_oog ||
+                    status_changed ||
+                    call_tree_diverged ||
+                    event_logs_diverged ||
+                    output_changed ||
+                    created_address_changed ||
+                    logs_bloom_changed
                 {
                     let divergence_type = if would_oog || schedule_success != normal_success {
                         DivergenceType::Status
@@ -1173,8 +1139,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         self.record_divergence(div);
                         self.divergences_found += 1;
                         recorded_divergences += 1;
-                    } else if recorded_divergences
-                        == self.max_divergences_per_block.unwrap_or_default()
+                    } else if recorded_divergences ==
+                        self.max_divergences_per_block.unwrap_or_default()
                     {
                         warn!(
                             target: "exex::research",
@@ -1195,14 +1161,14 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 coverage.total_baseline_gas_used += normal_gas_used;
                 coverage.total_schedule_gas_used += schedule_gas;
                 coverage.total_gas_delta += total_delta;
-                if gas_changed
-                    || would_oog
-                    || status_changed
-                    || call_tree_diverged
-                    || event_logs_diverged
-                    || output_changed
-                    || created_address_changed
-                    || logs_bloom_changed
+                if gas_changed ||
+                    would_oog ||
+                    status_changed ||
+                    call_tree_diverged ||
+                    event_logs_diverged ||
+                    output_changed ||
+                    created_address_changed ||
+                    logs_bloom_changed
                 {
                     coverage.divergence_count += 1;
                 }
