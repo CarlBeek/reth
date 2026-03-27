@@ -392,13 +392,13 @@ impl<N: NetworkPrimitives> EthMessage<N> {
     pub const fn is_request(&self) -> bool {
         matches!(
             self,
-            Self::GetBlockBodies(_)
-                | Self::GetBlockHeaders(_)
-                | Self::GetReceipts(_)
-                | Self::GetReceipts70(_)
-                | Self::GetBlockAccessLists(_)
-                | Self::GetPooledTransactions(_)
-                | Self::GetNodeData(_)
+            Self::GetBlockBodies(_) |
+                Self::GetBlockHeaders(_) |
+                Self::GetReceipts(_) |
+                Self::GetReceipts70(_) |
+                Self::GetBlockAccessLists(_) |
+                Self::GetPooledTransactions(_) |
+                Self::GetNodeData(_)
         )
     }
 
@@ -406,14 +406,14 @@ impl<N: NetworkPrimitives> EthMessage<N> {
     pub const fn is_response(&self) -> bool {
         matches!(
             self,
-            Self::PooledTransactions(_)
-                | Self::Receipts(_)
-                | Self::Receipts69(_)
-                | Self::Receipts70(_)
-                | Self::BlockAccessLists(_)
-                | Self::BlockHeaders(_)
-                | Self::BlockBodies(_)
-                | Self::NodeData(_)
+            Self::PooledTransactions(_) |
+                Self::Receipts(_) |
+                Self::Receipts69(_) |
+                Self::Receipts70(_) |
+                Self::BlockAccessLists(_) |
+                Self::BlockHeaders(_) |
+                Self::BlockBodies(_) |
+                Self::NodeData(_)
         )
     }
 

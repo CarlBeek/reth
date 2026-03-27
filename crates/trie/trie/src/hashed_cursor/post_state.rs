@@ -301,14 +301,14 @@ where
 
         // If either cursor is currently pointing to the last entry which was returned then consume
         // that entry so that `choose_next_entry` is looking at the subsequent one.
-        if let Some((key, _)) = self.post_state_cursor.current()
-            && key == &last_key
+        if let Some((key, _)) = self.post_state_cursor.current() &&
+            key == &last_key
         {
             self.post_state_cursor.first_after(&last_key);
         }
 
-        if let Some((key, _)) = &self.cursor_entry
-            && key == &last_key
+        if let Some((key, _)) = &self.cursor_entry &&
+            key == &last_key
         {
             self.cursor_next()?;
         }

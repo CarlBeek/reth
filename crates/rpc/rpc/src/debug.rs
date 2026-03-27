@@ -73,8 +73,8 @@ where
         // Spawn a task caching bad blocks
         executor.spawn_task(async move {
             while let Some(event) = stream.next().await {
-                if let ConsensusEngineEvent::InvalidBlock(block) = event
-                    && let Ok(recovered) =
+                if let ConsensusEngineEvent::InvalidBlock(block) = event &&
+                    let Ok(recovered) =
                         RecoveredBlock::try_recover_sealed(block.as_ref().clone())
                 {
                     bad_block_store.insert(recovered);

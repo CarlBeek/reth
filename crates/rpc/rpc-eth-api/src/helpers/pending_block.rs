@@ -170,9 +170,9 @@ pub trait LoadPendingBlock:
             // Is the pending block cached?
             if let Some(pending_block) = lock.as_ref() {
                 // Is the cached block not expired and latest is its parent?
-                if evm_env.block_env.number() == U256::from(pending_block.block().number())
-                    && parent.hash() == pending_block.block().parent_hash()
-                    && now <= pending_block.expires_at
+                if evm_env.block_env.number() == U256::from(pending_block.block().number()) &&
+                    parent.hash() == pending_block.block().parent_hash() &&
+                    now <= pending_block.expires_at
                 {
                     return Ok(Some(pending_block.clone()));
                 }
@@ -318,8 +318,8 @@ pub trait LoadPendingBlock:
 
                 // There's only limited amount of blob space available per block, so we need to
                 // check if the EIP-4844 can still fit in the block
-                if let Some(tx_blob_gas) = tx.blob_gas_used()
-                    && sum_blob_gas_used + tx_blob_gas > blob_params.max_blob_gas_per_block()
+                if let Some(tx_blob_gas) = tx.blob_gas_used() &&
+                    sum_blob_gas_used + tx_blob_gas > blob_params.max_blob_gas_per_block()
                 {
                     // we can't fit this _blob_ transaction into the block, so we mark it as
                     // invalid, which removes its dependent transactions from

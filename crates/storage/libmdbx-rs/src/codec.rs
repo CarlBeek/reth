@@ -41,8 +41,8 @@ impl TableObject for Cow<'_, [u8]> {
 
         #[cfg(not(feature = "return-borrowed"))]
         {
-            let is_dirty = (!K::IS_READ_ONLY)
-                && crate::error::mdbx_result(unsafe {
+            let is_dirty = (!K::IS_READ_ONLY) &&
+                crate::error::mdbx_result(unsafe {
                     ffi::mdbx_is_dirty(_txn, data_val.iov_base)
                 })?;
 

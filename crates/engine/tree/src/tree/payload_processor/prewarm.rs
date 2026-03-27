@@ -177,9 +177,9 @@ where
                 }
 
                 // Send withdrawal prefetch targets after all transactions dispatched
-                if let Some(to_multi_proof) = to_multi_proof
-                    && let Some(withdrawals) = &ctx.env.withdrawals
-                    && !withdrawals.is_empty()
+                if let Some(to_multi_proof) = to_multi_proof &&
+                    let Some(withdrawals) = &ctx.env.withdrawals &&
+                    !withdrawals.is_empty()
                 {
                     let targets = multiproof_targets_from_withdrawals(withdrawals);
                     let _ = to_multi_proof.send(MultiProofMessage::PrefetchProofs(targets));

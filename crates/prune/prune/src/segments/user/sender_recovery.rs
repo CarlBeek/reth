@@ -214,8 +214,8 @@ mod tests {
                 .map(|block| block.transaction_count())
                 .sum::<usize>()
                 .min(
-                    next_tx_number_to_prune as usize
-                        + input.limiter.deleted_entries_limit().unwrap(),
+                    next_tx_number_to_prune as usize +
+                        input.limiter.deleted_entries_limit().unwrap(),
                 )
                 .sub(1);
 

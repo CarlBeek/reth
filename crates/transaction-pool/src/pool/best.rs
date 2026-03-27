@@ -57,9 +57,8 @@ impl<T: TransactionOrdering> Iterator for BestTransactionsWithFees<T> {
             let best = Iterator::next(&mut self.best)?;
             // If both the base fee and blob fee (if applicable for EIP-4844) are satisfied, return
             // the transaction
-            if best.transaction.max_fee_per_gas() >= self.base_fee as u128
-                && best
-                    .transaction
+            if best.transaction.max_fee_per_gas() >= self.base_fee as u128 &&
+                best.transaction
                     .max_fee_per_blob_gas()
                     .is_none_or(|fee| fee >= self.base_fee_per_blob_gas as u128)
             {
@@ -130,8 +129,8 @@ impl<T: TransactionOrdering> BestTransactions<T> {
         loop {
             match self.new_transaction_receiver.as_mut()?.try_recv() {
                 Ok(tx) => {
-                    if let Some(last_priority) = &self.last_priority
-                        && &tx.priority > last_priority
+                    if let Some(last_priority) = &self.last_priority &&
+                        &tx.priority > last_priority
                     {
                         // we skip transactions if we already yielded a transaction with lower
                         // priority
@@ -399,9 +398,9 @@ where
         // If we have space, try prioritizing transactions
         if self.prioritized_gas < self.max_prioritized_gas {
             for item in &mut self.inner {
-                if self.prioritized_senders.contains(&item.transaction.sender())
-                    && self.prioritized_gas + item.transaction.gas_limit()
-                        <= self.max_prioritized_gas
+                if self.prioritized_senders.contains(&item.transaction.sender()) &&
+                    self.prioritized_gas + item.transaction.gas_limit() <=
+                        self.max_prioritized_gas
                 {
                     self.prioritized_gas += item.transaction.gas_limit();
                     return Some(item);

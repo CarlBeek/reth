@@ -63,8 +63,8 @@ impl NodeRecord {
     /// See also [`std::net::Ipv6Addr::to_ipv4_mapped`]
     pub fn convert_ipv4_mapped(&mut self) -> bool {
         // convert IPv4 mapped IPv6 address
-        if let IpAddr::V6(v6) = self.address
-            && let Some(v4) = v6.to_ipv4_mapped()
+        if let IpAddr::V6(v6) = self.address &&
+            let Some(v4) = v6.to_ipv4_mapped()
         {
             self.address = v4.into();
             return true;

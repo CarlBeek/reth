@@ -102,8 +102,8 @@ where
                 )
             })
             .transpose()?
-            .flatten()
-            && target_prunable_block > input.checkpoint().block_number
+            .flatten() &&
+            target_prunable_block > input.checkpoint().block_number
         {
             input.checkpoint = Some(StageCheckpoint::new(target_prunable_block));
 

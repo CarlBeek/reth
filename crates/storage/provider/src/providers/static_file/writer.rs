@@ -152,8 +152,8 @@ impl<N: NodePrimitives> StaticFileWriters<N> {
             &self.storage_change_sets,
         ] {
             let writer = writer_lock.read();
-            if let Some(writer) = writer.as_ref()
-                && writer.will_prune_on_commit()
+            if let Some(writer) = writer.as_ref() &&
+                writer.will_prune_on_commit()
             {
                 return true;
             }
@@ -516,8 +516,8 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             return Ok(());
         }
 
-        if let Some(offset) = self.current_changeset_offset.take()
-            && let Some(writer) = &mut self.changeset_offsets
+        if let Some(offset) = self.current_changeset_offset.take() &&
+            let Some(writer) = &mut self.changeset_offsets
         {
             writer.append(&offset).map_err(ProviderError::other)?;
         }
@@ -711,8 +711,8 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             .as_ref()
             .map(|block_range| block_range.end())
             .or_else(|| {
-                (self.writer.user_header().expected_block_start()
-                    > self.reader().genesis_block_number())
+                (self.writer.user_header().expected_block_start() >
+                    self.reader().genesis_block_number())
                 .then(|| self.writer.user_header().expected_block_start() - 1)
             });
 
@@ -792,8 +792,8 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         // Handle changeset offset tracking for changeset segments
         if segment.is_change_based() {
             // Write previous block's offset if we have one
-            if let Some(offset) = self.current_changeset_offset.take()
-                && let Some(writer) = &mut self.changeset_offsets
+            if let Some(offset) = self.current_changeset_offset.take() &&
+                let Some(writer) = &mut self.changeset_offsets
             {
                 writer.append(&offset).map_err(ProviderError::other)?;
             }
@@ -972,8 +972,8 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 // * it's a tx-based segment AND `last_block` is lower than the first block of this
                 //   file's block range. Otherwise, having no rows simply means that this block
                 //   range has no transactions, but the file should remain.
-                if block_start != 0
-                    && (segment.is_headers() || last_block.is_some_and(|b| b < block_start))
+                if block_start != 0 &&
+                    (segment.is_headers() || last_block.is_some_and(|b| b < block_start))
                 {
                     self.delete_current_and_open_previous()?;
                 } else {

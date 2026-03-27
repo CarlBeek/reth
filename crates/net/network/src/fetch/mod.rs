@@ -129,8 +129,8 @@ impl<N: NetworkPrimitives> StateFetcher<N> {
     ///
     /// Returns `true` if this a newer block
     pub(crate) fn update_peer_block(&mut self, peer_id: &PeerId, hash: B256, number: u64) -> bool {
-        if let Some(peer) = self.peers.get_mut(peer_id)
-            && number > peer.best_number
+        if let Some(peer) = self.peers.get_mut(peer_id) &&
+            number > peer.best_number
         {
             peer.best_hash = hash;
             peer.best_number = number;
@@ -169,8 +169,8 @@ impl<N: NetworkPrimitives> StateFetcher<N> {
             }
 
             // replace best peer if this peer has better rtt and both have same range quality
-            if maybe_better.1.timeout() < best_peer.1.timeout()
-                && !maybe_better.1.last_response_likely_bad
+            if maybe_better.1.timeout() < best_peer.1.timeout() &&
+                !maybe_better.1.last_response_likely_bad
             {
                 best_peer = maybe_better;
             }
@@ -569,9 +569,9 @@ impl<N: NetworkPrimitives> DownloadRequest<N> {
     /// Returns the requested priority of this request
     const fn get_priority(&self) -> &Priority {
         match self {
-            Self::GetBlockHeaders { priority, .. }
-            | Self::GetBlockBodies { priority, .. }
-            | Self::GetReceipts { priority, .. } => priority,
+            Self::GetBlockHeaders { priority, .. } |
+            Self::GetBlockBodies { priority, .. } |
+            Self::GetReceipts { priority, .. } => priority,
         }
     }
 

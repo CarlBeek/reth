@@ -728,8 +728,8 @@ fn parse_accounts(
         let GenesisAccountWithAddress { genesis_account, address } = serde_json::from_str(&line)?;
         collector.insert(address, genesis_account)?;
 
-        if !collector.is_empty()
-            && collector.len().is_multiple_of(AVERAGE_COUNT_ACCOUNTS_PER_GB_STATE_DUMP)
+        if !collector.is_empty() &&
+            collector.len().is_multiple_of(AVERAGE_COUNT_ACCOUNTS_PER_GB_STATE_DUMP)
         {
             info!(target: "reth::cli",
                 parsed_new_accounts=collector.len(),
@@ -788,8 +788,8 @@ where
 
         accounts.push((address, account));
 
-        if (index > 0 && index.is_multiple_of(AVERAGE_COUNT_ACCOUNTS_PER_GB_STATE_DUMP))
-            || index == accounts_len - 1
+        if (index > 0 && index.is_multiple_of(AVERAGE_COUNT_ACCOUNTS_PER_GB_STATE_DUMP)) ||
+            index == accounts_len - 1
         {
             total_inserted_accounts += accounts.len();
 

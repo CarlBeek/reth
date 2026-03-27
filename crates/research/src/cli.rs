@@ -236,9 +236,9 @@ impl ResearchArgs {
 
     /// Check if any schedules are configured.
     pub fn has_schedules(&self) -> bool {
-        self.eip2780_enabled
-            || !self.csv_schedules.is_empty()
-            || !self.multiplier_schedules.is_empty()
+        self.eip2780_enabled ||
+            !self.csv_schedules.is_empty() ||
+            !self.multiplier_schedules.is_empty()
     }
 
     /// Get the number of configured schedules.

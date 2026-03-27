@@ -420,14 +420,14 @@ impl StageCheckpoint {
         match stage_checkpoint {
             StageUnitCheckpoint::Account(AccountHashingCheckpoint {
                 progress: entities, ..
-            })
-            | StageUnitCheckpoint::Storage(StorageHashingCheckpoint {
+            }) |
+            StageUnitCheckpoint::Storage(StorageHashingCheckpoint {
                 progress: entities, ..
-            })
-            | StageUnitCheckpoint::Entities(entities)
-            | StageUnitCheckpoint::Execution(ExecutionCheckpoint { progress: entities, .. })
-            | StageUnitCheckpoint::Headers(HeadersCheckpoint { progress: entities, .. })
-            | StageUnitCheckpoint::IndexHistory(IndexHistoryCheckpoint {
+            }) |
+            StageUnitCheckpoint::Entities(entities) |
+            StageUnitCheckpoint::Execution(ExecutionCheckpoint { progress: entities, .. }) |
+            StageUnitCheckpoint::Headers(HeadersCheckpoint { progress: entities, .. }) |
+            StageUnitCheckpoint::IndexHistory(IndexHistoryCheckpoint {
                 progress: entities,
                 ..
             }) => Some(entities),
@@ -469,10 +469,10 @@ impl StageUnitCheckpoint {
     /// range.
     pub const fn set_block_range(&mut self, from: u64, to: u64) -> Option<CheckpointBlockRange> {
         match self {
-            Self::Account(AccountHashingCheckpoint { block_range, .. })
-            | Self::Storage(StorageHashingCheckpoint { block_range, .. })
-            | Self::Execution(ExecutionCheckpoint { block_range, .. })
-            | Self::IndexHistory(IndexHistoryCheckpoint { block_range, .. }) => {
+            Self::Account(AccountHashingCheckpoint { block_range, .. }) |
+            Self::Storage(StorageHashingCheckpoint { block_range, .. }) |
+            Self::Execution(ExecutionCheckpoint { block_range, .. }) |
+            Self::IndexHistory(IndexHistoryCheckpoint { block_range, .. }) => {
                 let old_range = *block_range;
                 *block_range = CheckpointBlockRange { from, to };
 

@@ -442,8 +442,8 @@ where
             }
 
             // Skips the first `after` number of matching traces.
-            if let Some(cutoff) = after.map(|a| a as usize)
-                && cutoff < all_traces.len()
+            if let Some(cutoff) = after.map(|a| a as usize) &&
+                cutoff < all_traces.len()
             {
                 all_traces.drain(..cutoff);
                 // we removed the first `after` traces
@@ -462,8 +462,8 @@ where
 
         // If `after` is greater than or equal to the number of matched traces, it returns an
         // empty array.
-        if let Some(cutoff) = after.map(|a| a as usize)
-            && cutoff >= all_traces.len()
+        if let Some(cutoff) = after.map(|a| a as usize) &&
+            cutoff >= all_traces.len()
         {
             return Ok(vec![]);
         }
@@ -497,8 +497,8 @@ where
             .await?
             .map(|traces| traces.into_iter().flatten().collect::<Vec<_>>());
 
-        if let Some(traces) = traces.as_mut()
-            && let Some(base_block_reward) = self.calculate_base_block_reward(block.header())?
+        if let Some(traces) = traces.as_mut() &&
+            let Some(base_block_reward) = self.calculate_base_block_reward(block.header())?
         {
             traces.extend(self.extract_reward_traces(
                 block.header(),

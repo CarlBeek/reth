@@ -67,8 +67,8 @@ pub trait EthFees:
             }
 
             // ensure the given reward percentiles aren't excessive
-            if reward_percentiles.as_ref().map(|perc| perc.len() as u64)
-                > Some(self.gas_oracle().config().max_reward_percentile_count)
+            if reward_percentiles.as_ref().map(|perc| perc.len() as u64) >
+                Some(self.gas_oracle().config().max_reward_percentile_count)
             {
                 return Err(EthApiError::InvalidRewardPercentiles.into());
             }
@@ -77,9 +77,9 @@ pub trait EthFees:
             // need to validate that they are monotonically
             // increasing and 0 <= p <= 100
             // Note: The types used ensure that the percentiles are never < 0
-            if let Some(percentiles) = &reward_percentiles
-                && (percentiles.iter().any(|p| *p < 0.0 || *p > 100.0)
-                    || percentiles.windows(2).any(|w| w[0] > w[1]))
+            if let Some(percentiles) = &reward_percentiles &&
+                (percentiles.iter().any(|p| *p < 0.0 || *p > 100.0) ||
+                    percentiles.windows(2).any(|w| w[0] > w[1]))
             {
                 return Err(EthApiError::InvalidRewardPercentiles.into());
             }

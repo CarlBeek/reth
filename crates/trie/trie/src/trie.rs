@@ -394,9 +394,9 @@ impl StateRootContext {
         H: HashedCursor,
         K: AsRef<AddedRemovedKeys>,
     {
-        (self.updated_storage_nodes
-            + account_node_iter.walker.removed_keys_len()
-            + hash_builder.updates_len()) as u64
+        (self.updated_storage_nodes +
+            account_node_iter.walker.removed_keys_len() +
+            hash_builder.updates_len()) as u64
     }
 
     /// Processes the result of a storage root calculation.

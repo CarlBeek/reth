@@ -718,11 +718,14 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             let baseline_logs_bloom = Self::logs_bloom_hex(&normal_result.result);
             let baseline_call_frames_hash = Self::hash_serialized(&baseline_call_frames);
             let baseline_event_logs_hash = Self::hash_serialized(&baseline_event_logs);
-            normal_db.commit(normal_result.state);
 
             // --- EXECUTION: Per-schedule re-execution with gas modifications ---
             // Each execution-modifying schedule gets its own full execution pass
             // so gas changes propagate naturally through subcalls.
+            //
+            // IMPORTANT: re-execution happens BEFORE committing baseline state so
+            // that schedule runs see the same pre-tx state the baseline saw.
+            // The baseline commit is deferred until after all schedule runs.
             struct PerScheduleResult {
                 success: bool,
                 gas_used: u64,
@@ -745,11 +748,12 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             let mut schedule_results: Vec<PerScheduleResult> =
                 Vec::with_capacity(self.execution_schedules.len());
 
-            // Each schedule executes against the baseline state (normal_db)
-            // after the baseline transaction has been committed. We do NOT
-            // commit schedule results — each transaction is evaluated
-            // independently against the true chain state, so schedule-induced
-            // state drift from tx N never contaminates tx N+1's analysis.
+            // Each schedule executes against the pre-tx state (normal_db before
+            // baseline commit) so that re-execution sees exactly the same state
+            // the baseline saw. We do NOT commit schedule results — each
+            // transaction is evaluated independently, so schedule-induced state
+            // drift from tx N never contaminates tx N+1's analysis. The baseline
+            // commit is deferred until after the re-execution loop.
             for schedule in self.execution_schedules.iter() {
                 // For "Both" schedules (intrinsic + execution), adjust gas_limit
                 // so execution gets the correct gas budget under the new intrinsic.
@@ -879,9 +883,13 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 });
             }
 
+            // Commit baseline state AFTER all schedule re-executions so that
+            // (a) schedule runs saw pre-tx state, and (b) the next tx's baseline
+            // sees the correct post-tx state.
             let normal_gas_used = normal_result.result.gas_used();
             let normal_success = normal_result.result.is_success();
             let tx_hash = *tx.tx_hash();
+            normal_db.commit(normal_result.state);
 
             // --- ANALYZE EACH SCHEDULE ---
             for schedule in &self.all_schedules {

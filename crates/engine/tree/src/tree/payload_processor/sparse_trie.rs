@@ -306,9 +306,9 @@ where
                 self.promote_pending_account_updates()?;
                 self.metrics.sparse_trie_process_updates_duration_histogram.record(t.elapsed());
 
-                if self.finished_state_updates
-                    && self.account_updates.is_empty()
-                    && self.storage_updates.iter().all(|(_, updates)| updates.is_empty())
+                if self.finished_state_updates &&
+                    self.account_updates.is_empty() &&
+                    self.storage_updates.iter().all(|(_, updates)| updates.is_empty())
                 {
                     break;
                 }
@@ -629,8 +629,8 @@ where
         let mut tries_to_compute_roots: Vec<(B256, SendStorageTriePtr<S>)> =
             Vec::with_capacity(addresses_to_compute_roots.len());
         for address in addresses_to_compute_roots {
-            if let Some(trie) = self.trie.storage_tries_mut().get_mut(&address)
-                && !trie.is_root_cached()
+            if let Some(trie) = self.trie.storage_tries_mut().get_mut(&address) &&
+                !trie.is_root_cached()
             {
                 tries_to_compute_roots.push((address, SendStorageTriePtr(trie)));
             }

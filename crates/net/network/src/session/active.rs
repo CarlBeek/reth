@@ -388,8 +388,8 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
 
     /// Returns the deadline timestamp at which the request times out
     fn request_deadline(&self) -> Instant {
-        Instant::now()
-            + Duration::from_millis(self.internal_request_timeout.load(Ordering::Relaxed))
+        Instant::now() +
+            Duration::from_millis(self.internal_request_timeout.load(Ordering::Relaxed))
     }
 
     /// Handle a Response to the peer
@@ -709,8 +709,8 @@ impl<N: NetworkPrimitives> Future for ActiveSession<N> {
                 }
 
                 // we also need to check if we have multiple responses queued up
-                if this.queued_outgoing.messages.len() > MAX_QUEUED_OUTGOING_RESPONSES
-                    && this.queued_response_count() > MAX_QUEUED_OUTGOING_RESPONSES
+                if this.queued_outgoing.messages.len() > MAX_QUEUED_OUTGOING_RESPONSES &&
+                    this.queued_response_count() > MAX_QUEUED_OUTGOING_RESPONSES
                 {
                     // if we've queued up more responses than allowed, we don't poll for new
                     // messages and break the receive loop early
@@ -786,8 +786,8 @@ impl<N: NetworkPrimitives> Future for ActiveSession<N> {
 
         while this.internal_request_timeout_interval.poll_tick(cx).is_ready() {
             // check for timed out requests
-            if this.check_timed_out_requests(Instant::now())
-                && let Poll::Ready(Ok(_)) = this.to_session_manager.poll_reserve(cx)
+            if this.check_timed_out_requests(Instant::now()) &&
+                let Poll::Ready(Ok(_)) = this.to_session_manager.poll_reserve(cx)
             {
                 let msg = ActiveSessionMessage::ProtocolBreach { peer_id: this.remote_peer_id };
                 this.pending_message_to_session = Some(msg);

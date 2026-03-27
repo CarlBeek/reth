@@ -80,8 +80,8 @@ impl<R: Resolver, K: EnrKeyUnambiguous> QueryPool<R, K> {
 
             // queue in new queries if we have capacity
             'queries: while self.active_queries.len() < self.rate_limit.limit() as usize {
-                if self.rate_limit.poll_ready(cx).is_ready()
-                    && let Some(query) = self.queued_queries.pop_front()
+                if self.rate_limit.poll_ready(cx).is_ready() &&
+                    let Some(query) = self.queued_queries.pop_front()
                 {
                     self.rate_limit.tick();
                     self.active_queries.push(query);

@@ -270,8 +270,8 @@ pub trait LoadState:
         Self: SpawnBlocking,
     {
         async move {
-            if at.is_pending()
-                && let Ok(Some(state)) = self.local_pending_state().await
+            if at.is_pending() &&
+                let Ok(Some(state)) = self.local_pending_state().await
             {
                 return Ok(state);
             }

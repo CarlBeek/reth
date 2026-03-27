@@ -172,8 +172,8 @@ where
     ///
     /// Returns `None` if no more requests are required.
     fn next_request(&mut self) -> Option<HeadersRequest> {
-        if let Some(local_head) = self.local_block_number()
-            && self.next_request_block_number > local_head
+        if let Some(local_head) = self.local_block_number() &&
+            self.next_request_block_number > local_head
         {
             let request =
                 calc_next_request(local_head, self.next_request_block_number, self.request_limit);
@@ -860,8 +860,8 @@ where
 
             let concurrent_request_limit = this.concurrent_request_limit();
             // populate requests
-            while this.in_progress_queue.len() < concurrent_request_limit
-                && this.buffered_responses.len() < this.max_buffered_responses
+            while this.in_progress_queue.len() < concurrent_request_limit &&
+                this.buffered_responses.len() < this.max_buffered_responses
             {
                 if let Some(request) = this.next_request() {
                     trace!(

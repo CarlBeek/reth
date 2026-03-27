@@ -160,11 +160,10 @@ where
                 tx_range,
                 &mut limiter,
                 |(tx_num, receipt)| {
-                    let skip = num_addresses > 0
-                        && receipt
-                            .logs()
-                            .iter()
-                            .any(|log| filtered_addresses[..num_addresses].contains(&&log.address));
+                    let skip = num_addresses > 0 &&
+                        receipt.logs().iter().any(|log| {
+                            filtered_addresses[..num_addresses].contains(&&log.address)
+                        });
 
                     if skip {
                         last_skipped_transaction = *tx_num;
@@ -342,8 +341,8 @@ mod tests {
 
             assert_eq!(
                 db.table::<tables::Receipts>().unwrap().len(),
-                blocks.iter().map(|block| block.transaction_count()).sum::<usize>()
-                    - ((pruned_tx + 1) - unprunable) as usize
+                blocks.iter().map(|block| block.transaction_count()).sum::<usize>() -
+                    ((pruned_tx + 1) - unprunable) as usize
             );
 
             output.progress.is_finished()
@@ -360,8 +359,8 @@ mod tests {
             // Either we only find our contract, or the receipt is part of the unprunable receipts
             // set by tip - 128
             assert!(
-                receipt.logs.iter().any(|l| l.address == deposit_contract_addr)
-                    || provider.block_by_transaction_id(tx_num).unwrap().unwrap() > tip - 128,
+                receipt.logs.iter().any(|l| l.address == deposit_contract_addr) ||
+                    provider.block_by_transaction_id(tx_num).unwrap().unwrap() > tip - 128,
             );
         }
     }

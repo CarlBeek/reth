@@ -220,8 +220,8 @@ where
         validate_cancun_gas(block)?;
     }
 
-    if chain_spec.is_osaka_active_at_timestamp(block.timestamp())
-        && block.rlp_length() > MAX_RLP_BLOCK_SIZE
+    if chain_spec.is_osaka_active_at_timestamp(block.timestamp()) &&
+        block.rlp_length() > MAX_RLP_BLOCK_SIZE
     {
         return Err(ConsensusError::BlockTooLarge {
             rlp_length: block.rlp_length(),
@@ -376,11 +376,11 @@ pub fn validate_against_parent_gas_limit<
     chain_spec: &ChainSpec,
 ) -> Result<(), ConsensusError> {
     // Determine the parent gas limit, considering elasticity multiplier on the London fork.
-    let parent_gas_limit = if !chain_spec.is_london_active_at_block(parent.number())
-        && chain_spec.is_london_active_at_block(header.number())
+    let parent_gas_limit = if !chain_spec.is_london_active_at_block(parent.number()) &&
+        chain_spec.is_london_active_at_block(header.number())
     {
-        parent.gas_limit()
-            * chain_spec.base_fee_params_at_timestamp(header.timestamp()).elasticity_multiplier
+        parent.gas_limit() *
+            chain_spec.base_fee_params_at_timestamp(header.timestamp()).elasticity_multiplier
                 as u64
     } else {
         parent.gas_limit()

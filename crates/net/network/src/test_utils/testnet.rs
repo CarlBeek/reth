@@ -758,8 +758,8 @@ impl NetworkEventStream {
     pub async fn next_session_established(&mut self) -> Option<PeerId> {
         while let Some(ev) = self.inner.next().await {
             match ev {
-                NetworkEvent::ActivePeerSession { info, .. }
-                | NetworkEvent::Peer(PeerEvent::SessionEstablished(info)) => {
+                NetworkEvent::ActivePeerSession { info, .. } |
+                NetworkEvent::Peer(PeerEvent::SessionEstablished(info)) => {
                     return Some(info.peer_id)
                 }
                 _ => {}

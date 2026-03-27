@@ -59,8 +59,8 @@ impl BanList {
     pub fn evict_peers(&mut self, now: Instant) -> Vec<PeerId> {
         let mut evicted = Vec::new();
         self.banned_peers.retain(|peer, until| {
-            if let Some(until) = until
-                && now > *until
+            if let Some(until) = until &&
+                now > *until
             {
                 evicted.push(*peer);
                 return false;
@@ -74,8 +74,8 @@ impl BanList {
     pub fn evict_ips(&mut self, now: Instant) -> Vec<IpAddr> {
         let mut evicted = Vec::new();
         self.banned_ips.retain(|peer, until| {
-            if let Some(until) = until
-                && now > *until
+            if let Some(until) = until &&
+                now > *until
             {
                 evicted.push(*peer);
                 return false;

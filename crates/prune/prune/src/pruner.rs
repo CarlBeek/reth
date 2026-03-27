@@ -199,8 +199,8 @@ where
                 .flatten()
             {
                 // Check if segment has a required stage that must be finished first
-                if let Some(required_stage) = segment.required_stage()
-                    && !is_stage_finished(provider, required_stage)?
+                if let Some(required_stage) = segment.required_stage() &&
+                    !is_stage_finished(provider, required_stage)?
                 {
                     debug!(
                         target: "pruner",
@@ -287,8 +287,8 @@ where
         // Saturating subtraction is needed for the case when the chain was reverted, meaning
         // current block number might be less than the previous tip block number.
         // If that's the case, no pruning is needed as outdated data is also reverted.
-        if tip_block_number.saturating_sub(self.previous_tip_block_number.unwrap_or_default())
-            >= self.min_block_interval as u64
+        if tip_block_number.saturating_sub(self.previous_tip_block_number.unwrap_or_default()) >=
+            self.min_block_interval as u64
         {
             debug!(
                 target: "pruner",

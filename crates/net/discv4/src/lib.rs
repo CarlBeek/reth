@@ -635,8 +635,8 @@ impl Discv4Service {
     /// [`NatResolver::ExternalAddr`]. In the case of [`NatResolver::ExternalAddr`], it will return
     /// the first IP address found for the domain associated with the discv4 UDP port.
     fn resolve_external_ip(&mut self) {
-        if let Some(r) = &self.resolve_external_ip_interval
-            && let Some(external_ip) =
+        if let Some(r) = &self.resolve_external_ip_interval &&
+            let Some(external_ip) =
                 r.resolver().clone().as_external_ip(self.local_node_record.udp_port)
         {
             self.set_external_ip_addr(external_ip);
@@ -778,8 +778,8 @@ impl Discv4Service {
             self.kbuckets
                 .closest_values(&target_key)
                 .filter(|node| {
-                    node.value.has_endpoint_proof
-                        && !self.pending_find_nodes.contains_key(&node.key.preimage().0)
+                    node.value.has_endpoint_proof &&
+                        !self.pending_find_nodes.contains_key(&node.key.preimage().0)
                 })
                 .take(MAX_NODES_PER_BUCKET)
                 .map(|n| (target_key.distance(&n.key), n.value.record)),
@@ -913,8 +913,8 @@ impl Discv4Service {
 
     /// Check if the peer has an active bond.
     fn has_bond(&self, remote_id: PeerId, remote_ip: IpAddr) -> bool {
-        if let Some(timestamp) = self.received_pongs.last_pong(remote_id, remote_ip)
-            && timestamp.elapsed() < self.config.bond_expiration
+        if let Some(timestamp) = self.received_pongs.last_pong(remote_id, remote_ip) &&
+            timestamp.elapsed() < self.config.bond_expiration
         {
             return true;
         }
@@ -1230,8 +1230,8 @@ impl Discv4Service {
             return;
         }
 
-        if self.pending_pings.contains_key(&node.id)
-            || self.pending_find_nodes.contains_key(&node.id)
+        if self.pending_pings.contains_key(&node.id) ||
+            self.pending_find_nodes.contains_key(&node.id)
         {
             return;
         }
@@ -2326,9 +2326,9 @@ impl CachedFindNode {
         secret_key: &secp256k1::SecretKey,
         expire: u64,
     ) -> (Bytes, B256) {
-        if let Some(c) = cache.as_ref()
-            && c.target == target
-            && c.cached_at.elapsed() < ttl
+        if let Some(c) = cache.as_ref() &&
+            c.target == target &&
+            c.cached_at.elapsed() < ttl
         {
             return (c.payload.clone(), c.hash);
         }
@@ -2725,8 +2725,8 @@ mod tests {
         })
         .await;
 
-        let expiry = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-            + 10000000000000;
+        let expiry = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() +
+            10000000000000;
         let msg = Neighbours { nodes: vec![service2.local_node_record], expire: expiry };
         service.on_neighbours(msg, record.tcp_addr(), id);
         // wait for the processed ping

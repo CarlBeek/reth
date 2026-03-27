@@ -147,14 +147,14 @@ fn do_verify_only<TX: DbTx, A: TrieTableAdapter>(tx: &TX) -> eyre::Result<()> {
 
             // Record metrics based on output type
             match output {
-                Output::AccountExtra(_, _)
-                | Output::AccountWrong { .. }
-                | Output::AccountMissing(_, _) => {
+                Output::AccountExtra(_, _) |
+                Output::AccountWrong { .. } |
+                Output::AccountMissing(_, _) => {
                     metrics.account_inconsistencies.increment(1);
                 }
-                Output::StorageExtra(_, _, _)
-                | Output::StorageWrong { .. }
-                | Output::StorageMissing(_, _, _) => {
+                Output::StorageExtra(_, _, _) |
+                Output::StorageWrong { .. } |
+                Output::StorageMissing(_, _, _) => {
                     metrics.storage_inconsistencies.increment(1);
                 }
                 Output::Progress(_) => unreachable!(),
@@ -265,14 +265,14 @@ where
 
             // Record metrics based on output type
             match &output {
-                Output::AccountExtra(_, _)
-                | Output::AccountWrong { .. }
-                | Output::AccountMissing(_, _) => {
+                Output::AccountExtra(_, _) |
+                Output::AccountWrong { .. } |
+                Output::AccountMissing(_, _) => {
                     metrics.account_inconsistencies.increment(1);
                 }
-                Output::StorageExtra(_, _, _)
-                | Output::StorageWrong { .. }
-                | Output::StorageMissing(_, _, _) => {
+                Output::StorageExtra(_, _, _) |
+                Output::StorageWrong { .. } |
+                Output::StorageMissing(_, _, _) => {
                     metrics.storage_inconsistencies.increment(1);
                 }
                 Output::Progress(_) => {}
@@ -298,14 +298,14 @@ where
                     storage_trie_cursor.delete_current()?;
                 }
             }
-            Output::AccountWrong { path, expected: node, .. }
-            | Output::AccountMissing(path, node) => {
+            Output::AccountWrong { path, expected: node, .. } |
+            Output::AccountMissing(path, node) => {
                 // Wrong/missing account node value, upsert it
                 let key: A::AccountKey = path.into();
                 account_trie_cursor.upsert(key, &node)?;
             }
-            Output::StorageWrong { account, path, expected: node, .. }
-            | Output::StorageMissing(account, path, node) => {
+            Output::StorageWrong { account, path, expected: node, .. } |
+            Output::StorageMissing(account, path, node) => {
                 // Wrong/missing storage node value, upsert it
                 // (We can't just use `upsert` method with a dup cursor, it's not properly
                 // supported)

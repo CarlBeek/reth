@@ -520,8 +520,8 @@ where
                     }
                     // Try to get pending block and receipts
                     if let Ok(Some(pending_block)) = self.eth_api.local_pending_block().await {
-                        if let BlockNumberOrTag::Number(to_block) = to_block
-                            && to_block < pending_block.block.number()
+                        if let BlockNumberOrTag::Number(to_block) = to_block &&
+                            to_block < pending_block.block.number()
                         {
                             // this block range is empty based on the user input
                             return Ok(Vec::new());
@@ -559,14 +559,14 @@ where
                     .flatten();
 
                 // Return error if toBlock exceeds current head
-                if let Some(t) = to
-                    && t > info.best_number
+                if let Some(t) = to &&
+                    t > info.best_number
                 {
                     return Err(EthFilterError::BlockRangeExceedsHead);
                 }
 
-                if let Some(f) = from
-                    && f > info.best_number
+                if let Some(f) = from &&
+                    f > info.best_number
                 {
                     // start block higher than local head, can return empty
                     return Ok(Vec::new());
@@ -728,9 +728,9 @@ where
             // size check but only if range is multiple blocks, so we always return all
             // logs of a single block
             let is_multi_block_range = from_block != to_block;
-            if let Some(max_logs_per_response) = limits.max_logs_per_response
-                && is_multi_block_range
-                && all_logs.len() > max_logs_per_response
+            if let Some(max_logs_per_response) = limits.max_logs_per_response &&
+                is_multi_block_range &&
+                all_logs.len() > max_logs_per_response
             {
                 debug!(
                     target: "rpc::eth::filter",
@@ -974,10 +974,10 @@ impl From<EthFilterError> for jsonrpsee::types::error::ErrorObject<'static> {
                 rpc_error_with_code(jsonrpsee::types::error::INTERNAL_ERROR_CODE, err.to_string())
             }
             EthFilterError::EthAPIError(err) => err.into(),
-            err @ (EthFilterError::InvalidBlockRangeParams
-            | EthFilterError::QueryExceedsMaxBlocks(_)
-            | EthFilterError::QueryExceedsMaxResults { .. }
-            | EthFilterError::BlockRangeExceedsHead) => {
+            err @ (EthFilterError::InvalidBlockRangeParams |
+            EthFilterError::QueryExceedsMaxBlocks(_) |
+            EthFilterError::QueryExceedsMaxResults { .. } |
+            EthFilterError::BlockRangeExceedsHead) => {
                 rpc_error_with_code(jsonrpsee::types::error::INVALID_PARAMS_CODE, err.to_string())
             }
         }

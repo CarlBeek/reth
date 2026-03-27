@@ -516,8 +516,8 @@ where
                 .next_notification_id
                 .checked_sub(this.min_id)
                 .expect("exex expected notification ID outside the manager's range");
-            if let Some(notification) = this.buffer.get(notification_index)
-                && let Poll::Ready(Err(err)) = exex.send(cx, notification)
+            if let Some(notification) = this.buffer.get(notification_index) &&
+                let Poll::Ready(Err(err)) = exex.send(cx, notification)
             {
                 // The channel was closed, which is irrecoverable for the manager
                 return Poll::Ready(Err(err.into()));

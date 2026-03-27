@@ -69,8 +69,8 @@ pub fn derive_zstd(input: TokenStream) -> TokenStream {
     let mut decompressor = None;
 
     for attr in &input.attrs {
-        if attr.path().is_ident("reth_zstd")
-            && let Err(err) = attr.parse_nested_meta(|meta| {
+        if attr.path().is_ident("reth_zstd") &&
+            let Err(err) = attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("compressor") {
                     let value = meta.value()?;
                     let path: syn::Path = value.parse()?;

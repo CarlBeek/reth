@@ -73,8 +73,8 @@ impl<H: HashedCursorFactory + Clone> Iterator for StateRootBranchNodesIter<H> {
         loop {
             // If we already started iterating through a storage trie's updates, continue doing
             // so.
-            if let Some((account, storage_updates)) = self.curr_storage.as_mut()
-                && let Some((path, node)) = storage_updates.pop()
+            if let Some((account, storage_updates)) = self.curr_storage.as_mut() &&
+                let Some((path, node)) = storage_updates.pop()
             {
                 let node = BranchNode::Storage(*account, path, node);
                 return Some(Ok(node));

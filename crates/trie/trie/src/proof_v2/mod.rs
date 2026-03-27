@@ -217,13 +217,13 @@ where
             // point the target for 0xabc2 will not match the branch due to its prefix, but any of
             // the other targets would, so we need to check those as well.
             if lower.key_nibbles.starts_with(path) {
-                return !check_min_len
-                    || (path.len() >= lower.min_len as usize
-                        || targets
+                return !check_min_len ||
+                    (path.len() >= lower.min_len as usize ||
+                        targets
                             .skip_iter()
                             .take_while(|target| target.key_nibbles.starts_with(path))
-                            .any(|target| path.len() >= target.min_len as usize)
-                        || targets
+                            .any(|target| path.len() >= target.min_len as usize) ||
+                        targets
                             .rev_iter()
                             .take_while(|target| target.key_nibbles.starts_with(path))
                             .any(|target| path.len() >= target.min_len as usize));
@@ -684,8 +684,8 @@ where
         }
 
         // Loop over all keys in the range, calling `push_leaf` on each.
-        while let Some((key, _)) = hashed_cursor_current.as_ref()
-            && upper_bound.is_none_or(|upper_bound| key < &upper_bound)
+        while let Some((key, _)) = hashed_cursor_current.as_ref() &&
+            upper_bound.is_none_or(|upper_bound| key < &upper_bound)
         {
             let (key, val) =
                 core::mem::take(hashed_cursor_current).expect("while-let checks for Some");
@@ -1080,8 +1080,8 @@ where
             // the cached branch for this child. We push it onto the `cached_branch_stack` and loop
             // back to the top.
             if let TrieCursorState::Available(next_cached_path, next_cached_branch) =
-                &trie_cursor_state
-                && next_cached_path.starts_with(&child_path)
+                &trie_cursor_state &&
+                next_cached_path.starts_with(&child_path)
             {
                 // Push the current cached branch back on before pushing its child and then looping
                 self.cached_branch_stack.push((cached_path, cached_branch));
@@ -1188,8 +1188,8 @@ where
             //
             // This can specifically happen when there is a cached branch which shouldn't exist, or
             // if state mask bit is set on a cached branch which shouldn't be.
-            if let Some(prev_lower) = prev_uncalculated_lower_bound.as_ref()
-                && calc_lower_bound < *prev_lower
+            if let Some(prev_lower) = prev_uncalculated_lower_bound.as_ref() &&
+                calc_lower_bound < *prev_lower
             {
                 let msg = format!(
                     "next_uncached_key_range went backwards: calc_lower={calc_lower_bound:?} < \
@@ -1713,8 +1713,8 @@ mod tests {
             // Helper function to check if a node path matches at least one target
             let node_matches_target = |node_path: &Nibbles| -> bool {
                 targets_vec.iter().any(|target| {
-                    target.key_nibbles.starts_with(node_path)
-                        && node_path.len() >= target.min_len as usize
+                    target.key_nibbles.starts_with(node_path) &&
+                        node_path.len() >= target.min_len as usize
                 })
             };
 

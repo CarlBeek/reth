@@ -200,8 +200,8 @@ where
         };
 
         // constrain to the max price
-        if let Some(max_price) = self.oracle_config.max_price
-            && price > max_price
+        if let Some(max_price) = self.oracle_config.max_price &&
+            price > max_price
         {
             price = max_price;
         }
@@ -250,8 +250,8 @@ where
             };
 
             // ignore transactions with a tip under the configured threshold
-            if let Some(ignore_under) = self.ignore_price
-                && effective_tip < Some(ignore_under)
+            if let Some(ignore_under) = self.ignore_price &&
+                effective_tip < Some(ignore_under)
             {
                 continue;
             }
@@ -334,8 +334,8 @@ where
         }
 
         // constrain to the max price
-        if let Some(max_price) = self.oracle_config.max_price
-            && suggestion > max_price
+        if let Some(max_price) = self.oracle_config.max_price &&
+            suggestion > max_price
         {
             suggestion = max_price;
         }

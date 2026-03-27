@@ -252,8 +252,8 @@ impl<'b, Provider: DBProvider + ChangeSetReader + StorageChangeSetReader + Block
     where
         Provider: StorageSettingsCache,
     {
-        if !self.lowest_available_blocks.is_account_history_available(self.block_number)
-            || !self.lowest_available_blocks.is_storage_history_available(self.block_number)
+        if !self.lowest_available_blocks.is_account_history_available(self.block_number) ||
+            !self.lowest_available_blocks.is_storage_history_available(self.block_number)
         {
             return Err(ProviderError::StateAtBlockPruned(self.block_number));
         }
@@ -727,8 +727,8 @@ where
         // This check is worth it, the `cursor.prev()` check is rarely triggered (the if will
         // short-circuit) and when it passes we save a full seek into the changeset/plain state
         // table.
-        let is_before_first_write = needs_prev_shard_check(rank, found_block, block_number)
-            && !cursor.prev()?.is_some_and(|(k, _)| key_filter(&k));
+        let is_before_first_write = needs_prev_shard_check(rank, found_block, block_number) &&
+            !cursor.prev()?.is_some_and(|(k, _)| key_filter(&k));
 
         Ok(HistoryInfo::from_lookup(
             found_block,

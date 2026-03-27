@@ -79,8 +79,8 @@ where
 
         // Validate gas limit against the configured call gas limit before any DB calls
         let call_gas_limit = self.inner.eth_api.call_gas_limit();
-        if let Some(gas_limit) = gas_limit
-            && gas_limit > call_gas_limit
+        if let Some(gas_limit) = gas_limit &&
+            gas_limit > call_gas_limit
         {
             return Err(
                 EthApiError::InvalidTransaction(RpcInvalidTransactionError::GasTooHigh).into()

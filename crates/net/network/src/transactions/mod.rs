@@ -428,8 +428,8 @@ impl<Pool: TransactionPool, N: NetworkPrimitives> TransactionsManager<Pool, N> {
     /// Returns `true` if [`TransactionsManager`] has capacity to request pending hashes. Returns
     /// `false` if [`TransactionsManager`] is operating close to full capacity.
     fn has_capacity_for_fetching_pending_hashes(&self) -> bool {
-        self.has_capacity_for_pending_pool_imports()
-            && self.transaction_fetcher.has_capacity_for_fetching_pending_hashes()
+        self.has_capacity_for_pending_pool_imports() &&
+            self.transaction_fetcher.has_capacity_for_fetching_pending_hashes()
     }
 
     /// Returns `true` if [`TransactionsManager`] has capacity for more pending pool imports.
@@ -674,9 +674,9 @@ impl<Pool: TransactionPool, N: NetworkPrimitives> TransactionsManager<Pool, N> {
                 }
             };
 
-            if is_eth68_message
-                && let Some((actual_ty_byte, _)) = *metadata_ref_mut
-                && let Ok(parsed_tx_type) = TxType::try_from(actual_ty_byte)
+            if is_eth68_message &&
+                let Some((actual_ty_byte, _)) = *metadata_ref_mut &&
+                let Ok(parsed_tx_type) = TxType::try_from(actual_ty_byte)
             {
                 tx_types_counter.increase_by_tx_type(parsed_tx_type);
             }
@@ -1574,8 +1574,9 @@ where
                     // try once more, because mostlikely the channel is now empty and the waker is
                     // registered if this is pending, if we filled additional hashes, we poll again
                     // on the next iteration
-                    let limit = SOFT_LIMIT_COUNT_HASHES_IN_NEW_POOLED_TRANSACTIONS_BROADCAST_MESSAGE
-                        - new_txs.len();
+                    let limit =
+                        SOFT_LIMIT_COUNT_HASHES_IN_NEW_POOLED_TRANSACTIONS_BROADCAST_MESSAGE -
+                            new_txs.len();
                     this.pending_transactions.poll_recv_many(cx, &mut new_txs, limit).is_ready()
                 }
             }
@@ -1656,8 +1657,8 @@ where
         // Sends at most one request.
         duration_metered_exec!(
             {
-                if this.has_capacity_for_fetching_pending_hashes()
-                    && this.on_fetch_hashes_pending_fetch()
+                if this.has_capacity_for_fetching_pending_hashes() &&
+                    this.on_fetch_hashes_pending_fetch()
                 {
                     maybe_more_tx_fetch_events = true;
                 }
@@ -1678,12 +1679,12 @@ where
         this.transaction_fetcher.update_metrics();
 
         // all channels are fully drained and import futures pending
-        if maybe_more_network_events
-            || maybe_more_commands
-            || maybe_more_tx_events
-            || maybe_more_tx_fetch_events
-            || maybe_more_pool_imports
-            || maybe_more_pending_txns
+        if maybe_more_network_events ||
+            maybe_more_commands ||
+            maybe_more_tx_events ||
+            maybe_more_tx_fetch_events ||
+            maybe_more_pool_imports ||
+            maybe_more_pending_txns
         {
             // make sure we're woken up again
             cx.waker().wake_by_ref();
@@ -1881,8 +1882,8 @@ impl<T: SignedTransaction> FullTransactionsBuilder<T> {
         }
 
         let new_size = self.total_size + transaction.size;
-        if new_size > DEFAULT_SOFT_LIMIT_BYTE_SIZE_TRANSACTIONS_BROADCAST_MESSAGE
-            && self.total_size > 0
+        if new_size > DEFAULT_SOFT_LIMIT_BYTE_SIZE_TRANSACTIONS_BROADCAST_MESSAGE &&
+            self.total_size > 0
         {
             // transaction does not fit into the message
             self.pooled.push(transaction);
@@ -2302,8 +2303,8 @@ mod tests {
         let mut established = listener0.take(2);
         while let Some(ev) = established.next().await {
             match ev {
-                NetworkEvent::ActivePeerSession { .. }
-                | NetworkEvent::Peer(PeerEvent::SessionEstablished(_)) => {
+                NetworkEvent::ActivePeerSession { .. } |
+                NetworkEvent::Peer(PeerEvent::SessionEstablished(_)) => {
                     // to insert a new peer in transactions peerset
                     transactions.on_network_event(ev);
                 }
@@ -2471,8 +2472,8 @@ mod tests {
         let mut established = listener0.take(2);
         while let Some(ev) = established.next().await {
             match ev {
-                NetworkEvent::ActivePeerSession { .. }
-                | NetworkEvent::Peer(PeerEvent::SessionEstablished(_)) => {
+                NetworkEvent::ActivePeerSession { .. } |
+                NetworkEvent::Peer(PeerEvent::SessionEstablished(_)) => {
                     // to insert a new peer in transactions peerset
                     transactions.on_network_event(ev);
                 }
@@ -2549,8 +2550,8 @@ mod tests {
         let mut established = listener0.take(2);
         while let Some(ev) = established.next().await {
             match ev {
-                NetworkEvent::ActivePeerSession { .. }
-                | NetworkEvent::Peer(PeerEvent::SessionEstablished(_)) => {
+                NetworkEvent::ActivePeerSession { .. } |
+                NetworkEvent::Peer(PeerEvent::SessionEstablished(_)) => {
                     transactions.on_network_event(ev);
                 }
                 NetworkEvent::Peer(PeerEvent::PeerAdded(_peer_id)) => {}

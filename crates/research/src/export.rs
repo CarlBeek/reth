@@ -1095,8 +1095,8 @@ fn seed_generation_from_snapshot(
             if !schedule_dir_name.starts_with("schedule_name=") {
                 continue;
             }
-            if changed.contains(schedule_dir_name.as_str())
-                || !active.contains(schedule_dir_name.as_str())
+            if changed.contains(schedule_dir_name.as_str()) ||
+                !active.contains(schedule_dir_name.as_str())
             {
                 continue;
             }

@@ -118,11 +118,11 @@ impl StaticFileSegment {
     pub const fn columns(&self) -> usize {
         match self {
             Self::Headers => 3,
-            Self::Transactions
-            | Self::Receipts
-            | Self::TransactionSenders
-            | Self::AccountChangeSets
-            | Self::StorageChangeSets => 1,
+            Self::Transactions |
+            Self::Receipts |
+            Self::TransactionSenders |
+            Self::AccountChangeSets |
+            Self::StorageChangeSets => 1,
         }
     }
 
@@ -200,11 +200,11 @@ impl StaticFileSegment {
     pub const fn is_block_based(&self) -> bool {
         match self {
             Self::Headers => true,
-            Self::Receipts
-            | Self::Transactions
-            | Self::TransactionSenders
-            | Self::AccountChangeSets
-            | Self::StorageChangeSets => false,
+            Self::Receipts |
+            Self::Transactions |
+            Self::TransactionSenders |
+            Self::AccountChangeSets |
+            Self::StorageChangeSets => false,
         }
     }
 

@@ -180,8 +180,8 @@ where
 
         let call_type = match inputs.scheme() {
             revm::context_interface::CreateScheme::Create => CallType::Create,
-            revm::context_interface::CreateScheme::Create2 { .. }
-            | revm::context_interface::CreateScheme::Custom { .. } => CallType::Create2,
+            revm::context_interface::CreateScheme::Create2 { .. } |
+            revm::context_interface::CreateScheme::Custom { .. } => CallType::Create2,
         };
 
         self.call_stack.push(CallStackEntry {

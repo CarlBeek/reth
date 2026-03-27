@@ -234,8 +234,8 @@ pub async fn fee_history_cache_new_blocks_task<St, Provider, N>(
     let mut fetch_missing_block = Fuse::terminated();
 
     loop {
-        if fetch_missing_block.is_terminated()
-            && let Some(block_number) = missing_blocks.pop_front()
+        if fetch_missing_block.is_terminated() &&
+            let Some(block_number) = missing_blocks.pop_front()
         {
             trace!(target: "rpc::fee", ?block_number, "Fetching missing block for fee history cache");
             if let Ok(Some(hash)) = provider.block_hash(block_number) {

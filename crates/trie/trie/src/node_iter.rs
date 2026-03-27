@@ -122,8 +122,8 @@ where
     ///
     /// If `metrics` feature is enabled, it also updates the metrics.
     fn seek_hashed_entry(&mut self, key: B256) -> Result<Option<(B256, H::Value)>, DatabaseError> {
-        if let Some((last_key, last_value)) = self.last_next_result
-            && last_key == key
+        if let Some((last_key, last_value)) = self.last_next_result &&
+            last_key == key
         {
             trace!(target: "trie::node_iter", seek_key = ?key, "reusing result from last next() call instead of seeking");
             self.last_next_result = None; // Consume the cached value
@@ -280,9 +280,9 @@ where
                     // the database, so the walker will advance to the branch node after it. Because
                     // of this, we need to check that the current walker key has a prefix of the key
                     // that we seeked to.
-                    if can_skip_node
-                        && self.walker.key().is_some_and(|key| key.starts_with(&seek_prefix))
-                        && self.walker.children_are_in_trie()
+                    if can_skip_node &&
+                        self.walker.key().is_some_and(|key| key.starts_with(&seek_prefix)) &&
+                        self.walker.children_are_in_trie()
                     {
                         trace!(
                             target: "trie::node_iter",

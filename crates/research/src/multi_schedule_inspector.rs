@@ -121,12 +121,12 @@ use std::{collections::VecDeque, sync::Arc};
 fn is_oog_error(result: InstructionResult) -> bool {
     matches!(
         result,
-        InstructionResult::OutOfGas
-            | InstructionResult::MemoryOOG
-            | InstructionResult::MemoryLimitOOG
-            | InstructionResult::PrecompileOOG
-            | InstructionResult::InvalidOperandOOG
-            | InstructionResult::ReentrancySentryOOG
+        InstructionResult::OutOfGas |
+            InstructionResult::MemoryOOG |
+            InstructionResult::MemoryLimitOOG |
+            InstructionResult::PrecompileOOG |
+            InstructionResult::InvalidOperandOOG |
+            InstructionResult::ReentrancySentryOOG
     )
 }
 
@@ -784,9 +784,9 @@ where
             // Uses per-frame `any_positive_delta_in_subtree` rather than the global
             // `any_positive_delta_applied` to avoid false positives where a positive
             // delta at depth 0 is unrelated to a natural OOG at depth 3.
-            if is_oog_error(outcome.result.result)
-                && !self.oog_occurred
-                && entry.any_positive_delta_in_subtree
+            if is_oog_error(outcome.result.result) &&
+                !self.oog_occurred &&
+                entry.any_positive_delta_in_subtree
             {
                 self.oog_occurred = true;
                 if self.oog_info.is_none() {
@@ -807,8 +807,8 @@ where
     fn create(&mut self, _context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
         let (call_type, opcode) = match inputs.scheme() {
             revm::context_interface::CreateScheme::Create => (CallType::Create, 0xF0u8),
-            revm::context_interface::CreateScheme::Create2 { .. }
-            | revm::context_interface::CreateScheme::Custom { .. } => (CallType::Create2, 0xF5),
+            revm::context_interface::CreateScheme::Create2 { .. } |
+            revm::context_interface::CreateScheme::Custom { .. } => (CallType::Create2, 0xF5),
         };
 
         let parent_has_positive_delta =
@@ -859,9 +859,9 @@ where
             }
 
             // Indirect OOG detection for CREATE (same per-subtree logic as call_end).
-            if is_oog_error(outcome.result.result)
-                && !self.oog_occurred
-                && entry.any_positive_delta_in_subtree
+            if is_oog_error(outcome.result.result) &&
+                !self.oog_occurred &&
+                entry.any_positive_delta_in_subtree
             {
                 self.oog_occurred = true;
                 if self.oog_info.is_none() {
