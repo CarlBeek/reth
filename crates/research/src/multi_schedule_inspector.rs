@@ -470,6 +470,21 @@ impl ScheduleInspector {
         matches!(opcode, 0xF0 | 0xF1 | 0xF2 | 0xF4 | 0xF5 | 0xFA)
     }
 
+    /// Record a gas delta against the per-opcode counters in OperationCounts.
+    fn record_opcode_gas_delta(op_counts: &mut OperationCounts, opcode: u8, delta: i64) {
+        match opcode {
+            0x04 => op_counts.div_gas_delta += delta,
+            0x05 => op_counts.sdiv_gas_delta += delta,
+            0x06 => op_counts.mod_gas_delta += delta,
+            0x07 => op_counts.smod_gas_delta += delta,
+            0x08 => op_counts.addmod_gas_delta += delta,
+            0x09 => op_counts.mulmod_gas_delta += delta,
+            0x0A => op_counts.exp_gas_delta += delta,
+            0x20 => op_counts.keccak256_gas_delta += delta,
+            _ => {}
+        }
+    }
+
     /// Apply a gas delta to the interpreter, recording divergence/OOG as needed.
     ///
     /// Returns `true` if execution should continue, `false` if OOG halted the
@@ -602,6 +617,19 @@ where
             _ => {}
         }
 
+        // Count repriced opcodes
+        match self.current_opcode {
+            0x04 => self.op_counts.div_count += 1,
+            0x05 => self.op_counts.sdiv_count += 1,
+            0x06 => self.op_counts.mod_count += 1,
+            0x07 => self.op_counts.smod_count += 1,
+            0x08 => self.op_counts.addmod_count += 1,
+            0x09 => self.op_counts.mulmod_count += 1,
+            0x0A => self.op_counts.exp_count += 1,
+            0x20 => self.op_counts.keccak256_count += 1,
+            _ => {}
+        }
+
         // Track memory usage
         let memory_words = (interp.memory.len() + 31) / 32;
         if memory_words as u64 > self.op_counts.memory_words_allocated {
@@ -615,6 +643,7 @@ where
             let gas_delta = self.schedule.opcode_gas_delta(self.current_opcode, &opcode_ctx);
             if gas_delta != 0 {
                 self.call_delta_pre_applied = true;
+                Self::record_opcode_gas_delta(&mut self.op_counts, self.current_opcode, gas_delta);
                 if !self.apply_gas_delta(interp, gas_delta, self.current_opcode) {
                     return; // OOG — interpreter is halted, don't continue
                 }
@@ -649,6 +678,7 @@ where
         let gas_delta = explicit_gas_delta.saturating_add(multiplier_gas_delta);
 
         if gas_delta != 0 {
+            Self::record_opcode_gas_delta(&mut self.op_counts, current_opcode, gas_delta);
             self.apply_gas_delta(interp, gas_delta, current_opcode);
         }
     }

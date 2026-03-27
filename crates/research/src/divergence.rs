@@ -134,6 +134,57 @@ pub struct OperationCounts {
 
     /// Number of CREATE/CREATE2 operations
     pub create_count: u64,
+
+    // ── Repriced opcode counts and cumulative gas deltas ──
+
+    /// Number of DIV (0x04) operations
+    #[serde(default)]
+    pub div_count: u64,
+    /// Cumulative additional gas charged for DIV
+    #[serde(default)]
+    pub div_gas_delta: i64,
+
+    /// Number of SDIV (0x05) operations
+    #[serde(default)]
+    pub sdiv_count: u64,
+    #[serde(default)]
+    pub sdiv_gas_delta: i64,
+
+    /// Number of MOD (0x06) operations
+    #[serde(default)]
+    pub mod_count: u64,
+    #[serde(default)]
+    pub mod_gas_delta: i64,
+
+    /// Number of SMOD (0x07) operations
+    #[serde(default)]
+    pub smod_count: u64,
+    #[serde(default)]
+    pub smod_gas_delta: i64,
+
+    /// Number of ADDMOD (0x08) operations
+    #[serde(default)]
+    pub addmod_count: u64,
+    #[serde(default)]
+    pub addmod_gas_delta: i64,
+
+    /// Number of MULMOD (0x09) operations
+    #[serde(default)]
+    pub mulmod_count: u64,
+    #[serde(default)]
+    pub mulmod_gas_delta: i64,
+
+    /// Number of EXP (0x0A) operations
+    #[serde(default)]
+    pub exp_count: u64,
+    #[serde(default)]
+    pub exp_gas_delta: i64,
+
+    /// Number of KECCAK256 (0x20) operations
+    #[serde(default)]
+    pub keccak256_count: u64,
+    #[serde(default)]
+    pub keccak256_gas_delta: i64,
 }
 
 /// Location where divergence first occurred.
