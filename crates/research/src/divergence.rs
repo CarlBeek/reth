@@ -310,6 +310,11 @@ pub struct CallFrame {
 
     /// Output/return data
     pub output: Option<Bytes>,
+
+    /// Cumulative repricing gas delta applied within this call frame.
+    /// Positive means the schedule made this frame's opcodes more expensive.
+    #[serde(default)]
+    pub repricing_gas_delta: i64,
 }
 
 /// Type of call.

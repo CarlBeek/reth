@@ -260,6 +260,9 @@ struct CallStackEntry {
     caller_pc: usize,
     gas_at_start: u64,
     function_selector: Option<[u8; 4]>,
+    /// Cumulative repricing gas delta accumulated during this frame's execution.
+    repricing_gas_delta: i64,
+
     /// Whether any positive gas delta was applied in this frame, any ancestor,
     /// or any descendant. This flag is inherited from the parent on frame entry
     /// (so if the caller had positive deltas that reduced forwarded gas, the
@@ -497,6 +500,9 @@ impl ScheduleInspector {
     ) -> bool {
         self.record_divergence(interp, opcode);
         self.additional_gas_charged += gas_delta;
+        if let Some(frame) = self.call_stack.last_mut() {
+            frame.repricing_gas_delta += gas_delta;
+        }
 
         if gas_delta > 0 {
             self.any_positive_delta_applied = true;
@@ -707,6 +713,7 @@ where
             caller_pc: self.current_pc,
             gas_at_start: self.gas_before_step.unwrap_or(0),
             function_selector,
+            repricing_gas_delta: 0,
             any_positive_delta_in_subtree: parent_has_positive_delta,
         });
 
@@ -715,6 +722,8 @@ where
 
     fn call_end(&mut self, _context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
         if let Some(entry) = self.call_stack.pop() {
+            let mut frame_repricing_delta = entry.repricing_gas_delta;
+
             // Apply precompile gas delta if this was a precompile call.
             // The inspector's step()/step_end() hooks don't fire for precompiles
             // (they execute inline without an interpreter loop), so we apply the
@@ -739,6 +748,7 @@ where
                 let total_delta = precompile_delta.saturating_add(multiplier_delta);
                 if total_delta != 0 {
                     self.additional_gas_charged += total_delta;
+                    frame_repricing_delta += total_delta;
                     if total_delta > 0 {
                         self.any_positive_delta_applied = true;
                         if let Some(parent) = self.call_stack.last_mut() {
@@ -797,6 +807,7 @@ where
                 success: call_success,
                 input: input_bytes,
                 output: Some(outcome.result.output.clone()),
+                repricing_gas_delta: frame_repricing_delta,
             });
 
             // Propagate per-frame positive delta flag to parent.
@@ -852,6 +863,7 @@ where
             caller_pc: self.current_pc,
             gas_at_start: self.gas_before_step.unwrap_or(0),
             function_selector: None,
+            repricing_gas_delta: 0,
             any_positive_delta_in_subtree: parent_has_positive_delta,
         });
 
@@ -879,6 +891,7 @@ where
                 success: create_success,
                 input: Some(inputs.init_code().clone()),
                 output: Some(outcome.result.output.clone()),
+                repricing_gas_delta: entry.repricing_gas_delta,
             });
 
             // Propagate per-frame positive delta flag to parent.

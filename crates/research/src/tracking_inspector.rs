@@ -170,6 +170,7 @@ where
                 success: outcome.result.result.is_ok(),
                 input: input_bytes,
                 output: Some(outcome.result.output.clone()),
+                repricing_gas_delta: 0,
             });
         }
     }
@@ -218,6 +219,7 @@ where
                 success: outcome.result.result.is_ok(),
                 input: Some(inputs.init_code().clone()),
                 output: Some(outcome.result.output.clone()),
+                repricing_gas_delta: 0,
             });
         }
     }
