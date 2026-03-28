@@ -42,16 +42,16 @@ if [[ "${RETH_NATIVE_BUILD:-1}" == "1" ]]; then
     export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native"
 fi
 
-if [[ ! -x target/maxperf/reth-research ]]; then
-    echo "[xeon-perf] building reth-research-bin with --profile maxperf"
-    cargo build --profile maxperf -p reth-research-bin
+if [[ ! -x target/release/reth-research ]]; then
+    echo "[xeon-perf] building reth-research-bin with --release"
+    cargo build --release -p reth-research-bin
 fi
 
 echo "[xeon-perf] cpus=$TOTAL_CPUS reserved=$RESERVED_CPU_CORES worker_cpus=$WORKER_CPUS ram_gb=$TOTAL_RAM_GB"
 echo "[xeon-perf] cross_block_cache_mb=$ENGINE_CROSS_BLOCK_CACHE_MB prewarming_threads=$ENGINE_PREWARMING_THREADS"
 echo "[xeon-perf] storage_workers=$ENGINE_STORAGE_WORKERS account_workers=$ENGINE_ACCOUNT_WORKERS"
 
-exec ./target/maxperf/reth-research node \
+exec ./target/release/reth-research node \
     --engine.reserved-cpu-cores "$RESERVED_CPU_CORES" \
     --engine.cross-block-cache-size "$ENGINE_CROSS_BLOCK_CACHE_MB" \
     --engine.prewarming-threads "$ENGINE_PREWARMING_THREADS" \
