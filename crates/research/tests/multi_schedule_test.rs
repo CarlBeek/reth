@@ -583,13 +583,9 @@ fn test_full_workflow_cli_to_analysis() {
 
     let baseline =
         ExecutionSummary::new(true, 21000, 21000).with_operation_counts(OperationCounts {
-            sload_count: 0,
-            sstore_count: 0,
-            call_count: 0,
-            log_count: 0,
             total_ops: 100,
             memory_words_allocated: 10,
-            create_count: 0,
+            ..Default::default()
         });
 
     // Step 6: Analyze transaction
@@ -798,7 +794,7 @@ fn test_subcall_gas_propagation_with_schedule() {
     let mut evm = ctx.build_mainnet();
     let baseline_result = evm.transact(tx.clone()).expect("baseline should succeed");
     assert!(baseline_result.result.is_success(), "baseline tx should succeed");
-    let baseline_gas = baseline_result.result.gas_used();
+    let baseline_gas = baseline_result.result.tx_gas_used();
 
     // --- Schedule execution (DIV costs +2000 per op) ---
     let csv_data = r#"Opcode,Parameter,Current Gas,New Gas
@@ -817,7 +813,7 @@ DIV,constant,5,2005
     });
     let mut evm2 = ctx2.build_mainnet_with_inspector(&mut inspector);
     let schedule_result = evm2.inspect_tx(tx).expect("schedule execution should not error");
-    let schedule_gas = schedule_result.result.gas_used();
+    let schedule_gas = schedule_result.result.tx_gas_used();
 
     // The inspector should report non-zero additional gas charged
     let insp_result = inspector.result();
@@ -980,7 +976,7 @@ fn test_multiplier_schedule_changes_execution_gas() {
     let mut baseline_evm = ctx.build_mainnet();
     let baseline_result = baseline_evm.transact(tx.clone()).expect("baseline should succeed");
     assert!(baseline_result.result.is_success(), "baseline tx should succeed");
-    let baseline_gas = baseline_result.result.gas_used();
+    let baseline_gas = baseline_result.result.tx_gas_used();
 
     let db2 = setup_evm_db(caller_addr, Address::ZERO, sender, caller_code, Bytes::new());
     let mut inspector =
@@ -993,7 +989,7 @@ fn test_multiplier_schedule_changes_execution_gas() {
     let schedule_result = evm2.inspect_tx(tx).expect("multiplier execution should succeed");
     assert!(schedule_result.result.is_success(), "multiplier tx should still succeed");
 
-    let schedule_gas = schedule_result.result.gas_used();
+    let schedule_gas = schedule_result.result.tx_gas_used();
     let insp_result = inspector.result();
 
     assert!(
@@ -1108,8 +1104,8 @@ DIV,constant,5,1005
     );
 
     // Verify the schedule tx used more gas overall
-    let baseline_gas = baseline_result.result.gas_used();
-    let schedule_gas = schedule_result.result.gas_used();
+    let baseline_gas = baseline_result.result.tx_gas_used();
+    let schedule_gas = schedule_result.result.tx_gas_used();
     assert!(
         schedule_gas > baseline_gas,
         "schedule should use more gas: baseline={baseline_gas}, schedule={schedule_gas}"
@@ -1419,7 +1415,7 @@ fn test_call_opcode_gas_delta_affects_forwarding() {
     let mut evm = ctx.build_mainnet();
     let baseline_result = evm.transact(tx.clone()).expect("baseline should succeed");
     assert!(baseline_result.result.is_success(), "baseline tx should succeed");
-    let baseline_gas = baseline_result.result.gas_used();
+    let baseline_gas = baseline_result.result.tx_gas_used();
 
     // --- Schedule: CALL opcode costs +5000 ---
     let csv_data = r#"Opcode,Parameter,Current Gas,New Gas
@@ -1438,7 +1434,7 @@ CALL,constant,100,5100
     });
     let mut evm2 = ctx2.build_mainnet_with_inspector(&mut inspector);
     let schedule_result = evm2.inspect_tx(tx).expect("schedule execution should not error");
-    let schedule_gas = schedule_result.result.gas_used();
+    let schedule_gas = schedule_result.result.tx_gas_used();
 
     let insp_result = inspector.result();
     assert!(

@@ -332,9 +332,8 @@ where
 
         // Try to charge the additional gas
         if additional_gas > 0 {
-            if !interp.gas.record_cost(additional_gas) {
+            if !interp.gas.record_regular_cost(additional_gas) {
                 // OUT OF GAS! The execution actually failed due to repricing
-                // When record_cost returns false, revm will automatically halt execution
                 self.oog_occurred = true;
 
                 let opcode_byte = interp.bytecode.opcode();
@@ -342,6 +341,7 @@ where
 
                 self.record_oog(interp, opcode_byte, opcode_name.clone());
                 self.record_divergence_location(interp, opcode_byte, opcode_name);
+                interp.halt_oog();
             }
         }
     }

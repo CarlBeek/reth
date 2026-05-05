@@ -25,7 +25,7 @@ use reth_ethereum::{
     exex::{ExExContext, ExExEvent, ExExNotification},
     node::EthereumNode,
 };
-use reth_evm::{ConfigureEvm, Evm, TransactionEnv};
+use reth_evm::{ConfigureEvm, Evm, TransactionEnvMut};
 use reth_node_api::{BlockTy, FullNodeComponents};
 use reth_node_core::args::ResearchArgs;
 use reth_primitives_traits::BlockBody;
@@ -224,7 +224,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             access_list_storage_slots,
             authorization_list_num,
         )
-        .initial_gas
+        .initial_total_gas
     }
 
     /// Create a new research ExEx.
@@ -852,7 +852,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 drop(evm);
 
                 let sched_success = result.result.is_success();
-                let sched_gas_used = result.result.gas_used();
+                let sched_gas_used = result.result.tx_gas_used();
                 let op_counts = Self::serialize_trace(inspector.operation_counts());
                 let insp_result = inspector.result();
                 let (output_hash, output_len) = Self::output_hash_and_len(&result.result);
@@ -886,7 +886,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             // Commit baseline state AFTER all schedule re-executions so that
             // (a) schedule runs saw pre-tx state, and (b) the next tx's baseline
             // sees the correct post-tx state.
-            let normal_gas_used = normal_result.result.gas_used();
+            let normal_gas_used = normal_result.result.tx_gas_used();
             let normal_success = normal_result.result.is_success();
             let tx_hash = *tx.tx_hash();
             normal_db.commit(normal_result.state);
