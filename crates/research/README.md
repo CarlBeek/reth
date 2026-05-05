@@ -19,6 +19,7 @@ state so schedule-induced failures can cascade across later transactions in the 
 ## Supported Schedules
 
 - `EIP-2780` intrinsic repricing
+- `EIP-8037` native state creation gas and reservoir accounting
 - CSV-driven opcode and precompile repricing
 - Uniform execution gas multipliers
 - Combined intrinsic + execution schedules via the shared `GasSchedule` trait
@@ -36,6 +37,12 @@ For each schedule divergence, the live path can persist:
 - first detected OOG / divergence location metadata
 - baseline vs schedule call frames when the call tree differs
 - baseline vs schedule event logs when emitted logs differ
+- `would_fit_in_original_limit`: whether the schedule's `gas_used` would still
+  fit inside the transaction's original `tx_gas_limit` (i.e. the original tx
+  would have survived the schedule unchanged)
+- `min_multiplier_to_succeed`: smallest gas-limit multiplier (`gas_used /
+  tx_gas_limit`) that lets the replay finish; `NULL` when the replay halted
+  for non-gas reasons or even at the inflated limit
 
 ## Current Limits
 
@@ -62,5 +69,11 @@ Use this crate for:
 - early historical replay experiments
 - spotting candidate breakage patterns
 - quantifying how often a repricing changes gas or status on historical chain data
+
+For EIP-8037 reservoir experiments, use `--research.eip8037` and optionally
+`--research.gas-limit-multiplier <N>`. The multiplier only inflates gas limits for the schedule
+replay (so the reservoir can fill); `would_fit_in_original_limit` and `min_multiplier_to_succeed`
+then tell you whether the original tx survived the schedule unchanged and, if not, how much extra
+gas it would have needed.
 
 Do not use it as the sole basis for ship / no-ship decisions on Ethereum protocol changes.

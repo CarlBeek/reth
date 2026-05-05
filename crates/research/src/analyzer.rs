@@ -280,6 +280,12 @@ impl MultiScheduleAnalyzer {
             schedule_log_count: 0,
             baseline_logs_bloom: String::new(),
             schedule_logs_bloom: String::new(),
+            would_fit_in_original_limit: comparison
+                .execution_comparison
+                .as_ref()
+                .map(|e| e.schedule_success)
+                .unwrap_or(baseline.success),
+            min_multiplier_to_succeed: None,
         };
 
         match db.record_schedule_divergence(&divergence) {

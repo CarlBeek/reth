@@ -290,6 +290,9 @@ mod tests {
             gas_limit: 100_000,
             is_create,
             recipient_info,
+            access_list_accounts: 0,
+            access_list_storage_slots: 0,
+            authorization_count: 0,
         }
     }
 
@@ -365,6 +368,9 @@ mod tests {
                 balance: U256::from(100),
                 nonce: 1,
             }),
+            access_list_accounts: 0,
+            access_list_storage_slots: 0,
+            authorization_count: 0,
         };
 
         let intrinsic = schedule.intrinsic_gas(&ctx).unwrap();
@@ -416,6 +422,9 @@ mod tests {
                 balance: U256::from(100),
                 nonce: 1,
             }),
+            access_list_accounts: 0,
+            access_list_storage_slots: 0,
+            authorization_count: 0,
         };
 
         assert_eq!(schedule.intrinsic_gas(&ctx), Some(9_000));

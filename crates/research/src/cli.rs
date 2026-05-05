@@ -4,7 +4,8 @@
 //! to configure multi-schedule research experiments.
 
 use crate::schedule::{
-    CsvPricingError, CsvPricingSchedule, Eip2780Schedule, MultiplierSchedule, ScheduleRegistry,
+    CsvPricingError, CsvPricingSchedule, Eip2780Schedule, Eip8037Schedule, MultiplierSchedule,
+    ScheduleRegistry,
 };
 use std::path::PathBuf;
 use thiserror::Error;
@@ -38,7 +39,7 @@ pub enum CliError {
     },
 
     /// No schedules configured
-    #[error("No schedules configured. Enable at least one schedule with --research.eip2780, --research.csv, or --research.multiplier")]
+    #[error("No schedules configured. Enable at least one schedule with --research.eip2780, --research.eip8037, --research.csv, or --research.multiplier")]
     NoSchedules,
 
     /// Schedule registry error
@@ -137,6 +138,9 @@ pub struct ResearchArgs {
     /// Enable EIP-2780 intrinsic gas experiment
     pub eip2780_enabled: bool,
 
+    /// Enable EIP-8037 state creation gas experiment
+    pub eip8037_enabled: bool,
+
     /// CSV pricing schedules (name=path pairs)
     pub csv_schedules: Vec<NamedCsvSchedule>,
 
@@ -160,6 +164,9 @@ pub struct ResearchArgs {
 
     /// Maximum divergences to record per block
     pub max_divergences_per_block: Option<usize>,
+
+    /// Inflate schedule replay transaction gas limits by this factor.
+    pub gas_limit_multiplier: Option<u64>,
 }
 
 impl ResearchArgs {
@@ -176,6 +183,12 @@ impl ResearchArgs {
     /// Enable EIP-2780 schedule.
     pub fn with_eip2780(mut self) -> Self {
         self.eip2780_enabled = true;
+        self
+    }
+
+    /// Enable EIP-8037 schedule.
+    pub fn with_eip8037(mut self) -> Self {
+        self.eip8037_enabled = true;
         self
     }
 
@@ -234,9 +247,16 @@ impl ResearchArgs {
         self
     }
 
+    /// Set the schedule replay gas limit multiplier.
+    pub fn with_gas_limit_multiplier(mut self, multiplier: u64) -> Self {
+        self.gas_limit_multiplier = Some(multiplier);
+        self
+    }
+
     /// Check if any schedules are configured.
     pub fn has_schedules(&self) -> bool {
         self.eip2780_enabled ||
+            self.eip8037_enabled ||
             !self.csv_schedules.is_empty() ||
             !self.multiplier_schedules.is_empty()
     }
@@ -245,6 +265,9 @@ impl ResearchArgs {
     pub fn schedule_count(&self) -> usize {
         let mut count = 0;
         if self.eip2780_enabled {
+            count += 1;
+        }
+        if self.eip8037_enabled {
             count += 1;
         }
         count += self.csv_schedules.len();
@@ -263,6 +286,11 @@ impl ResearchArgs {
         // Add EIP-2780 if enabled
         if self.eip2780_enabled {
             registry.register(Eip2780Schedule::new())?;
+        }
+
+        // Add EIP-8037 if enabled
+        if self.eip8037_enabled {
+            registry.register(Eip8037Schedule::new())?;
         }
 
         // Add CSV schedules
@@ -285,6 +313,10 @@ impl ResearchArgs {
 
         if self.eip2780_enabled {
             parts.push("eip-2780".to_string());
+        }
+
+        if self.eip8037_enabled {
+            parts.push("eip-8037".to_string());
         }
 
         for csv in &self.csv_schedules {
@@ -355,14 +387,18 @@ mod tests {
     fn test_research_args_builder() {
         let args = ResearchArgs::new()
             .with_eip2780()
+            .with_eip8037()
             .with_multiplier("128x", 128)
             .unwrap()
             .with_start_block(1000000)
+            .with_gas_limit_multiplier(8)
             .with_db_path(PathBuf::from("./test.db"));
 
         assert!(args.eip2780_enabled);
+        assert!(args.eip8037_enabled);
         assert_eq!(args.multiplier_schedules.len(), 1);
         assert_eq!(args.start_block, 1000000);
+        assert_eq!(args.gas_limit_multiplier, Some(8));
         assert_eq!(args.db_path, PathBuf::from("./test.db"));
     }
 
@@ -370,12 +406,13 @@ mod tests {
     fn test_research_args_schedule_count() {
         let args = ResearchArgs::new()
             .with_eip2780()
+            .with_eip8037()
             .with_multiplier("128x", 128)
             .unwrap()
             .with_multiplier("256x", 256)
             .unwrap();
 
-        assert_eq!(args.schedule_count(), 3);
+        assert_eq!(args.schedule_count(), 4);
     }
 
     #[test]
@@ -404,6 +441,15 @@ mod tests {
 
         assert_eq!(registry.len(), 1);
         assert!(registry.get("eip-2780").is_some());
+    }
+
+    #[test]
+    fn test_research_args_build_registry_with_eip8037() {
+        let args = ResearchArgs::new().with_eip8037();
+        let registry = args.build_registry().unwrap();
+
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get("eip-8037").is_some());
     }
 
     #[test]

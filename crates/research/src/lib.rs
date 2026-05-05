@@ -10,6 +10,7 @@
 //! experiments at once, comparing each against baseline Ethereum execution:
 //!
 //! - **EIP-2780**: Reduced intrinsic gas based on transaction category
+//! - **EIP-8037**: Native state creation gas with reservoir accounting
 //! - **CSV Pricing**: Per-opcode/precompile gas repricing from CSV files
 //! - **Multipliers**: Uniform gas cost multiplication (e.g., 128x)
 //!
@@ -38,6 +39,7 @@
 //! - [`schedule`]: Gas schedule trait and implementations
 //!   - [`schedule::GasSchedule`]: Core trait for gas pricing experiments
 //!   - [`schedule::Eip2780Schedule`]: Transaction category-based intrinsic gas
+//!   - [`schedule::Eip8037Schedule`]: Native EIP-8037 state-gas metering
 //!   - [`schedule::CsvPricingSchedule`]: Per-opcode pricing from CSV files
 //!   - [`schedule::MultiplierSchedule`]: Uniform gas multiplier
 //!   - [`schedule::ScheduleRegistry`]: Manages multiple schedules
@@ -70,6 +72,7 @@
 //! // Configure schedules
 //! let args = ResearchArgs::new()
 //!     .with_eip2780()  // Enable EIP-2780 intrinsic gas experiment
+//!     .with_eip8037()  // Enable EIP-8037 state-gas experiment
 //!     .with_csv("7904-v1", "./schedules/7904_v1.csv")?  // CSV pricing
 //!     .with_multiplier("128x", 128)?  // Uniform 128x multiplier
 //!     .with_db_path(PathBuf::from("research.db"));
@@ -108,6 +111,7 @@
 //!         balance: U256::from(100),
 //!         nonce: 1,
 //!     }),
+//!     ..Default::default()
 //! };
 //!
 //! // EIP-2780 calculates reduced intrinsic gas
@@ -156,8 +160,10 @@
 //! # Combined experiment
 //! reth-research \
 //!   --research.eip2780 \
+//!   --research.eip8037 \
 //!   --research.csv 7904-prelim=./7904_prelim.csv \
 //!   --research.multiplier 128x=128 \
+//!   --research.gas-limit-multiplier 8 \
 //!   --research.db-path ./full-analysis.db
 //! ```
 //!

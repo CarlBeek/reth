@@ -5,6 +5,7 @@
 //!
 //! Supported schedules:
 //! - EIP-2780: Reduced intrinsic gas based on transaction category
+//! - EIP-8037: Native state creation gas and reservoir accounting
 //! - CSV Pricing: Per-opcode/precompile gas repricing from CSV files
 //! - Multiplier: Uniform gas cost multiplication
 //!
@@ -13,7 +14,9 @@
 //! ```sh
 //! cargo run --release -p reth-research-bin node --dev --dev.block-time 5s \
 //!   --research.eip2780 \
+//!   --research.eip8037 \
 //!   --research.csv 7904-prelim=./schedules/7904_prelim.csv \
+//!   --research.gas-limit-multiplier 8 \
 //!   --research.db-path ./divergences.db
 //! ```
 
@@ -25,7 +28,7 @@ use reth_ethereum::{
     exex::{ExExContext, ExExEvent, ExExNotification},
     node::EthereumNode,
 };
-use reth_evm::{ConfigureEvm, Evm, TransactionEnvMut};
+use reth_evm::{block::BlockExecutorFactory, ConfigureEvm, Evm, EvmFactory, TransactionEnvMut};
 use reth_node_api::{BlockTy, FullNodeComponents};
 use reth_node_core::args::ResearchArgs;
 use reth_primitives_traits::BlockBody;
@@ -38,6 +41,7 @@ use reth_research::{
 };
 use reth_revm::{database::StateProviderDatabase, db::State, Database, DatabaseCommit};
 use reth_tracing::tracing::{debug, info, warn};
+use revm::{context::BlockEnv, context_interface::Cfg, primitives::hardfork::SpecId};
 use revm_interpreter::gas::calculate_initial_tx_gas;
 use std::{collections::HashMap, sync::Arc, thread::JoinHandle};
 use tokio::sync::mpsc;
@@ -144,6 +148,8 @@ struct ResearchExEx<Node: FullNodeComponents> {
     start_block: u64,
     /// Maximum divergence rows to persist per block.
     max_divergences_per_block: Option<usize>,
+    /// Inflate schedule replay gas limits by this factor.
+    gas_limit_multiplier: u64,
     /// Channel sender for async database writes
     db_tx: Option<mpsc::UnboundedSender<DbCommand>>,
     /// Handle for async database writer task
@@ -153,7 +159,15 @@ struct ResearchExEx<Node: FullNodeComponents> {
     divergences_found: u64,
 }
 
-impl<Node: FullNodeComponents> ResearchExEx<Node> {
+impl<Node> ResearchExEx<Node>
+where
+    Node: FullNodeComponents,
+    Node::Evm: ConfigureEvm<
+        BlockExecutorFactory: BlockExecutorFactory<
+            EvmFactory: EvmFactory<Spec = SpecId, BlockEnv = BlockEnv>,
+        >,
+    >,
+{
     fn serialize_trace<T: serde::Serialize>(value: &T) -> Option<String> {
         serde_json::to_string(value).ok()
     }
@@ -234,6 +248,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
         db_path: std::path::PathBuf,
         start_block: u64,
         max_divergences_per_block: Option<usize>,
+        gas_limit_multiplier: u64,
     ) -> eyre::Result<Self> {
         let registry = Arc::new(registry);
         let all_schedules = registry.all();
@@ -414,6 +429,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             schedule_metadata,
             start_block,
             max_divergences_per_block,
+            gas_limit_multiplier: gas_limit_multiplier.max(1),
             db_tx,
             db_writer_task,
             blocks_processed: 0,
@@ -561,10 +577,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
     async fn analyze_block(
         &mut self,
         block: &reth_primitives_traits::RecoveredBlock<BlockTy<Node::Types>>,
-    ) -> eyre::Result<bool>
-    where
-        Node::Evm: ConfigureEvm,
-    {
+    ) -> eyre::Result<bool> {
         let block_number = block.number();
         let block_hash = block.hash();
         let parent_hash = block.parent_hash();
@@ -634,6 +647,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             let access_list_storage_slots =
                 tx.access_list().map(|list| list.storage_keys_count()).unwrap_or_default() as u64;
             let authorization_count = tx.authorization_count().unwrap_or_default();
+            let schedule_execution_gas_limit = gas_limit.saturating_mul(self.gas_limit_multiplier);
             let baseline_intrinsic_gas = Self::baseline_intrinsic_gas(
                 &input,
                 is_create,
@@ -682,6 +696,9 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     gas_limit,
                     is_create,
                     recipient_info,
+                    access_list_accounts,
+                    access_list_storage_slots,
+                    authorization_count,
                 })
             } else {
                 None
@@ -755,6 +772,17 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
             // drift from tx N never contaminates tx N+1's analysis. The baseline
             // commit is deferred until after the re-execution loop.
             for schedule in self.execution_schedules.iter() {
+                let mut schedule_evm_env = evm_env.clone();
+                let native_env_configured = schedule.configure_evm_env(&mut schedule_evm_env);
+
+                if self.gas_limit_multiplier > 1 {
+                    schedule_evm_env.cfg_env.disable_block_gas_limit = true;
+                    schedule_evm_env.cfg_env.disable_balance_check = true;
+                    if !schedule_evm_env.cfg_env.is_amsterdam_eip8037_enabled() {
+                        schedule_evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+                    }
+                }
+
                 // For "Both" schedules (intrinsic + execution), adjust gas_limit
                 // so execution gets the correct gas budget under the new intrinsic.
                 // The EVM always deducts baseline intrinsic, so we offset gas_limit
@@ -762,36 +790,29 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 // gas (and vice versa).
                 //
                 // When the schedule lowers intrinsic (negative delta), the adjusted
-                // gas_limit would exceed the original. We cap at gas_limit to avoid
-                // InsufficientFunds failures (the sender only had balance for the
-                // original gas_limit * gas_price). This means the extra execution
-                // budget from cheaper intrinsic is not modeled.
+                // gas_limit can exceed the original. We cap at the replay gas limit.
+                // If the replay limit is inflated, balance checks are disabled above
+                // so increased max cost does not mask the schedule result.
                 //
-                // **Impact**: a "Both" schedule that lowers intrinsic may produce
-                // false OOGs in the execution pass. Since the execution portion
-                // doesn't get the extra budget freed by cheaper intrinsic, opcodes
-                // that would have succeeded with the full budget may OOG. The
-                // reported result is conservative (may report failures that wouldn't
-                // actually occur). This trade-off is acceptable because
-                // InsufficientFunds from exceeding gas_limit would produce a more
-                // confusing false failure. Gas total reconstruction (below) is still
-                // correct: it replaces baseline intrinsic with schedule intrinsic in
-                // the reported total, so the gas delta accounts for the intrinsic
-                // difference even though the execution portion was capped.
+                // Gas total reconstruction (below) is still correct: it replaces
+                // baseline intrinsic with schedule intrinsic in the reported total,
+                // so the gas delta accounts for the intrinsic difference.
                 //
                 // If `intrinsic_delta` is large enough to drive `adjusted` below the
                 // EVM's baseline intrinsic cost, `transact()` will fail (the EVM
                 // rejects the tx before execution begins). This is caught below and
                 // recorded as a definitive schedule-induced failure.
                 let mut sched_tx_env = tx_env.clone();
-                if schedule.modifies_intrinsic() {
+                sched_tx_env.set_gas_limit(schedule_execution_gas_limit);
+                if schedule.modifies_intrinsic() && !schedule.uses_native_intrinsic_gas() {
                     if let Some(ref ctx) = tx_context {
                         if let Some(schedule_intrinsic) = schedule.intrinsic_gas(ctx) {
                             let intrinsic_delta =
-                                schedule_intrinsic as i64 - baseline_intrinsic_gas as i64;
-                            let raw_adjusted = gas_limit as i64 - intrinsic_delta;
-                            let adjusted = raw_adjusted.clamp(0, gas_limit as i64) as u64;
-                            if raw_adjusted < 0 || raw_adjusted > gas_limit as i64 {
+                                i128::from(schedule_intrinsic) - i128::from(baseline_intrinsic_gas);
+                            let replay_limit = i128::from(schedule_execution_gas_limit);
+                            let raw_adjusted = replay_limit - intrinsic_delta;
+                            let adjusted = raw_adjusted.clamp(0, replay_limit) as u64;
+                            if raw_adjusted < 0 || raw_adjusted > replay_limit {
                                 debug!(
                                     target: "exex::research",
                                     block = block_number,
@@ -799,6 +820,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                                     schedule = schedule.name(),
                                     %intrinsic_delta,
                                     %gas_limit,
+                                    %schedule_execution_gas_limit,
                                     %adjusted,
                                     "Gas limit clamped for 'Both' schedule — execution \
                                      budget may be conservative"
@@ -812,7 +834,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 let mut inspector = ScheduleInspector::new(schedule.clone());
                 let mut evm = self.ctx.evm_config().evm_with_env_and_inspector(
                     &mut normal_db,
-                    evm_env.clone(),
+                    schedule_evm_env,
                     &mut inspector,
                 );
                 let result = match evm.transact(sched_tx_env) {
@@ -823,6 +845,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                             block = block_number,
                             tx_idx,
                             schedule = schedule.name(),
+                            native_env_configured,
                             error = ?e,
                             "Schedule execution failed"
                         );
@@ -855,6 +878,12 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 let sched_gas_used = result.result.tx_gas_used();
                 let op_counts = Self::serialize_trace(inspector.operation_counts());
                 let insp_result = inspector.result();
+                let halt_info = match &result.result {
+                    revm::context_interface::result::ExecutionResult::Halt { reason, .. } => {
+                        Some(format!("Execution halted: {reason:?}"))
+                    }
+                    _ => None,
+                };
                 let (output_hash, output_len) = Self::output_hash_and_len(&result.result);
                 let created_address = result.result.created_address().map(Self::hex_address);
                 let log_count = result.result.logs().len() as u64;
@@ -866,7 +895,11 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                     success: sched_success,
                     gas_used: sched_gas_used,
                     operation_counts: op_counts,
-                    oog_info: insp_result.oog_info.as_ref().map(|oog| format!("{oog:?}")),
+                    oog_info: insp_result
+                        .oog_info
+                        .as_ref()
+                        .map(|oog| format!("{oog:?}"))
+                        .or(halt_info),
                     divergence_location: insp_result
                         .divergence_location
                         .as_ref()
@@ -924,6 +957,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                 let (
                     schedule_gas,
                     schedule_success,
+                    schedule_replay_success,
                     formatted_op_counts,
                     oog_info,
                     divergence_location,
@@ -972,6 +1006,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         (
                             gas,
                             success,
+                            r.success,
                             r.operation_counts.clone(),
                             r.oog_info.clone(),
                             r.divergence_location.clone(),
@@ -1010,6 +1045,7 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         (
                             gas,
                             success,
+                            normal_success,
                             None,
                             None,
                             None,
@@ -1066,6 +1102,15 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
 
                     let gas_efficiency_ratio = if normal_gas_used > 0 {
                         Some(schedule_gas as f64 / normal_gas_used as f64)
+                    } else {
+                        None
+                    };
+                    // Min gas-limit multiplier required for the schedule to succeed.
+                    // Only meaningful when the replay actually completed under the
+                    // (possibly inflated) replay limit; otherwise the gas_used we'd
+                    // divide by is the OOG cap, not the true minimum.
+                    let min_multiplier_to_succeed = if schedule_replay_success && gas_limit > 0 {
+                        Some(schedule_gas as f64 / gas_limit as f64)
                     } else {
                         None
                     };
@@ -1137,6 +1182,8 @@ impl<Node: FullNodeComponents> ResearchExEx<Node> {
                         schedule_log_count,
                         baseline_logs_bloom: baseline_logs_bloom.clone(),
                         schedule_logs_bloom,
+                        would_fit_in_original_limit: schedule_success,
+                        min_multiplier_to_succeed,
                     };
 
                     let should_record = self
@@ -1332,8 +1379,25 @@ async fn research_exex<Node: FullNodeComponents>(
     db_path: std::path::PathBuf,
     start_block: u64,
     max_divergences_per_block: Option<usize>,
-) -> eyre::Result<()> {
-    ResearchExEx::new(ctx, registry, db_path, start_block, max_divergences_per_block)?.run().await
+    gas_limit_multiplier: u64,
+) -> eyre::Result<()>
+where
+    Node::Evm: ConfigureEvm<
+        BlockExecutorFactory: BlockExecutorFactory<
+            EvmFactory: EvmFactory<Spec = SpecId, BlockEnv = BlockEnv>,
+        >,
+    >,
+{
+    ResearchExEx::new(
+        ctx,
+        registry,
+        db_path,
+        start_block,
+        max_divergences_per_block,
+        gas_limit_multiplier,
+    )?
+    .run()
+    .await
 }
 
 fn main() -> eyre::Result<()> {
@@ -1342,7 +1406,7 @@ fn main() -> eyre::Result<()> {
         // Check if any schedules are configured
             if !research_args.has_schedules() {
                 return Err(eyre::eyre!(
-                    "No research schedules configured. Use --research.eip2780, --research.csv, or --research.multiplier"
+                    "No research schedules configured. Use --research.eip2780, --research.eip8037, --research.csv, or --research.multiplier"
                 ));
             }
 
@@ -1354,6 +1418,7 @@ fn main() -> eyre::Result<()> {
             let db_path = research_args.db_path.clone();
             let start_block = research_args.start_block;
             let max_divergences_per_block = research_args.max_divergences_per_block;
+            let gas_limit_multiplier = research_args.gas_limit_multiplier;
 
             info!(
                 target: "reth::cli",
@@ -1361,6 +1426,7 @@ fn main() -> eyre::Result<()> {
                 db_path = ?db_path,
                 start_block,
                 max_divergences_per_block,
+                gas_limit_multiplier,
                 "Starting multi-schedule research mode"
             );
 
@@ -1376,6 +1442,7 @@ fn main() -> eyre::Result<()> {
                             db_path,
                             start_block,
                             max_divergences_per_block,
+                            gas_limit_multiplier,
                         ))
                     }
                 })

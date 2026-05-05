@@ -31,6 +31,15 @@ pub struct TxContext {
 
     /// Recipient account info (for classifying tx type)
     pub recipient_info: Option<RecipientInfo>,
+
+    /// Number of access-list accounts in the transaction.
+    pub access_list_accounts: u64,
+
+    /// Number of access-list storage keys in the transaction.
+    pub access_list_storage_slots: u64,
+
+    /// Number of EIP-7702 authorizations in the transaction.
+    pub authorization_count: u64,
 }
 
 /// Information about the transaction recipient.
@@ -86,6 +95,9 @@ impl TxContext {
             gas_limit,
             is_create,
             recipient_info: None,
+            access_list_accounts: 0,
+            access_list_storage_slots: 0,
+            authorization_count: 0,
         }
     }
 

@@ -158,6 +158,8 @@ struct HotRow {
     schedule_call_frames_hash: Option<String>,
     baseline_event_logs_hash: Option<String>,
     schedule_event_logs_hash: Option<String>,
+    would_fit_in_original_limit: bool,
+    min_multiplier_to_succeed: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -347,6 +349,8 @@ fn hot_schema() -> Arc<Schema> {
         Field::new("schedule_call_frames_hash", DataType::Utf8, true),
         Field::new("baseline_event_logs_hash", DataType::Utf8, true),
         Field::new("schedule_event_logs_hash", DataType::Utf8, true),
+        Field::new("would_fit_in_original_limit", DataType::Boolean, false),
+        Field::new("min_multiplier_to_succeed", DataType::Float64, true),
     ]))
 }
 
@@ -453,6 +457,8 @@ fn hot_batch(rows: &[HotRow]) -> Result<RecordBatch, ExportError> {
             opt_string_array(rows.iter().map(|r| r.schedule_call_frames_hash.clone()).collect()),
             opt_string_array(rows.iter().map(|r| r.baseline_event_logs_hash.clone()).collect()),
             opt_string_array(rows.iter().map(|r| r.schedule_event_logs_hash.clone()).collect()),
+            bool_array(rows.iter().map(|r| r.would_fit_in_original_limit).collect()),
+            opt_f64_array(rows.iter().map(|r| r.min_multiplier_to_succeed).collect()),
         ],
     )
 }
@@ -801,7 +807,8 @@ fn export_hot_for_schedule(
                 baseline_created_address, schedule_created_address, baseline_log_count,
                 schedule_log_count, baseline_logs_bloom, schedule_logs_bloom,
                 baseline_call_frames_hash, schedule_call_frames_hash,
-                baseline_event_logs_hash, schedule_event_logs_hash
+                baseline_event_logs_hash, schedule_event_logs_hash,
+                would_fit_in_original_limit, min_multiplier_to_succeed
          FROM schedule_divergences
          WHERE schedule_name = ?1
          ORDER BY block_number, tx_index",
@@ -877,6 +884,8 @@ fn export_hot_for_schedule(
             schedule_call_frames_hash: row.get(52)?,
             baseline_event_logs_hash: row.get(53)?,
             schedule_event_logs_hash: row.get(54)?,
+            would_fit_in_original_limit: row.get(55)?,
+            min_multiplier_to_succeed: row.get(56)?,
         };
         max_id = max_id.max(divergence_id);
         sink.push(block_number, hot)?;
@@ -1380,6 +1389,8 @@ mod tests {
             schedule_log_count: 0,
             baseline_logs_bloom: String::new(),
             schedule_logs_bloom: String::new(),
+            would_fit_in_original_limit: true,
+            min_multiplier_to_succeed: Some(0.95),
         }
     }
 

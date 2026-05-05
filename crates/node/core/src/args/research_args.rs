@@ -17,6 +17,12 @@ pub struct ResearchArgs {
     #[arg(long = "research.eip2780", help_heading = "Research")]
     pub eip2780: bool,
 
+    /// Enable EIP-8037 state creation gas experiment.
+    ///
+    /// This uses revm's native EIP-8037 state-gas and reservoir accounting.
+    #[arg(long = "research.eip8037", help_heading = "Research")]
+    pub eip8037: bool,
+
     /// Add a CSV-based gas pricing schedule.
     ///
     /// Format: name=path (e.g., --research.csv 7904-v1=./pricing.csv)
@@ -46,17 +52,32 @@ pub struct ResearchArgs {
         help_heading = "Research"
     )]
     pub max_divergences_per_block: Option<usize>,
+
+    /// Inflate transaction gas limits during schedule replay.
+    ///
+    /// The final success comparison still uses the transaction's original gas
+    /// limit, so this can reveal how much gas would be needed without masking
+    /// that the original transaction would fail under the schedule.
+    #[arg(
+        long = "research.gas-limit-multiplier",
+        value_name = "MULT",
+        default_value_t = 1,
+        help_heading = "Research"
+    )]
+    pub gas_limit_multiplier: u64,
 }
 
 impl Default for ResearchArgs {
     fn default() -> Self {
         Self {
             eip2780: false,
+            eip8037: false,
             csv_schedules: Vec::new(),
             multiplier_schedules: Vec::new(),
             db_path: PathBuf::from("./divergence.db"),
             start_block: 0,
             max_divergences_per_block: None,
+            gas_limit_multiplier: 1,
         }
     }
 }
@@ -64,13 +85,19 @@ impl Default for ResearchArgs {
 impl ResearchArgs {
     /// Check if any research schedules are configured.
     pub const fn has_schedules(&self) -> bool {
-        self.eip2780 || !self.csv_schedules.is_empty() || !self.multiplier_schedules.is_empty()
+        self.eip2780 ||
+            self.eip8037 ||
+            !self.csv_schedules.is_empty() ||
+            !self.multiplier_schedules.is_empty()
     }
 
     /// Get the number of configured schedules.
     pub const fn schedule_count(&self) -> usize {
         let mut count = 0;
         if self.eip2780 {
+            count += 1;
+        }
+        if self.eip8037 {
             count += 1;
         }
         count += self.csv_schedules.len();
@@ -97,6 +124,14 @@ impl ResearchArgs {
 
         if self.eip2780 {
             args = args.with_eip2780();
+        }
+
+        if self.eip8037 {
+            args = args.with_eip8037();
+        }
+
+        if self.gas_limit_multiplier > 1 {
+            args = args.with_gas_limit_multiplier(self.gas_limit_multiplier);
         }
 
         for csv_spec in &self.csv_schedules {
@@ -136,6 +171,14 @@ impl ResearchArgs {
             args = args.with_eip2780();
         }
 
+        if self.eip8037 {
+            args = args.with_eip8037();
+        }
+
+        if self.gas_limit_multiplier > 1 {
+            args = args.with_gas_limit_multiplier(self.gas_limit_multiplier);
+        }
+
         for csv_spec in &self.csv_schedules {
             let schedule = NamedCsvSchedule::parse(csv_spec)?;
             args = args.with_csv_schedule(schedule);
@@ -173,6 +216,14 @@ mod tests {
     fn test_parse_research_args_eip2780() {
         let args = CommandParser::<ResearchArgs>::parse_from(["reth", "--research.eip2780"]).args;
         assert!(args.eip2780);
+        assert!(args.has_schedules());
+        assert_eq!(args.schedule_count(), 1);
+    }
+
+    #[test]
+    fn test_parse_research_args_eip8037() {
+        let args = CommandParser::<ResearchArgs>::parse_from(["reth", "--research.eip8037"]).args;
+        assert!(args.eip8037);
         assert!(args.has_schedules());
         assert_eq!(args.schedule_count(), 1);
     }
@@ -231,6 +282,8 @@ mod tests {
             "18000000",
             "--research.max-divergences-per-block",
             "25",
+            "--research.gas-limit-multiplier",
+            "8",
         ])
         .args;
         assert!(args.eip2780);
@@ -239,6 +292,7 @@ mod tests {
         assert_eq!(args.db_path, PathBuf::from("./results.db"));
         assert_eq!(args.start_block, 18000000);
         assert_eq!(args.max_divergences_per_block, Some(25));
+        assert_eq!(args.gas_limit_multiplier, 8);
         assert_eq!(args.schedule_count(), 3);
     }
 }

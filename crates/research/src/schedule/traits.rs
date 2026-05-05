@@ -2,6 +2,8 @@
 
 use super::context::{OpcodeContext, TxContext};
 use alloy_primitives::Address;
+use reth_evm::EvmEnv;
+use revm::primitives::hardfork::SpecId;
 use std::fmt::Debug;
 
 /// The kind of modifications a schedule makes.
@@ -134,6 +136,29 @@ pub trait GasSchedule: Send + Sync + Debug {
         None
     }
 
+    /// Configure the EVM environment used for this schedule's replay pass.
+    ///
+    /// Most schedules are implemented as explicit inspector deltas and leave the
+    /// EVM environment unchanged. Native fork-style schedules can use this hook
+    /// to enable protocol behavior that cannot be expressed as isolated opcode
+    /// deltas, while still comparing the result against the baseline execution.
+    ///
+    /// Returns `true` if the schedule changed the environment.
+    fn configure_evm_env(&self, env: &mut EvmEnv<SpecId>) -> bool {
+        let _ = env;
+        false
+    }
+
+    /// Whether the schedule's intrinsic gas is enforced by its configured EVM
+    /// environment.
+    ///
+    /// When this is `false`, the research runner offsets the replay
+    /// transaction gas limit to compensate for intrinsic-gas changes because the
+    /// EVM still deducts baseline intrinsic gas internally.
+    fn uses_native_intrinsic_gas(&self) -> bool {
+        false
+    }
+
     /// Whether this schedule modifies intrinsic gas.
     fn modifies_intrinsic(&self) -> bool {
         matches!(self.kind(), ScheduleKind::IntrinsicOnly | ScheduleKind::Both)
@@ -196,6 +221,14 @@ impl GasSchedule for Box<dyn GasSchedule> {
 
     fn execution_gas_multiplier(&self) -> Option<u64> {
         (**self).execution_gas_multiplier()
+    }
+
+    fn configure_evm_env(&self, env: &mut EvmEnv<SpecId>) -> bool {
+        (**self).configure_evm_env(env)
+    }
+
+    fn uses_native_intrinsic_gas(&self) -> bool {
+        (**self).uses_native_intrinsic_gas()
     }
 
     fn config_fingerprint(&self) -> String {

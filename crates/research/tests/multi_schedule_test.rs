@@ -124,6 +124,7 @@ fn test_eip2780_transfer_to_eoa() {
             balance: U256::from(100),
             nonce: 1,
         }),
+        ..Default::default()
     };
 
     let intrinsic = schedule.intrinsic_gas(&ctx).unwrap();
@@ -155,6 +156,7 @@ fn test_eip2780_call_to_contract() {
             balance: U256::ZERO,
             nonce: 1,
         }),
+        ..Default::default()
     };
 
     let intrinsic = schedule.intrinsic_gas(&ctx).unwrap();
@@ -186,6 +188,7 @@ fn test_eip2780_nop_to_self() {
             balance: U256::from(100),
             nonce: 1,
         }),
+        ..Default::default()
     };
 
     let intrinsic = schedule.intrinsic_gas(&ctx).unwrap();
@@ -210,6 +213,7 @@ fn test_eip2780_contract_creation() {
         gas_limit: 1_000_000,
         is_create: true,
         recipient_info: None,
+        ..Default::default()
     };
 
     let intrinsic = schedule.intrinsic_gas(&ctx).unwrap();
@@ -290,6 +294,7 @@ fn test_analyzer_with_eip2780_schedule() {
             balance: U256::from(100),
             nonce: 1,
         }),
+        ..Default::default()
     };
 
     let baseline = ExecutionSummary::new(true, 21000, 21000);
@@ -357,6 +362,7 @@ fn test_analyzer_with_database() {
             balance: U256::from(100),
             nonce: 1,
         }),
+        ..Default::default()
     };
 
     let baseline = ExecutionSummary::new(true, 21000, 21000);
@@ -455,6 +461,8 @@ fn test_database_schedule_divergence_workflow() {
         schedule_log_count: 0,
         baseline_logs_bloom: String::new(),
         schedule_logs_bloom: String::new(),
+        would_fit_in_original_limit: true,
+        min_multiplier_to_succeed: Some(0.286),
     };
 
     let div2 = ScheduleDivergence {
@@ -519,6 +527,8 @@ fn test_database_schedule_divergence_workflow() {
         schedule_log_count: 0,
         baseline_logs_bloom: String::new(),
         schedule_logs_bloom: String::new(),
+        would_fit_in_original_limit: false,
+        min_multiplier_to_succeed: Some(2.0),
     };
 
     db.record_schedule_divergence(&div1).unwrap();
@@ -579,6 +589,7 @@ fn test_full_workflow_cli_to_analysis() {
             balance: U256::from(100),
             nonce: 1,
         }),
+        ..Default::default()
     };
 
     let baseline =

@@ -67,6 +67,15 @@ pub struct ScheduleDivergence {
     pub schedule_success: bool,
     /// Additional gas charged under this schedule
     pub schedule_gas_used: u64,
+    /// Whether `schedule_gas_used` would still fit within the original
+    /// `tx_gas_limit` (i.e. the original transaction would have survived the
+    /// schedule without any extra gas budget).
+    pub would_fit_in_original_limit: bool,
+    /// Smallest gas-limit multiplier that lets the schedule replay succeed
+    /// (`schedule_gas_used / tx_gas_limit`). `None` when the replay halted
+    /// regardless of gas (revert / non-OOG halt), when the gas limit was
+    /// inflated and still hit OOG, or when `tx_gas_limit` is zero.
+    pub min_multiplier_to_succeed: Option<f64>,
     /// Schedule intrinsic gas (if modified)
     pub schedule_intrinsic_gas: Option<u64>,
 
@@ -274,6 +283,8 @@ fn initialize_schema_on_connection(conn: &Connection) -> Result<(), DatabaseErro
                 -- Schedule execution
                 schedule_success BOOLEAN NOT NULL,
                 schedule_gas_used INTEGER NOT NULL,
+                would_fit_in_original_limit BOOLEAN NOT NULL DEFAULT 0,
+                min_multiplier_to_succeed REAL,
                 schedule_intrinsic_gas INTEGER,
 
                 -- Analysis
@@ -374,6 +385,8 @@ fn initialize_schema_on_connection(conn: &Connection) -> Result<(), DatabaseErro
         "schedule_log_count INTEGER NOT NULL DEFAULT 0",
         "baseline_logs_bloom TEXT NOT NULL DEFAULT ''",
         "schedule_logs_bloom TEXT NOT NULL DEFAULT ''",
+        "would_fit_in_original_limit BOOLEAN NOT NULL DEFAULT 0",
+        "min_multiplier_to_succeed REAL",
     ] {
         let Some(column_name) = column_def.split_whitespace().next() else {
             continue;
@@ -543,7 +556,8 @@ impl DivergenceDatabase {
                 baseline_output_hash, schedule_output_hash,
                 baseline_created_address, schedule_created_address,
                 baseline_log_count, schedule_log_count,
-                baseline_logs_bloom, schedule_logs_bloom
+                baseline_logs_bloom, schedule_logs_bloom,
+                would_fit_in_original_limit, min_multiplier_to_succeed
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
@@ -551,7 +565,7 @@ impl DivergenceDatabase {
                 ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
                 ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50,
                 ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60,
-                ?61
+                ?61, ?62, ?63
             )
             ON CONFLICT(schedule_name, block_number, tx_index, tx_hash) DO UPDATE SET
                 timestamp = excluded.timestamp,
@@ -610,7 +624,9 @@ impl DivergenceDatabase {
                 baseline_log_count = excluded.baseline_log_count,
                 schedule_log_count = excluded.schedule_log_count,
                 baseline_logs_bloom = excluded.baseline_logs_bloom,
-                schedule_logs_bloom = excluded.schedule_logs_bloom
+                schedule_logs_bloom = excluded.schedule_logs_bloom,
+                would_fit_in_original_limit = excluded.would_fit_in_original_limit,
+                min_multiplier_to_succeed = excluded.min_multiplier_to_succeed
             WHERE
                 timestamp IS NOT excluded.timestamp OR
                 schedule_kind IS NOT excluded.schedule_kind OR
@@ -668,7 +684,9 @@ impl DivergenceDatabase {
                 baseline_log_count IS NOT excluded.baseline_log_count OR
                 schedule_log_count IS NOT excluded.schedule_log_count OR
                 baseline_logs_bloom IS NOT excluded.baseline_logs_bloom OR
-                schedule_logs_bloom IS NOT excluded.schedule_logs_bloom",
+                schedule_logs_bloom IS NOT excluded.schedule_logs_bloom OR
+                would_fit_in_original_limit IS NOT excluded.would_fit_in_original_limit OR
+                min_multiplier_to_succeed IS NOT excluded.min_multiplier_to_succeed",
             params![
                 divergence.schedule_name,
                 divergence.block_number,
@@ -731,6 +749,8 @@ impl DivergenceDatabase {
                 divergence.schedule_log_count,
                 divergence.baseline_logs_bloom,
                 divergence.schedule_logs_bloom,
+                divergence.would_fit_in_original_limit,
+                divergence.min_multiplier_to_succeed,
             ],
         )?;
 
@@ -778,7 +798,8 @@ impl DivergenceDatabase {
                 baseline_output_hash, schedule_output_hash,
                 baseline_created_address, schedule_created_address,
                 baseline_log_count, schedule_log_count,
-                baseline_logs_bloom, schedule_logs_bloom
+                baseline_logs_bloom, schedule_logs_bloom,
+                would_fit_in_original_limit, min_multiplier_to_succeed
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
@@ -786,7 +807,7 @@ impl DivergenceDatabase {
                 ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
                 ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50,
                 ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60,
-                ?61
+                ?61, ?62, ?63
             )
             ON CONFLICT(schedule_name, block_number, tx_index, tx_hash) DO UPDATE SET
                 timestamp = excluded.timestamp,
@@ -845,7 +866,9 @@ impl DivergenceDatabase {
                 baseline_log_count = excluded.baseline_log_count,
                 schedule_log_count = excluded.schedule_log_count,
                 baseline_logs_bloom = excluded.baseline_logs_bloom,
-                schedule_logs_bloom = excluded.schedule_logs_bloom
+                schedule_logs_bloom = excluded.schedule_logs_bloom,
+                would_fit_in_original_limit = excluded.would_fit_in_original_limit,
+                min_multiplier_to_succeed = excluded.min_multiplier_to_succeed
             WHERE
                 timestamp IS NOT excluded.timestamp OR
                 schedule_kind IS NOT excluded.schedule_kind OR
@@ -903,7 +926,9 @@ impl DivergenceDatabase {
                 baseline_log_count IS NOT excluded.baseline_log_count OR
                 schedule_log_count IS NOT excluded.schedule_log_count OR
                 baseline_logs_bloom IS NOT excluded.baseline_logs_bloom OR
-                schedule_logs_bloom IS NOT excluded.schedule_logs_bloom",
+                schedule_logs_bloom IS NOT excluded.schedule_logs_bloom OR
+                would_fit_in_original_limit IS NOT excluded.would_fit_in_original_limit OR
+                min_multiplier_to_succeed IS NOT excluded.min_multiplier_to_succeed",
         )?;
         let mut count = 0;
         for divergence in divergences {
@@ -969,6 +994,8 @@ impl DivergenceDatabase {
                 divergence.schedule_log_count,
                 divergence.baseline_logs_bloom,
                 divergence.schedule_logs_bloom,
+                divergence.would_fit_in_original_limit,
+                divergence.min_multiplier_to_succeed,
             ])?;
             count += 1;
         }
@@ -1379,6 +1406,8 @@ mod tests {
             schedule_log_count: 0,
             baseline_logs_bloom: String::new(),
             schedule_logs_bloom: String::new(),
+            would_fit_in_original_limit: false,
+            min_multiplier_to_succeed: None,
         };
 
         let id = db.record_schedule_divergence(&divergence).unwrap();
@@ -1457,6 +1486,8 @@ mod tests {
                     schedule_log_count: 0,
                     baseline_logs_bloom: String::new(),
                     schedule_logs_bloom: String::new(),
+                    would_fit_in_original_limit: false,
+                    min_multiplier_to_succeed: None,
                 };
                 db.record_schedule_divergence(&divergence).unwrap();
             }
@@ -1562,6 +1593,8 @@ mod tests {
                 schedule_log_count: 0,
                 baseline_logs_bloom: String::new(),
                 schedule_logs_bloom: String::new(),
+                would_fit_in_original_limit: false,
+                min_multiplier_to_succeed: None,
             };
             db.record_schedule_divergence(&divergence).unwrap();
         }
@@ -1641,6 +1674,8 @@ mod tests {
                 schedule_log_count: 0,
                 baseline_logs_bloom: String::new(),
                 schedule_logs_bloom: String::new(),
+                would_fit_in_original_limit: false,
+                min_multiplier_to_succeed: None,
             };
             db.record_schedule_divergence(&divergence).unwrap();
         }
@@ -1717,6 +1752,8 @@ mod tests {
                 schedule_log_count: 0,
                 baseline_logs_bloom: String::new(),
                 schedule_logs_bloom: String::new(),
+                would_fit_in_original_limit: false,
+                min_multiplier_to_succeed: None,
             };
             db.record_schedule_divergence(&divergence).unwrap();
         }
@@ -1793,6 +1830,8 @@ mod tests {
             schedule_log_count: 0,
             baseline_logs_bloom: String::new(),
             schedule_logs_bloom: String::new(),
+            would_fit_in_original_limit: false,
+            min_multiplier_to_succeed: None,
         };
 
         db.record_schedule_divergence(&divergence).unwrap();
