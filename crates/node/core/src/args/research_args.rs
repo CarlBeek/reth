@@ -7,7 +7,7 @@ use std::path::PathBuf;
 ///
 /// This supports running multiple gas schedule experiments simultaneously,
 /// comparing each against baseline Ethereum execution.
-#[derive(Debug, Clone, Args, PartialEq)]
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
 #[command(next_help_heading = "Research")]
 pub struct ResearchArgs {
     /// Enable EIP-2780 intrinsic gas experiment.
@@ -63,12 +63,12 @@ impl Default for ResearchArgs {
 
 impl ResearchArgs {
     /// Check if any research schedules are configured.
-    pub fn has_schedules(&self) -> bool {
+    pub const fn has_schedules(&self) -> bool {
         self.eip2780 || !self.csv_schedules.is_empty() || !self.multiplier_schedules.is_empty()
     }
 
     /// Get the number of configured schedules.
-    pub fn schedule_count(&self) -> usize {
+    pub const fn schedule_count(&self) -> usize {
         let mut count = 0;
         if self.eip2780 {
             count += 1;
@@ -120,7 +120,7 @@ impl ResearchArgs {
         reth_research::database::DivergenceDatabase::open(&self.db_path)
     }
 
-    /// Convert to the research crate's ResearchArgs type.
+    /// Convert to the research crate's [`reth_research::ResearchArgs`] type.
     pub fn to_research_args(&self) -> Result<reth_research::ResearchArgs, reth_research::CliError> {
         use reth_research::{NamedCsvSchedule, NamedMultiplierSchedule};
 

@@ -1,7 +1,7 @@
 //! Schedule inspector that applies gas cost modifications during execution.
 //!
 //! This inspector re-executes a transaction under a given gas schedule by actually
-//! modifying gas charges via `interp.gas.record_cost()` / `erase_cost()`. Because
+//! modifying gas charges via `interp.gas.record_regular_cost()` / `erase_cost()`. Because
 //! the EVM sees the real modified gas, subcall gas forwarding is handled naturally —
 //! if a caller burns more gas before a CALL, the subcall receives less gas, and may
 //! OOG where it previously succeeded.
@@ -38,7 +38,7 @@
 //! current_cost), not an absolute replacement. The EVM still charges its own base
 //! cost separately. The total gas consumed is the same regardless of deduction
 //! order, but the intermediate `remaining` value between the inspector's charge and
-//! the EVM's charge differs. This intermediate value matters: if `record_cost(delta)`
+//! the EVM's charge differs. This intermediate value matters: if `record_regular_cost(delta)`
 //! succeeds but leaves `remaining` so low that the EVM's own CALL base-cost check
 //! then fails, the EVM will halt with OOG. The inspector detects this via indirect
 //! OOG detection in `call_end()` / `create_end()`, including the caller's PC from
@@ -48,7 +48,7 @@
 //!
 //! # Asymmetry in cost increase vs decrease propagation
 //!
-//! Gas *increases* propagate fully through subcalls — `record_cost()` can drive the
+//! Gas *increases* propagate fully through subcalls — `record_regular_cost()` can drive the
 //! frame to OOG. Gas *decreases* (refunds via `erase_cost()`) are capped at the
 //! frame's gas limit to avoid arithmetic overflow, since `erase_cost()` performs
 //! unchecked addition on `remaining`. This means a schedule that makes opcodes
@@ -509,7 +509,7 @@ impl ScheduleInspector {
             if let Some(frame) = self.call_stack.last_mut() {
                 frame.any_positive_delta_in_subtree = true;
             }
-            if !interp.gas.record_cost(gas_delta as u64) {
+            if !interp.gas.record_regular_cost(gas_delta as u64) {
                 self.record_oog(interp, opcode);
                 interp.halt_oog();
                 return false;
@@ -775,7 +775,7 @@ where
                             // Charge the extra gas from the precompile frame's budget.
                             // We already checked above that remaining >= delta, so this
                             // cannot fail.
-                            let _ = outcome.result.gas.record_cost(total_delta as u64);
+                            let _ = outcome.result.gas.record_regular_cost(total_delta as u64);
                         }
                     } else {
                         // Refund gas (precompile is cheaper under this schedule)
