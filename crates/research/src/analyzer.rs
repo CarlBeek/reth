@@ -286,6 +286,14 @@ impl MultiScheduleAnalyzer {
                 .map(|e| e.schedule_success)
                 .unwrap_or(baseline.success),
             min_multiplier_to_succeed: None,
+            baseline_total_gas_spent: 0,
+            baseline_gas_refunded: 0,
+            schedule_total_gas_spent: 0,
+            schedule_state_gas_spent: 0,
+            schedule_initial_state_gas: 0,
+            schedule_initial_reservoir: 0,
+            schedule_floor_gas: 0,
+            schedule_gas_refunded: 0,
         };
 
         match db.record_schedule_divergence(&divergence) {

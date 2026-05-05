@@ -735,6 +735,8 @@ where
             let baseline_logs_bloom = Self::logs_bloom_hex(&normal_result.result);
             let baseline_call_frames_hash = Self::hash_serialized(&baseline_call_frames);
             let baseline_event_logs_hash = Self::hash_serialized(&baseline_event_logs);
+            let baseline_total_gas_spent = normal_result.result.gas().total_gas_spent();
+            let baseline_gas_refunded = normal_result.result.gas().inner_refunded();
 
             // --- EXECUTION: Per-schedule re-execution with gas modifications ---
             // Each execution-modifying schedule gets its own full execution pass
@@ -746,6 +748,12 @@ where
             struct PerScheduleResult {
                 success: bool,
                 gas_used: u64,
+                total_gas_spent: u64,
+                state_gas_spent: u64,
+                initial_state_gas: u64,
+                initial_reservoir: u64,
+                floor_gas: u64,
+                gas_refunded: u64,
                 operation_counts: Option<String>,
                 oog_info: Option<String>,
                 divergence_location: Option<String>,
@@ -774,6 +782,31 @@ where
             for schedule in self.execution_schedules.iter() {
                 let mut schedule_evm_env = evm_env.clone();
                 let native_env_configured = schedule.configure_evm_env(&mut schedule_evm_env);
+
+                // Capture the per-tx state-gas reservoir budget under the schedule's
+                // EVM env. For non-EIP-8037 schedules, both values stay 0 (no
+                // reservoir). For EIP-8037 schedules, we recompute against the
+                // *original* gas_limit so the recorded reservoir reflects what a
+                // mainnet tx would have, not the inflated replay limit.
+                let (schedule_initial_state_gas, schedule_initial_reservoir) =
+                    if schedule_evm_env.cfg_env.is_amsterdam_eip8037_enabled() {
+                        let init_gas = calculate_initial_tx_gas(
+                            SpecId::AMSTERDAM,
+                            &input,
+                            is_create,
+                            access_list_accounts,
+                            access_list_storage_slots,
+                            authorization_count,
+                        );
+                        let (_limit, reservoir) = init_gas.initial_gas_and_reservoir(
+                            gas_limit,
+                            revm::primitives::eip7825::TX_GAS_LIMIT_CAP,
+                            true,
+                        );
+                        (init_gas.initial_state_gas, reservoir)
+                    } else {
+                        (0, 0)
+                    };
 
                 if self.gas_limit_multiplier > 1 {
                     schedule_evm_env.cfg_env.disable_block_gas_limit = true;
@@ -856,6 +889,12 @@ where
                         schedule_results.push(PerScheduleResult {
                             success: false,
                             gas_used: gas_limit,
+                            total_gas_spent: 0,
+                            state_gas_spent: 0,
+                            initial_state_gas: schedule_initial_state_gas,
+                            initial_reservoir: schedule_initial_reservoir,
+                            floor_gas: 0,
+                            gas_refunded: 0,
                             operation_counts: None,
                             oog_info: Some(format!("EVM transact failed: {e:?}")),
                             divergence_location: None,
@@ -876,6 +915,10 @@ where
 
                 let sched_success = result.result.is_success();
                 let sched_gas_used = result.result.tx_gas_used();
+                let sched_total_gas_spent = result.result.gas().total_gas_spent();
+                let sched_state_gas_spent = result.result.gas().state_gas_spent();
+                let sched_floor_gas = result.result.gas().floor_gas();
+                let sched_gas_refunded = result.result.gas().inner_refunded();
                 let op_counts = Self::serialize_trace(inspector.operation_counts());
                 let insp_result = inspector.result();
                 let halt_info = match &result.result {
@@ -894,6 +937,12 @@ where
                 schedule_results.push(PerScheduleResult {
                     success: sched_success,
                     gas_used: sched_gas_used,
+                    total_gas_spent: sched_total_gas_spent,
+                    state_gas_spent: sched_state_gas_spent,
+                    initial_state_gas: schedule_initial_state_gas,
+                    initial_reservoir: schedule_initial_reservoir,
+                    floor_gas: sched_floor_gas,
+                    gas_refunded: sched_gas_refunded,
                     operation_counts: op_counts,
                     oog_info: insp_result
                         .oog_info
@@ -958,6 +1007,12 @@ where
                     schedule_gas,
                     schedule_success,
                     schedule_replay_success,
+                    schedule_total_gas_spent,
+                    schedule_state_gas_spent,
+                    schedule_initial_state_gas,
+                    schedule_initial_reservoir,
+                    schedule_floor_gas,
+                    schedule_gas_refunded,
                     formatted_op_counts,
                     oog_info,
                     divergence_location,
@@ -1007,6 +1062,12 @@ where
                             gas,
                             success,
                             r.success,
+                            r.total_gas_spent,
+                            r.state_gas_spent,
+                            r.initial_state_gas,
+                            r.initial_reservoir,
+                            r.floor_gas,
+                            r.gas_refunded,
                             r.operation_counts.clone(),
                             r.oog_info.clone(),
                             r.divergence_location.clone(),
@@ -1039,13 +1100,21 @@ where
                         )
                     }
                     None => {
-                        // Intrinsic-only schedule: estimate from baseline
+                        // Intrinsic-only schedule: no execution result, so the
+                        // schedule-side state-gas / reservoir / refund counters
+                        // stay zero — only the baseline equivalents are meaningful.
                         let gas = (normal_gas_used as i64 + intrinsic_delta).max(0) as u64;
                         let success = normal_success && gas <= gas_limit;
                         (
                             gas,
                             success,
                             normal_success,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
                             None,
                             None,
                             None,
@@ -1184,6 +1253,14 @@ where
                         schedule_logs_bloom,
                         would_fit_in_original_limit: schedule_success,
                         min_multiplier_to_succeed,
+                        baseline_total_gas_spent,
+                        baseline_gas_refunded,
+                        schedule_total_gas_spent,
+                        schedule_state_gas_spent,
+                        schedule_initial_state_gas,
+                        schedule_initial_reservoir,
+                        schedule_floor_gas,
+                        schedule_gas_refunded,
                     };
 
                     let should_record = self

@@ -62,11 +62,31 @@ pub struct ScheduleDivergence {
     pub baseline_gas_used: u64,
     /// Baseline intrinsic gas
     pub baseline_intrinsic_gas: u64,
+    /// Total baseline gas spent before refund (regular + state)
+    pub baseline_total_gas_spent: u64,
+    /// Raw baseline gas refund (`Gas::refunded()` — capped per EIP-3529).
+    pub baseline_gas_refunded: u64,
 
     /// Schedule execution succeeded (simulated)
     pub schedule_success: bool,
     /// Additional gas charged under this schedule
     pub schedule_gas_used: u64,
+    /// Total schedule gas spent before refund (regular + state)
+    pub schedule_total_gas_spent: u64,
+    /// Net state gas charged under this schedule (initial + runtime,
+    /// already net of EIP-7702 reservoir refund). Zero unless EIP-8037 is enabled.
+    pub schedule_state_gas_spent: u64,
+    /// State gas charged at transaction start (auth-list + create-tx state gas,
+    /// gross of EIP-7702 reservoir refund). Zero unless EIP-8037 is enabled.
+    pub schedule_initial_state_gas: u64,
+    /// Per-tx state-gas reservoir size at the start of execution (after the
+    /// initial state-gas deduction and EIP-7702 reservoir refund). Zero unless
+    /// EIP-8037 is enabled.
+    pub schedule_initial_reservoir: u64,
+    /// EIP-7623 floor gas under this schedule.
+    pub schedule_floor_gas: u64,
+    /// Raw schedule gas refund (`Gas::refunded()` — capped per EIP-3529).
+    pub schedule_gas_refunded: u64,
     /// Whether `schedule_gas_used` would still fit within the original
     /// `tx_gas_limit` (i.e. the original transaction would have survived the
     /// schedule without any extra gas budget).
@@ -279,10 +299,18 @@ fn initialize_schema_on_connection(conn: &Connection) -> Result<(), DatabaseErro
                 baseline_success BOOLEAN NOT NULL,
                 baseline_gas_used INTEGER NOT NULL,
                 baseline_intrinsic_gas INTEGER NOT NULL,
+                baseline_total_gas_spent INTEGER NOT NULL DEFAULT 0,
+                baseline_gas_refunded INTEGER NOT NULL DEFAULT 0,
 
                 -- Schedule execution
                 schedule_success BOOLEAN NOT NULL,
                 schedule_gas_used INTEGER NOT NULL,
+                schedule_total_gas_spent INTEGER NOT NULL DEFAULT 0,
+                schedule_state_gas_spent INTEGER NOT NULL DEFAULT 0,
+                schedule_initial_state_gas INTEGER NOT NULL DEFAULT 0,
+                schedule_initial_reservoir INTEGER NOT NULL DEFAULT 0,
+                schedule_floor_gas INTEGER NOT NULL DEFAULT 0,
+                schedule_gas_refunded INTEGER NOT NULL DEFAULT 0,
                 would_fit_in_original_limit BOOLEAN NOT NULL DEFAULT 0,
                 min_multiplier_to_succeed REAL,
                 schedule_intrinsic_gas INTEGER,
@@ -387,6 +415,14 @@ fn initialize_schema_on_connection(conn: &Connection) -> Result<(), DatabaseErro
         "schedule_logs_bloom TEXT NOT NULL DEFAULT ''",
         "would_fit_in_original_limit BOOLEAN NOT NULL DEFAULT 0",
         "min_multiplier_to_succeed REAL",
+        "baseline_total_gas_spent INTEGER NOT NULL DEFAULT 0",
+        "baseline_gas_refunded INTEGER NOT NULL DEFAULT 0",
+        "schedule_total_gas_spent INTEGER NOT NULL DEFAULT 0",
+        "schedule_state_gas_spent INTEGER NOT NULL DEFAULT 0",
+        "schedule_initial_state_gas INTEGER NOT NULL DEFAULT 0",
+        "schedule_initial_reservoir INTEGER NOT NULL DEFAULT 0",
+        "schedule_floor_gas INTEGER NOT NULL DEFAULT 0",
+        "schedule_gas_refunded INTEGER NOT NULL DEFAULT 0",
     ] {
         let Some(column_name) = column_def.split_whitespace().next() else {
             continue;
@@ -557,7 +593,11 @@ impl DivergenceDatabase {
                 baseline_created_address, schedule_created_address,
                 baseline_log_count, schedule_log_count,
                 baseline_logs_bloom, schedule_logs_bloom,
-                would_fit_in_original_limit, min_multiplier_to_succeed
+                would_fit_in_original_limit, min_multiplier_to_succeed,
+                baseline_total_gas_spent, baseline_gas_refunded,
+                schedule_total_gas_spent, schedule_state_gas_spent,
+                schedule_initial_state_gas, schedule_initial_reservoir,
+                schedule_floor_gas, schedule_gas_refunded
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
@@ -565,7 +605,8 @@ impl DivergenceDatabase {
                 ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
                 ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50,
                 ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60,
-                ?61, ?62, ?63
+                ?61, ?62, ?63, ?64, ?65, ?66, ?67, ?68, ?69, ?70,
+                ?71
             )
             ON CONFLICT(schedule_name, block_number, tx_index, tx_hash) DO UPDATE SET
                 timestamp = excluded.timestamp,
@@ -626,7 +667,15 @@ impl DivergenceDatabase {
                 baseline_logs_bloom = excluded.baseline_logs_bloom,
                 schedule_logs_bloom = excluded.schedule_logs_bloom,
                 would_fit_in_original_limit = excluded.would_fit_in_original_limit,
-                min_multiplier_to_succeed = excluded.min_multiplier_to_succeed
+                min_multiplier_to_succeed = excluded.min_multiplier_to_succeed,
+                baseline_total_gas_spent = excluded.baseline_total_gas_spent,
+                baseline_gas_refunded = excluded.baseline_gas_refunded,
+                schedule_total_gas_spent = excluded.schedule_total_gas_spent,
+                schedule_state_gas_spent = excluded.schedule_state_gas_spent,
+                schedule_initial_state_gas = excluded.schedule_initial_state_gas,
+                schedule_initial_reservoir = excluded.schedule_initial_reservoir,
+                schedule_floor_gas = excluded.schedule_floor_gas,
+                schedule_gas_refunded = excluded.schedule_gas_refunded
             WHERE
                 timestamp IS NOT excluded.timestamp OR
                 schedule_kind IS NOT excluded.schedule_kind OR
@@ -686,7 +735,15 @@ impl DivergenceDatabase {
                 baseline_logs_bloom IS NOT excluded.baseline_logs_bloom OR
                 schedule_logs_bloom IS NOT excluded.schedule_logs_bloom OR
                 would_fit_in_original_limit IS NOT excluded.would_fit_in_original_limit OR
-                min_multiplier_to_succeed IS NOT excluded.min_multiplier_to_succeed",
+                min_multiplier_to_succeed IS NOT excluded.min_multiplier_to_succeed OR
+                baseline_total_gas_spent IS NOT excluded.baseline_total_gas_spent OR
+                baseline_gas_refunded IS NOT excluded.baseline_gas_refunded OR
+                schedule_total_gas_spent IS NOT excluded.schedule_total_gas_spent OR
+                schedule_state_gas_spent IS NOT excluded.schedule_state_gas_spent OR
+                schedule_initial_state_gas IS NOT excluded.schedule_initial_state_gas OR
+                schedule_initial_reservoir IS NOT excluded.schedule_initial_reservoir OR
+                schedule_floor_gas IS NOT excluded.schedule_floor_gas OR
+                schedule_gas_refunded IS NOT excluded.schedule_gas_refunded",
             params![
                 divergence.schedule_name,
                 divergence.block_number,
@@ -751,6 +808,14 @@ impl DivergenceDatabase {
                 divergence.schedule_logs_bloom,
                 divergence.would_fit_in_original_limit,
                 divergence.min_multiplier_to_succeed,
+                divergence.baseline_total_gas_spent,
+                divergence.baseline_gas_refunded,
+                divergence.schedule_total_gas_spent,
+                divergence.schedule_state_gas_spent,
+                divergence.schedule_initial_state_gas,
+                divergence.schedule_initial_reservoir,
+                divergence.schedule_floor_gas,
+                divergence.schedule_gas_refunded,
             ],
         )?;
 
@@ -799,7 +864,11 @@ impl DivergenceDatabase {
                 baseline_created_address, schedule_created_address,
                 baseline_log_count, schedule_log_count,
                 baseline_logs_bloom, schedule_logs_bloom,
-                would_fit_in_original_limit, min_multiplier_to_succeed
+                would_fit_in_original_limit, min_multiplier_to_succeed,
+                baseline_total_gas_spent, baseline_gas_refunded,
+                schedule_total_gas_spent, schedule_state_gas_spent,
+                schedule_initial_state_gas, schedule_initial_reservoir,
+                schedule_floor_gas, schedule_gas_refunded
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
@@ -807,7 +876,8 @@ impl DivergenceDatabase {
                 ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
                 ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50,
                 ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60,
-                ?61, ?62, ?63
+                ?61, ?62, ?63, ?64, ?65, ?66, ?67, ?68, ?69, ?70,
+                ?71
             )
             ON CONFLICT(schedule_name, block_number, tx_index, tx_hash) DO UPDATE SET
                 timestamp = excluded.timestamp,
@@ -868,7 +938,15 @@ impl DivergenceDatabase {
                 baseline_logs_bloom = excluded.baseline_logs_bloom,
                 schedule_logs_bloom = excluded.schedule_logs_bloom,
                 would_fit_in_original_limit = excluded.would_fit_in_original_limit,
-                min_multiplier_to_succeed = excluded.min_multiplier_to_succeed
+                min_multiplier_to_succeed = excluded.min_multiplier_to_succeed,
+                baseline_total_gas_spent = excluded.baseline_total_gas_spent,
+                baseline_gas_refunded = excluded.baseline_gas_refunded,
+                schedule_total_gas_spent = excluded.schedule_total_gas_spent,
+                schedule_state_gas_spent = excluded.schedule_state_gas_spent,
+                schedule_initial_state_gas = excluded.schedule_initial_state_gas,
+                schedule_initial_reservoir = excluded.schedule_initial_reservoir,
+                schedule_floor_gas = excluded.schedule_floor_gas,
+                schedule_gas_refunded = excluded.schedule_gas_refunded
             WHERE
                 timestamp IS NOT excluded.timestamp OR
                 schedule_kind IS NOT excluded.schedule_kind OR
@@ -928,7 +1006,15 @@ impl DivergenceDatabase {
                 baseline_logs_bloom IS NOT excluded.baseline_logs_bloom OR
                 schedule_logs_bloom IS NOT excluded.schedule_logs_bloom OR
                 would_fit_in_original_limit IS NOT excluded.would_fit_in_original_limit OR
-                min_multiplier_to_succeed IS NOT excluded.min_multiplier_to_succeed",
+                min_multiplier_to_succeed IS NOT excluded.min_multiplier_to_succeed OR
+                baseline_total_gas_spent IS NOT excluded.baseline_total_gas_spent OR
+                baseline_gas_refunded IS NOT excluded.baseline_gas_refunded OR
+                schedule_total_gas_spent IS NOT excluded.schedule_total_gas_spent OR
+                schedule_state_gas_spent IS NOT excluded.schedule_state_gas_spent OR
+                schedule_initial_state_gas IS NOT excluded.schedule_initial_state_gas OR
+                schedule_initial_reservoir IS NOT excluded.schedule_initial_reservoir OR
+                schedule_floor_gas IS NOT excluded.schedule_floor_gas OR
+                schedule_gas_refunded IS NOT excluded.schedule_gas_refunded",
         )?;
         let mut count = 0;
         for divergence in divergences {
@@ -996,6 +1082,14 @@ impl DivergenceDatabase {
                 divergence.schedule_logs_bloom,
                 divergence.would_fit_in_original_limit,
                 divergence.min_multiplier_to_succeed,
+                divergence.baseline_total_gas_spent,
+                divergence.baseline_gas_refunded,
+                divergence.schedule_total_gas_spent,
+                divergence.schedule_state_gas_spent,
+                divergence.schedule_initial_state_gas,
+                divergence.schedule_initial_reservoir,
+                divergence.schedule_floor_gas,
+                divergence.schedule_gas_refunded,
             ])?;
             count += 1;
         }
@@ -1408,6 +1502,14 @@ mod tests {
             schedule_logs_bloom: String::new(),
             would_fit_in_original_limit: false,
             min_multiplier_to_succeed: None,
+            baseline_total_gas_spent: 0,
+            baseline_gas_refunded: 0,
+            schedule_total_gas_spent: 0,
+            schedule_state_gas_spent: 0,
+            schedule_initial_state_gas: 0,
+            schedule_initial_reservoir: 0,
+            schedule_floor_gas: 0,
+            schedule_gas_refunded: 0,
         };
 
         let id = db.record_schedule_divergence(&divergence).unwrap();
@@ -1488,6 +1590,14 @@ mod tests {
                     schedule_logs_bloom: String::new(),
                     would_fit_in_original_limit: false,
                     min_multiplier_to_succeed: None,
+                    baseline_total_gas_spent: 0,
+                    baseline_gas_refunded: 0,
+                    schedule_total_gas_spent: 0,
+                    schedule_state_gas_spent: 0,
+                    schedule_initial_state_gas: 0,
+                    schedule_initial_reservoir: 0,
+                    schedule_floor_gas: 0,
+                    schedule_gas_refunded: 0,
                 };
                 db.record_schedule_divergence(&divergence).unwrap();
             }
@@ -1595,6 +1705,14 @@ mod tests {
                 schedule_logs_bloom: String::new(),
                 would_fit_in_original_limit: false,
                 min_multiplier_to_succeed: None,
+                baseline_total_gas_spent: 0,
+                baseline_gas_refunded: 0,
+                schedule_total_gas_spent: 0,
+                schedule_state_gas_spent: 0,
+                schedule_initial_state_gas: 0,
+                schedule_initial_reservoir: 0,
+                schedule_floor_gas: 0,
+                schedule_gas_refunded: 0,
             };
             db.record_schedule_divergence(&divergence).unwrap();
         }
@@ -1676,6 +1794,14 @@ mod tests {
                 schedule_logs_bloom: String::new(),
                 would_fit_in_original_limit: false,
                 min_multiplier_to_succeed: None,
+                baseline_total_gas_spent: 0,
+                baseline_gas_refunded: 0,
+                schedule_total_gas_spent: 0,
+                schedule_state_gas_spent: 0,
+                schedule_initial_state_gas: 0,
+                schedule_initial_reservoir: 0,
+                schedule_floor_gas: 0,
+                schedule_gas_refunded: 0,
             };
             db.record_schedule_divergence(&divergence).unwrap();
         }
@@ -1754,6 +1880,14 @@ mod tests {
                 schedule_logs_bloom: String::new(),
                 would_fit_in_original_limit: false,
                 min_multiplier_to_succeed: None,
+                baseline_total_gas_spent: 0,
+                baseline_gas_refunded: 0,
+                schedule_total_gas_spent: 0,
+                schedule_state_gas_spent: 0,
+                schedule_initial_state_gas: 0,
+                schedule_initial_reservoir: 0,
+                schedule_floor_gas: 0,
+                schedule_gas_refunded: 0,
             };
             db.record_schedule_divergence(&divergence).unwrap();
         }
@@ -1832,6 +1966,14 @@ mod tests {
             schedule_logs_bloom: String::new(),
             would_fit_in_original_limit: false,
             min_multiplier_to_succeed: None,
+            baseline_total_gas_spent: 0,
+            baseline_gas_refunded: 0,
+            schedule_total_gas_spent: 0,
+            schedule_state_gas_spent: 0,
+            schedule_initial_state_gas: 0,
+            schedule_initial_reservoir: 0,
+            schedule_floor_gas: 0,
+            schedule_gas_refunded: 0,
         };
 
         db.record_schedule_divergence(&divergence).unwrap();

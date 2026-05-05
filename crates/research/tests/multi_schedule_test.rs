@@ -463,6 +463,14 @@ fn test_database_schedule_divergence_workflow() {
         schedule_logs_bloom: String::new(),
         would_fit_in_original_limit: true,
         min_multiplier_to_succeed: Some(0.286),
+        baseline_total_gas_spent: 21_000,
+        baseline_gas_refunded: 0,
+        schedule_total_gas_spent: 6_000,
+        schedule_state_gas_spent: 0,
+        schedule_initial_state_gas: 0,
+        schedule_initial_reservoir: 0,
+        schedule_floor_gas: 0,
+        schedule_gas_refunded: 0,
     };
 
     let div2 = ScheduleDivergence {
@@ -529,6 +537,14 @@ fn test_database_schedule_divergence_workflow() {
         schedule_logs_bloom: String::new(),
         would_fit_in_original_limit: false,
         min_multiplier_to_succeed: Some(2.0),
+        baseline_total_gas_spent: 50_000,
+        baseline_gas_refunded: 0,
+        schedule_total_gas_spent: 100_000,
+        schedule_state_gas_spent: 0,
+        schedule_initial_state_gas: 0,
+        schedule_initial_reservoir: 0,
+        schedule_floor_gas: 0,
+        schedule_gas_refunded: 0,
     };
 
     db.record_schedule_divergence(&div1).unwrap();
