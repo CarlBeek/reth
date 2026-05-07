@@ -35,7 +35,7 @@ use reth_primitives_traits::BlockBody;
 use reth_provider::StateProviderFactory;
 use reth_research::{
     database::{DivergenceDatabase, ScheduleBlockCoverage},
-    divergence::{CallFrame, DivergenceType, EventLog},
+    divergence::{CallFrame, DivergenceLocation, DivergenceType, EventLog},
     schedule::{GasSchedule, RecipientInfo, ScheduleKind, ScheduleRegistry, TxContext},
     ScheduleDivergence, ScheduleInspector, TrackingInspector,
 };
@@ -186,6 +186,32 @@ where
 
     fn hex_bloom(bloom: Bloom) -> String {
         format!("{bloom:#x}")
+    }
+
+    /// Synthesize a `DivergenceLocation` from the recorded call frames when the
+    /// inspector didn't capture one itself.
+    ///
+    /// Native-revm schedules (e.g. EIP-8037) drive their gas accounting inside
+    /// the modified spec rather than via per-opcode deltas, so the inspector's
+    /// `record_divergence` (gated on `apply_gas_delta`) never fires. Without a
+    /// location, downstream forensics can't bucket failures by call depth or
+    /// contract. As a fallback, we point the location at the deepest failed
+    /// frame in the schedule run — that's where the schedule's accounting most
+    /// likely diverged from baseline. `pc`/`opcode` are unrecoverable post-hoc;
+    /// only `contract` and `call_depth` are filled with real data.
+    fn derive_divergence_location(call_frames: &[CallFrame]) -> Option<DivergenceLocation> {
+        let deepest_failed = call_frames
+            .iter()
+            .filter(|f| !f.success)
+            .max_by_key(|f| f.depth)?;
+        Some(DivergenceLocation {
+            contract: deepest_failed.to.unwrap_or(deepest_failed.from),
+            function_selectors: Vec::new(),
+            pc: 0,
+            call_depth: deepest_failed.depth,
+            opcode: 0,
+            opcode_name: String::new(),
+        })
     }
 
     fn format_affected_opcodes(schedule: &dyn GasSchedule) -> Option<String> {
@@ -951,6 +977,8 @@ where
                         .or(halt_info),
                     divergence_location: insp_result
                         .divergence_location
+                        .clone()
+                        .or_else(|| Self::derive_divergence_location(&call_frames))
                         .as_ref()
                         .map(|loc| format!("{loc:?}")),
                     call_frames_hash: Self::hash_serialized(&call_frames),
