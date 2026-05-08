@@ -31,7 +31,6 @@ pub struct TrackingInspector {
 /// Entry in the call stack.
 #[derive(Debug, Clone)]
 struct CallStackEntry {
-    call_index: usize,
     depth: usize,
     from: Address,
     to: Option<Address>,
@@ -123,7 +122,6 @@ where
     }
 
     fn call(&mut self, _context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
-        let call_index = self.call_frames.len();
         let depth = self.call_stack.len();
 
         let call_type = match inputs.scheme {
@@ -135,11 +133,15 @@ where
 
         let function_selector = Self::extract_function_selector(&inputs.input);
 
+        // Use `bytecode_address` (the contract whose code is executing) rather
+        // than `target_address` (the storage context — which equals the caller
+        // for DELEGATECALL). This matches `ScheduleInspector`, so call frames
+        // from the two inspectors line up structurally for the
+        // call-tree-changed comparison in the ExEx.
         self.call_stack.push(CallStackEntry {
-            call_index,
             depth,
             from: inputs.caller,
-            to: Some(inputs.target_address),
+            to: Some(inputs.bytecode_address),
             call_type,
             gas_provided: inputs.gas_limit,
             function_selector,
@@ -159,8 +161,13 @@ where
             // Calculate gas used (gas_provided - gas_remaining)
             let gas_used = entry.gas_provided.saturating_sub(outcome.result.gas.remaining());
 
+            // Assign `call_index` at completion time to match
+            // `ScheduleInspector` (sequential by completion order rather than
+            // dispatch order). The two inspectors otherwise produce different
+            // indices for nested calls, breaking the call-tree-changed
+            // comparison even on identical executions.
             self.call_frames.push(CallFrame {
-                call_index: entry.call_index,
+                call_index: self.call_frames.len(),
                 depth: entry.depth,
                 from: entry.from,
                 to: entry.to,
@@ -176,7 +183,6 @@ where
     }
 
     fn create(&mut self, _context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
-        let call_index = self.call_frames.len();
         let depth = self.call_stack.len();
 
         let call_type = match inputs.scheme() {
@@ -186,7 +192,6 @@ where
         };
 
         self.call_stack.push(CallStackEntry {
-            call_index,
             depth,
             from: inputs.caller(),
             to: None, // CREATE doesn't have a target address yet
@@ -209,7 +214,7 @@ where
             let gas_used = entry.gas_provided.saturating_sub(outcome.result.gas.remaining());
 
             self.call_frames.push(CallFrame {
-                call_index: entry.call_index,
+                call_index: self.call_frames.len(),
                 depth: entry.depth,
                 from: entry.from,
                 to: Some(created_address),

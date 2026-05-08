@@ -188,6 +188,30 @@ where
         format!("{bloom:#x}")
     }
 
+    /// Whether two call-frame sequences differ structurally.
+    ///
+    /// Compares the *shape* of each tx's call tree — depth, caller/callee
+    /// addresses, call type, success, and calldata — while ignoring fields
+    /// that always differ for gas-modifying schedules (`gas_used`,
+    /// `gas_provided`, `repricing_gas_delta`, `output`). A naive `Vec`
+    /// equality check flagged every gas-only repricing as a "call tree
+    /// changed" divergence even when the call sequence was identical, which
+    /// drowned out the genuine structural changes downstream consumers care
+    /// about.
+    fn call_trees_structurally_differ(left: &[CallFrame], right: &[CallFrame]) -> bool {
+        if left.len() != right.len() {
+            return true;
+        }
+        left.iter().zip(right.iter()).any(|(l, r)| {
+            l.depth != r.depth ||
+                l.from != r.from ||
+                l.to != r.to ||
+                l.call_type != r.call_type ||
+                l.success != r.success ||
+                l.input != r.input
+        })
+    }
+
     /// Synthesize a `DivergenceLocation` from the recorded call frames when the
     /// inspector didn't capture one itself.
     ///
@@ -1138,7 +1162,10 @@ where
                             r.gas_used
                         };
                         let success = r.success && gas <= gas_limit;
-                        let call_tree_diverged = r.call_frames != baseline_call_frames;
+                        let call_tree_diverged = Self::call_trees_structurally_differ(
+                            &r.call_frames,
+                            &baseline_call_frames,
+                        );
                         let event_logs_diverged = r.event_logs != baseline_event_logs;
                         let output_changed = r.output_hash != baseline_output_hash ||
                             r.output_len != baseline_output_len;
