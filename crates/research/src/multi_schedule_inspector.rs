@@ -271,6 +271,16 @@ struct CallStackEntry {
     /// depth 0 correctly propagates to a callee OOG at depth 1, but an
     /// unrelated call tree without positive deltas won't false-positive.
     any_positive_delta_in_subtree: bool,
+
+    /// Program counter of the most recent `step()` within this frame.
+    /// Captured on every opcode so that when a native-revm schedule (e.g.
+    /// EIP-8037) drives the frame to an OOG inside revm's own gas accounting,
+    /// `call_end` / `create_end` can attribute the divergence to the offending
+    /// opcode rather than reporting placeholder zeros.
+    last_step_pc: usize,
+    /// Opcode of the most recent `step()` within this frame. Paired with
+    /// `last_step_pc`.
+    last_step_opcode: u8,
 }
 
 /// Gas opcode event for loop detection.
@@ -420,7 +430,40 @@ impl ScheduleInspector {
             pc: interp.bytecode.pc(),
             call_depth: self.call_stack.len(),
             opcode,
-            opcode_name: format!("0x{:02x}", opcode),
+            opcode_name: Self::opcode_name(opcode),
+        });
+    }
+
+    /// Record divergence location from a popped frame's last-seen step.
+    ///
+    /// Used by `call_end` / `create_end` when a frame halts with an OOG-class
+    /// error but no explicit `apply_gas_delta` ever fired for the schedule
+    /// (i.e. native-revm schedules like EIP-8037, where gas accounting lives
+    /// inside revm rather than in per-opcode deltas). The popped entry's
+    /// `last_step_pc` / `last_step_opcode` are the most recent opcode the
+    /// inspector saw within that frame, which is the opcode whose execution
+    /// triggered revm's gas check.
+    ///
+    /// `contract` is taken from the popped frame; `function_selectors` come
+    /// from the still-active call stack plus the popped frame so the chain
+    /// reflects what was on the stack at the OOG point. No-ops if a divergence
+    /// has already been recorded.
+    fn record_frame_divergence(&mut self, popped: &CallStackEntry) {
+        if self.divergence_location.is_some() {
+            return;
+        }
+
+        let mut function_selectors: Vec<Option<[u8; 4]>> =
+            self.call_stack.iter().map(|entry| entry.function_selector).collect();
+        function_selectors.push(popped.function_selector);
+
+        self.divergence_location = Some(DivergenceLocation {
+            contract: popped.contract,
+            function_selectors,
+            pc: popped.last_step_pc,
+            call_depth: popped.depth + 1,
+            opcode: popped.last_step_opcode,
+            opcode_name: Self::opcode_name(popped.last_step_opcode),
         });
     }
 
@@ -582,6 +625,17 @@ where
         self.gas_before_step = Some(interp.gas.remaining());
         self.current_opcode = interp.bytecode.opcode();
         self.current_pc = interp.bytecode.pc();
+
+        // Track the most recent opcode/pc per active frame. For native-revm
+        // schedules (e.g. EIP-8037) the inspector's `apply_gas_delta` never
+        // fires, so `record_divergence` is never called from `step_end`. When
+        // revm's own gas accounting then halts a frame with OOG, `call_end` /
+        // `create_end` reads these fields to attribute the divergence to the
+        // opcode that triggered it rather than a placeholder.
+        if let Some(frame) = self.call_stack.last_mut() {
+            frame.last_step_pc = self.current_pc;
+            frame.last_step_opcode = self.current_opcode;
+        }
         // Reset for this opcode. The flag may be true here if a parent frame's
         // CALL set it and then the subcall frame started — this is expected.
         // The invariant is that step_end() of the *same* frame respects the
@@ -715,6 +769,8 @@ where
             function_selector,
             repricing_gas_delta: 0,
             any_positive_delta_in_subtree: parent_has_positive_delta,
+            last_step_pc: 0,
+            last_step_opcode: 0,
         });
 
         None
@@ -842,6 +898,23 @@ where
                     });
                 }
             }
+
+            // Capture divergence location for native-revm schedules. When the
+            // schedule's gas accounting lives inside revm (e.g. EIP-8037),
+            // `apply_gas_delta` never fires so `record_divergence` was never
+            // called from `step_end`. The most recent step seen within the
+            // popped frame is the opcode whose execution triggered revm's gas
+            // check, so use that as the divergence point. Limited to OOG-class
+            // results to avoid attributing intentional reverts to the schedule.
+            //
+            // Skipped when `last_step_opcode == 0` (no step ran in the frame —
+            // empty bytecode or precompile) so we don't claim a STOP at pc 0.
+            if is_oog_error(outcome.result.result) &&
+                self.divergence_location.is_none() &&
+                entry.last_step_opcode != 0
+            {
+                self.record_frame_divergence(&entry);
+            }
         }
     }
 
@@ -865,6 +938,8 @@ where
             function_selector: None,
             repricing_gas_delta: 0,
             any_positive_delta_in_subtree: parent_has_positive_delta,
+            last_step_pc: 0,
+            last_step_opcode: 0,
         });
 
         None
@@ -918,6 +993,19 @@ where
                         pattern: OogPattern::CallChain,
                     });
                 }
+            }
+
+            // Native-revm divergence capture (see call_end for rationale).
+            // For CREATE, populate the popped entry's contract with the
+            // resolved created address so downstream forensics can attribute
+            // the failure to a specific deploy.
+            if is_oog_error(outcome.result.result) &&
+                self.divergence_location.is_none() &&
+                entry.last_step_opcode != 0
+            {
+                let mut popped = entry.clone();
+                popped.contract = created_address;
+                self.record_frame_divergence(&popped);
             }
         }
     }

@@ -337,7 +337,8 @@ where
                 self.oog_occurred = true;
 
                 let opcode_byte = interp.bytecode.opcode();
-                let opcode_name = format!("0x{:02x}", opcode_byte);
+                let opcode_name = revm::bytecode::opcode::OpCode::new(opcode_byte)
+                    .map_or_else(|| format!("0x{opcode_byte:02x}"), |op| op.as_str().to_string());
 
                 self.record_oog(interp, opcode_byte, opcode_name.clone());
                 self.record_divergence_location(interp, opcode_byte, opcode_name);

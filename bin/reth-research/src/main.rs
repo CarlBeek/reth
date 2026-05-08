@@ -191,26 +191,26 @@ where
     /// Synthesize a `DivergenceLocation` from the recorded call frames when the
     /// inspector didn't capture one itself.
     ///
-    /// Native-revm schedules (e.g. EIP-8037) drive their gas accounting inside
-    /// the modified spec rather than via per-opcode deltas, so the inspector's
-    /// `record_divergence` (gated on `apply_gas_delta`) never fires. Without a
-    /// location, downstream forensics can't bucket failures by call depth or
-    /// contract. As a fallback, we point the location at the deepest failed
-    /// frame in the schedule run — that's where the schedule's accounting most
-    /// likely diverged from baseline. `pc`/`opcode` are unrecoverable post-hoc;
-    /// only `contract` and `call_depth` are filled with real data.
+    /// The `ScheduleInspector` records a divergence location whenever
+    /// `apply_gas_delta` triggers OOG (per-opcode deltas) or when a frame ends
+    /// with an OOG-class result (native-revm schedules like EIP-8037). This
+    /// fallback handles the remaining cases — non-OOG schedule-induced
+    /// failures (e.g. revert from a hard-coded gas check, halt for an unrelated
+    /// reason) — by pointing at the deepest failed frame in the schedule run.
+    ///
+    /// Records emitted from this fallback have `pc = 0` / `opcode = 0xfe` (the
+    /// `INVALID` mnemonic, used here as a "post-hoc fallback" sentinel) so
+    /// downstream consumers can distinguish synthesized fallback rows from
+    /// real per-opcode divergence captures.
     fn derive_divergence_location(call_frames: &[CallFrame]) -> Option<DivergenceLocation> {
-        let deepest_failed = call_frames
-            .iter()
-            .filter(|f| !f.success)
-            .max_by_key(|f| f.depth)?;
+        let deepest_failed = call_frames.iter().filter(|f| !f.success).max_by_key(|f| f.depth)?;
         Some(DivergenceLocation {
             contract: deepest_failed.to.unwrap_or(deepest_failed.from),
             function_selectors: Vec::new(),
             pc: 0,
             call_depth: deepest_failed.depth,
-            opcode: 0,
-            opcode_name: String::new(),
+            opcode: 0xfe,
+            opcode_name: "FALLBACK".to_string(),
         })
     }
 
