@@ -88,6 +88,21 @@ pub struct ResearchArgs {
         help_heading = "Research"
     )]
     pub backfill_min_block: u64,
+
+    /// Maximum concurrent backfill workers.
+    ///
+    /// Each worker analyzes one historical block at a time on a blocking
+    /// thread, so this scales backfill throughput linearly with cores until
+    /// disk reads or the DB writer saturate. `0` (the default) auto-selects
+    /// `available_parallelism - 1`, leaving one core for the live arm and the
+    /// async runtime.
+    #[arg(
+        long = "research.backfill-concurrency",
+        value_name = "WORKERS",
+        default_value_t = 0,
+        help_heading = "Research"
+    )]
+    pub backfill_concurrency: usize,
 }
 
 impl Default for ResearchArgs {
@@ -103,6 +118,7 @@ impl Default for ResearchArgs {
             gas_limit_multiplier: 1,
             backfill: false,
             backfill_min_block: 0,
+            backfill_concurrency: 0,
         }
     }
 }

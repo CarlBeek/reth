@@ -24,7 +24,7 @@ use alloy_consensus::{constants::KECCAK_EMPTY, transaction::TxHashRef, BlockHead
 use alloy_eips::BlockHashOrNumber;
 use alloy_primitives::{keccak256, logs_bloom, Address, Bloom, Bytes, U256};
 use clap::Parser;
-use futures::{FutureExt, TryStreamExt};
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt, TryStreamExt};
 use reth_ethereum::{
     exex::{ExExContext, ExExEvent, ExExNotification},
     node::EthereumNode,
@@ -44,8 +44,15 @@ use reth_revm::{database::StateProviderDatabase, db::State, Database, DatabaseCo
 use reth_tracing::tracing::{debug, info, warn};
 use revm::{context::BlockEnv, context_interface::Cfg, primitives::hardfork::SpecId};
 use revm_interpreter::gas::calculate_initial_tx_gas;
-use std::{collections::HashMap, sync::Arc, thread::JoinHandle};
-use tokio::sync::mpsc;
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    thread::JoinHandle,
+};
+use tokio::{sync::mpsc, task::JoinHandle as TokioJoinHandle};
 
 enum DbCommand {
     Record(ScheduleDivergence),
@@ -129,10 +136,16 @@ fn flush_pending_divergence_batch(
     pending_records.clear();
 }
 
-/// Research ExEx that performs multi-schedule execution analysis on committed blocks.
-struct ResearchExEx<Node: FullNodeComponents> {
-    /// ExEx context
-    ctx: ExExContext<Node>,
+/// Analyzer state shared between the live arm and concurrent backfill workers.
+///
+/// This struct holds everything needed to analyze a single block: the node
+/// components (provider + EVM config), the configured schedules and their
+/// metadata, and the channel into the DB writer thread. All fields are either
+/// `Clone` (cheaply, via `Arc`-backed types) or `Copy`, so the whole struct is
+/// safe to wrap in `Arc` and hand to `tokio::task::spawn_blocking` workers.
+struct Analyzer<Node: FullNodeComponents> {
+    /// Node components — provides access to provider() and evm_config().
+    components: Node,
     /// Schedule registry containing all configured experiments
     registry: Arc<ScheduleRegistry>,
     /// All schedules in deterministic order
@@ -145,14 +158,23 @@ struct ResearchExEx<Node: FullNodeComponents> {
     has_intrinsic_schedules: bool,
     /// Static formatted schedule metadata reused across blocks
     schedule_metadata: HashMap<String, ScheduleMetadata>,
-    /// Start block for analysis
-    start_block: u64,
     /// Maximum divergence rows to persist per block.
     max_divergences_per_block: Option<usize>,
     /// Inflate schedule replay gas limits by this factor.
     gas_limit_multiplier: u64,
     /// Channel sender for async database writes
     db_tx: Option<mpsc::UnboundedSender<DbCommand>>,
+    /// Total divergences emitted across all workers. Atomic because backfill
+    /// workers run concurrently with the live arm.
+    divergences_found: AtomicU64,
+}
+
+/// Research ExEx that performs multi-schedule execution analysis on committed blocks.
+struct ResearchExEx<Node: FullNodeComponents> {
+    /// ExEx context (owns the notifications stream + events sender).
+    ctx: ExExContext<Node>,
+    /// Shared analyzer state. Cloned into each backfill worker via `Arc::clone`.
+    analyzer: Arc<Analyzer<Node>>,
     /// Handle for async database writer task
     db_writer_task: Option<JoinHandle<()>>,
     /// Read-side handle to the divergence DB. Used by the backfill arm to
@@ -160,22 +182,28 @@ struct ResearchExEx<Node: FullNodeComponents> {
     /// configuration. Shares the underlying `Arc<Mutex<Connection>>` with the
     /// writer thread, so reads briefly block writes (and vice versa).
     divergence_db: Option<DivergenceDatabase>,
+    /// Start block for live analysis
+    start_block: u64,
     /// Whether to backfill historical blocks during idle windows.
     backfill_enabled: bool,
     /// Inclusive lower bound for backfill.
     backfill_min_block: u64,
+    /// Maximum concurrent backfill workers (>= 1 when backfill is enabled).
+    backfill_concurrency: usize,
     /// Cursor for the next backfill block, lazily initialized to `head - 1` on
     /// the first idle tick.
     next_backfill_block: Option<u64>,
     /// Set once the cursor has walked below `backfill_min_block` (or there is
-    /// nothing to backfill), so the run loop stops polling the backfill arm.
+    /// nothing left to dispatch), so the run loop stops trying to spawn workers.
     backfill_exhausted: bool,
-    /// Statistics
+    /// In-flight backfill workers. Each entry is the join handle of a
+    /// `spawn_blocking` task running `Analyzer::analyze_block_by_number`.
+    in_flight_backfill: FuturesUnordered<TokioJoinHandle<eyre::Result<bool>>>,
+    /// Total blocks processed (live + backfill).
     blocks_processed: u64,
-    divergences_found: u64,
 }
 
-impl<Node> ResearchExEx<Node>
+impl<Node> Analyzer<Node>
 where
     Node: FullNodeComponents,
     Node::Evm: ConfigureEvm<
@@ -319,7 +347,17 @@ where
         )
         .initial_total_gas
     }
+}
 
+impl<Node> ResearchExEx<Node>
+where
+    Node: FullNodeComponents,
+    Node::Evm: ConfigureEvm<
+        BlockExecutorFactory: BlockExecutorFactory<
+            EvmFactory: EvmFactory<Spec = SpecId, BlockEnv = BlockEnv>,
+        >,
+    >,
+{
     /// Create a new research ExEx.
     fn new(
         ctx: ExExContext<Node>,
@@ -330,6 +368,7 @@ where
         gas_limit_multiplier: u64,
         backfill: bool,
         backfill_min_block: u64,
+        backfill_concurrency: usize,
     ) -> eyre::Result<Self> {
         let registry = Arc::new(registry);
         let all_schedules = registry.all();
@@ -344,11 +383,13 @@ where
         let schedule_metadata: HashMap<String, ScheduleMetadata> = all_schedules
             .iter()
             .map(|schedule| {
-                let affected_opcodes = Self::format_affected_opcodes(schedule.as_ref());
-                let affected_precompiles = Self::format_affected_precompiles(schedule.as_ref());
+                let affected_opcodes = Analyzer::<Node>::format_affected_opcodes(schedule.as_ref());
+                let affected_precompiles =
+                    Analyzer::<Node>::format_affected_precompiles(schedule.as_ref());
                 let kind = format!("{:?}", schedule.kind());
                 let description = schedule.description().to_string();
-                let config_hash = Self::hash_bytes(schedule.config_fingerprint().as_bytes());
+                let config_hash =
+                    Analyzer::<Node>::hash_bytes(schedule.config_fingerprint().as_bytes());
                 (
                     schedule.name().to_string(),
                     ScheduleMetadata {
@@ -512,26 +553,44 @@ where
             );
         }
 
-        Ok(Self {
-            ctx,
+        // Resolve concurrency: 0 means "auto" → leave one core for the live arm.
+        let backfill_concurrency = if !backfill_enabled {
+            0
+        } else if backfill_concurrency == 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get().saturating_sub(1).max(1))
+                .unwrap_or(1)
+        } else {
+            backfill_concurrency
+        };
+
+        let analyzer = Arc::new(Analyzer {
+            components: ctx.components.clone(),
             registry,
             all_schedules,
             execution_schedules,
             execution_schedule_indices,
             has_intrinsic_schedules,
             schedule_metadata,
-            start_block,
             max_divergences_per_block,
             gas_limit_multiplier: gas_limit_multiplier.max(1),
             db_tx,
+            divergences_found: AtomicU64::new(0),
+        });
+
+        Ok(Self {
+            ctx,
+            analyzer,
             db_writer_task,
             divergence_db,
+            start_block,
             backfill_enabled,
             backfill_min_block,
+            backfill_concurrency,
             next_backfill_block: None,
             backfill_exhausted: false,
+            in_flight_backfill: FuturesUnordered::new(),
             blocks_processed: 0,
-            divergences_found: 0,
         })
     }
 
@@ -540,20 +599,21 @@ where
         info!(
             target: "exex::research",
             start_block = self.start_block,
-            schedule_count = self.registry.len(),
+            schedule_count = self.analyzer.registry.len(),
             backfill_enabled = self.backfill_enabled,
             backfill_min_block = self.backfill_min_block,
+            backfill_concurrency = self.backfill_concurrency,
             "Multi-schedule Research ExEx started"
         );
 
-        // Loop structure: drain any ready notifications first, then either do
-        // one backfill step or block-await the next notification. `now_or_never`
-        // gives us the "ready right now" check without registering a real waker
-        // — that's fine, because the backfill arm always loops back here, and
-        // the `try_next().await` arm does register one. Live notifications
-        // therefore preempt backfill at most one historical block late.
+        // Run loop:
+        // 1. Drain any ready notifications (highest priority).
+        // 2. Drain any finished backfill workers.
+        // 3. Spawn new backfill workers up to `backfill_concurrency`.
+        // 4. Block on whichever comes first: a notification, or a worker completing. The
+        //    notification arm is biased.
         'outer: loop {
-            // Drain whatever notifications are immediately ready.
+            // 1. Drain whatever notifications are immediately ready.
             loop {
                 match self.ctx.notifications.try_next().now_or_never() {
                     Some(Ok(Some(notification))) => {
@@ -565,25 +625,76 @@ where
                 }
             }
 
-            // No notification ready. Do one backfill step or block-await.
-            if self.backfill_enabled && !self.backfill_exhausted {
-                if let Err(e) = self.try_backfill_one_block().await {
-                    warn!(
-                        target: "exex::research::backfill",
-                        error = %e,
-                        "Backfill step failed"
-                    );
-                }
-            } else {
+            // 2. Reap finished backfill workers without blocking.
+            self.drain_finished_backfill_workers();
+
+            // 3. Spawn new backfill workers up to the configured concurrency.
+            //    `next_uncovered_backfill_block` may set `backfill_exhausted`, in which case the
+            //    inner loop terminates.
+            while self.backfill_enabled &&
+                !self.backfill_exhausted &&
+                self.in_flight_backfill.len() < self.backfill_concurrency
+            {
+                let block_number = match self.next_uncovered_backfill_block() {
+                    Ok(Some(n)) => n,
+                    Ok(None) => break, // no work right now, or exhausted
+                    Err(e) => {
+                        warn!(target: "exex::research::backfill", error = %e, "next_uncovered_backfill_block failed");
+                        break;
+                    }
+                };
+                let analyzer = self.analyzer.clone();
+                let task = tokio::task::spawn_blocking(move || {
+                    analyzer.analyze_block_by_number(block_number)
+                });
+                self.in_flight_backfill.push(task);
+            }
+
+            // 4. If nothing is in flight and backfill is exhausted/disabled, just block on the next
+            //    notification. Otherwise race notifications against worker completions.
+            if self.in_flight_backfill.is_empty() {
                 match self.ctx.notifications.try_next().await? {
                     Some(notification) => self.handle_notification(notification).await?,
                     None => break,
                 }
+            } else {
+                // Borrow disjoint fields out before select! to keep the macro happy.
+                let notifications = &mut self.ctx.notifications;
+                let in_flight = &mut self.in_flight_backfill;
+                let outcome: SelectOutcome<<Node::Evm as ConfigureEvm>::Primitives> = tokio::select! {
+                    biased;
+                    notif = notifications.try_next() => {
+                        match notif? {
+                            Some(n) => SelectOutcome::Notification(n),
+                            None => SelectOutcome::StreamClosed,
+                        }
+                    }
+                    completed = in_flight.next() => {
+                        SelectOutcome::WorkerCompleted(completed)
+                    }
+                };
+                match outcome {
+                    SelectOutcome::Notification(n) => self.handle_notification(n).await?,
+                    SelectOutcome::StreamClosed => break,
+                    SelectOutcome::WorkerCompleted(Some(result)) => {
+                        self.handle_backfill_completion(result);
+                    }
+                    SelectOutcome::WorkerCompleted(None) => {
+                        // FuturesUnordered drained between `is_empty` check and select!.
+                        // Nothing to do — the next iteration will re-evaluate.
+                    }
+                }
             }
         }
 
-        // Flush pending DB commands on shutdown.
-        drop(self.db_tx.take());
+        // Shutdown: stop spawning new workers, drain in-flight ones, then
+        // close the DB writer channel by dropping the analyzer (which holds
+        // the only main-task-side `db_tx` clone).
+        self.backfill_exhausted = true;
+        while let Some(result) = self.in_flight_backfill.next().await {
+            self.handle_backfill_completion(result);
+        }
+        drop(self.analyzer);
         if let Some(task) = self.db_writer_task.take() {
             if let Err(err) = task.join() {
                 warn!(target: "exex::research", error = ?err, "Database writer task join failed during shutdown");
@@ -591,6 +702,155 @@ where
         }
 
         Ok(())
+    }
+
+    /// Reap any backfill workers that have finished, without blocking.
+    fn drain_finished_backfill_workers(&mut self) {
+        loop {
+            let polled = self.in_flight_backfill.next().now_or_never();
+            match polled {
+                Some(Some(result)) => self.handle_backfill_completion(result),
+                Some(None) => break, // FuturesUnordered is empty
+                None => break,       // none ready
+            }
+        }
+    }
+
+    /// Update counters and emit logs for a finished backfill worker.
+    fn handle_backfill_completion(
+        &mut self,
+        result: Result<eyre::Result<bool>, tokio::task::JoinError>,
+    ) {
+        match result {
+            Ok(Ok(true)) => {
+                self.blocks_processed += 1;
+            }
+            Ok(Ok(false)) => {
+                // Worker hit a transient skip (state unavailable, block
+                // missing); already logged in analyze_block_by_number.
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    target: "exex::research::backfill",
+                    error = %e,
+                    "Backfill worker returned error"
+                );
+            }
+            Err(join_err) => {
+                warn!(
+                    target: "exex::research::backfill",
+                    error = %join_err,
+                    "Backfill worker panicked or was cancelled"
+                );
+            }
+        }
+    }
+
+    /// Find the next block number whose coverage rows are missing for the
+    /// current schedule configuration, advancing the cursor past any blocks
+    /// that are already fully covered. Returns:
+    /// - `Ok(Some(n))` — block `n` is the next backfill candidate (cursor advanced past it).
+    /// - `Ok(None)` — no work right now (either skipped the per-tick budget or exhausted).
+    fn next_uncovered_backfill_block(&mut self) -> eyre::Result<Option<u64>> {
+        // Lazily initialize the cursor on the first call.
+        if self.next_backfill_block.is_none() {
+            let head = self.analyzer.components.provider().best_block_number()?;
+            if head == 0 {
+                self.backfill_exhausted = true;
+                return Ok(None);
+            }
+            let start = head.saturating_sub(1);
+            if start < self.backfill_min_block {
+                self.backfill_exhausted = true;
+                info!(
+                    target: "exex::research::backfill",
+                    head,
+                    backfill_min_block = self.backfill_min_block,
+                    "Backfill exhausted before starting (head below min)"
+                );
+                return Ok(None);
+            }
+            info!(
+                target: "exex::research::backfill",
+                cursor = start,
+                backfill_min_block = self.backfill_min_block,
+                concurrency = self.backfill_concurrency,
+                "Backfill cursor initialized"
+            );
+            self.next_backfill_block = Some(start);
+        }
+
+        let Some(divergence_db) = self.divergence_db.clone() else {
+            self.backfill_exhausted = true;
+            return Ok(None);
+        };
+
+        // Cap how far we walk per call when skipping already-covered blocks,
+        // so a long covered streak still yields back to the run loop.
+        const MAX_SKIPS_PER_CALL: u64 = 1024;
+        let mut skipped = 0u64;
+
+        while let Some(cursor) = self.next_backfill_block {
+            if cursor < self.backfill_min_block {
+                self.backfill_exhausted = true;
+                info!(
+                    target: "exex::research::backfill",
+                    backfill_min_block = self.backfill_min_block,
+                    "Backfill cursor reached lower bound — stopping"
+                );
+                return Ok(None);
+            }
+            if skipped >= MAX_SKIPS_PER_CALL {
+                return Ok(None);
+            }
+
+            // Strict dedupe: every configured schedule must have a coverage
+            // row at this block under its current config_hash.
+            let mut all_covered = true;
+            for schedule in &self.analyzer.all_schedules {
+                let metadata = self
+                    .analyzer
+                    .schedule_metadata
+                    .get(schedule.name())
+                    .expect("metadata exists for every schedule");
+                match divergence_db.has_schedule_block_coverage_with_config(
+                    schedule.name(),
+                    cursor,
+                    &metadata.config_hash,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        all_covered = false;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(
+                            target: "exex::research::backfill",
+                            block = cursor,
+                            schedule = schedule.name(),
+                            error = %e,
+                            "Coverage lookup failed; treating block as uncovered"
+                        );
+                        all_covered = false;
+                        break;
+                    }
+                }
+            }
+
+            // Advance cursor regardless — we either return this block as the
+            // next candidate, or it's fully covered and we move on.
+            self.next_backfill_block = cursor.checked_sub(1);
+
+            if all_covered {
+                skipped += 1;
+                continue;
+            }
+
+            return Ok(Some(cursor));
+        }
+
+        self.backfill_exhausted = true;
+        Ok(None)
     }
 
     /// Handle a single live `ExExNotification`.
@@ -614,10 +874,10 @@ where
                         block = block_number,
                         tx_count = block.body().transactions().len(),
                         "Analyzing block with {} schedules",
-                        self.registry.len()
+                        self.analyzer.registry.len()
                     );
 
-                    match self.analyze_block(block).await {
+                    match self.analyzer.analyze_block(block) {
                         Ok(true) => {
                             self.blocks_processed += 1;
                             highest_finished = Some(block.num_hash());
@@ -651,7 +911,7 @@ where
                 let from_block = (*range.start()).max(self.start_block);
                 let to_block = *range.end();
                 if from_block <= to_block {
-                    self.delete_divergences_in_block_range(from_block, to_block);
+                    self.analyzer.delete_divergences_in_block_range(from_block, to_block);
                 }
 
                 info!(
@@ -667,7 +927,7 @@ where
                         continue;
                     }
 
-                    match self.analyze_block(block).await {
+                    match self.analyzer.analyze_block(block) {
                         Ok(true) => {
                             self.blocks_processed += 1;
                             highest_finished = Some(block.num_hash());
@@ -701,7 +961,7 @@ where
                 let from_block = (*range.start()).max(self.start_block);
                 let to_block = *range.end();
                 if from_block <= to_block {
-                    self.delete_divergences_in_block_range(from_block, to_block);
+                    self.analyzer.delete_divergences_in_block_range(from_block, to_block);
                 }
 
                 info!(
@@ -713,190 +973,88 @@ where
         }
         Ok(())
     }
+}
 
-    /// Walk one step of the backfill cursor: skip blocks already covered under
-    /// every configured schedule's current `config_hash`, then analyze the
-    /// first uncovered block.
-    ///
-    /// Returns `Ok(())` after either analyzing one block or determining there
-    /// is no more work (in which case `backfill_exhausted` is set so the run
-    /// loop stops polling this arm).
-    async fn try_backfill_one_block(&mut self) -> eyre::Result<()> {
-        // Lazily initialize the cursor on the first idle tick. We start from
-        // `head - 1`: the live tip will arrive via the notification stream.
-        if self.next_backfill_block.is_none() {
-            let head = self.ctx.provider().best_block_number()?;
-            if head == 0 {
-                self.backfill_exhausted = true;
-                return Ok(());
-            }
-            let start = head.saturating_sub(1);
-            if start < self.backfill_min_block {
-                self.backfill_exhausted = true;
-                info!(
+/// Carries one of three loop outcomes from `tokio::select!` so the run loop
+/// can re-borrow `self` mutably to dispatch each case.
+enum SelectOutcome<P: reth_node_api::NodePrimitives> {
+    Notification(ExExNotification<P>),
+    StreamClosed,
+    WorkerCompleted(Option<Result<eyre::Result<bool>, tokio::task::JoinError>>),
+}
+
+impl<Node> Analyzer<Node>
+where
+    Node: FullNodeComponents,
+    Node::Evm: ConfigureEvm<
+        BlockExecutorFactory: BlockExecutorFactory<
+            EvmFactory: EvmFactory<Spec = SpecId, BlockEnv = BlockEnv>,
+        >,
+    >,
+{
+    /// Load a recovered block by number and run multi-schedule analysis.
+    /// Used by backfill workers — returns `Ok(false)` for transient skips
+    /// (state unavailable, block missing) so the run loop can continue.
+    fn analyze_block_by_number(&self, block_number: u64) -> eyre::Result<bool> {
+        let recovered = match self
+            .components
+            .provider()
+            .recovered_block(BlockHashOrNumber::Number(block_number), TransactionVariant::WithHash)
+        {
+            Ok(Some(block)) => block,
+            Ok(None) => {
+                debug!(
                     target: "exex::research::backfill",
-                    head,
-                    backfill_min_block = self.backfill_min_block,
-                    "Backfill exhausted before starting (head below min)"
+                    block = block_number,
+                    "recovered_block returned None; skipping"
                 );
-                return Ok(());
+                return Ok(false);
             }
-            info!(
-                target: "exex::research::backfill",
-                cursor = start,
-                backfill_min_block = self.backfill_min_block,
-                "Backfill cursor initialized"
-            );
-            self.next_backfill_block = Some(start);
-        }
-
-        let Some(divergence_db) = self.divergence_db.clone() else {
-            self.backfill_exhausted = true;
-            return Ok(());
+            Err(e) => {
+                warn!(
+                    target: "exex::research::backfill",
+                    block = block_number,
+                    error = %e,
+                    "Failed to load recovered block"
+                );
+                return Ok(false);
+            }
         };
 
-        // Cap how far we walk per tick when skipping already-covered blocks, so
-        // a long covered streak still yields back to the run loop.
-        const MAX_SKIPS_PER_TICK: u64 = 1024;
-        let mut skipped = 0u64;
+        debug!(
+            target: "exex::research::backfill",
+            block = block_number,
+            tx_count = recovered.body().transactions().len(),
+            "Analyzing backfill block"
+        );
 
-        while let Some(cursor) = self.next_backfill_block {
-            if cursor < self.backfill_min_block {
-                self.backfill_exhausted = true;
-                info!(
+        match self.analyze_block(&recovered) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                debug!(
                     target: "exex::research::backfill",
-                    backfill_min_block = self.backfill_min_block,
-                    "Backfill cursor reached lower bound — stopping"
+                    block = block_number,
+                    "Historical state unavailable for backfill block; skipping"
                 );
-                return Ok(());
+                Ok(false)
             }
-            if skipped >= MAX_SKIPS_PER_TICK {
-                return Ok(());
-            }
-
-            // Strict dedupe: every configured schedule must have a coverage
-            // row at this block under its current config_hash.
-            let mut all_covered = true;
-            for schedule in &self.all_schedules {
-                let metadata = self
-                    .schedule_metadata
-                    .get(schedule.name())
-                    .expect("metadata exists for every schedule");
-                match divergence_db.has_schedule_block_coverage_with_config(
-                    schedule.name(),
-                    cursor,
-                    &metadata.config_hash,
-                ) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        all_covered = false;
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(
-                            target: "exex::research::backfill",
-                            block = cursor,
-                            schedule = schedule.name(),
-                            error = %e,
-                            "Coverage lookup failed; treating block as uncovered"
-                        );
-                        all_covered = false;
-                        break;
-                    }
-                }
-            }
-
-            if all_covered {
-                self.next_backfill_block = cursor.checked_sub(1);
-                skipped += 1;
-                continue;
-            }
-
-            // First uncovered block — fetch and analyze.
-            let recovered = match self
-                .ctx
-                .provider()
-                .recovered_block(BlockHashOrNumber::Number(cursor), TransactionVariant::WithHash)
-            {
-                Ok(Some(block)) => block,
-                Ok(None) => {
-                    debug!(
-                        target: "exex::research::backfill",
-                        block = cursor,
-                        "recovered_block returned None; skipping"
-                    );
-                    self.next_backfill_block = cursor.checked_sub(1);
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!(
-                        target: "exex::research::backfill",
-                        block = cursor,
-                        error = %e,
-                        "Failed to load recovered block"
-                    );
-                    self.next_backfill_block = cursor.checked_sub(1);
-                    return Ok(());
-                }
-            };
-
-            debug!(
-                target: "exex::research::backfill",
-                block = cursor,
-                tx_count = recovered.body().transactions().len(),
-                "Analyzing backfill block"
-            );
-
-            match self.analyze_block(&recovered).await {
-                Ok(true) => {
-                    self.blocks_processed += 1;
-                    self.next_backfill_block = cursor.checked_sub(1);
-                    return Ok(());
-                }
-                Ok(false) => {
-                    // Historical state not available right now (transient
-                    // during initial sync). Skip and continue downward — the
-                    // archival snapshot is dense enough that this should be
-                    // rare in steady state.
-                    debug!(
-                        target: "exex::research::backfill",
-                        block = cursor,
-                        "Historical state unavailable for backfill block; skipping"
-                    );
-                    self.next_backfill_block = cursor.checked_sub(1);
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!(
-                        target: "exex::research::backfill",
-                        block = cursor,
-                        error = %e,
-                        "analyze_block failed during backfill"
-                    );
-                    self.next_backfill_block = cursor.checked_sub(1);
-                    return Ok(());
-                }
-            }
+            Err(e) => Err(e),
         }
-
-        // Cursor walked off the bottom (reached backfill_min_block).
-        self.backfill_exhausted = true;
-        Ok(())
     }
 
     /// Analyze a single block using multi-schedule execution.
-    async fn analyze_block(
-        &mut self,
+    fn analyze_block(
+        &self,
         block: &reth_primitives_traits::RecoveredBlock<BlockTy<Node::Types>>,
     ) -> eyre::Result<bool> {
         let block_number = block.number();
         let block_hash = block.hash();
         let parent_hash = block.parent_hash();
         let block_start = std::time::Instant::now();
-        let provider = self.ctx.provider();
+        let provider = self.components.provider();
         let block_timestamp = block.timestamp();
 
-        let evm_env = match self.ctx.evm_config().evm_env(block.header()) {
+        let evm_env = match self.components.evm_config().evm_env(block.header()) {
             Ok(env) => env,
             Err(e) => {
                 warn!(
@@ -942,7 +1100,7 @@ where
         let mut recorded_divergences = 0usize;
 
         for (tx_idx, tx) in block.transactions_recovered().enumerate() {
-            let tx_env = self.ctx.evm_config().tx_env(tx);
+            let tx_env = self.components.evm_config().tx_env(tx);
 
             // Extract transaction fields using Transaction trait
             // Use kind() to get TxKind which tells us if it's create or call
@@ -1017,7 +1175,7 @@ where
 
             // --- EXECUTION: Baseline ---
             let mut baseline_inspector = TrackingInspector::new();
-            let mut normal_evm = self.ctx.evm_config().evm_with_env_and_inspector(
+            let mut normal_evm = self.components.evm_config().evm_with_env_and_inspector(
                 &mut normal_db,
                 evm_env.clone(),
                 &mut baseline_inspector,
@@ -1204,7 +1362,7 @@ where
                 }
 
                 let mut inspector = ScheduleInspector::new(schedule.clone());
-                let mut evm = self.ctx.evm_config().evm_with_env_and_inspector(
+                let mut evm = self.components.evm_config().evm_with_env_and_inspector(
                     &mut normal_db,
                     schedule_evm_env,
                     &mut inspector,
@@ -1655,7 +1813,7 @@ where
                         .unwrap_or(true);
                     if should_record {
                         self.record_divergence(div);
-                        self.divergences_found += 1;
+                        self.divergences_found.fetch_add(1, Ordering::Relaxed);
                         recorded_divergences += 1;
                     } else if recorded_divergences ==
                         self.max_divergences_per_block.unwrap_or_default()
@@ -1845,6 +2003,7 @@ async fn research_exex<Node: FullNodeComponents>(
     gas_limit_multiplier: u64,
     backfill: bool,
     backfill_min_block: u64,
+    backfill_concurrency: usize,
 ) -> eyre::Result<()>
 where
     Node::Evm: ConfigureEvm<
@@ -1862,6 +2021,7 @@ where
         gas_limit_multiplier,
         backfill,
         backfill_min_block,
+        backfill_concurrency,
     )?
     .run()
     .await
@@ -1888,6 +2048,7 @@ fn main() -> eyre::Result<()> {
             let gas_limit_multiplier = research_args.gas_limit_multiplier;
             let backfill = research_args.backfill;
             let backfill_min_block = research_args.backfill_min_block;
+            let backfill_concurrency = research_args.backfill_concurrency;
 
             info!(
                 target: "reth::cli",
@@ -1898,6 +2059,7 @@ fn main() -> eyre::Result<()> {
                 gas_limit_multiplier,
                 backfill,
                 backfill_min_block,
+                backfill_concurrency,
                 "Starting multi-schedule research mode"
             );
 
@@ -1916,6 +2078,7 @@ fn main() -> eyre::Result<()> {
                             gas_limit_multiplier,
                             backfill,
                             backfill_min_block,
+                            backfill_concurrency,
                         ))
                     }
                 })
