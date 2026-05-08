@@ -467,6 +467,30 @@ impl ScheduleInspector {
         });
     }
 
+    /// Record OOG diagnostic info from a popped frame's last-seen step.
+    ///
+    /// Mirrors `record_frame_divergence` for the `OutOfGasInfo` field. Used
+    /// when a frame halts with an OOG-class error and no `apply_gas_delta`
+    /// fired (native-revm schedules). Without this path the only signal
+    /// downstream forensics receive is the unstructured `halt_info` string,
+    /// which doesn't carry pc / opcode / contract fields. No-ops if
+    /// `oog_info` is already populated.
+    fn record_frame_oog_info(&mut self, popped: &CallStackEntry, gas_remaining: u64) {
+        if self.oog_info.is_some() {
+            return;
+        }
+        let pattern = self.infer_oog_pattern(popped.last_step_opcode);
+        self.oog_info = Some(OutOfGasInfo {
+            opcode: popped.last_step_opcode,
+            opcode_name: Self::opcode_name(popped.last_step_opcode),
+            pc: popped.last_step_pc,
+            contract: popped.contract,
+            call_depth: popped.depth + 1,
+            gas_remaining,
+            pattern,
+        });
+    }
+
     /// Infer OOG pattern based on opcode.
     fn infer_oog_pattern(&self, opcode: u8) -> OogPattern {
         match opcode {
@@ -915,6 +939,14 @@ where
             {
                 self.record_frame_divergence(&entry);
             }
+
+            // Same path for `oog_info`. Without this, native-revm OOGs only
+            // surface as the unstructured `halt_info` string ("Execution
+            // halted: OutOfGas(...)") which downstream regex pipelines can't
+            // extract pc / opcode / contract from.
+            if is_oog_error(outcome.result.result) && entry.last_step_opcode != 0 {
+                self.record_frame_oog_info(&entry, outcome.result.gas.remaining());
+            }
         }
     }
 
@@ -999,13 +1031,13 @@ where
             // For CREATE, populate the popped entry's contract with the
             // resolved created address so downstream forensics can attribute
             // the failure to a specific deploy.
-            if is_oog_error(outcome.result.result) &&
-                self.divergence_location.is_none() &&
-                entry.last_step_opcode != 0
-            {
+            if is_oog_error(outcome.result.result) && entry.last_step_opcode != 0 {
                 let mut popped = entry.clone();
                 popped.contract = created_address;
-                self.record_frame_divergence(&popped);
+                if self.divergence_location.is_none() {
+                    self.record_frame_divergence(&popped);
+                }
+                self.record_frame_oog_info(&popped, outcome.result.gas.remaining());
             }
         }
     }
