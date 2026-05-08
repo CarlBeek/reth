@@ -822,6 +822,26 @@ where
                 // reservoir). For EIP-8037 schedules, we recompute against the
                 // *original* gas_limit so the recorded reservoir reflects what a
                 // mainnet tx would have, not the inflated replay limit.
+                //
+                // EIP-8037 reservoir semantics (combined with EIP-7825's
+                // `TX_GAS_LIMIT_CAP` of 16,777,216):
+                //
+                //     reservoir = max(0, tx_gas_limit - intrinsic_regular_gas
+                //                        - (TX_GAS_LIMIT_CAP - intrinsic_regular_gas))
+                //               = max(0, tx_gas_limit - TX_GAS_LIMIT_CAP)
+                //                 [adjusted for state-gas deduction + 7702 refund]
+                //
+                // The reservoir is ONLY non-zero when a transaction's
+                // declared gas_limit exceeds `TX_GAS_LIMIT_CAP`. Current
+                // mainnet (EIP-7825 active) caps txs at 16.7M, so historical
+                // replays will always observe `schedule_initial_reservoir == 0`
+                // — and consequently every byte of `runtime_state_gas` will
+                // appear as `runtime_state_gas_spillover`. That is the spec.
+                // The reservoir mechanism only starts producing variance once
+                // EIP-8037 ships and contracts opt into higher gas_limits to
+                // use the state-gas budget. Until then, downstream forensics
+                // should treat reservoir-utilisation panels as "all rows fall
+                // in the overflow bucket" by design, not as a data bug.
                 let (schedule_initial_state_gas, schedule_initial_reservoir) =
                     if schedule_evm_env.cfg_env.is_amsterdam_eip8037_enabled() {
                         let init_gas = calculate_initial_tx_gas(
