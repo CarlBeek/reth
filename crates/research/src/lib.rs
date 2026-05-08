@@ -202,6 +202,7 @@ pub mod export;
 pub mod inspector;
 pub mod metrics;
 pub mod multi_schedule_inspector;
+pub mod oog_chain;
 pub mod schedule;
 pub mod tracking_inspector;
 

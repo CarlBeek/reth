@@ -321,6 +321,28 @@ pub struct CallFrame {
     /// Positive means the schedule made this frame's opcodes more expensive.
     #[serde(default)]
     pub repricing_gas_delta: i64,
+
+    /// Gas argument the caller pushed onto the stack at the CALL opcode (top of
+    /// stack at the moment of CALL/CALLCODE/DELEGATECALL/STATICCALL execution).
+    ///
+    /// `None` for CREATE/CREATE2 (which don't take gas as a stack argument), the
+    /// root frame, and frames built by the baseline `TrackingInspector` (which
+    /// doesn't capture stack values).
+    ///
+    /// Used together with `parent_gas_at_call` to detect whether the parent
+    /// passed the EIP-150 63/64 cap (proportional forwarding) or a smaller
+    /// hardcoded amount (`.transfer()` 2300 stipend, fixed constants, or
+    /// fractional patterns like `gas() / 2`).
+    #[serde(default)]
+    pub gas_requested_on_stack: Option<u64>,
+
+    /// Gas remaining in the parent frame at the moment the CALL opcode
+    /// executed (before the EIP-150 cap was applied to derive the child's
+    /// `gas_provided`).
+    ///
+    /// `None` for the root frame and for baseline `TrackingInspector` frames.
+    #[serde(default)]
+    pub parent_gas_at_call: Option<u64>,
 }
 
 /// Type of call.

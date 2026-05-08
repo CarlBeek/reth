@@ -178,6 +178,8 @@ where
                 input: input_bytes,
                 output: Some(outcome.result.output.clone()),
                 repricing_gas_delta: 0,
+                gas_requested_on_stack: None,
+                parent_gas_at_call: None,
             });
         }
     }
@@ -225,6 +227,8 @@ where
                 input: Some(inputs.init_code().clone()),
                 output: Some(outcome.result.output.clone()),
                 repricing_gas_delta: 0,
+                gas_requested_on_stack: None,
+                parent_gas_at_call: None,
             });
         }
     }

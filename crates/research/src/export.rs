@@ -169,6 +169,9 @@ struct HotRow {
     schedule_initial_reservoir: u64,
     schedule_floor_gas: u64,
     schedule_gas_refunded: u64,
+    oog_chain_proportional: Option<bool>,
+    oog_bottleneck_depth: Option<u64>,
+    oog_bottleneck_kind: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -373,6 +376,9 @@ fn hot_schema() -> Arc<Schema> {
         Field::new("schedule_initial_reservoir", DataType::UInt64, false),
         Field::new("schedule_floor_gas", DataType::UInt64, false),
         Field::new("schedule_gas_refunded", DataType::UInt64, false),
+        Field::new("oog_chain_proportional", DataType::Boolean, true),
+        Field::new("oog_bottleneck_depth", DataType::UInt64, true),
+        Field::new("oog_bottleneck_kind", DataType::Utf8, true),
     ]))
 }
 
@@ -490,6 +496,9 @@ fn hot_batch(rows: &[HotRow]) -> Result<RecordBatch, ExportError> {
             u64_array(rows.iter().map(|r| r.schedule_initial_reservoir).collect()),
             u64_array(rows.iter().map(|r| r.schedule_floor_gas).collect()),
             u64_array(rows.iter().map(|r| r.schedule_gas_refunded).collect()),
+            opt_bool_array(rows.iter().map(|r| r.oog_chain_proportional).collect()),
+            opt_u64_array(rows.iter().map(|r| r.oog_bottleneck_depth).collect()),
+            opt_string_array(rows.iter().map(|r| r.oog_bottleneck_kind.clone()).collect()),
         ],
     )
 }
@@ -843,7 +852,8 @@ fn export_hot_for_schedule(
                 baseline_total_gas_spent, baseline_gas_refunded,
                 schedule_total_gas_spent, schedule_state_gas_spent,
                 schedule_initial_state_gas, schedule_initial_reservoir,
-                schedule_floor_gas, schedule_gas_refunded
+                schedule_floor_gas, schedule_gas_refunded,
+                oog_chain_proportional, oog_bottleneck_depth, oog_bottleneck_kind
          FROM schedule_divergences
          WHERE schedule_name = ?1
          ORDER BY block_number, tx_index",
@@ -930,6 +940,9 @@ fn export_hot_for_schedule(
             schedule_initial_reservoir: row.get(63)?,
             schedule_floor_gas: row.get(64)?,
             schedule_gas_refunded: row.get(65)?,
+            oog_chain_proportional: row.get(66)?,
+            oog_bottleneck_depth: row.get(67)?,
+            oog_bottleneck_kind: row.get(68)?,
         };
         max_id = max_id.max(divergence_id);
         sink.push(block_number, hot)?;
@@ -1444,6 +1457,9 @@ mod tests {
             schedule_initial_reservoir: 0,
             schedule_floor_gas: 0,
             schedule_gas_refunded: 0,
+            oog_chain_proportional: None,
+            oog_bottleneck_depth: None,
+            oog_bottleneck_kind: None,
         }
     }
 
