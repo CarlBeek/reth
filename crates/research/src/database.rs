@@ -96,6 +96,18 @@ pub struct ScheduleDivergence {
     /// regardless of gas (revert / non-OOG halt), when the gas limit was
     /// inflated and still hit OOG, or when `tx_gas_limit` is zero.
     pub min_multiplier_to_succeed: Option<f64>,
+    /// How the schedule replay terminated when `min_multiplier_to_succeed` is
+    /// `None`. Lets consumers distinguish two reasons a tx is "unresolved":
+    /// - `Some(true)`: the replay halted with an OOG-class reason at the inflated
+    ///   `gas_limit_multiplier * tx_gas_limit` budget — the true minimum multiplier is greater
+    ///   than the configured search cap, so re-running with a higher
+    ///   `--research.gas-limit-multiplier` may resolve the row ("search exhausted").
+    /// - `Some(false)`: the replay halted for a non-gas reason or reverted — no amount of gas
+    ///   would let this transaction succeed under the schedule ("non-gas failure", e.g. hard-coded
+    ///   contract checks).
+    /// - `None`: the replay succeeded (so `min_multiplier_to_succeed` is populated) or there was
+    ///   no replay (intrinsic-only schedule).
+    pub replay_halt_oog: Option<bool>,
     /// Schedule intrinsic gas (if modified)
     pub schedule_intrinsic_gas: Option<u64>,
 
@@ -313,6 +325,7 @@ fn initialize_schema_on_connection(conn: &Connection) -> Result<(), DatabaseErro
                 schedule_gas_refunded INTEGER NOT NULL DEFAULT 0,
                 would_fit_in_original_limit BOOLEAN NOT NULL DEFAULT 0,
                 min_multiplier_to_succeed REAL,
+                replay_halt_oog BOOLEAN,
                 schedule_intrinsic_gas INTEGER,
 
                 -- Analysis
@@ -415,6 +428,7 @@ fn initialize_schema_on_connection(conn: &Connection) -> Result<(), DatabaseErro
         "schedule_logs_bloom TEXT NOT NULL DEFAULT ''",
         "would_fit_in_original_limit BOOLEAN NOT NULL DEFAULT 0",
         "min_multiplier_to_succeed REAL",
+        "replay_halt_oog BOOLEAN",
         "baseline_total_gas_spent INTEGER NOT NULL DEFAULT 0",
         "baseline_gas_refunded INTEGER NOT NULL DEFAULT 0",
         "schedule_total_gas_spent INTEGER NOT NULL DEFAULT 0",
@@ -593,7 +607,7 @@ impl DivergenceDatabase {
                 baseline_created_address, schedule_created_address,
                 baseline_log_count, schedule_log_count,
                 baseline_logs_bloom, schedule_logs_bloom,
-                would_fit_in_original_limit, min_multiplier_to_succeed,
+                would_fit_in_original_limit, min_multiplier_to_succeed, replay_halt_oog,
                 baseline_total_gas_spent, baseline_gas_refunded,
                 schedule_total_gas_spent, schedule_state_gas_spent,
                 schedule_initial_state_gas, schedule_initial_reservoir,
@@ -606,7 +620,7 @@ impl DivergenceDatabase {
                 ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50,
                 ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60,
                 ?61, ?62, ?63, ?64, ?65, ?66, ?67, ?68, ?69, ?70,
-                ?71
+                ?71, ?72
             )
             ON CONFLICT(schedule_name, block_number, tx_index, tx_hash) DO UPDATE SET
                 timestamp = excluded.timestamp,
@@ -668,6 +682,7 @@ impl DivergenceDatabase {
                 schedule_logs_bloom = excluded.schedule_logs_bloom,
                 would_fit_in_original_limit = excluded.would_fit_in_original_limit,
                 min_multiplier_to_succeed = excluded.min_multiplier_to_succeed,
+                replay_halt_oog = excluded.replay_halt_oog,
                 baseline_total_gas_spent = excluded.baseline_total_gas_spent,
                 baseline_gas_refunded = excluded.baseline_gas_refunded,
                 schedule_total_gas_spent = excluded.schedule_total_gas_spent,
@@ -736,6 +751,7 @@ impl DivergenceDatabase {
                 schedule_logs_bloom IS NOT excluded.schedule_logs_bloom OR
                 would_fit_in_original_limit IS NOT excluded.would_fit_in_original_limit OR
                 min_multiplier_to_succeed IS NOT excluded.min_multiplier_to_succeed OR
+                replay_halt_oog IS NOT excluded.replay_halt_oog OR
                 baseline_total_gas_spent IS NOT excluded.baseline_total_gas_spent OR
                 baseline_gas_refunded IS NOT excluded.baseline_gas_refunded OR
                 schedule_total_gas_spent IS NOT excluded.schedule_total_gas_spent OR
@@ -808,6 +824,7 @@ impl DivergenceDatabase {
                 divergence.schedule_logs_bloom,
                 divergence.would_fit_in_original_limit,
                 divergence.min_multiplier_to_succeed,
+                divergence.replay_halt_oog,
                 divergence.baseline_total_gas_spent,
                 divergence.baseline_gas_refunded,
                 divergence.schedule_total_gas_spent,
@@ -864,7 +881,7 @@ impl DivergenceDatabase {
                 baseline_created_address, schedule_created_address,
                 baseline_log_count, schedule_log_count,
                 baseline_logs_bloom, schedule_logs_bloom,
-                would_fit_in_original_limit, min_multiplier_to_succeed,
+                would_fit_in_original_limit, min_multiplier_to_succeed, replay_halt_oog,
                 baseline_total_gas_spent, baseline_gas_refunded,
                 schedule_total_gas_spent, schedule_state_gas_spent,
                 schedule_initial_state_gas, schedule_initial_reservoir,
@@ -877,7 +894,7 @@ impl DivergenceDatabase {
                 ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50,
                 ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60,
                 ?61, ?62, ?63, ?64, ?65, ?66, ?67, ?68, ?69, ?70,
-                ?71
+                ?71, ?72
             )
             ON CONFLICT(schedule_name, block_number, tx_index, tx_hash) DO UPDATE SET
                 timestamp = excluded.timestamp,
@@ -939,6 +956,7 @@ impl DivergenceDatabase {
                 schedule_logs_bloom = excluded.schedule_logs_bloom,
                 would_fit_in_original_limit = excluded.would_fit_in_original_limit,
                 min_multiplier_to_succeed = excluded.min_multiplier_to_succeed,
+                replay_halt_oog = excluded.replay_halt_oog,
                 baseline_total_gas_spent = excluded.baseline_total_gas_spent,
                 baseline_gas_refunded = excluded.baseline_gas_refunded,
                 schedule_total_gas_spent = excluded.schedule_total_gas_spent,
@@ -1007,6 +1025,7 @@ impl DivergenceDatabase {
                 schedule_logs_bloom IS NOT excluded.schedule_logs_bloom OR
                 would_fit_in_original_limit IS NOT excluded.would_fit_in_original_limit OR
                 min_multiplier_to_succeed IS NOT excluded.min_multiplier_to_succeed OR
+                replay_halt_oog IS NOT excluded.replay_halt_oog OR
                 baseline_total_gas_spent IS NOT excluded.baseline_total_gas_spent OR
                 baseline_gas_refunded IS NOT excluded.baseline_gas_refunded OR
                 schedule_total_gas_spent IS NOT excluded.schedule_total_gas_spent OR
@@ -1082,6 +1101,7 @@ impl DivergenceDatabase {
                 divergence.schedule_logs_bloom,
                 divergence.would_fit_in_original_limit,
                 divergence.min_multiplier_to_succeed,
+                divergence.replay_halt_oog,
                 divergence.baseline_total_gas_spent,
                 divergence.baseline_gas_refunded,
                 divergence.schedule_total_gas_spent,
@@ -1502,6 +1522,7 @@ mod tests {
             schedule_logs_bloom: String::new(),
             would_fit_in_original_limit: false,
             min_multiplier_to_succeed: None,
+            replay_halt_oog: None,
             baseline_total_gas_spent: 0,
             baseline_gas_refunded: 0,
             schedule_total_gas_spent: 0,
@@ -1590,6 +1611,7 @@ mod tests {
                     schedule_logs_bloom: String::new(),
                     would_fit_in_original_limit: false,
                     min_multiplier_to_succeed: None,
+                    replay_halt_oog: None,
                     baseline_total_gas_spent: 0,
                     baseline_gas_refunded: 0,
                     schedule_total_gas_spent: 0,
@@ -1705,6 +1727,7 @@ mod tests {
                 schedule_logs_bloom: String::new(),
                 would_fit_in_original_limit: false,
                 min_multiplier_to_succeed: None,
+                replay_halt_oog: None,
                 baseline_total_gas_spent: 0,
                 baseline_gas_refunded: 0,
                 schedule_total_gas_spent: 0,
@@ -1794,6 +1817,7 @@ mod tests {
                 schedule_logs_bloom: String::new(),
                 would_fit_in_original_limit: false,
                 min_multiplier_to_succeed: None,
+                replay_halt_oog: None,
                 baseline_total_gas_spent: 0,
                 baseline_gas_refunded: 0,
                 schedule_total_gas_spent: 0,
@@ -1880,6 +1904,7 @@ mod tests {
                 schedule_logs_bloom: String::new(),
                 would_fit_in_original_limit: false,
                 min_multiplier_to_succeed: None,
+                replay_halt_oog: None,
                 baseline_total_gas_spent: 0,
                 baseline_gas_refunded: 0,
                 schedule_total_gas_spent: 0,
@@ -1966,6 +1991,7 @@ mod tests {
             schedule_logs_bloom: String::new(),
             would_fit_in_original_limit: false,
             min_multiplier_to_succeed: None,
+            replay_halt_oog: None,
             baseline_total_gas_spent: 0,
             baseline_gas_refunded: 0,
             schedule_total_gas_spent: 0,

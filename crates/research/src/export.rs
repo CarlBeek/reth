@@ -160,6 +160,7 @@ struct HotRow {
     schedule_event_logs_hash: Option<String>,
     would_fit_in_original_limit: bool,
     min_multiplier_to_succeed: Option<f64>,
+    replay_halt_oog: Option<bool>,
     baseline_total_gas_spent: u64,
     baseline_gas_refunded: u64,
     schedule_total_gas_spent: u64,
@@ -276,6 +277,10 @@ fn bool_array(values: Vec<bool>) -> ArrayRef {
     Arc::new(BooleanArray::from(values))
 }
 
+fn opt_bool_array(values: Vec<Option<bool>>) -> ArrayRef {
+    Arc::new(BooleanArray::from(values))
+}
+
 fn coverage_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("schedule_name", DataType::Utf8, false),
@@ -359,6 +364,7 @@ fn hot_schema() -> Arc<Schema> {
         Field::new("schedule_event_logs_hash", DataType::Utf8, true),
         Field::new("would_fit_in_original_limit", DataType::Boolean, false),
         Field::new("min_multiplier_to_succeed", DataType::Float64, true),
+        Field::new("replay_halt_oog", DataType::Boolean, true),
         Field::new("baseline_total_gas_spent", DataType::UInt64, false),
         Field::new("baseline_gas_refunded", DataType::UInt64, false),
         Field::new("schedule_total_gas_spent", DataType::UInt64, false),
@@ -475,6 +481,7 @@ fn hot_batch(rows: &[HotRow]) -> Result<RecordBatch, ExportError> {
             opt_string_array(rows.iter().map(|r| r.schedule_event_logs_hash.clone()).collect()),
             bool_array(rows.iter().map(|r| r.would_fit_in_original_limit).collect()),
             opt_f64_array(rows.iter().map(|r| r.min_multiplier_to_succeed).collect()),
+            opt_bool_array(rows.iter().map(|r| r.replay_halt_oog).collect()),
             u64_array(rows.iter().map(|r| r.baseline_total_gas_spent).collect()),
             u64_array(rows.iter().map(|r| r.baseline_gas_refunded).collect()),
             u64_array(rows.iter().map(|r| r.schedule_total_gas_spent).collect()),
@@ -832,7 +839,7 @@ fn export_hot_for_schedule(
                 schedule_log_count, baseline_logs_bloom, schedule_logs_bloom,
                 baseline_call_frames_hash, schedule_call_frames_hash,
                 baseline_event_logs_hash, schedule_event_logs_hash,
-                would_fit_in_original_limit, min_multiplier_to_succeed,
+                would_fit_in_original_limit, min_multiplier_to_succeed, replay_halt_oog,
                 baseline_total_gas_spent, baseline_gas_refunded,
                 schedule_total_gas_spent, schedule_state_gas_spent,
                 schedule_initial_state_gas, schedule_initial_reservoir,
@@ -914,14 +921,15 @@ fn export_hot_for_schedule(
             schedule_event_logs_hash: row.get(54)?,
             would_fit_in_original_limit: row.get(55)?,
             min_multiplier_to_succeed: row.get(56)?,
-            baseline_total_gas_spent: row.get(57)?,
-            baseline_gas_refunded: row.get(58)?,
-            schedule_total_gas_spent: row.get(59)?,
-            schedule_state_gas_spent: row.get(60)?,
-            schedule_initial_state_gas: row.get(61)?,
-            schedule_initial_reservoir: row.get(62)?,
-            schedule_floor_gas: row.get(63)?,
-            schedule_gas_refunded: row.get(64)?,
+            replay_halt_oog: row.get(57)?,
+            baseline_total_gas_spent: row.get(58)?,
+            baseline_gas_refunded: row.get(59)?,
+            schedule_total_gas_spent: row.get(60)?,
+            schedule_state_gas_spent: row.get(61)?,
+            schedule_initial_state_gas: row.get(62)?,
+            schedule_initial_reservoir: row.get(63)?,
+            schedule_floor_gas: row.get(64)?,
+            schedule_gas_refunded: row.get(65)?,
         };
         max_id = max_id.max(divergence_id);
         sink.push(block_number, hot)?;
@@ -1427,6 +1435,7 @@ mod tests {
             schedule_logs_bloom: String::new(),
             would_fit_in_original_limit: true,
             min_multiplier_to_succeed: Some(0.95),
+            replay_halt_oog: None,
             baseline_total_gas_spent: 21_000,
             baseline_gas_refunded: 0,
             schedule_total_gas_spent: 20_000,

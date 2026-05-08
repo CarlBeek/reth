@@ -57,7 +57,10 @@ pub struct ResearchArgs {
     ///
     /// The final success comparison still uses the transaction's original gas
     /// limit, so this can reveal how much gas would be needed without masking
-    /// that the original transaction would fail under the schedule.
+    /// that the original transaction would fail under the schedule. Replays
+    /// that still hit OOG at the inflated budget are recorded with
+    /// `replay_halt_oog = true` and `min_multiplier_to_succeed = NULL` —
+    /// re-run with a higher value to recover the true minimum for those rows.
     #[arg(
         long = "research.gas-limit-multiplier",
         value_name = "MULT",

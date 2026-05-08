@@ -286,6 +286,7 @@ impl MultiScheduleAnalyzer {
                 .map(|e| e.schedule_success)
                 .unwrap_or(baseline.success),
             min_multiplier_to_succeed: None,
+            replay_halt_oog: None,
             baseline_total_gas_spent: 0,
             baseline_gas_refunded: 0,
             schedule_total_gas_spent: 0,

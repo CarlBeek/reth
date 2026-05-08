@@ -783,6 +783,14 @@ where
                 operation_counts: Option<String>,
                 oog_info: Option<String>,
                 divergence_location: Option<String>,
+                /// `Some(true)` if the schedule replay halted with an
+                /// OOG-class halt reason at the inflated replay gas limit
+                /// (search exhausted — true minimum multiplier exceeds the
+                /// configured `--research.gas-limit-multiplier`). `Some(false)`
+                /// if it halted for a non-gas reason or reverted (no amount of
+                /// gas would resolve the failure). `None` when the replay
+                /// succeeded.
+                replay_halt_oog: Option<bool>,
                 call_frames: Vec<CallFrame>,
                 event_logs: Vec<EventLog>,
                 output_hash: Option<String>,
@@ -924,6 +932,11 @@ where
                             operation_counts: None,
                             oog_info: Some(format!("EVM transact failed: {e:?}")),
                             divergence_location: None,
+                            // `transact()` rejected the tx outright (e.g.
+                            // gas_limit below baseline intrinsic). This is a
+                            // schedule-induced gas failure — bumping the
+                            // replay multiplier could let it run.
+                            replay_halt_oog: Some(true),
                             call_frames: Vec::new(),
                             event_logs: Vec::new(),
                             output_hash: None,
@@ -947,11 +960,34 @@ where
                 let sched_gas_refunded = result.result.gas().inner_refunded();
                 let op_counts = Self::serialize_trace(inspector.operation_counts());
                 let insp_result = inspector.result();
-                let halt_info = match &result.result {
+                let halt_reason_debug = match &result.result {
                     revm::context_interface::result::ExecutionResult::Halt { reason, .. } => {
-                        Some(format!("Execution halted: {reason:?}"))
+                        Some(format!("{reason:?}"))
                     }
                     _ => None,
+                };
+                let halt_info =
+                    halt_reason_debug.as_ref().map(|reason| format!("Execution halted: {reason}"));
+                // Distinguish search-exhausted (replay OOG'd at inflated
+                // budget — needs more than `gas_limit_multiplier`) from
+                // non-gas failures (revert, stack errors, etc.). `None` when
+                // the replay succeeded so consumers can ignore the field.
+                //
+                // The `EvmFactory::HaltReason` associated type is generic, so
+                // we can't pattern-match the concrete revm `HaltReason` enum
+                // here. Match against the `Debug` representation instead —
+                // any spec-conformant `HaltReason` includes a `From<HaltReason>`
+                // bound and renders OOG variants with the literal `OutOfGas`
+                // prefix.
+                let replay_halt_oog = match &result.result {
+                    revm::context_interface::result::ExecutionResult::Halt { .. } => {
+                        let is_oog = halt_reason_debug
+                            .as_deref()
+                            .is_some_and(|reason| reason.starts_with("OutOfGas"));
+                        Some(is_oog)
+                    }
+                    revm::context_interface::result::ExecutionResult::Revert { .. } => Some(false),
+                    revm::context_interface::result::ExecutionResult::Success { .. } => None,
                 };
                 let (output_hash, output_len) = Self::output_hash_and_len(&result.result);
                 let created_address = result.result.created_address().map(Self::hex_address);
@@ -981,6 +1017,7 @@ where
                         .or_else(|| Self::derive_divergence_location(&call_frames))
                         .as_ref()
                         .map(|loc| format!("{loc:?}")),
+                    replay_halt_oog,
                     call_frames_hash: Self::hash_serialized(&call_frames),
                     event_logs_hash: Self::hash_serialized(&event_logs),
                     call_frames,
@@ -1044,6 +1081,7 @@ where
                     formatted_op_counts,
                     oog_info,
                     divergence_location,
+                    replay_halt_oog,
                     call_tree_diverged,
                     event_logs_diverged,
                     baseline_call_frames_json,
@@ -1099,6 +1137,7 @@ where
                             r.operation_counts.clone(),
                             r.oog_info.clone(),
                             r.divergence_location.clone(),
+                            r.replay_halt_oog,
                             call_tree_diverged,
                             event_logs_diverged,
                             call_tree_diverged
@@ -1143,6 +1182,7 @@ where
                             0,
                             0,
                             0,
+                            None,
                             None,
                             None,
                             None,
@@ -1281,6 +1321,16 @@ where
                         schedule_logs_bloom,
                         would_fit_in_original_limit: schedule_success,
                         min_multiplier_to_succeed,
+                        // Only emit a halt-class signal when
+                        // `min_multiplier_to_succeed` is unresolvable. Once
+                        // the replay succeeded the multiplier value is
+                        // authoritative, so the redundant halt info would
+                        // just confuse consumers.
+                        replay_halt_oog: if min_multiplier_to_succeed.is_some() {
+                            None
+                        } else {
+                            replay_halt_oog
+                        },
                         baseline_total_gas_spent,
                         baseline_gas_refunded,
                         schedule_total_gas_spent,
