@@ -238,12 +238,25 @@ where
         })
     }
 
+    /// Format the schedule's affected-opcode list for storage.
+    ///
+    /// Returns `Some("[]")` when the schedule explicitly declares no affected
+    /// opcodes, mirroring [`Self::format_affected_precompiles`]. `NULL` is
+    /// reserved for "field never computed".
     fn format_affected_opcodes(schedule: &dyn GasSchedule) -> Option<String> {
         let mut opcodes = schedule.affected_opcodes();
         opcodes.sort_unstable();
-        (!opcodes.is_empty()).then(|| format!("{opcodes:?}"))
+        Some(format!("{opcodes:?}"))
     }
 
+    /// Format the schedule's affected-precompile list for storage.
+    ///
+    /// Returns `Some("[]")` when the schedule explicitly declares no affected
+    /// precompiles (EIP-8037 is state-gas focused and doesn't reprice any
+    /// precompiles, so it falls through to the trait default), and a sorted
+    /// debug-formatted address list otherwise. Distinguishing "deliberately
+    /// empty" from `NULL` (= field never computed) lets downstream consumers
+    /// tell whether the schedule's coverage is known.
     fn format_affected_precompiles(schedule: &dyn GasSchedule) -> Option<String> {
         let mut addresses: Vec<_> = schedule
             .affected_precompiles()
@@ -251,7 +264,7 @@ where
             .map(|address| format!("{address:#x}"))
             .collect();
         addresses.sort();
-        (!addresses.is_empty()).then(|| format!("{addresses:?}"))
+        Some(format!("{addresses:?}"))
     }
 
     fn output_hash_and_len<HR>(
