@@ -295,6 +295,9 @@ impl MultiScheduleAnalyzer {
             schedule_initial_reservoir: 0,
             schedule_floor_gas: 0,
             schedule_gas_refunded: 0,
+            oog_chain_proportional: None,
+            oog_bottleneck_depth: None,
+            oog_bottleneck_kind: None,
         };
 
         match db.record_schedule_divergence(&divergence) {

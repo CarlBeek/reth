@@ -201,6 +201,30 @@ pub struct ScheduleDivergence {
     pub baseline_logs_bloom: String,
     /// Schedule logs bloom
     pub schedule_logs_bloom: String,
+
+    /// Whether every parent→child hop on the path from the tx root to the
+    /// schedule-OOG frame received gas via the EIP-150 63/64 rule (i.e. each
+    /// hop's `gas_requested_on_stack >= floor(parent_gas_at_call * 63/64) -
+    /// 100`). When true, the failure can in principle be recovered by raising
+    /// the wallet's outer gas limit — gas amplifies down through every hop.
+    /// When false, some frame in the chain throttled gas (`.transfer()` 2300
+    /// stipend, hardcoded constant, fractional like `gas() / 2`), and outer
+    /// gas can't reach below that frame.
+    ///
+    /// `None` for non-OOG divergences (gas-pattern only, log changes, etc.)
+    /// and for rows where call-frame data is missing.
+    pub oog_chain_proportional: Option<bool>,
+    /// Depth of the first throttled hop walking root → OOG. `None` when the
+    /// chain is fully proportional or when the divergence isn't an OOG.
+    pub oog_bottleneck_depth: Option<u64>,
+    /// Type of throttle at the bottleneck frame:
+    /// - `"Stipend2300"` — `.transfer()` / `.send()` (gas argument == 2300)
+    /// - `"FixedGas"` — small or medium hardcoded constant
+    /// - `"FractionalGas"` — fraction of available gas (e.g. `gas() / 2`)
+    ///
+    /// `None` when the chain is fully proportional, when the divergence isn't
+    /// an OOG, or when call-frame data is missing.
+    pub oog_bottleneck_kind: Option<String>,
 }
 
 /// Per-block, per-schedule coverage summary.
@@ -437,6 +461,9 @@ fn initialize_schema_on_connection(conn: &Connection) -> Result<(), DatabaseErro
         "schedule_initial_reservoir INTEGER NOT NULL DEFAULT 0",
         "schedule_floor_gas INTEGER NOT NULL DEFAULT 0",
         "schedule_gas_refunded INTEGER NOT NULL DEFAULT 0",
+        "oog_chain_proportional BOOLEAN",
+        "oog_bottleneck_depth INTEGER",
+        "oog_bottleneck_kind TEXT",
     ] {
         let Some(column_name) = column_def.split_whitespace().next() else {
             continue;
@@ -611,7 +638,8 @@ impl DivergenceDatabase {
                 baseline_total_gas_spent, baseline_gas_refunded,
                 schedule_total_gas_spent, schedule_state_gas_spent,
                 schedule_initial_state_gas, schedule_initial_reservoir,
-                schedule_floor_gas, schedule_gas_refunded
+                schedule_floor_gas, schedule_gas_refunded,
+                oog_chain_proportional, oog_bottleneck_depth, oog_bottleneck_kind
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
@@ -620,7 +648,7 @@ impl DivergenceDatabase {
                 ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50,
                 ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60,
                 ?61, ?62, ?63, ?64, ?65, ?66, ?67, ?68, ?69, ?70,
-                ?71, ?72
+                ?71, ?72, ?73, ?74, ?75
             )
             ON CONFLICT(schedule_name, block_number, tx_index, tx_hash) DO UPDATE SET
                 timestamp = excluded.timestamp,
@@ -690,7 +718,10 @@ impl DivergenceDatabase {
                 schedule_initial_state_gas = excluded.schedule_initial_state_gas,
                 schedule_initial_reservoir = excluded.schedule_initial_reservoir,
                 schedule_floor_gas = excluded.schedule_floor_gas,
-                schedule_gas_refunded = excluded.schedule_gas_refunded
+                schedule_gas_refunded = excluded.schedule_gas_refunded,
+                oog_chain_proportional = excluded.oog_chain_proportional,
+                oog_bottleneck_depth = excluded.oog_bottleneck_depth,
+                oog_bottleneck_kind = excluded.oog_bottleneck_kind
             WHERE
                 timestamp IS NOT excluded.timestamp OR
                 schedule_kind IS NOT excluded.schedule_kind OR
@@ -759,7 +790,10 @@ impl DivergenceDatabase {
                 schedule_initial_state_gas IS NOT excluded.schedule_initial_state_gas OR
                 schedule_initial_reservoir IS NOT excluded.schedule_initial_reservoir OR
                 schedule_floor_gas IS NOT excluded.schedule_floor_gas OR
-                schedule_gas_refunded IS NOT excluded.schedule_gas_refunded",
+                schedule_gas_refunded IS NOT excluded.schedule_gas_refunded OR
+                oog_chain_proportional IS NOT excluded.oog_chain_proportional OR
+                oog_bottleneck_depth IS NOT excluded.oog_bottleneck_depth OR
+                oog_bottleneck_kind IS NOT excluded.oog_bottleneck_kind",
             params![
                 divergence.schedule_name,
                 divergence.block_number,
@@ -833,6 +867,9 @@ impl DivergenceDatabase {
                 divergence.schedule_initial_reservoir,
                 divergence.schedule_floor_gas,
                 divergence.schedule_gas_refunded,
+                divergence.oog_chain_proportional,
+                divergence.oog_bottleneck_depth,
+                divergence.oog_bottleneck_kind,
             ],
         )?;
 
@@ -885,7 +922,8 @@ impl DivergenceDatabase {
                 baseline_total_gas_spent, baseline_gas_refunded,
                 schedule_total_gas_spent, schedule_state_gas_spent,
                 schedule_initial_state_gas, schedule_initial_reservoir,
-                schedule_floor_gas, schedule_gas_refunded
+                schedule_floor_gas, schedule_gas_refunded,
+                oog_chain_proportional, oog_bottleneck_depth, oog_bottleneck_kind
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
@@ -894,7 +932,7 @@ impl DivergenceDatabase {
                 ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50,
                 ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60,
                 ?61, ?62, ?63, ?64, ?65, ?66, ?67, ?68, ?69, ?70,
-                ?71, ?72
+                ?71, ?72, ?73, ?74, ?75
             )
             ON CONFLICT(schedule_name, block_number, tx_index, tx_hash) DO UPDATE SET
                 timestamp = excluded.timestamp,
@@ -964,7 +1002,10 @@ impl DivergenceDatabase {
                 schedule_initial_state_gas = excluded.schedule_initial_state_gas,
                 schedule_initial_reservoir = excluded.schedule_initial_reservoir,
                 schedule_floor_gas = excluded.schedule_floor_gas,
-                schedule_gas_refunded = excluded.schedule_gas_refunded
+                schedule_gas_refunded = excluded.schedule_gas_refunded,
+                oog_chain_proportional = excluded.oog_chain_proportional,
+                oog_bottleneck_depth = excluded.oog_bottleneck_depth,
+                oog_bottleneck_kind = excluded.oog_bottleneck_kind
             WHERE
                 timestamp IS NOT excluded.timestamp OR
                 schedule_kind IS NOT excluded.schedule_kind OR
@@ -1033,7 +1074,10 @@ impl DivergenceDatabase {
                 schedule_initial_state_gas IS NOT excluded.schedule_initial_state_gas OR
                 schedule_initial_reservoir IS NOT excluded.schedule_initial_reservoir OR
                 schedule_floor_gas IS NOT excluded.schedule_floor_gas OR
-                schedule_gas_refunded IS NOT excluded.schedule_gas_refunded",
+                schedule_gas_refunded IS NOT excluded.schedule_gas_refunded OR
+                oog_chain_proportional IS NOT excluded.oog_chain_proportional OR
+                oog_bottleneck_depth IS NOT excluded.oog_bottleneck_depth OR
+                oog_bottleneck_kind IS NOT excluded.oog_bottleneck_kind",
         )?;
         let mut count = 0;
         for divergence in divergences {
@@ -1110,6 +1154,9 @@ impl DivergenceDatabase {
                 divergence.schedule_initial_reservoir,
                 divergence.schedule_floor_gas,
                 divergence.schedule_gas_refunded,
+                divergence.oog_chain_proportional,
+                divergence.oog_bottleneck_depth,
+                divergence.oog_bottleneck_kind,
             ])?;
             count += 1;
         }
@@ -1556,6 +1603,9 @@ mod tests {
             schedule_initial_reservoir: 0,
             schedule_floor_gas: 0,
             schedule_gas_refunded: 0,
+            oog_chain_proportional: None,
+            oog_bottleneck_depth: None,
+            oog_bottleneck_kind: None,
         };
 
         let id = db.record_schedule_divergence(&divergence).unwrap();
@@ -1645,6 +1695,9 @@ mod tests {
                     schedule_initial_reservoir: 0,
                     schedule_floor_gas: 0,
                     schedule_gas_refunded: 0,
+                    oog_chain_proportional: None,
+                    oog_bottleneck_depth: None,
+                    oog_bottleneck_kind: None,
                 };
                 db.record_schedule_divergence(&divergence).unwrap();
             }
@@ -1761,6 +1814,9 @@ mod tests {
                 schedule_initial_reservoir: 0,
                 schedule_floor_gas: 0,
                 schedule_gas_refunded: 0,
+                oog_chain_proportional: None,
+                oog_bottleneck_depth: None,
+                oog_bottleneck_kind: None,
             };
             db.record_schedule_divergence(&divergence).unwrap();
         }
@@ -1851,6 +1907,9 @@ mod tests {
                 schedule_initial_reservoir: 0,
                 schedule_floor_gas: 0,
                 schedule_gas_refunded: 0,
+                oog_chain_proportional: None,
+                oog_bottleneck_depth: None,
+                oog_bottleneck_kind: None,
             };
             db.record_schedule_divergence(&divergence).unwrap();
         }
@@ -1938,6 +1997,9 @@ mod tests {
                 schedule_initial_reservoir: 0,
                 schedule_floor_gas: 0,
                 schedule_gas_refunded: 0,
+                oog_chain_proportional: None,
+                oog_bottleneck_depth: None,
+                oog_bottleneck_kind: None,
             };
             db.record_schedule_divergence(&divergence).unwrap();
         }
@@ -2025,6 +2087,9 @@ mod tests {
             schedule_initial_reservoir: 0,
             schedule_floor_gas: 0,
             schedule_gas_refunded: 0,
+            oog_chain_proportional: None,
+            oog_bottleneck_depth: None,
+            oog_bottleneck_kind: None,
         };
 
         db.record_schedule_divergence(&divergence).unwrap();

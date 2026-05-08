@@ -161,6 +161,13 @@ pub struct ScheduleInspector {
     cached_keccak_msg_size: Option<usize>,
     cached_exp_byte_size: Option<usize>,
 
+    /// Captured at `step()` for the upcoming CALL/CALLCODE/DELEGATECALL/
+    /// STATICCALL opcode: the raw gas argument the caller pushed onto the
+    /// stack (top of stack at CALL invocation). Consumed in `call()` to
+    /// populate the child frame's `gas_requested_on_stack`. Cleared after
+    /// each consumption.
+    pending_call_stack_gas: Option<u64>,
+
     /// Call stack for tracking depth
     call_stack: Vec<CallStackEntry>,
 
@@ -281,6 +288,12 @@ struct CallStackEntry {
     /// Opcode of the most recent `step()` within this frame. Paired with
     /// `last_step_pc`.
     last_step_opcode: u8,
+    /// Raw gas argument the caller pushed onto the stack at the CALL opcode.
+    /// `None` for CREATE/CREATE2 and the root frame.
+    gas_requested_on_stack: Option<u64>,
+    /// Parent's remaining gas at the moment the CALL/CREATE opcode executed,
+    /// before the EIP-150 cap was applied. `None` for the root frame.
+    parent_gas_at_call: Option<u64>,
 }
 
 /// Gas opcode event for loop detection.
@@ -304,6 +317,7 @@ impl ScheduleInspector {
             current_pc: 0,
             cached_keccak_msg_size: None,
             cached_exp_byte_size: None,
+            pending_call_stack_gas: None,
             call_stack: Vec::new(),
             call_frames: Vec::new(),
             event_logs: Vec::new(),
@@ -688,6 +702,19 @@ where
             None
         };
 
+        // Capture the raw gas argument the caller pushed onto the stack at
+        // CALL/CALLCODE/DELEGATECALL/STATICCALL. Top-of-stack is `gas` for all
+        // four. Saturated to u64; the caller may push values up to 2^256-1
+        // (canonical "all available gas" pattern), so we clamp to u64::MAX.
+        // Consumed by `call()` to populate the child frame's
+        // `gas_requested_on_stack`.
+        self.pending_call_stack_gas = match self.current_opcode {
+            0xF1 | 0xF2 | 0xF4 | 0xFA => {
+                interp.stack.peek(0).ok().map(|gas| gas.saturating_to::<u64>())
+            }
+            _ => None,
+        };
+
         // Track operation counts
         self.op_counts.total_ops += 1;
 
@@ -783,6 +810,11 @@ where
         let parent_has_positive_delta =
             self.call_stack.last().map_or(false, |p| p.any_positive_delta_in_subtree);
 
+        // Take the stack-gas captured in step() (None if call() fired without
+        // a preceding step, e.g. the root frame).
+        let gas_requested_on_stack = self.pending_call_stack_gas.take();
+        let parent_gas_at_call = self.gas_before_step;
+
         self.call_stack.push(CallStackEntry {
             depth: self.call_stack.len(),
             contract: inputs.bytecode_address,
@@ -795,6 +827,8 @@ where
             any_positive_delta_in_subtree: parent_has_positive_delta,
             last_step_pc: 0,
             last_step_opcode: 0,
+            gas_requested_on_stack,
+            parent_gas_at_call,
         });
 
         None
@@ -888,6 +922,8 @@ where
                 input: input_bytes,
                 output: Some(outcome.result.output.clone()),
                 repricing_gas_delta: frame_repricing_delta,
+                gas_requested_on_stack: entry.gas_requested_on_stack,
+                parent_gas_at_call: entry.parent_gas_at_call,
             });
 
             // Propagate per-frame positive delta flag to parent.
@@ -972,6 +1008,10 @@ where
             any_positive_delta_in_subtree: parent_has_positive_delta,
             last_step_pc: 0,
             last_step_opcode: 0,
+            // CREATE/CREATE2 don't take a gas argument from the stack; the
+            // EVM forwards 63/64 of available gas automatically.
+            gas_requested_on_stack: None,
+            parent_gas_at_call: self.gas_before_step,
         });
 
         None
@@ -999,6 +1039,8 @@ where
                 input: Some(inputs.init_code().clone()),
                 output: Some(outcome.result.output.clone()),
                 repricing_gas_delta: entry.repricing_gas_delta,
+                gas_requested_on_stack: entry.gas_requested_on_stack,
+                parent_gas_at_call: entry.parent_gas_at_call,
             });
 
             // Propagate per-frame positive delta flag to parent.

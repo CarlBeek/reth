@@ -37,6 +37,7 @@ use reth_provider::{BlockNumReader, BlockReader, StateProviderFactory, Transacti
 use reth_research::{
     database::{DivergenceDatabase, ScheduleBlockCoverage},
     divergence::{CallFrame, DivergenceLocation, DivergenceType, EventLog},
+    oog_chain::classify_oog_chain,
     schedule::{GasSchedule, RecipientInfo, ScheduleKind, ScheduleRegistry, TxContext},
     ScheduleDivergence, ScheduleInspector, TrackingInspector,
 };
@@ -1234,6 +1235,12 @@ where
                 /// gas would resolve the failure). `None` when the replay
                 /// succeeded.
                 replay_halt_oog: Option<bool>,
+                /// Structured OOG depth (1-based), `None` for non-OOG runs.
+                /// Captured from `OutOfGasInfo.call_depth` before the info is
+                /// debug-formatted into the SQL `oog_info` column. Used by the
+                /// chain-walk classifier to find the OOG frame in
+                /// `call_frames`.
+                oog_call_depth: Option<usize>,
                 call_frames: Vec<CallFrame>,
                 event_logs: Vec<EventLog>,
                 output_hash: Option<String>,
@@ -1400,6 +1407,9 @@ where
                             // schedule-induced gas failure — bumping the
                             // replay multiplier could let it run.
                             replay_halt_oog: Some(true),
+                            // `transact()` rejected before any frame ran, so
+                            // we have no call tree to walk.
+                            oog_call_depth: None,
                             call_frames: Vec::new(),
                             event_logs: Vec::new(),
                             output_hash: None,
@@ -1481,6 +1491,7 @@ where
                         .as_ref()
                         .map(|loc| format!("{loc:?}")),
                     replay_halt_oog,
+                    oog_call_depth: insp_result.oog_info.as_ref().map(|oog| oog.call_depth),
                     call_frames_hash: Self::hash_serialized(&call_frames),
                     event_logs_hash: Self::hash_serialized(&event_logs),
                     call_frames,
@@ -1723,6 +1734,26 @@ where
                         .cloned()
                         .expect("all schedules should have static metadata");
 
+                    // Classify the OOG chain (root → OOG frame) so the
+                    // dashboard can distinguish wallet-fixable failures
+                    // (every hop received gas via the EIP-150 63/64 rule)
+                    // from contract-bottlenecked ones (some frame throttled
+                    // gas with `.transfer()` 2300 stipend, fixed constant,
+                    // or fractional pattern). Only meaningful for OOG-class
+                    // divergences — non-OOG rows leave these fields NULL.
+                    let (oog_chain_proportional, oog_bottleneck_depth, oog_bottleneck_kind) =
+                        match exec_result.and_then(|r| {
+                            r.oog_call_depth
+                                .and_then(|depth| classify_oog_chain(&r.call_frames, depth))
+                        }) {
+                            Some(analysis) => (
+                                Some(analysis.proportional),
+                                analysis.bottleneck_depth,
+                                analysis.bottleneck_kind.map(|k| k.as_str().to_string()),
+                            ),
+                            None => (None, None, None),
+                        };
+
                     let div = ScheduleDivergence {
                         schedule_name: schedule_name.to_string(),
                         block_number,
@@ -1805,6 +1836,9 @@ where
                         schedule_initial_reservoir,
                         schedule_floor_gas,
                         schedule_gas_refunded,
+                        oog_chain_proportional,
+                        oog_bottleneck_depth,
+                        oog_bottleneck_kind,
                     };
 
                     let should_record = self
