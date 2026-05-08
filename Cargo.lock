@@ -9963,6 +9963,7 @@ name = "reth-research-bin"
 version = "2.2.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips 2.0.4",
  "alloy-primitives",
  "clap",
  "eyre",

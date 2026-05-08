@@ -29,6 +29,7 @@ reth-research = { path = "../../crates/research" }
 
 # Alloy
 alloy-consensus.workspace = true
+alloy-eips.workspace = true
 alloy-primitives.workspace = true
 
 # Revm

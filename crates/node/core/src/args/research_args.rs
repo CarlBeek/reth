@@ -68,6 +68,26 @@ pub struct ResearchArgs {
         help_heading = "Research"
     )]
     pub gas_limit_multiplier: u64,
+
+    /// Enable historical backfill during idle periods.
+    ///
+    /// When the node has caught up to the chain head and no notifications are
+    /// pending, the ExEx walks the chain backward from the current head and
+    /// re-analyzes blocks whose coverage rows are missing for the current
+    /// schedule configuration. Live `ChainCommitted` notifications take
+    /// priority — backfill resumes on the next idle window.
+    #[arg(long = "research.backfill", help_heading = "Research")]
+    pub backfill: bool,
+
+    /// Inclusive lower bound for backfill. Backfill stops once the cursor
+    /// crosses this block number. Defaults to genesis (0).
+    #[arg(
+        long = "research.backfill-min-block",
+        value_name = "BLOCK",
+        default_value_t = 0,
+        help_heading = "Research"
+    )]
+    pub backfill_min_block: u64,
 }
 
 impl Default for ResearchArgs {
@@ -81,6 +101,8 @@ impl Default for ResearchArgs {
             start_block: 0,
             max_divergences_per_block: None,
             gas_limit_multiplier: 1,
+            backfill: false,
+            backfill_min_block: 0,
         }
     }
 }

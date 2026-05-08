@@ -1259,6 +1259,31 @@ impl DivergenceDatabase {
         Ok(deleted)
     }
 
+    /// Whether a coverage row already exists for `(schedule_name, block_number)`
+    /// under the given `schedule_config_hash`.
+    ///
+    /// Used by backfill to skip blocks already analyzed under the current
+    /// schedule configuration. A row written under a stale config_hash does
+    /// NOT count as covered, so changing a schedule's config (CSV contents,
+    /// multiplier value, etc.) re-opens the block for backfill.
+    pub fn has_schedule_block_coverage_with_config(
+        &self,
+        schedule_name: &str,
+        block_number: u64,
+        schedule_config_hash: &str,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT 1 FROM schedule_block_coverage
+             WHERE schedule_name = ?1
+               AND block_number = ?2
+               AND schedule_config_hash = ?3
+             LIMIT 1",
+        )?;
+        let exists = stmt.exists(params![schedule_name, block_number, schedule_config_hash])?;
+        Ok(exists)
+    }
+
     /// Get total gas delta for a schedule.
     pub fn total_gas_delta_for_schedule(&self, schedule_name: &str) -> Result<i64, DatabaseError> {
         let conn = self.conn.lock().unwrap();
@@ -2041,5 +2066,44 @@ mod tests {
 
         let deleted = db.delete_schedule_block_coverage_in_block_range(100, 100).unwrap();
         assert_eq!(deleted, 1);
+    }
+
+    #[test]
+    fn test_has_schedule_block_coverage_with_config() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        let coverage = ScheduleBlockCoverage {
+            schedule_name: "sched-a".to_string(),
+            schedule_kind: "ExecutionOnly".to_string(),
+            schedule_config_hash: "hash-v1".to_string(),
+            block_number: 42,
+            block_hash: B256::repeat_byte(0x42),
+            parent_hash: B256::repeat_byte(0x41),
+            timestamp: 0,
+            tx_count: 0,
+            divergence_count: 0,
+            status_divergence_count: 0,
+            gas_divergence_count: 0,
+            call_tree_divergence_count: 0,
+            event_log_divergence_count: 0,
+            output_divergence_count: 0,
+            created_address_divergence_count: 0,
+            logs_bloom_divergence_count: 0,
+            total_baseline_gas_used: 0,
+            total_schedule_gas_used: 0,
+            total_gas_delta: 0,
+        };
+        db.record_schedule_block_coverage(&coverage).unwrap();
+
+        // Exact match → covered.
+        assert!(db.has_schedule_block_coverage_with_config("sched-a", 42, "hash-v1").unwrap());
+
+        // Different config_hash → uncovered (config changed).
+        assert!(!db.has_schedule_block_coverage_with_config("sched-a", 42, "hash-v2").unwrap());
+
+        // Different block → uncovered.
+        assert!(!db.has_schedule_block_coverage_with_config("sched-a", 43, "hash-v1").unwrap());
+
+        // Different schedule → uncovered.
+        assert!(!db.has_schedule_block_coverage_with_config("sched-b", 42, "hash-v1").unwrap());
     }
 }
