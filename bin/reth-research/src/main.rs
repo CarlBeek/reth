@@ -21,9 +21,10 @@
 //! ```
 
 use alloy_consensus::{constants::KECCAK_EMPTY, transaction::TxHashRef, BlockHeader, Transaction};
+use alloy_eips::BlockHashOrNumber;
 use alloy_primitives::{keccak256, logs_bloom, Address, Bloom, Bytes, U256};
 use clap::Parser;
-use futures::TryStreamExt;
+use futures::{FutureExt, TryStreamExt};
 use reth_ethereum::{
     exex::{ExExContext, ExExEvent, ExExNotification},
     node::EthereumNode,
@@ -32,7 +33,7 @@ use reth_evm::{block::BlockExecutorFactory, ConfigureEvm, Evm, EvmFactory, Trans
 use reth_node_api::{BlockTy, FullNodeComponents};
 use reth_node_core::args::ResearchArgs;
 use reth_primitives_traits::BlockBody;
-use reth_provider::StateProviderFactory;
+use reth_provider::{BlockNumReader, BlockReader, StateProviderFactory, TransactionVariant};
 use reth_research::{
     database::{DivergenceDatabase, ScheduleBlockCoverage},
     divergence::{CallFrame, DivergenceLocation, DivergenceType, EventLog},
@@ -154,6 +155,21 @@ struct ResearchExEx<Node: FullNodeComponents> {
     db_tx: Option<mpsc::UnboundedSender<DbCommand>>,
     /// Handle for async database writer task
     db_writer_task: Option<JoinHandle<()>>,
+    /// Read-side handle to the divergence DB. Used by the backfill arm to
+    /// check whether a block is already covered under the current schedule
+    /// configuration. Shares the underlying `Arc<Mutex<Connection>>` with the
+    /// writer thread, so reads briefly block writes (and vice versa).
+    divergence_db: Option<DivergenceDatabase>,
+    /// Whether to backfill historical blocks during idle windows.
+    backfill_enabled: bool,
+    /// Inclusive lower bound for backfill.
+    backfill_min_block: u64,
+    /// Cursor for the next backfill block, lazily initialized to `head - 1` on
+    /// the first idle tick.
+    next_backfill_block: Option<u64>,
+    /// Set once the cursor has walked below `backfill_min_block` (or there is
+    /// nothing to backfill), so the run loop stops polling the backfill arm.
+    backfill_exhausted: bool,
     /// Statistics
     blocks_processed: u64,
     divergences_found: u64,
@@ -312,6 +328,8 @@ where
         start_block: u64,
         max_divergences_per_block: Option<usize>,
         gas_limit_multiplier: u64,
+        backfill: bool,
+        backfill_min_block: u64,
     ) -> eyre::Result<Self> {
         let registry = Arc::new(registry);
         let all_schedules = registry.all();
@@ -345,7 +363,7 @@ where
             .collect();
 
         // Initialize database and async writer
-        let (db_tx, db_writer_task) = if db_path.to_str() != Some(":memory:") {
+        let (divergence_db, db_tx, db_writer_task) = if db_path.to_str() != Some(":memory:") {
             let divergence_db = DivergenceDatabase::open(&db_path)?;
 
             info!(
@@ -371,9 +389,11 @@ where
 
             // Spawn database writer task
             let (tx, mut rx) = mpsc::unbounded_channel::<DbCommand>();
+            let writer_db = divergence_db.clone();
             let writer_task = std::thread::Builder::new()
                 .name("reth-research-db-writer".to_string())
                 .spawn(move || {
+                let divergence_db = writer_db;
                 const DB_WRITE_BATCH_SIZE: usize = 256;
                 let mut write_count = 0u64;
                 let mut pending_records = Vec::with_capacity(DB_WRITE_BATCH_SIZE);
@@ -477,10 +497,20 @@ where
             })
             .map_err(|err| eyre::eyre!("failed to spawn db writer thread: {err}"))?;
 
-            (Some(tx), Some(writer_task))
+            (Some(divergence_db), Some(tx), Some(writer_task))
         } else {
-            (None, None)
+            (None, None, None)
         };
+
+        // Backfill requires a real DB — there's nowhere to record dedupe
+        // information against an in-memory database that disappears at shutdown.
+        let backfill_enabled = backfill && divergence_db.is_some();
+        if backfill && divergence_db.is_none() {
+            warn!(
+                target: "exex::research",
+                "Backfill requested but disabled: db-path is in-memory"
+            );
+        }
 
         Ok(Self {
             ctx,
@@ -495,6 +525,11 @@ where
             gas_limit_multiplier: gas_limit_multiplier.max(1),
             db_tx,
             db_writer_task,
+            divergence_db,
+            backfill_enabled,
+            backfill_min_block,
+            next_backfill_block: None,
+            backfill_exhausted: false,
             blocks_processed: 0,
             divergences_found: 0,
         })
@@ -506,121 +541,43 @@ where
             target: "exex::research",
             start_block = self.start_block,
             schedule_count = self.registry.len(),
+            backfill_enabled = self.backfill_enabled,
+            backfill_min_block = self.backfill_min_block,
             "Multi-schedule Research ExEx started"
         );
 
-        while let Some(notification) = self.ctx.notifications.try_next().await? {
-            match &notification {
-                ExExNotification::ChainCommitted { new } => {
-                    let mut highest_finished = None;
-                    for (_block_number, block) in new.blocks() {
-                        let block_number = block.number();
-
-                        if block_number < self.start_block {
-                            highest_finished = Some(block.num_hash());
-                            continue;
-                        }
-
-                        debug!(
-                            target: "exex::research",
-                            block = block_number,
-                            tx_count = block.body().transactions().len(),
-                            "Analyzing block with {} schedules",
-                            self.registry.len()
-                        );
-
-                        match self.analyze_block(block).await {
-                            Ok(true) => {
-                                self.blocks_processed += 1;
-                                highest_finished = Some(block.num_hash());
-                            }
-                            Ok(false) => {
-                                debug!(
-                                    target: "exex::research",
-                                    block = block_number,
-                                    "Deferred block analysis until historical state is available"
-                                );
-                                break;
-                            }
-                            Err(e) => {
-                                warn!(
-                                    target: "exex::research",
-                                    block = block_number,
-                                    error = %e,
-                                    "Failed to analyze block"
-                                );
-                                break;
-                            }
-                        }
+        // Loop structure: drain any ready notifications first, then either do
+        // one backfill step or block-await the next notification. `now_or_never`
+        // gives us the "ready right now" check without registering a real waker
+        // — that's fine, because the backfill arm always loops back here, and
+        // the `try_next().await` arm does register one. Live notifications
+        // therefore preempt backfill at most one historical block late.
+        'outer: loop {
+            // Drain whatever notifications are immediately ready.
+            loop {
+                match self.ctx.notifications.try_next().now_or_never() {
+                    Some(Ok(Some(notification))) => {
+                        self.handle_notification(notification).await?;
                     }
-
-                    if let Some(num_hash) = highest_finished {
-                        self.ctx.events.send(ExExEvent::FinishedHeight(num_hash))?;
-                    }
+                    Some(Ok(None)) => break 'outer,
+                    Some(Err(e)) => return Err(e),
+                    None => break,
                 }
-                ExExNotification::ChainReorged { old, new } => {
-                    let range = old.range();
-                    let from_block = (*range.start()).max(self.start_block);
-                    let to_block = *range.end();
-                    if from_block <= to_block {
-                        self.delete_divergences_in_block_range(from_block, to_block);
-                    }
+            }
 
-                    info!(
-                        target: "exex::research",
-                        "Chain reorg detected, processing new chain"
+            // No notification ready. Do one backfill step or block-await.
+            if self.backfill_enabled && !self.backfill_exhausted {
+                if let Err(e) = self.try_backfill_one_block().await {
+                    warn!(
+                        target: "exex::research::backfill",
+                        error = %e,
+                        "Backfill step failed"
                     );
-
-                    let mut highest_finished = None;
-                    for (_block_number, block) in new.blocks() {
-                        let block_number = block.number();
-                        if block_number < self.start_block {
-                            highest_finished = Some(block.num_hash());
-                            continue;
-                        }
-
-                        match self.analyze_block(block).await {
-                            Ok(true) => {
-                                self.blocks_processed += 1;
-                                highest_finished = Some(block.num_hash());
-                            }
-                            Ok(false) => {
-                                debug!(
-                                    target: "exex::research",
-                                    block = block_number,
-                                    "Deferred reorg block analysis until historical state is available"
-                                );
-                                break;
-                            }
-                            Err(e) => {
-                                warn!(
-                                    target: "exex::research",
-                                    block = block_number,
-                                    error = %e,
-                                    "Failed to analyze block after reorg"
-                                );
-                                break;
-                            }
-                        }
-                    }
-
-                    if let Some(num_hash) = highest_finished {
-                        self.ctx.events.send(ExExEvent::FinishedHeight(num_hash))?;
-                    }
                 }
-                ExExNotification::ChainReverted { old } => {
-                    let range = old.range();
-                    let from_block = (*range.start()).max(self.start_block);
-                    let to_block = *range.end();
-                    if from_block <= to_block {
-                        self.delete_divergences_in_block_range(from_block, to_block);
-                    }
-
-                    info!(
-                        target: "exex::research",
-                        reverted_tip = old.tip().number(),
-                        "Chain reverted"
-                    );
+            } else {
+                match self.ctx.notifications.try_next().await? {
+                    Some(notification) => self.handle_notification(notification).await?,
+                    None => break,
                 }
             }
         }
@@ -633,6 +590,297 @@ where
             }
         }
 
+        Ok(())
+    }
+
+    /// Handle a single live `ExExNotification`.
+    async fn handle_notification(
+        &mut self,
+        notification: ExExNotification<<Node::Evm as ConfigureEvm>::Primitives>,
+    ) -> eyre::Result<()> {
+        match &notification {
+            ExExNotification::ChainCommitted { new } => {
+                let mut highest_finished = None;
+                for (_block_number, block) in new.blocks() {
+                    let block_number = block.number();
+
+                    if block_number < self.start_block {
+                        highest_finished = Some(block.num_hash());
+                        continue;
+                    }
+
+                    debug!(
+                        target: "exex::research",
+                        block = block_number,
+                        tx_count = block.body().transactions().len(),
+                        "Analyzing block with {} schedules",
+                        self.registry.len()
+                    );
+
+                    match self.analyze_block(block).await {
+                        Ok(true) => {
+                            self.blocks_processed += 1;
+                            highest_finished = Some(block.num_hash());
+                        }
+                        Ok(false) => {
+                            debug!(
+                                target: "exex::research",
+                                block = block_number,
+                                "Deferred block analysis until historical state is available"
+                            );
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(
+                                target: "exex::research",
+                                block = block_number,
+                                error = %e,
+                                "Failed to analyze block"
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(num_hash) = highest_finished {
+                    self.ctx.events.send(ExExEvent::FinishedHeight(num_hash))?;
+                }
+            }
+            ExExNotification::ChainReorged { old, new } => {
+                let range = old.range();
+                let from_block = (*range.start()).max(self.start_block);
+                let to_block = *range.end();
+                if from_block <= to_block {
+                    self.delete_divergences_in_block_range(from_block, to_block);
+                }
+
+                info!(
+                    target: "exex::research",
+                    "Chain reorg detected, processing new chain"
+                );
+
+                let mut highest_finished = None;
+                for (_block_number, block) in new.blocks() {
+                    let block_number = block.number();
+                    if block_number < self.start_block {
+                        highest_finished = Some(block.num_hash());
+                        continue;
+                    }
+
+                    match self.analyze_block(block).await {
+                        Ok(true) => {
+                            self.blocks_processed += 1;
+                            highest_finished = Some(block.num_hash());
+                        }
+                        Ok(false) => {
+                            debug!(
+                                target: "exex::research",
+                                block = block_number,
+                                "Deferred reorg block analysis until historical state is available"
+                            );
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(
+                                target: "exex::research",
+                                block = block_number,
+                                error = %e,
+                                "Failed to analyze block after reorg"
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(num_hash) = highest_finished {
+                    self.ctx.events.send(ExExEvent::FinishedHeight(num_hash))?;
+                }
+            }
+            ExExNotification::ChainReverted { old } => {
+                let range = old.range();
+                let from_block = (*range.start()).max(self.start_block);
+                let to_block = *range.end();
+                if from_block <= to_block {
+                    self.delete_divergences_in_block_range(from_block, to_block);
+                }
+
+                info!(
+                    target: "exex::research",
+                    reverted_tip = old.tip().number(),
+                    "Chain reverted"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Walk one step of the backfill cursor: skip blocks already covered under
+    /// every configured schedule's current `config_hash`, then analyze the
+    /// first uncovered block.
+    ///
+    /// Returns `Ok(())` after either analyzing one block or determining there
+    /// is no more work (in which case `backfill_exhausted` is set so the run
+    /// loop stops polling this arm).
+    async fn try_backfill_one_block(&mut self) -> eyre::Result<()> {
+        // Lazily initialize the cursor on the first idle tick. We start from
+        // `head - 1`: the live tip will arrive via the notification stream.
+        if self.next_backfill_block.is_none() {
+            let head = self.ctx.provider().best_block_number()?;
+            if head == 0 {
+                self.backfill_exhausted = true;
+                return Ok(());
+            }
+            let start = head.saturating_sub(1);
+            if start < self.backfill_min_block {
+                self.backfill_exhausted = true;
+                info!(
+                    target: "exex::research::backfill",
+                    head,
+                    backfill_min_block = self.backfill_min_block,
+                    "Backfill exhausted before starting (head below min)"
+                );
+                return Ok(());
+            }
+            info!(
+                target: "exex::research::backfill",
+                cursor = start,
+                backfill_min_block = self.backfill_min_block,
+                "Backfill cursor initialized"
+            );
+            self.next_backfill_block = Some(start);
+        }
+
+        let Some(divergence_db) = self.divergence_db.clone() else {
+            self.backfill_exhausted = true;
+            return Ok(());
+        };
+
+        // Cap how far we walk per tick when skipping already-covered blocks, so
+        // a long covered streak still yields back to the run loop.
+        const MAX_SKIPS_PER_TICK: u64 = 1024;
+        let mut skipped = 0u64;
+
+        while let Some(cursor) = self.next_backfill_block {
+            if cursor < self.backfill_min_block {
+                self.backfill_exhausted = true;
+                info!(
+                    target: "exex::research::backfill",
+                    backfill_min_block = self.backfill_min_block,
+                    "Backfill cursor reached lower bound — stopping"
+                );
+                return Ok(());
+            }
+            if skipped >= MAX_SKIPS_PER_TICK {
+                return Ok(());
+            }
+
+            // Strict dedupe: every configured schedule must have a coverage
+            // row at this block under its current config_hash.
+            let mut all_covered = true;
+            for schedule in &self.all_schedules {
+                let metadata = self
+                    .schedule_metadata
+                    .get(schedule.name())
+                    .expect("metadata exists for every schedule");
+                match divergence_db.has_schedule_block_coverage_with_config(
+                    schedule.name(),
+                    cursor,
+                    &metadata.config_hash,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        all_covered = false;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(
+                            target: "exex::research::backfill",
+                            block = cursor,
+                            schedule = schedule.name(),
+                            error = %e,
+                            "Coverage lookup failed; treating block as uncovered"
+                        );
+                        all_covered = false;
+                        break;
+                    }
+                }
+            }
+
+            if all_covered {
+                self.next_backfill_block = cursor.checked_sub(1);
+                skipped += 1;
+                continue;
+            }
+
+            // First uncovered block — fetch and analyze.
+            let recovered = match self
+                .ctx
+                .provider()
+                .recovered_block(BlockHashOrNumber::Number(cursor), TransactionVariant::WithHash)
+            {
+                Ok(Some(block)) => block,
+                Ok(None) => {
+                    debug!(
+                        target: "exex::research::backfill",
+                        block = cursor,
+                        "recovered_block returned None; skipping"
+                    );
+                    self.next_backfill_block = cursor.checked_sub(1);
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!(
+                        target: "exex::research::backfill",
+                        block = cursor,
+                        error = %e,
+                        "Failed to load recovered block"
+                    );
+                    self.next_backfill_block = cursor.checked_sub(1);
+                    return Ok(());
+                }
+            };
+
+            debug!(
+                target: "exex::research::backfill",
+                block = cursor,
+                tx_count = recovered.body().transactions().len(),
+                "Analyzing backfill block"
+            );
+
+            match self.analyze_block(&recovered).await {
+                Ok(true) => {
+                    self.blocks_processed += 1;
+                    self.next_backfill_block = cursor.checked_sub(1);
+                    return Ok(());
+                }
+                Ok(false) => {
+                    // Historical state not available right now (transient
+                    // during initial sync). Skip and continue downward — the
+                    // archival snapshot is dense enough that this should be
+                    // rare in steady state.
+                    debug!(
+                        target: "exex::research::backfill",
+                        block = cursor,
+                        "Historical state unavailable for backfill block; skipping"
+                    );
+                    self.next_backfill_block = cursor.checked_sub(1);
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!(
+                        target: "exex::research::backfill",
+                        block = cursor,
+                        error = %e,
+                        "analyze_block failed during backfill"
+                    );
+                    self.next_backfill_block = cursor.checked_sub(1);
+                    return Ok(());
+                }
+            }
+        }
+
+        // Cursor walked off the bottom (reached backfill_min_block).
+        self.backfill_exhausted = true;
         Ok(())
     }
 
@@ -1595,6 +1843,8 @@ async fn research_exex<Node: FullNodeComponents>(
     start_block: u64,
     max_divergences_per_block: Option<usize>,
     gas_limit_multiplier: u64,
+    backfill: bool,
+    backfill_min_block: u64,
 ) -> eyre::Result<()>
 where
     Node::Evm: ConfigureEvm<
@@ -1610,6 +1860,8 @@ where
         start_block,
         max_divergences_per_block,
         gas_limit_multiplier,
+        backfill,
+        backfill_min_block,
     )?
     .run()
     .await
@@ -1634,6 +1886,8 @@ fn main() -> eyre::Result<()> {
             let start_block = research_args.start_block;
             let max_divergences_per_block = research_args.max_divergences_per_block;
             let gas_limit_multiplier = research_args.gas_limit_multiplier;
+            let backfill = research_args.backfill;
+            let backfill_min_block = research_args.backfill_min_block;
 
             info!(
                 target: "reth::cli",
@@ -1642,6 +1896,8 @@ fn main() -> eyre::Result<()> {
                 start_block,
                 max_divergences_per_block,
                 gas_limit_multiplier,
+                backfill,
+                backfill_min_block,
                 "Starting multi-schedule research mode"
             );
 
@@ -1658,6 +1914,8 @@ fn main() -> eyre::Result<()> {
                             start_block,
                             max_divergences_per_block,
                             gas_limit_multiplier,
+                            backfill,
+                            backfill_min_block,
                         ))
                     }
                 })
