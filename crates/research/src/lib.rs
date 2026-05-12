@@ -193,6 +193,7 @@
 
 pub mod block_aggregator;
 pub mod cli;
+pub mod contract_metadata;
 pub mod database_duckdb;
 pub mod divergence;
 pub mod multi_schedule_inspector;
