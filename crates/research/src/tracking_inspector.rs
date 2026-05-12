@@ -277,6 +277,7 @@ where
                 repricing_gas_delta: 0,
                 gas_requested_on_stack: None,
                 parent_gas_at_call: None,
+                value_wei: None,
             });
         }
     }
@@ -333,6 +334,7 @@ where
                 repricing_gas_delta: 0,
                 gas_requested_on_stack: None,
                 parent_gas_at_call: None,
+                value_wei: None,
             });
         }
     }

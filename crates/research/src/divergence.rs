@@ -343,6 +343,15 @@ pub struct CallFrame {
     /// `None` for the root frame and for baseline `TrackingInspector` frames.
     #[serde(default)]
     pub parent_gas_at_call: Option<u64>,
+
+    /// Value transferred (in wei) when the frame was opened. `None` for
+    /// DELEGATECALL / STATICCALL (which can't transfer value), CREATE
+    /// frames where the value is part of `init_code`, and frames from the
+    /// baseline `TrackingInspector`. Carried as the lower 128 bits of a
+    /// U256 — values that exceed `u128::MAX` are saturated; this stays
+    /// well above any realistic ETH amount.
+    #[serde(default)]
+    pub value_wei: Option<u128>,
 }
 
 /// Type of call.

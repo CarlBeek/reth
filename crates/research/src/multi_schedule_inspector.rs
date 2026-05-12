@@ -1046,6 +1046,14 @@ where
                 revm::interpreter::CallInput::SharedBuffer(_) => None,
             };
 
+            // Transfer-value only: `CallValue::Apparent` (DELEGATECALL)
+            // is not transferred, so we treat its presence as "no
+            // transfer" rather than recording the apparent number.
+            let value_wei = match inputs.value {
+                revm::interpreter::CallValue::Transfer(v) => Some(v.saturating_to::<u128>()),
+                revm::interpreter::CallValue::Apparent(_) => None,
+            };
+
             self.call_frames.push(CallFrame {
                 call_index: self.call_frames.len(),
                 depth: entry.depth,
@@ -1060,6 +1068,7 @@ where
                 repricing_gas_delta: frame_repricing_delta,
                 gas_requested_on_stack: entry.gas_requested_on_stack,
                 parent_gas_at_call: entry.parent_gas_at_call,
+                value_wei,
             });
 
             // Propagate per-frame positive delta flag to parent.
@@ -1172,6 +1181,10 @@ where
             let created_address = outcome.address.unwrap_or(Address::ZERO);
             let create_success = outcome.result.result.is_ok();
 
+            // CREATE/CREATE2 endow the new contract with `inputs.value`;
+            // we capture it in the same column as CALL's transfer value.
+            let value_wei = Some(inputs.value().saturating_to::<u128>());
+
             self.call_frames.push(CallFrame {
                 call_index: self.call_frames.len(),
                 depth: entry.depth,
@@ -1186,6 +1199,7 @@ where
                 repricing_gas_delta: entry.repricing_gas_delta,
                 gas_requested_on_stack: entry.gas_requested_on_stack,
                 parent_gas_at_call: entry.parent_gas_at_call,
+                value_wei,
             });
 
             // Propagate per-frame positive delta flag to parent.

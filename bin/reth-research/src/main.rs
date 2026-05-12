@@ -22,7 +22,7 @@
 
 use alloy_consensus::{constants::KECCAK_EMPTY, transaction::TxHashRef, BlockHeader, Transaction};
 use alloy_eips::BlockHashOrNumber;
-use alloy_primitives::{keccak256, logs_bloom, Address, Bloom, Bytes, U256};
+use alloy_primitives::{keccak256, logs_bloom, Address, Bloom, Bytes, B256, U256};
 use clap::Parser;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt, TryStreamExt};
 use reth_ethereum::{
@@ -1805,11 +1805,27 @@ where
                             schedule_state_gas_spent: Some(schedule_state_gas_spent),
                             schedule_initial_state_gas: Some(schedule_initial_state_gas),
                             schedule_initial_reservoir: Some(schedule_initial_reservoir),
-                            // 8037 reservoir-derived fields land in a follow-up.
-                            runtime_state_gas: None,
-                            runtime_state_gas_spillover: None,
+                            // Derived 8037 figures, mirroring what
+                            // `BlockAggregator` computes per bucket:
+                            //   runtime_state_gas = state_gas_spent − initial_state_gas
+                            //   spillover         = runtime_state_gas − initial_reservoir
+                            //   reservoir_exhausted = spillover > 0
+                            // All saturate to zero on underflow.
+                            runtime_state_gas: Some(
+                                schedule_state_gas_spent.saturating_sub(schedule_initial_state_gas),
+                            ),
+                            runtime_state_gas_spillover: Some(
+                                schedule_state_gas_spent
+                                    .saturating_sub(schedule_initial_state_gas)
+                                    .saturating_sub(schedule_initial_reservoir),
+                            ),
                             state_gas_category: tx_category.map(|s| s.to_string()),
-                            reservoir_exhausted: None,
+                            reservoir_exhausted: Some(
+                                schedule_state_gas_spent
+                                    .saturating_sub(schedule_initial_state_gas)
+                                    .saturating_sub(schedule_initial_reservoir) >
+                                    0,
+                            ),
                         };
 
                         // Inspector emits frames in post-order DFS — children
@@ -1817,40 +1833,62 @@ where
                         // index `i` (with depth `d > 0`) is the first
                         // subsequent frame at depth `d - 1`.
                         let parent_call_indices = derive_parent_call_indices(frames_ref);
+
+                        // Pull codehashes for every distinct frame target
+                        // out of the historical state we already loaded
+                        // for analysis (`normal_db`). One revm `basic()`
+                        // lookup per address; results cached so repeat
+                        // hits in the same drill-in tx are free. Failures
+                        // — self-destructed contracts, missing accounts —
+                        // leave the column NULL rather than aborting the
+                        // drill-in record.
+                        let mut codehash_cache: HashMap<Address, Option<B256>> = HashMap::new();
                         let call_frames_rows: Vec<CallFrameRow> = frames_ref
                             .iter()
                             .enumerate()
-                            .map(|(i, f)| CallFrameRow {
-                                call_index: f.call_index as u32,
-                                parent_call_index: parent_call_indices[i],
-                                depth: f.depth as u32,
-                                from_address: f.from,
-                                to_address: f.to.unwrap_or_default(),
-                                // For non-DELEGATECALL frames this equals
-                                // `to_address`; once the inspector splits
-                                // storage-context vs code-holder for
-                                // DELEGATECALL, this column will carry the
-                                // code holder while `to_address` carries
-                                // the storage target. Today both come from
-                                // the same source.
-                                code_address: f.to,
-                                codehash: None,
-                                call_type: format_call_type(&f.call_type),
-                                selector: extract_selector_bytes(&f.input),
-                                value_wei: None,
-                                gas_provided: f.gas_provided,
-                                gas_used: f.gas_used,
-                                gas_margin: Some(
-                                    (f.gas_provided as i64).saturating_sub(f.gas_used as i64),
-                                ),
-                                success: f.success,
-                                parent_gas_at_call: f.parent_gas_at_call,
-                                gas_requested_on_stack: f.gas_requested_on_stack,
-                                eip150_cap_binding: eip150_cap_binding(
-                                    f.gas_requested_on_stack,
-                                    f.parent_gas_at_call,
-                                ),
-                                state_gas_running: None,
+                            .map(|(i, f)| {
+                                let codehash = f.to.and_then(|addr| {
+                                    *codehash_cache.entry(addr).or_insert_with(|| {
+                                        match normal_db.basic(addr) {
+                                            Ok(Some(info)) if info.code_hash != KECCAK_EMPTY => {
+                                                Some(info.code_hash)
+                                            }
+                                            _ => None,
+                                        }
+                                    })
+                                });
+                                CallFrameRow {
+                                    call_index: f.call_index as u32,
+                                    parent_call_index: parent_call_indices[i],
+                                    depth: f.depth as u32,
+                                    from_address: f.from,
+                                    to_address: f.to.unwrap_or_default(),
+                                    // For non-DELEGATECALL frames this equals
+                                    // `to_address`; once the inspector splits
+                                    // storage-context vs code-holder for
+                                    // DELEGATECALL, this column will carry the
+                                    // code holder while `to_address` carries
+                                    // the storage target. Today both come from
+                                    // the same source.
+                                    code_address: f.to,
+                                    codehash,
+                                    call_type: format_call_type(&f.call_type),
+                                    selector: extract_selector_bytes(&f.input),
+                                    value_wei: f.value_wei.map(|v| v.to_string()),
+                                    gas_provided: f.gas_provided,
+                                    gas_used: f.gas_used,
+                                    gas_margin: Some(
+                                        (f.gas_provided as i64).saturating_sub(f.gas_used as i64),
+                                    ),
+                                    success: f.success,
+                                    parent_gas_at_call: f.parent_gas_at_call,
+                                    gas_requested_on_stack: f.gas_requested_on_stack,
+                                    eip150_cap_binding: eip150_cap_binding(
+                                        f.gas_requested_on_stack,
+                                        f.parent_gas_at_call,
+                                    ),
+                                    state_gas_running: None,
+                                }
                             })
                             .collect();
 
@@ -2179,6 +2217,7 @@ mod tests {
             repricing_gas_delta: 0,
             gas_requested_on_stack: None,
             parent_gas_at_call: None,
+            value_wei: None,
         }
     }
 
