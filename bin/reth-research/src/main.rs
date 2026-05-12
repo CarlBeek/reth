@@ -1868,10 +1868,30 @@ where
                     None
                 };
 
+                // Derive the runtime state-gas decomposition for the
+                // 8037 aggregates: `runtime_state_gas = state_gas_spent -
+                // initial_state_gas`, and the spillover is whatever
+                // exceeded the per-tx reservoir.
+                let runtime_state_gas =
+                    schedule_state_gas_spent.saturating_sub(schedule_initial_state_gas);
+                let state_gas_spillover =
+                    runtime_state_gas.saturating_sub(schedule_initial_reservoir);
+                let has_runtime_state = runtime_state_gas > 0;
+
                 aggregators
                     .get_mut(schedule_name)
                     .expect("aggregator exists for every schedule")
-                    .observe_tx(bucket, total_delta, drill_in);
+                    .observe_tx(reth_research::block_aggregator::TxObservation {
+                        bucket,
+                        gas_delta: total_delta,
+                        state_gas_spent: schedule_state_gas_spent,
+                        state_gas_spillover,
+                        min_multiplier_to_succeed,
+                        is_creation: is_create,
+                        has_authorization: authorization_count > 0,
+                        has_runtime_state,
+                        drill_in_record: drill_in,
+                    });
             }
         }
 

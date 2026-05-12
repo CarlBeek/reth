@@ -63,6 +63,31 @@ struct BucketAccumulator {
     ///                    counts 1 ≤ |gas_delta| < 2.
     ///   bin 11 → |gas_delta| >= 2^10 (1024)
     gas_delta_log2_hist: [i32; 12],
+
+    // EIP-8037 state-gas aggregates. Zero for schedules that don't track
+    // state gas; emitted as None on the row when the bucket saw zero
+    // state-gas activity so the column reads cleanly as "n/a".
+    state_gas_sum: u64,
+    state_gas_spillover_sum: u64,
+
+    /// 12-bin histogram of `min_multiplier_to_succeed` values. See
+    /// [`multiplier_bin`] for boundaries. `bin 0` collects txs where the
+    /// replay didn't resolve a multiplier (None) — failures or
+    /// not-applicable.
+    multiplier_log2_hist: [i32; 12],
+    /// Number of observations that contributed to `multiplier_log2_hist`
+    /// (i.e. had a meaningful multiplier or were explicitly counted as
+    /// None). Used to decide whether to emit the histogram at all.
+    multiplier_observations: u32,
+
+    // 7904 / state-gas category counters. A single tx may increment more
+    // than one of these (e.g. a contract creation that also burned
+    // runtime state gas) — they're independent indicators rather than
+    // mutually-exclusive buckets.
+    tx_count_creation: u32,
+    tx_count_authorization: u32,
+    tx_count_runtime_state: u32,
+    tx_count_no_state: u32,
 }
 
 impl BucketAccumulator {
@@ -80,6 +105,39 @@ impl BucketAccumulator {
     }
 }
 
+/// 12-bin histogram of `min_multiplier_to_succeed` (replay's required
+/// gas-limit inflation). Mirrors the bin labels the dashboard expects:
+/// `None` (no multiplier), ≤1.0, ≤1.25, ≤1.5, ≤2, ≤3, ≤4, ≤5, ≤6, ≤7,
+/// ≤8, >8.
+fn multiplier_bin(value: Option<f64>) -> usize {
+    let Some(v) = value else {
+        return 0;
+    };
+    if v <= 1.0 {
+        1
+    } else if v <= 1.25 {
+        2
+    } else if v <= 1.5 {
+        3
+    } else if v <= 2.0 {
+        4
+    } else if v <= 3.0 {
+        5
+    } else if v <= 4.0 {
+        6
+    } else if v <= 5.0 {
+        7
+    } else if v <= 6.0 {
+        8
+    } else if v <= 7.0 {
+        9
+    } else if v <= 8.0 {
+        10
+    } else {
+        11
+    }
+}
+
 /// Pick the bin index for a signed gas delta. Bin 0 = exact zero;
 /// bin 11 = `|delta| >= 1024`. See [`BucketAccumulator::gas_delta_log2_hist`].
 fn log2_bin(gas_delta: i64) -> usize {
@@ -91,6 +149,41 @@ fn log2_bin(gas_delta: i64) -> usize {
     let bits = 64 - abs.leading_zeros() as usize;
     // bits 1 → bin 1, bits 2 → bin 2, ..., bits 10 → bin 10, bits 11+ → bin 11.
     bits.min(11)
+}
+
+/// Observation passed to [`BlockAggregator::observe_tx`].
+///
+/// Bundles the bucket assignment with every per-tx metric the aggregator
+/// rolls into `block_summaries`. New fields can be added here without
+/// changing the call signature.
+#[derive(Debug, Clone)]
+pub struct TxObservation {
+    /// Bucket the classifier assigned to this (tx, schedule).
+    pub bucket: Bucket,
+    /// `schedule_gas_used - baseline_gas_used`.
+    pub gas_delta: i64,
+    /// Net EIP-8037 state gas the schedule actually charged. Zero for
+    /// schedules that don't engage state gas.
+    pub state_gas_spent: u64,
+    /// Portion of `state_gas_spent` that spilled into regular gas
+    /// because the reservoir wasn't large enough.
+    pub state_gas_spillover: u64,
+    /// Smallest gas-limit multiplier the schedule required for the
+    /// replay to succeed. `None` when the replay halted regardless of
+    /// gas (revert / non-OOG halt) or at the inflated replay cap.
+    pub min_multiplier_to_succeed: Option<f64>,
+    /// Whether the tx is a contract creation.
+    pub is_creation: bool,
+    /// Whether the tx carries an EIP-7702 authorization list.
+    pub has_authorization: bool,
+    /// Whether any state gas was charged during execution (i.e.
+    /// post-intrinsic). False when the tx only paid the initial state-gas
+    /// allotment with no spillover.
+    pub has_runtime_state: bool,
+    /// Per-tx drill-in record — populated only for drill-in buckets
+    /// (`EventLogsChanged` / `ContractBroken`); ignored for aggregate
+    /// buckets.
+    pub drill_in_record: Option<DrillInRecord>,
 }
 
 impl BlockAggregator {
@@ -106,22 +199,43 @@ impl BlockAggregator {
         }
     }
 
-    /// Record a single tx's classification + gas delta. The
-    /// `drill_in_record` payload is only honoured when `bucket.is_drill_in()`
-    /// — for aggregate-only buckets the per-tx data has already been
-    /// summed into running totals.
-    pub fn observe_tx(
-        &mut self,
-        bucket: Bucket,
-        gas_delta: i64,
-        drill_in_record: Option<DrillInRecord>,
-    ) {
+    /// Record a single tx's classification + per-tx metrics. Drill-in
+    /// records are kept only for `bucket.is_drill_in()`; aggregate
+    /// buckets discard them after rolling the metric counters.
+    pub fn observe_tx(&mut self, obs: TxObservation) {
         self.tx_count += 1;
-        let acc = self.buckets.entry(bucket).or_default();
+        let acc = self.buckets.entry(obs.bucket).or_default();
         acc.tx_count += 1;
-        acc.observe_gas_delta(gas_delta);
-        if bucket.is_drill_in() {
-            if let Some(record) = drill_in_record {
+        acc.observe_gas_delta(obs.gas_delta);
+
+        // 8037 state-gas aggregates.
+        acc.state_gas_sum = acc.state_gas_sum.saturating_add(obs.state_gas_spent);
+        acc.state_gas_spillover_sum =
+            acc.state_gas_spillover_sum.saturating_add(obs.state_gas_spillover);
+
+        // Multiplier histogram. We bin every tx (including those without
+        // a meaningful multiplier — they land in bin 0) so the histogram's
+        // bin sum equals `tx_count` and consumers can normalize.
+        let mbin = multiplier_bin(obs.min_multiplier_to_succeed);
+        acc.multiplier_log2_hist[mbin] = acc.multiplier_log2_hist[mbin].saturating_add(1);
+        acc.multiplier_observations = acc.multiplier_observations.saturating_add(1);
+
+        // 7904 category counters — independent indicators, so a single
+        // tx may bump multiple.
+        if obs.is_creation {
+            acc.tx_count_creation += 1;
+        }
+        if obs.has_authorization {
+            acc.tx_count_authorization += 1;
+        }
+        if obs.has_runtime_state {
+            acc.tx_count_runtime_state += 1;
+        } else {
+            acc.tx_count_no_state += 1;
+        }
+
+        if obs.bucket.is_drill_in() {
+            if let Some(record) = obs.drill_in_record {
                 self.drill_ins.push(record);
             }
         }
@@ -165,6 +279,15 @@ impl BlockAggregator {
                 Bucket::ContractBroken => coverage.tx_count_contract_broken = acc.tx_count,
             }
 
+            // Only emit the 8037 / multiplier columns when the bucket
+            // actually saw the relevant signal — `None` reads cleanly as
+            // "n/a for this bucket" in the dashboard.
+            let state_gas_sum = (acc.state_gas_sum > 0).then_some(acc.state_gas_sum);
+            let state_gas_spillover_sum =
+                (acc.state_gas_spillover_sum > 0).then_some(acc.state_gas_spillover_sum);
+            let multiplier_log2_hist =
+                (acc.multiplier_observations > 0).then_some(acc.multiplier_log2_hist);
+
             summaries.push(BlockSummaryRow {
                 schedule_name: self.meta.schedule_name.clone(),
                 block_number: self.meta.block_number,
@@ -175,16 +298,13 @@ impl BlockAggregator {
                 gas_delta_min: acc.gas_delta_min,
                 gas_delta_max: acc.gas_delta_max,
                 gas_delta_log2_hist: Some(acc.gas_delta_log2_hist),
-                // 8037 fields and 7904 opcode totals are deferred to a
-                // follow-up — the aggregator doesn't see per-frame data
-                // yet. Schema columns accept NULL.
-                state_gas_sum: None,
-                state_gas_spillover_sum: None,
-                multiplier_log2_hist: None,
-                tx_count_creation: None,
-                tx_count_authorization: None,
-                tx_count_runtime_state: None,
-                tx_count_no_state: None,
+                state_gas_sum,
+                state_gas_spillover_sum,
+                multiplier_log2_hist,
+                tx_count_creation: Some(acc.tx_count_creation),
+                tx_count_authorization: Some(acc.tx_count_authorization),
+                tx_count_runtime_state: Some(acc.tx_count_runtime_state),
+                tx_count_no_state: Some(acc.tx_count_no_state),
             });
         }
 
@@ -207,6 +327,21 @@ mod tests {
         }
     }
 
+    /// Build a minimal observation with everything-zero defaults.
+    fn obs(bucket: Bucket, gas_delta: i64) -> TxObservation {
+        TxObservation {
+            bucket,
+            gas_delta,
+            state_gas_spent: 0,
+            state_gas_spillover: 0,
+            min_multiplier_to_succeed: None,
+            is_creation: false,
+            has_authorization: false,
+            has_runtime_state: false,
+            drill_in_record: None,
+        }
+    }
+
     #[test]
     fn empty_block_emits_zero_count_coverage() {
         let agg = BlockAggregator::start_block(meta(), 0);
@@ -219,12 +354,10 @@ mod tests {
     #[test]
     fn coverage_counts_split_by_bucket() {
         let mut agg = BlockAggregator::start_block(meta(), 4);
-        agg.observe_tx(Bucket::Unchanged, 0, None);
-        agg.observe_tx(Bucket::GasOnly, 100, None);
-        agg.observe_tx(Bucket::WalletFixableShallow, 5_000, None);
-        // ContractBroken is drill-in, but we don't have a record fixture
-        // here — passing None just means the per-tx record isn't kept.
-        agg.observe_tx(Bucket::ContractBroken, 50_000, None);
+        agg.observe_tx(obs(Bucket::Unchanged, 0));
+        agg.observe_tx(obs(Bucket::GasOnly, 100));
+        agg.observe_tx(obs(Bucket::WalletFixableShallow, 5_000));
+        agg.observe_tx(obs(Bucket::ContractBroken, 50_000));
 
         let out = agg.finish_block();
         assert_eq!(out.coverage.tx_count, 4);
@@ -242,9 +375,13 @@ mod tests {
         let mut agg = BlockAggregator::start_block(meta(), 2);
 
         // Aggregate bucket — drill_in_record is ignored even if passed.
-        agg.observe_tx(Bucket::GasOnly, 100, Some(dummy_drill_in()));
+        let mut o = obs(Bucket::GasOnly, 100);
+        o.drill_in_record = Some(dummy_drill_in());
+        agg.observe_tx(o);
         // Drill-in bucket with a record — kept.
-        agg.observe_tx(Bucket::ContractBroken, -50, Some(dummy_drill_in()));
+        let mut o = obs(Bucket::ContractBroken, -50);
+        o.drill_in_record = Some(dummy_drill_in());
+        agg.observe_tx(o);
 
         let out = agg.finish_block();
         assert_eq!(out.drill_ins.len(), 1, "only ContractBroken should retain its record");
@@ -253,9 +390,9 @@ mod tests {
     #[test]
     fn gas_delta_aggregates_per_bucket() {
         let mut agg = BlockAggregator::start_block(meta(), 3);
-        agg.observe_tx(Bucket::GasOnly, 100, None);
-        agg.observe_tx(Bucket::GasOnly, -50, None);
-        agg.observe_tx(Bucket::GasOnly, 200, None);
+        agg.observe_tx(obs(Bucket::GasOnly, 100));
+        agg.observe_tx(obs(Bucket::GasOnly, -50));
+        agg.observe_tx(obs(Bucket::GasOnly, 200));
 
         let out = agg.finish_block();
         let summary = out.summaries.iter().find(|s| s.bucket == Bucket::GasOnly).unwrap();
@@ -264,6 +401,105 @@ mod tests {
         assert_eq!(summary.gas_delta_sum_sq, Some(100i64 * 100 + 50i64 * 50 + 200i64 * 200));
         assert_eq!(summary.gas_delta_min, Some(-50));
         assert_eq!(summary.gas_delta_max, Some(200));
+    }
+
+    #[test]
+    fn state_gas_aggregates_only_emit_when_non_zero() {
+        let mut agg = BlockAggregator::start_block(meta(), 2);
+        // Bucket A: state-gas-active tx.
+        let mut o = obs(Bucket::GasOnly, 0);
+        o.state_gas_spent = 5_000;
+        o.state_gas_spillover = 1_500;
+        agg.observe_tx(o);
+        // Bucket B: no state gas activity → state_gas_sum should be None.
+        agg.observe_tx(obs(Bucket::Unchanged, 0));
+
+        let out = agg.finish_block();
+        let gas_only = out.summaries.iter().find(|s| s.bucket == Bucket::GasOnly).unwrap();
+        assert_eq!(gas_only.state_gas_sum, Some(5_000));
+        assert_eq!(gas_only.state_gas_spillover_sum, Some(1_500));
+        let unchanged = out.summaries.iter().find(|s| s.bucket == Bucket::Unchanged).unwrap();
+        assert_eq!(unchanged.state_gas_sum, None);
+        assert_eq!(unchanged.state_gas_spillover_sum, None);
+    }
+
+    #[test]
+    fn category_counters_increment_independently() {
+        // A tx can be a contract creation AND carry an authorization AND
+        // burn runtime state gas. All three counters should fire.
+        let mut agg = BlockAggregator::start_block(meta(), 1);
+        agg.observe_tx(TxObservation {
+            bucket: Bucket::GasOnly,
+            gas_delta: 0,
+            state_gas_spent: 1_000,
+            state_gas_spillover: 0,
+            min_multiplier_to_succeed: None,
+            is_creation: true,
+            has_authorization: true,
+            has_runtime_state: true,
+            drill_in_record: None,
+        });
+        let out = agg.finish_block();
+        let summary = &out.summaries[0];
+        assert_eq!(summary.tx_count_creation, Some(1));
+        assert_eq!(summary.tx_count_authorization, Some(1));
+        assert_eq!(summary.tx_count_runtime_state, Some(1));
+        // `has_runtime_state` was true, so the no-state counter stays 0.
+        assert_eq!(summary.tx_count_no_state, Some(0));
+    }
+
+    #[test]
+    fn no_state_counter_fires_when_no_runtime_state_gas() {
+        let mut agg = BlockAggregator::start_block(meta(), 1);
+        agg.observe_tx(obs(Bucket::Unchanged, 0));
+        let out = agg.finish_block();
+        let summary = &out.summaries[0];
+        assert_eq!(summary.tx_count_no_state, Some(1));
+        assert_eq!(summary.tx_count_runtime_state, Some(0));
+    }
+
+    #[test]
+    fn multiplier_bin_boundaries() {
+        // Every "≤ N" interval lands in the expected bin.
+        assert_eq!(multiplier_bin(None), 0);
+        assert_eq!(multiplier_bin(Some(0.5)), 1);
+        assert_eq!(multiplier_bin(Some(1.0)), 1);
+        assert_eq!(multiplier_bin(Some(1.1)), 2);
+        assert_eq!(multiplier_bin(Some(1.25)), 2);
+        assert_eq!(multiplier_bin(Some(1.5)), 3);
+        assert_eq!(multiplier_bin(Some(2.0)), 4);
+        assert_eq!(multiplier_bin(Some(3.0)), 5);
+        assert_eq!(multiplier_bin(Some(4.0)), 6);
+        assert_eq!(multiplier_bin(Some(5.0)), 7);
+        assert_eq!(multiplier_bin(Some(6.0)), 8);
+        assert_eq!(multiplier_bin(Some(7.0)), 9);
+        assert_eq!(multiplier_bin(Some(8.0)), 10);
+        assert_eq!(multiplier_bin(Some(8.001)), 11);
+        assert_eq!(multiplier_bin(Some(100.0)), 11);
+    }
+
+    #[test]
+    fn multiplier_log2_hist_bins_observations() {
+        let mut agg = BlockAggregator::start_block(meta(), 3);
+        let mut o = obs(Bucket::GasOnly, 0);
+        o.min_multiplier_to_succeed = Some(1.0); // bin 1
+        agg.observe_tx(o);
+        let mut o = obs(Bucket::GasOnly, 0);
+        o.min_multiplier_to_succeed = Some(1.4); // bin 3 (1.25 < 1.4 ≤ 1.5)
+        agg.observe_tx(o);
+        let mut o = obs(Bucket::GasOnly, 0);
+        o.min_multiplier_to_succeed = None; // bin 0
+        agg.observe_tx(o);
+
+        let out = agg.finish_block();
+        let summary = &out.summaries[0];
+        let hist = summary.multiplier_log2_hist.expect("histogram emitted");
+        assert_eq!(hist[0], 1, "None landed in bin 0");
+        assert_eq!(hist[1], 1, "1.0 landed in bin 1");
+        assert_eq!(hist[3], 1, "1.4 landed in bin 3");
+        // Sum equals tx_count.
+        let total: i32 = hist.iter().sum();
+        assert_eq!(total as u32, summary.tx_count);
     }
 
     #[test]
