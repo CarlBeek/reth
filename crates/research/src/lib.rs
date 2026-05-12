@@ -196,6 +196,8 @@ pub mod cli;
 pub mod comparison;
 pub mod config;
 pub mod database;
+#[cfg(feature = "research-duckdb")]
+pub mod database_duckdb;
 pub mod divergence;
 pub mod executor;
 pub mod export;
