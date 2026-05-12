@@ -114,6 +114,35 @@ fn eip150_cap_binding(stack_gas: Option<u64>, parent_gas: Option<u64>) -> Option
     Some(s >= cap.saturating_sub(100))
 }
 
+/// Reconstruct each frame's parent index from the post-order DFS sequence
+/// the inspector emits.
+///
+/// For a frame at array index `i` with depth `d > 0`, its parent is the
+/// first frame after `i` whose depth is exactly `d - 1`. Frames at depth 0
+/// (the root) have no parent, so the returned slot is `None`. The result
+/// is indexed by array position, not by `CallFrame.call_index` — the
+/// caller pairs them up via `frames.iter().enumerate()`.
+///
+/// Output: `parent_call_indices[i] = Some(frames[parent_array_idx].call_index)`,
+/// pre-mapped to the schema's `call_index` value so writers don't have to
+/// look it up again.
+fn derive_parent_call_indices(frames: &[reth_research::divergence::CallFrame]) -> Vec<Option<u32>> {
+    let mut parents = vec![None; frames.len()];
+    for i in 0..frames.len() {
+        let d = frames[i].depth;
+        if d == 0 {
+            continue;
+        }
+        for j in (i + 1)..frames.len() {
+            if frames[j].depth == d - 1 {
+                parents[i] = Some(frames[j].call_index as u32);
+                break;
+            }
+        }
+    }
+    parents
+}
+
 /// Analyzer state shared between the live arm and concurrent backfill workers.
 ///
 /// This struct holds everything needed to analyze a single block: the node
@@ -1783,18 +1812,27 @@ where
                             reservoir_exhausted: None,
                         };
 
+                        // Inspector emits frames in post-order DFS — children
+                        // come before their parent. The parent of a frame at
+                        // index `i` (with depth `d > 0`) is the first
+                        // subsequent frame at depth `d - 1`.
+                        let parent_call_indices = derive_parent_call_indices(frames_ref);
                         let call_frames_rows: Vec<CallFrameRow> = frames_ref
                             .iter()
-                            .map(|f| CallFrameRow {
+                            .enumerate()
+                            .map(|(i, f)| CallFrameRow {
                                 call_index: f.call_index as u32,
-                                // Parent reconstruction from the post-order
-                                // frame array isn't part of the inspector
-                                // output today — leave NULL and the
-                                // consumer joins on `depth` when needed.
-                                parent_call_index: None,
+                                parent_call_index: parent_call_indices[i],
                                 depth: f.depth as u32,
                                 from_address: f.from,
                                 to_address: f.to.unwrap_or_default(),
+                                // For non-DELEGATECALL frames this equals
+                                // `to_address`; once the inspector splits
+                                // storage-context vs code-holder for
+                                // DELEGATECALL, this column will carry the
+                                // code holder while `to_address` carries
+                                // the storage target. Today both come from
+                                // the same source.
                                 code_address: f.to,
                                 codehash: None,
                                 call_type: format_call_type(&f.call_type),
@@ -2016,4 +2054,87 @@ fn main() -> eyre::Result<()> {
 
             handle.wait_for_node_exit().await
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::Address;
+    use reth_research::divergence::{CallFrame, CallType};
+
+    fn frame_at(call_index: usize, depth: usize) -> CallFrame {
+        CallFrame {
+            call_index,
+            depth,
+            from: Address::ZERO,
+            to: None,
+            call_type: CallType::Call,
+            gas_provided: 0,
+            gas_used: 0,
+            success: true,
+            input: None,
+            output: None,
+            repricing_gas_delta: 0,
+            gas_requested_on_stack: None,
+            parent_gas_at_call: None,
+        }
+    }
+
+    /// Single-frame tx: root only. No parent.
+    #[test]
+    fn parent_call_indices_for_single_root() {
+        let frames = vec![frame_at(0, 0)];
+        let parents = derive_parent_call_indices(&frames);
+        assert_eq!(parents, vec![None]);
+    }
+
+    /// Post-order DFS for a tx that did one sub-call: child completes
+    /// first (call_index 0, depth 1), then root (call_index 1, depth 0).
+    /// The child's parent is the root's call_index (1).
+    #[test]
+    fn parent_call_indices_for_root_with_one_subcall() {
+        let frames = vec![frame_at(0, 1), frame_at(1, 0)];
+        let parents = derive_parent_call_indices(&frames);
+        assert_eq!(parents, vec![Some(1), None]);
+    }
+
+    /// Three-deep chain: leaf → middle → root. Post-order is
+    /// [leaf, middle, root]; call_indices are [0, 1, 2].
+    /// Leaf's parent is middle (call_index 1); middle's parent is root
+    /// (call_index 2); root has no parent.
+    #[test]
+    fn parent_call_indices_for_three_deep_chain() {
+        let frames = vec![frame_at(0, 2), frame_at(1, 1), frame_at(2, 0)];
+        let parents = derive_parent_call_indices(&frames);
+        assert_eq!(parents, vec![Some(1), Some(2), None]);
+    }
+
+    /// Two siblings under one root. Order of completion:
+    /// sibling A (idx 0, depth 1), sibling B (idx 1, depth 1), root (idx 2, depth 0).
+    /// Both siblings' parent = root.
+    #[test]
+    fn parent_call_indices_for_two_siblings() {
+        let frames = vec![frame_at(0, 1), frame_at(1, 1), frame_at(2, 0)];
+        let parents = derive_parent_call_indices(&frames);
+        assert_eq!(parents, vec![Some(2), Some(2), None]);
+    }
+
+    /// Mixed-depth tree:
+    /// root calls A; A calls A1; A returns; root calls B.
+    /// Completion order: A1 (depth 2), A (depth 1), B (depth 1), root (depth 0).
+    /// call_indices match completion: [0, 1, 2, 3].
+    /// A1's parent is A (the first subsequent depth-1 frame, idx 1, call_index 1).
+    /// A's parent is root (the first subsequent depth-0 frame, idx 3, call_index 3).
+    /// B's parent is also root (the first subsequent depth-0 frame, idx 3, call_index 3).
+    #[test]
+    fn parent_call_indices_for_mixed_tree() {
+        let frames = vec![
+            frame_at(0, 2), // A1
+            frame_at(1, 1), // A
+            frame_at(2, 1), // B
+            frame_at(3, 0), // root
+        ];
+        let parents = derive_parent_call_indices(&frames);
+        assert_eq!(parents, vec![Some(1), Some(3), Some(3), None]);
+    }
 }
