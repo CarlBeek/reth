@@ -26,6 +26,11 @@ alloy-consensus.workspace = true
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
+# DuckDB — gated behind `research-duckdb` feature. `bundled` ships a
+# vendored DuckDB so there's no system dep. Used by the new storage path
+# being built per `docs/storage-redesign.md`; the SQLite path stays the
+# default until the consumer is fully migrated.
+duckdb = { version = "1.4", features = ["bundled"], optional = true }
 
 # Columnar export
 arrow-array = "54.2"
@@ -57,3 +62,7 @@ revm-database.workspace = true
 [features]
 default = []
 test-utils = []
+# Enables the new DuckDB-backed storage layer (see
+# `docs/storage-redesign.md`). When off, only the legacy SQLite path
+# compiles.
+research-duckdb = ["dep:duckdb"]
