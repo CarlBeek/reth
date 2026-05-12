@@ -402,6 +402,91 @@ pub struct EventLog {
     pub data: Bytes,
 }
 
+/// Maximum number of frames whose opcode counts are retained per
+/// transaction. Beyond this, the inspector flips `PerFrameCapture::truncated`
+/// to `true` and discards further frames' counts (execution continues
+/// normally — only the bookkeeping is dropped).
+///
+/// 1024 frames × ~6 KB per frame = ~6 MB heap upper bound per in-flight tx.
+/// A typical tx has < 20 frames; this only kicks in for pathological
+/// recursive or fan-out patterns.
+pub const MAX_TRACKED_FRAMES: u32 = 1024;
+
+/// Per-frame opcode counters captured by the inspector.
+///
+/// Counts and gas are tracked per-opcode (indexed by opcode byte) within a
+/// single call frame. The `call_index` identifies the frame in
+/// frame-open order, with the root frame at index 0.
+///
+/// Arrays are boxed so a `Vec<FrameOpcodeCounts>` keeps a small inline
+/// footprint; the 6 KB of opcode tables sits on the heap.
+///
+/// `gas_baseline` is the natural EVM gas cost the opcode would have charged
+/// without any schedule adjustment. `gas_schedule` is the cost actually
+/// charged under the schedule (`gas_baseline + per-opcode delta`). For the
+/// baseline `TrackingInspector` the two columns are equal.
+#[derive(Debug, Clone)]
+pub struct FrameOpcodeCounts {
+    /// Frame-open index in this transaction. Root = 0.
+    pub call_index: u32,
+    /// `counts[opcode]` — number of times the opcode executed in this frame.
+    pub counts: Box<[u64; 256]>,
+    /// `gas_baseline[opcode]` — total natural EVM gas charged by this opcode
+    /// in this frame.
+    pub gas_baseline: Box<[u64; 256]>,
+    /// `gas_schedule[opcode]` — total gas the schedule charged for this
+    /// opcode in this frame (natural + per-opcode delta).
+    pub gas_schedule: Box<[u64; 256]>,
+}
+
+impl FrameOpcodeCounts {
+    /// Allocate empty counters for a new frame at `call_index`.
+    pub fn new(call_index: u32) -> Self {
+        Self {
+            call_index,
+            counts: Box::new([0u64; 256]),
+            gas_baseline: Box::new([0u64; 256]),
+            gas_schedule: Box::new([0u64; 256]),
+        }
+    }
+
+    /// Iterator yielding `(opcode, count, gas_baseline, gas_schedule)` for
+    /// every opcode the frame actually used. Skips opcodes with `count == 0`
+    /// so the caller can serialize a sparse representation directly.
+    pub fn nonzero(&self) -> impl Iterator<Item = (u8, u64, u64, u64)> + '_ {
+        (0u16..=255u16).filter_map(move |op| {
+            let i = op as usize;
+            if self.counts[i] == 0 {
+                None
+            } else {
+                Some((op as u8, self.counts[i], self.gas_baseline[i], self.gas_schedule[i]))
+            }
+        })
+    }
+}
+
+/// Container for the inspector's per-frame opcode capture across a single
+/// transaction.
+///
+/// `frames` is in frame-open order: `frames[0]` is the root frame, the
+/// next entries are sub-calls in the order they were dispatched.
+/// `truncated` flips to `true` if more than [`MAX_TRACKED_FRAMES`] frames
+/// were opened in the tx; later frames' counts are silently dropped.
+#[derive(Debug, Clone, Default)]
+pub struct PerFrameCapture {
+    /// Per-frame opcode counts, indexed by frame-open order.
+    pub frames: Vec<FrameOpcodeCounts>,
+    /// Set to `true` once a tx opens more than [`MAX_TRACKED_FRAMES`] frames.
+    pub truncated: bool,
+}
+
+impl PerFrameCapture {
+    /// Empty capture (zero frames, not truncated).
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Per-tx classification used to decide whether the divergence is written
 /// per-tx (drill-in bucket) or rolled into per-block aggregates.
 ///
