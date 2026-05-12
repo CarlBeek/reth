@@ -17,6 +17,8 @@
 //! whose latest `analysis_runs.schema_version` doesn't match its compiled-in
 //! version. No migration shims — a major schema change is a full re-replay.
 
+use crate::divergence::{Bucket, EventLog, FrameOpcodeCounts};
+use alloy_primitives::{keccak256, Address, B256};
 use duckdb::{params, Connection};
 use std::{
     path::Path,
@@ -293,9 +295,18 @@ fn initialize_schema(conn: &Connection) -> Result<(), DuckDbDatabaseError> {
     // One row per call frame in the schedule trace of a drill-in
     // divergence. Baseline frames are NOT stored separately — derived
     // baseline costs live in divergence_opcode_counts.gas_baseline.
+    //
+    // FK constraints from child tables to `divergences` / this table are
+    // documented in the design doc but omitted at the DDL level because
+    // DuckDB's FK enforcement disallows the producer's per-block transactional
+    // delete pattern (`delete_block_range` walks children then parent within
+    // the same transaction; DuckDB raises "key still referenced" even after
+    // the child rows are removed). The producer maintains referential
+    // integrity at the application layer; the consumer relies on the
+    // implicit (divergence_id, call_index) and divergence_id keys via JOINs.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS divergence_call_frames (
-            divergence_id        UBIGINT NOT NULL REFERENCES divergences(divergence_id),
+            divergence_id        UBIGINT NOT NULL,
             call_index           UINTEGER NOT NULL,
             parent_call_index    UINTEGER,
             depth                UINTEGER NOT NULL,
@@ -319,8 +330,7 @@ fn initialize_schema(conn: &Connection) -> Result<(), DuckDbDatabaseError> {
     )?;
 
     // Sparse opcode counts keyed by frame. Zero rows omitted by the
-    // producer at insert time. FK to (divergence_id, call_index) so a
-    // single drop of a divergence cleans up all its rows.
+    // producer at insert time.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS divergence_opcode_counts (
             divergence_id   UBIGINT NOT NULL,
@@ -329,15 +339,13 @@ fn initialize_schema(conn: &Connection) -> Result<(), DuckDbDatabaseError> {
             count           UBIGINT NOT NULL,
             gas_baseline    UBIGINT NOT NULL,
             gas_schedule    UBIGINT NOT NULL,
-            PRIMARY KEY (divergence_id, call_index, opcode),
-            FOREIGN KEY (divergence_id, call_index)
-                REFERENCES divergence_call_frames(divergence_id, call_index)
+            PRIMARY KEY (divergence_id, call_index, opcode)
         );",
     )?;
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS divergence_event_logs (
-            divergence_id  UBIGINT NOT NULL REFERENCES divergences(divergence_id),
+            divergence_id  UBIGINT NOT NULL,
             trace_kind     VARCHAR NOT NULL,
             log_index      UINTEGER NOT NULL,
             address        VARCHAR NOT NULL,
@@ -399,6 +407,663 @@ fn initialize_schema(conn: &Connection) -> Result<(), DuckDbDatabaseError> {
          CREATE INDEX IF NOT EXISTS idx_bs_schedule_block ON block_summaries(schedule_name, block_number);",
     )?;
 
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Row types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One-shot output for a single (schedule, block): coverage row + zero or
+/// more bucket-summary rows + zero or more drill-in records. Built by the
+/// `BlockAggregator` and consumed by [`DuckDbDivergenceDatabase::record_block_output`]
+/// in a single transaction so the per-block state lands atomically.
+#[derive(Debug, Clone)]
+pub struct BlockOutput {
+    /// Always present. Counts go to `block_coverage`.
+    pub coverage: BlockCoverageRow,
+    /// One per non-empty bucket. Go to `block_summaries`.
+    pub summaries: Vec<BlockSummaryRow>,
+    /// Drill-in records — one per `EventLogsChanged` or `ContractBroken` tx.
+    pub drill_ins: Vec<DrillInRecord>,
+}
+
+/// Counts per bucket for one (schedule, block, block_hash). Always emitted
+/// regardless of divergence count so coverage joins work even for fully-
+/// matching blocks.
+#[allow(missing_docs)]
+#[derive(Debug, Clone)]
+pub struct BlockCoverageRow {
+    pub schedule_name: String,
+    pub schedule_config_hash: String,
+    pub block_number: u64,
+    pub block_hash: B256,
+    pub parent_hash: B256,
+    pub timestamp: u64,
+    pub tx_count: u32,
+    pub tx_count_unchanged: u32,
+    pub tx_count_trace_only: u32,
+    pub tx_count_gas_only: u32,
+    pub tx_count_event_logs_changed: u32,
+    pub tx_count_wallet_fixable_shallow: u32,
+    pub tx_count_wallet_fixable_deep_chain: u32,
+    pub tx_count_contract_broken: u32,
+}
+
+/// Aggregate summary for one (schedule, block, bucket). The 7904 / 8037
+/// fields stay `None` / zero until the per-frame data is plumbed into the
+/// aggregator (deferred to a follow-up).
+#[allow(missing_docs)]
+#[derive(Debug, Clone)]
+pub struct BlockSummaryRow {
+    pub schedule_name: String,
+    pub block_number: u64,
+    pub bucket: Bucket,
+    pub tx_count: u32,
+    pub gas_delta_sum: Option<i64>,
+    /// Sum of squared `gas_delta` for the bucket. Stored under DuckDB's
+    /// HUGEINT column type, but bound as `i64`: a single block's
+    /// sum-of-squares fits comfortably (per-tx delta < 30M, ~200 txs/block
+    /// → ~1.8 × 10^17, well below `i64::MAX`).
+    pub gas_delta_sum_sq: Option<i64>,
+    pub gas_delta_min: Option<i64>,
+    pub gas_delta_max: Option<i64>,
+    /// 12-bin log2 histogram of `abs(gas_delta)`. `None` for buckets where
+    /// no gas delta makes sense.
+    pub gas_delta_log2_hist: Option<[i32; 12]>,
+    pub state_gas_sum: Option<u64>,
+    pub state_gas_spillover_sum: Option<u64>,
+    pub multiplier_log2_hist: Option<[i32; 12]>,
+    pub tx_count_creation: Option<u32>,
+    pub tx_count_authorization: Option<u32>,
+    pub tx_count_runtime_state: Option<u32>,
+    pub tx_count_no_state: Option<u32>,
+}
+
+/// Per-tx drill-in record: the `divergences` row plus its dependent
+/// `divergence_call_frames`, `divergence_opcode_counts`, and
+/// `divergence_event_logs` rows. Emitted only for the
+/// `EventLogsChanged` and `ContractBroken` buckets — aggregate buckets
+/// collapse into `BlockSummaryRow`.
+#[allow(missing_docs)]
+#[derive(Debug, Clone)]
+pub struct DrillInRecord {
+    pub divergence: DivergenceRow,
+    pub call_frames: Vec<CallFrameRow>,
+    /// Per-frame opcode counts. The producer omits zero-count rows; this
+    /// vec is what `FrameOpcodeCounts::nonzero()` yielded for the tx.
+    pub opcode_counts: Vec<OpcodeCountRow>,
+    pub baseline_event_logs: Vec<EventLog>,
+    pub schedule_event_logs: Vec<EventLog>,
+}
+
+/// One row destined for `divergences`. Most fields mirror the column
+/// names; the schema_version / divergence_id / timestamp are filled in by
+/// the writer.
+#[allow(missing_docs)]
+#[derive(Debug, Clone)]
+pub struct DivergenceRow {
+    pub schedule_name: String,
+    pub schedule_config_hash: String,
+    pub block_number: u64,
+    pub tx_index: u32,
+    pub tx_hash: B256,
+    pub timestamp: u64,
+    pub bucket: Bucket,
+
+    pub sender: Address,
+    pub recipient: Option<Address>,
+    pub is_create: bool,
+    pub tx_gas_limit: u64,
+
+    pub baseline_success: bool,
+    pub schedule_success: bool,
+    pub status_changed: bool,
+    pub event_logs_changed: bool,
+    pub output_changed: bool,
+    pub logs_bloom_changed: bool,
+
+    pub baseline_gas_used: u64,
+    pub schedule_gas_used: u64,
+    pub gas_delta: i64,
+    pub baseline_total_gas_spent: Option<u64>,
+    pub baseline_gas_refunded: Option<u64>,
+    pub schedule_total_gas_spent: Option<u64>,
+    pub schedule_gas_refunded: Option<u64>,
+    pub schedule_intrinsic_gas: Option<u64>,
+    pub schedule_floor_gas: Option<u64>,
+    pub would_fit_in_original_limit: Option<bool>,
+    pub min_multiplier_to_succeed: Option<f64>,
+
+    pub divergence_contract: Option<Address>,
+    pub divergence_pc: Option<u32>,
+    pub divergence_call_depth: Option<i32>,
+    pub divergence_opcode: Option<u8>,
+    pub oog_contract: Option<Address>,
+    pub oog_pc: Option<u32>,
+    pub oog_call_depth: Option<i32>,
+    pub oog_opcode: Option<u8>,
+    pub oog_pattern: Option<String>,
+    pub oog_gas_remaining: Option<u64>,
+    pub oog_chain_proportional: Option<bool>,
+    pub oog_bottleneck_depth: Option<i32>,
+    pub oog_bottleneck_kind: Option<String>,
+
+    pub schedule_state_gas_spent: Option<u64>,
+    pub schedule_initial_state_gas: Option<u64>,
+    pub schedule_initial_reservoir: Option<u64>,
+    pub runtime_state_gas: Option<u64>,
+    pub runtime_state_gas_spillover: Option<u64>,
+    pub state_gas_category: Option<String>,
+    pub reservoir_exhausted: Option<bool>,
+}
+
+/// One frame row destined for `divergence_call_frames`. `call_index` and
+/// `parent_call_index` match the inspector's frame-open order (root = 0).
+#[allow(missing_docs)]
+#[derive(Debug, Clone)]
+pub struct CallFrameRow {
+    pub call_index: u32,
+    pub parent_call_index: Option<u32>,
+    pub depth: u32,
+    pub from_address: Address,
+    pub to_address: Address,
+    pub code_address: Option<Address>,
+    pub codehash: Option<B256>,
+    pub call_type: String,
+    pub selector: Option<[u8; 4]>,
+    pub value_wei: Option<String>,
+    pub gas_provided: u64,
+    pub gas_used: u64,
+    pub gas_margin: Option<i64>,
+    pub success: bool,
+    pub parent_gas_at_call: Option<u64>,
+    pub gas_requested_on_stack: Option<u64>,
+    pub eip150_cap_binding: Option<bool>,
+    pub state_gas_running: Option<u64>,
+}
+
+/// One row destined for `divergence_opcode_counts`. Producer omits zero-
+/// count rows.
+#[allow(missing_docs)]
+#[derive(Debug, Clone)]
+pub struct OpcodeCountRow {
+    pub call_index: u32,
+    pub opcode: u8,
+    pub count: u64,
+    pub gas_baseline: u64,
+    pub gas_schedule: u64,
+}
+
+impl OpcodeCountRow {
+    /// Build a vec of per-(frame, opcode) rows from the inspector's
+    /// `FrameOpcodeCounts`. Zero-count opcodes are skipped via
+    /// `FrameOpcodeCounts::nonzero`, producing the sparse representation
+    /// the schema expects.
+    pub fn from_frames(frames: &[FrameOpcodeCounts]) -> Vec<Self> {
+        let mut out = Vec::new();
+        for frame in frames {
+            for (opcode, count, gas_baseline, gas_schedule) in frame.nonzero() {
+                out.push(Self {
+                    call_index: frame.call_index,
+                    opcode,
+                    count,
+                    gas_baseline,
+                    gas_schedule,
+                });
+            }
+        }
+        out
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Write API
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl DuckDbDivergenceDatabase {
+    /// Persist all per-block state in a single transaction so the
+    /// coverage row, summaries, and drill-in records land together. Any
+    /// failure leaves the DB untouched.
+    pub fn record_block_output(&self, output: &BlockOutput) -> Result<(), DuckDbDatabaseError> {
+        let mut conn = self.conn.lock().expect("DuckDB connection mutex poisoned");
+        let tx = conn.transaction()?;
+
+        insert_block_coverage(&tx, &output.coverage)?;
+        for summary in &output.summaries {
+            insert_block_summary(&tx, summary)?;
+        }
+        for drill_in in &output.drill_ins {
+            let divergence_id = insert_divergence(&tx, &drill_in.divergence)?;
+            for frame in &drill_in.call_frames {
+                insert_call_frame(&tx, divergence_id, frame)?;
+            }
+            for opc in &drill_in.opcode_counts {
+                insert_opcode_count(&tx, divergence_id, opc)?;
+            }
+            for log in &drill_in.baseline_event_logs {
+                insert_event_log(&tx, divergence_id, "baseline", log)?;
+            }
+            for log in &drill_in.schedule_event_logs {
+                insert_event_log(&tx, divergence_id, "schedule", log)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Delete all rows in the inclusive block range from every per-block
+    /// table. Called on chain reorg / revert to drop stale data before
+    /// re-analysing the new tip.
+    ///
+    /// Deletes cascade through `divergences → call_frames → opcode_counts
+    /// → event_logs` by explicit DELETE statements rather than DB-side
+    /// CASCADE, so we keep the row counts visible for logging.
+    pub fn delete_block_range(
+        &self,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<BlockRangeDeleteCounts, DuckDbDatabaseError> {
+        let mut conn = self.conn.lock().expect("DuckDB connection mutex poisoned");
+        let tx = conn.transaction()?;
+        // Collect divergence_ids first so child-table deletes can target them.
+        let mut stmt = tx.prepare(
+            "SELECT divergence_id FROM divergences
+             WHERE block_number >= ? AND block_number <= ?",
+        )?;
+        let div_ids: Vec<i64> = stmt
+            .query_map(params![from_block as i64, to_block as i64], |row| row.get::<_, i64>(0))?
+            .collect::<Result<_, _>>()?;
+        drop(stmt);
+
+        // FKs are deliberately omitted from the DDL (see comment in
+        // `initialize_schema`), so we can issue a single ranged DELETE per
+        // child table instead of walking per-id. Each statement returns
+        // the row count for logging.
+        let _ = &div_ids; // collected for parity with prior FK-aware path
+
+        let event_logs_deleted = tx.execute(
+            "DELETE FROM divergence_event_logs
+             WHERE divergence_id IN
+                 (SELECT divergence_id FROM divergences
+                  WHERE block_number BETWEEN ? AND ?)",
+            params![from_block as i64, to_block as i64],
+        )?;
+        let opcode_counts_deleted = tx.execute(
+            "DELETE FROM divergence_opcode_counts
+             WHERE divergence_id IN
+                 (SELECT divergence_id FROM divergences
+                  WHERE block_number BETWEEN ? AND ?)",
+            params![from_block as i64, to_block as i64],
+        )?;
+        let call_frames_deleted = tx.execute(
+            "DELETE FROM divergence_call_frames
+             WHERE divergence_id IN
+                 (SELECT divergence_id FROM divergences
+                  WHERE block_number BETWEEN ? AND ?)",
+            params![from_block as i64, to_block as i64],
+        )?;
+        let divergences_deleted = tx.execute(
+            "DELETE FROM divergences WHERE block_number BETWEEN ? AND ?",
+            params![from_block as i64, to_block as i64],
+        )?;
+        let summaries_deleted = tx.execute(
+            "DELETE FROM block_summaries WHERE block_number >= ? AND block_number <= ?",
+            params![from_block as i64, to_block as i64],
+        )?;
+        let coverage_deleted = tx.execute(
+            "DELETE FROM block_coverage WHERE block_number >= ? AND block_number <= ?",
+            params![from_block as i64, to_block as i64],
+        )?;
+        tx.commit()?;
+
+        Ok(BlockRangeDeleteCounts {
+            coverage: coverage_deleted,
+            summaries: summaries_deleted,
+            divergences: divergences_deleted,
+            call_frames: call_frames_deleted,
+            opcode_counts: opcode_counts_deleted,
+            event_logs: event_logs_deleted,
+        })
+    }
+
+    /// Whether any divergence row exists for `(schedule_name,
+    /// block_number, schedule_config_hash)`. Used by the backfill arm to
+    /// skip blocks already covered under the current configuration.
+    pub fn has_block_coverage_with_config(
+        &self,
+        schedule_name: &str,
+        block_number: u64,
+        schedule_config_hash: &str,
+    ) -> Result<bool, DuckDbDatabaseError> {
+        let conn = self.conn.lock().expect("DuckDB connection mutex poisoned");
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM block_coverage
+                 WHERE schedule_name = ?
+                   AND block_number = ?
+                   AND schedule_config_hash = ?
+                 LIMIT 1",
+                params![schedule_name, block_number as i64, schedule_config_hash],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(exists.is_some())
+    }
+}
+
+/// Per-table row counts returned by
+/// [`DuckDbDivergenceDatabase::delete_block_range`]. Used for logging.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BlockRangeDeleteCounts {
+    pub coverage: usize,
+    pub summaries: usize,
+    pub divergences: usize,
+    pub call_frames: usize,
+    pub opcode_counts: usize,
+    pub event_logs: usize,
+}
+
+fn insert_block_coverage(
+    tx: &duckdb::Transaction<'_>,
+    row: &BlockCoverageRow,
+) -> Result<(), DuckDbDatabaseError> {
+    tx.execute(
+        "INSERT INTO block_coverage (
+            schedule_name, schedule_config_hash, block_number, block_hash,
+            parent_hash, timestamp, tx_count,
+            tx_count_unchanged, tx_count_trace_only, tx_count_gas_only,
+            tx_count_event_logs_changed, tx_count_wallet_fixable_shallow,
+            tx_count_wallet_fixable_deep_chain, tx_count_contract_broken
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (schedule_name, block_number, block_hash) DO UPDATE SET
+            schedule_config_hash               = excluded.schedule_config_hash,
+            parent_hash                        = excluded.parent_hash,
+            timestamp                          = excluded.timestamp,
+            tx_count                           = excluded.tx_count,
+            tx_count_unchanged                 = excluded.tx_count_unchanged,
+            tx_count_trace_only                = excluded.tx_count_trace_only,
+            tx_count_gas_only                  = excluded.tx_count_gas_only,
+            tx_count_event_logs_changed        = excluded.tx_count_event_logs_changed,
+            tx_count_wallet_fixable_shallow    = excluded.tx_count_wallet_fixable_shallow,
+            tx_count_wallet_fixable_deep_chain = excluded.tx_count_wallet_fixable_deep_chain,
+            tx_count_contract_broken           = excluded.tx_count_contract_broken",
+        params![
+            row.schedule_name,
+            row.schedule_config_hash,
+            row.block_number as i64,
+            row.block_hash.as_slice(),
+            row.parent_hash.as_slice(),
+            row.timestamp as i64,
+            row.tx_count as i64,
+            row.tx_count_unchanged as i64,
+            row.tx_count_trace_only as i64,
+            row.tx_count_gas_only as i64,
+            row.tx_count_event_logs_changed as i64,
+            row.tx_count_wallet_fixable_shallow as i64,
+            row.tx_count_wallet_fixable_deep_chain as i64,
+            row.tx_count_contract_broken as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_block_summary(
+    tx: &duckdb::Transaction<'_>,
+    row: &BlockSummaryRow,
+) -> Result<(), DuckDbDatabaseError> {
+    // The 12-bin histograms are passed as SQL-literal arrays because the
+    // duckdb-rust driver doesn't bind fixed-size `INTEGER[12]` params
+    // through ToSql. We inline them into the statement; all other values
+    // ride the regular `params!` path. `gas_delta_sum_sq` is bound as
+    // `i64` and CAST to HUGEINT at column-write time.
+    let gas_delta_log2_hist_sql = match row.gas_delta_log2_hist {
+        Some(arr) => format!(
+            "[{}]::INTEGER[12]",
+            arr.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+        ),
+        None => "NULL".to_string(),
+    };
+    let multiplier_log2_hist_sql = match row.multiplier_log2_hist {
+        Some(arr) => format!(
+            "[{}]::INTEGER[12]",
+            arr.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+        ),
+        None => "NULL".to_string(),
+    };
+
+    let stmt = format!(
+        "INSERT INTO block_summaries (
+            schedule_name, block_number, bucket, tx_count,
+            gas_delta_sum, gas_delta_sum_sq, gas_delta_min, gas_delta_max,
+            gas_delta_log2_hist,
+            opcode_count_totals_7904, opcode_gas_delta_totals_7904,
+            state_gas_sum, state_gas_spillover_sum,
+            multiplier_log2_hist,
+            tx_count_creation, tx_count_authorization,
+            tx_count_runtime_state, tx_count_no_state
+        ) VALUES (?, ?, ?, ?,
+                  ?, CAST(? AS HUGEINT), ?, ?,
+                  {gas_delta_log2_hist_sql},
+                  []::STRUCT(opcode UTINYINT, count UBIGINT)[],
+                  []::STRUCT(opcode UTINYINT, delta BIGINT)[],
+                  ?, ?,
+                  {multiplier_log2_hist_sql},
+                  ?, ?, ?, ?)
+        ON CONFLICT (schedule_name, block_number, bucket) DO UPDATE SET
+            tx_count                = excluded.tx_count,
+            gas_delta_sum           = excluded.gas_delta_sum,
+            gas_delta_sum_sq        = excluded.gas_delta_sum_sq,
+            gas_delta_min           = excluded.gas_delta_min,
+            gas_delta_max           = excluded.gas_delta_max,
+            gas_delta_log2_hist     = excluded.gas_delta_log2_hist,
+            state_gas_sum           = excluded.state_gas_sum,
+            state_gas_spillover_sum = excluded.state_gas_spillover_sum,
+            multiplier_log2_hist    = excluded.multiplier_log2_hist,
+            tx_count_creation       = excluded.tx_count_creation,
+            tx_count_authorization  = excluded.tx_count_authorization,
+            tx_count_runtime_state  = excluded.tx_count_runtime_state,
+            tx_count_no_state       = excluded.tx_count_no_state"
+    );
+
+    tx.execute(
+        &stmt,
+        params![
+            row.schedule_name,
+            row.block_number as i64,
+            row.bucket.as_str(),
+            row.tx_count as i64,
+            row.gas_delta_sum,
+            row.gas_delta_sum_sq,
+            row.gas_delta_min,
+            row.gas_delta_max,
+            row.state_gas_sum.map(|v| v as i64),
+            row.state_gas_spillover_sum.map(|v| v as i64),
+            row.tx_count_creation.map(|v| v as i64),
+            row.tx_count_authorization.map(|v| v as i64),
+            row.tx_count_runtime_state.map(|v| v as i64),
+            row.tx_count_no_state.map(|v| v as i64),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_divergence(
+    tx: &duckdb::Transaction<'_>,
+    row: &DivergenceRow,
+) -> Result<u64, DuckDbDatabaseError> {
+    let id: i64 = tx.query_row(
+        "INSERT INTO divergences (
+            schedule_name, schedule_config_hash, block_number, tx_index, tx_hash,
+            timestamp, bucket,
+            sender, recipient, is_create, tx_gas_limit,
+            baseline_success, schedule_success,
+            status_changed, event_logs_changed, output_changed, logs_bloom_changed,
+            baseline_gas_used, schedule_gas_used, gas_delta,
+            baseline_total_gas_spent, baseline_gas_refunded,
+            schedule_total_gas_spent, schedule_gas_refunded,
+            schedule_intrinsic_gas, schedule_floor_gas,
+            would_fit_in_original_limit, min_multiplier_to_succeed,
+            divergence_contract, divergence_pc, divergence_call_depth, divergence_opcode,
+            oog_contract, oog_pc, oog_call_depth, oog_opcode, oog_pattern, oog_gas_remaining,
+            oog_chain_proportional, oog_bottleneck_depth, oog_bottleneck_kind,
+            schedule_state_gas_spent, schedule_initial_state_gas, schedule_initial_reservoir,
+            runtime_state_gas, runtime_state_gas_spillover,
+            state_gas_category, reservoir_exhausted
+        ) VALUES (?, ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?,
+                  ?, ?,
+                  ?, ?, ?, ?,
+                  ?, ?, ?,
+                  ?, ?, ?, ?,
+                  ?, ?,
+                  ?, ?,
+                  ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?, ?)
+        RETURNING divergence_id",
+        params![
+            row.schedule_name,
+            row.schedule_config_hash,
+            row.block_number as i64,
+            row.tx_index as i64,
+            row.tx_hash.as_slice(),
+            row.timestamp as i64,
+            row.bucket.as_str(),
+            format!("{:#x}", row.sender),
+            row.recipient.map(|a| format!("{a:#x}")),
+            row.is_create,
+            row.tx_gas_limit as i64,
+            row.baseline_success,
+            row.schedule_success,
+            row.status_changed,
+            row.event_logs_changed,
+            row.output_changed,
+            row.logs_bloom_changed,
+            row.baseline_gas_used as i64,
+            row.schedule_gas_used as i64,
+            row.gas_delta,
+            row.baseline_total_gas_spent.map(|v| v as i64),
+            row.baseline_gas_refunded.map(|v| v as i64),
+            row.schedule_total_gas_spent.map(|v| v as i64),
+            row.schedule_gas_refunded.map(|v| v as i64),
+            row.schedule_intrinsic_gas.map(|v| v as i64),
+            row.schedule_floor_gas.map(|v| v as i64),
+            row.would_fit_in_original_limit,
+            row.min_multiplier_to_succeed,
+            row.divergence_contract.map(|a| format!("{a:#x}")),
+            row.divergence_pc.map(|v| v as i64),
+            row.divergence_call_depth,
+            row.divergence_opcode.map(|v| v as i64),
+            row.oog_contract.map(|a| format!("{a:#x}")),
+            row.oog_pc.map(|v| v as i64),
+            row.oog_call_depth,
+            row.oog_opcode.map(|v| v as i64),
+            row.oog_pattern,
+            row.oog_gas_remaining.map(|v| v as i64),
+            row.oog_chain_proportional,
+            row.oog_bottleneck_depth,
+            row.oog_bottleneck_kind,
+            row.schedule_state_gas_spent.map(|v| v as i64),
+            row.schedule_initial_state_gas.map(|v| v as i64),
+            row.schedule_initial_reservoir.map(|v| v as i64),
+            row.runtime_state_gas.map(|v| v as i64),
+            row.runtime_state_gas_spillover.map(|v| v as i64),
+            row.state_gas_category,
+            row.reservoir_exhausted,
+        ],
+        |r| r.get(0),
+    )?;
+    Ok(id as u64)
+}
+
+fn insert_call_frame(
+    tx: &duckdb::Transaction<'_>,
+    divergence_id: u64,
+    row: &CallFrameRow,
+) -> Result<(), DuckDbDatabaseError> {
+    tx.execute(
+        "INSERT INTO divergence_call_frames (
+            divergence_id, call_index, parent_call_index, depth,
+            from_address, to_address, code_address, codehash, call_type,
+            selector, value_wei, gas_provided, gas_used, gas_margin,
+            success, parent_gas_at_call, gas_requested_on_stack,
+            eip150_cap_binding, state_gas_running
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            divergence_id as i64,
+            row.call_index as i64,
+            row.parent_call_index.map(|v| v as i64),
+            row.depth as i64,
+            format!("{:#x}", row.from_address),
+            format!("{:#x}", row.to_address),
+            row.code_address.map(|a| format!("{a:#x}")),
+            row.codehash.map(|h| h.as_slice().to_vec()),
+            row.call_type,
+            row.selector.map(|s| s.to_vec()),
+            row.value_wei,
+            row.gas_provided as i64,
+            row.gas_used as i64,
+            row.gas_margin,
+            row.success,
+            row.parent_gas_at_call.map(|v| v as i64),
+            row.gas_requested_on_stack.map(|v| v as i64),
+            row.eip150_cap_binding,
+            row.state_gas_running.map(|v| v as i64),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_opcode_count(
+    tx: &duckdb::Transaction<'_>,
+    divergence_id: u64,
+    row: &OpcodeCountRow,
+) -> Result<(), DuckDbDatabaseError> {
+    tx.execute(
+        "INSERT INTO divergence_opcode_counts (
+            divergence_id, call_index, opcode, count, gas_baseline, gas_schedule
+        ) VALUES (?, ?, ?, ?, ?, ?)",
+        params![
+            divergence_id as i64,
+            row.call_index as i64,
+            row.opcode as i64,
+            row.count as i64,
+            row.gas_baseline as i64,
+            row.gas_schedule as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_event_log(
+    tx: &duckdb::Transaction<'_>,
+    divergence_id: u64,
+    trace_kind: &str,
+    log: &EventLog,
+) -> Result<(), DuckDbDatabaseError> {
+    let topic = |i: usize| log.topics.get(i).map(|t| t.as_slice().to_vec());
+    let data_hash = keccak256(&log.data);
+    tx.execute(
+        "INSERT INTO divergence_event_logs (
+            divergence_id, trace_kind, log_index, address,
+            topic0, topic1, topic2, topic3, data_bytes, data_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            divergence_id as i64,
+            trace_kind,
+            log.log_index as i64,
+            format!("{:#x}", log.address),
+            topic(0),
+            topic(1),
+            topic(2),
+            topic(3),
+            log.data.as_ref(),
+            data_hash.as_slice(),
+        ],
+    )?;
     Ok(())
 }
 
@@ -528,5 +1193,299 @@ mod tests {
         // No analysis_runs rows means no version constraint to violate.
         let dir = tempfile::tempdir().unwrap();
         let _db = DuckDbDivergenceDatabase::open(fresh_db_path(&dir)).unwrap();
+    }
+
+    /// Minimal `BlockCoverageRow` fixture for write-path tests.
+    fn fixture_coverage(
+        schedule: &str,
+        block: u64,
+        broken: u32,
+        log_changed: u32,
+    ) -> BlockCoverageRow {
+        BlockCoverageRow {
+            schedule_name: schedule.to_string(),
+            schedule_config_hash: "config".to_string(),
+            block_number: block,
+            block_hash: B256::repeat_byte(0xb0 + (block as u8 & 0x0f)),
+            parent_hash: B256::repeat_byte(0xa0),
+            timestamp: 1_700_000_000 + block,
+            tx_count: broken + log_changed,
+            tx_count_unchanged: 0,
+            tx_count_trace_only: 0,
+            tx_count_gas_only: 0,
+            tx_count_event_logs_changed: log_changed,
+            tx_count_wallet_fixable_shallow: 0,
+            tx_count_wallet_fixable_deep_chain: 0,
+            tx_count_contract_broken: broken,
+        }
+    }
+
+    /// Minimal `DivergenceRow` fixture for write-path tests. All optional
+    /// columns left as `None`.
+    fn fixture_divergence(
+        block: u64,
+        tx_index: u32,
+        bucket: Bucket,
+        gas_delta: i64,
+    ) -> DivergenceRow {
+        DivergenceRow {
+            schedule_name: "test".to_string(),
+            schedule_config_hash: "config".to_string(),
+            block_number: block,
+            tx_index,
+            tx_hash: B256::repeat_byte(0xdd),
+            timestamp: 1_700_000_000,
+            bucket,
+            sender: Address::repeat_byte(0x11),
+            recipient: Some(Address::repeat_byte(0x22)),
+            is_create: false,
+            tx_gas_limit: 500_000,
+            baseline_success: true,
+            schedule_success: matches!(bucket, Bucket::EventLogsChanged),
+            status_changed: matches!(bucket, Bucket::ContractBroken),
+            event_logs_changed: matches!(bucket, Bucket::EventLogsChanged),
+            output_changed: false,
+            logs_bloom_changed: false,
+            baseline_gas_used: 100_000,
+            schedule_gas_used: (100_000i64 + gas_delta).max(0) as u64,
+            gas_delta,
+            baseline_total_gas_spent: None,
+            baseline_gas_refunded: None,
+            schedule_total_gas_spent: None,
+            schedule_gas_refunded: None,
+            schedule_intrinsic_gas: None,
+            schedule_floor_gas: None,
+            would_fit_in_original_limit: None,
+            min_multiplier_to_succeed: None,
+            divergence_contract: None,
+            divergence_pc: None,
+            divergence_call_depth: None,
+            divergence_opcode: None,
+            oog_contract: None,
+            oog_pc: None,
+            oog_call_depth: None,
+            oog_opcode: None,
+            oog_pattern: None,
+            oog_gas_remaining: None,
+            oog_chain_proportional: None,
+            oog_bottleneck_depth: None,
+            oog_bottleneck_kind: None,
+            schedule_state_gas_spent: None,
+            schedule_initial_state_gas: None,
+            schedule_initial_reservoir: None,
+            runtime_state_gas: None,
+            runtime_state_gas_spillover: None,
+            state_gas_category: None,
+            reservoir_exhausted: None,
+        }
+    }
+
+    #[test]
+    fn record_block_output_writes_coverage_summaries_and_drill_in() {
+        let db = DuckDbDivergenceDatabase::in_memory().unwrap();
+
+        let drill_in = DrillInRecord {
+            divergence: fixture_divergence(100, 0, Bucket::ContractBroken, 12_345),
+            call_frames: vec![CallFrameRow {
+                call_index: 0,
+                parent_call_index: None,
+                depth: 0,
+                from_address: Address::repeat_byte(0x11),
+                to_address: Address::repeat_byte(0x22),
+                code_address: Some(Address::repeat_byte(0x22)),
+                codehash: Some(B256::repeat_byte(0xcc)),
+                call_type: "CALL".to_string(),
+                selector: Some([0x12, 0x34, 0x56, 0x78]),
+                value_wei: Some("0".to_string()),
+                gas_provided: 500_000,
+                gas_used: 120_000,
+                gas_margin: Some(380_000),
+                success: false,
+                parent_gas_at_call: None,
+                gas_requested_on_stack: None,
+                eip150_cap_binding: None,
+                state_gas_running: None,
+            }],
+            opcode_counts: vec![OpcodeCountRow {
+                call_index: 0,
+                opcode: 0x55,
+                count: 3,
+                gas_baseline: 60_000,
+                gas_schedule: 75_000,
+            }],
+            baseline_event_logs: vec![],
+            schedule_event_logs: vec![EventLog {
+                log_index: 0,
+                address: Address::repeat_byte(0x22),
+                topics: vec![B256::repeat_byte(0xab)],
+                data: alloy_primitives::Bytes::from(vec![1, 2, 3]),
+            }],
+        };
+
+        let output = BlockOutput {
+            coverage: fixture_coverage("test", 100, 1, 0),
+            summaries: vec![BlockSummaryRow {
+                schedule_name: "test".to_string(),
+                block_number: 100,
+                bucket: Bucket::ContractBroken,
+                tx_count: 1,
+                gas_delta_sum: Some(12_345),
+                gas_delta_sum_sq: Some(12_345i64 * 12_345i64),
+                gas_delta_min: Some(12_345),
+                gas_delta_max: Some(12_345),
+                gas_delta_log2_hist: Some([0; 12]),
+                state_gas_sum: None,
+                state_gas_spillover_sum: None,
+                multiplier_log2_hist: None,
+                tx_count_creation: None,
+                tx_count_authorization: None,
+                tx_count_runtime_state: None,
+                tx_count_no_state: None,
+            }],
+            drill_ins: vec![drill_in],
+        };
+
+        db.record_block_output(&output).unwrap();
+
+        let conn = db.conn.lock().unwrap();
+
+        // Coverage row landed.
+        let (tx_count, broken): (i64, i64) = conn
+            .query_row(
+                "SELECT tx_count, tx_count_contract_broken
+                 FROM block_coverage WHERE block_number = 100",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tx_count, 1);
+        assert_eq!(broken, 1);
+
+        // Summary row landed.
+        let summary_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM block_summaries WHERE block_number = 100", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(summary_count, 1);
+
+        // Divergence + child tables landed.
+        let div_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM divergences", [], |row| row.get(0)).unwrap();
+        assert_eq!(div_count, 1);
+
+        let frame_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM divergence_call_frames", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(frame_count, 1);
+
+        let opc_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM divergence_opcode_counts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(opc_count, 1);
+
+        let log_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM divergence_event_logs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(log_count, 1);
+    }
+
+    #[test]
+    fn delete_block_range_clears_all_per_block_tables() {
+        let db = DuckDbDivergenceDatabase::in_memory().unwrap();
+
+        // Seed two blocks; delete only one.
+        for block in [100u64, 200u64] {
+            let drill_in = DrillInRecord {
+                divergence: fixture_divergence(block, 0, Bucket::ContractBroken, 100),
+                call_frames: vec![CallFrameRow {
+                    call_index: 0,
+                    parent_call_index: None,
+                    depth: 0,
+                    from_address: Address::ZERO,
+                    to_address: Address::ZERO,
+                    code_address: None,
+                    codehash: None,
+                    call_type: "CALL".to_string(),
+                    selector: None,
+                    value_wei: None,
+                    gas_provided: 100,
+                    gas_used: 100,
+                    gas_margin: None,
+                    success: false,
+                    parent_gas_at_call: None,
+                    gas_requested_on_stack: None,
+                    eip150_cap_binding: None,
+                    state_gas_running: None,
+                }],
+                opcode_counts: vec![],
+                baseline_event_logs: vec![],
+                schedule_event_logs: vec![],
+            };
+            let output = BlockOutput {
+                coverage: fixture_coverage("test", block, 1, 0),
+                summaries: vec![],
+                drill_ins: vec![drill_in],
+            };
+            db.record_block_output(&output).unwrap();
+        }
+
+        // Sanity: two rows in coverage, two in divergences.
+        {
+            let conn = db.conn.lock().unwrap();
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM block_coverage", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(n, 2);
+        }
+
+        let counts = db.delete_block_range(100, 150).unwrap();
+        assert_eq!(counts.coverage, 1);
+        assert_eq!(counts.divergences, 1);
+        assert_eq!(counts.call_frames, 1);
+
+        let conn = db.conn.lock().unwrap();
+        let remaining: i64 =
+            conn.query_row("SELECT COUNT(*) FROM block_coverage", [], |row| row.get(0)).unwrap();
+        assert_eq!(remaining, 1);
+        let remaining_block: i64 = conn
+            .query_row("SELECT block_number FROM block_coverage", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining_block, 200);
+    }
+
+    #[test]
+    fn has_block_coverage_with_config_matches_strict() {
+        let db = DuckDbDivergenceDatabase::in_memory().unwrap();
+        let output = BlockOutput {
+            coverage: fixture_coverage("test", 42, 0, 0),
+            summaries: vec![],
+            drill_ins: vec![],
+        };
+        db.record_block_output(&output).unwrap();
+
+        assert!(db.has_block_coverage_with_config("test", 42, "config").unwrap());
+        // Different config_hash → uncovered (matches the strict dedupe
+        // semantics from the SQLite path).
+        assert!(!db.has_block_coverage_with_config("test", 42, "config-v2").unwrap());
+        assert!(!db.has_block_coverage_with_config("test", 43, "config").unwrap());
+        assert!(!db.has_block_coverage_with_config("other", 42, "config").unwrap());
+    }
+
+    #[test]
+    fn opcode_count_row_from_frames_skips_zero_opcodes() {
+        // A frame with one nonzero opcode (KECCAK256) and 255 zero-count
+        // opcodes should produce a single row.
+        let mut frame = FrameOpcodeCounts::new(0);
+        frame.counts[0x20] = 5;
+        frame.gas_baseline[0x20] = 150;
+        frame.gas_schedule[0x20] = 180;
+
+        let rows = OpcodeCountRow::from_frames(&[frame]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].opcode, 0x20);
+        assert_eq!(rows[0].count, 5);
+        assert_eq!(rows[0].gas_baseline, 150);
+        assert_eq!(rows[0].gas_schedule, 180);
     }
 }
