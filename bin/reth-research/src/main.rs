@@ -2014,10 +2014,92 @@ where
     .await
 }
 
+/// Adapter that turns the ExEx context's provider into a
+/// [`BytecodeFetcher`]. Uses the latest canonical state — codehashes of
+/// non-self-destructed contracts don't change, so "latest" is the right
+/// snapshot for a one-shot metadata backfill. Self-destructed accounts
+/// return `Ok(None)` and are skipped by the orchestration loop.
+struct ProviderBytecodeFetcher<P>
+where
+    P: StateProviderFactory,
+{
+    provider: P,
+}
+
+impl<P> reth_research::contract_metadata::BytecodeFetcher for ProviderBytecodeFetcher<P>
+where
+    P: StateProviderFactory,
+{
+    fn fetch_bytecode(
+        &self,
+        address: Address,
+    ) -> Result<Option<Vec<u8>>, reth_research::contract_metadata::BackfillError> {
+        let state = self.provider.latest().map_err(|e| {
+            reth_research::contract_metadata::BackfillError::Fetch { address, source: Box::new(e) }
+        })?;
+        let code = state.account_code(&address).map_err(|e| {
+            reth_research::contract_metadata::BackfillError::Fetch { address, source: Box::new(e) }
+        })?;
+        Ok(code.map(|bc| bc.bytes().to_vec()))
+    }
+}
+
+/// One-shot ExEx that opens the producer DuckDB, runs the contract-
+/// metadata backfill against the node's `latest` state, logs the
+/// resulting counters, and terminates the process. Idempotent — re-runs
+/// only fetch bytecode for codehashes that aren't already in
+/// `contract_metadata`.
+async fn run_metadata_backfill_exex<Node: FullNodeComponents>(
+    ctx: ExExContext<Node>,
+    db_path: std::path::PathBuf,
+) -> eyre::Result<()> {
+    use reth_research::{
+        contract_metadata::run_metadata_backfill, database_duckdb::DuckDbDivergenceDatabase,
+    };
+
+    info!(target: "reth::cli", path = ?db_path, "Opening producer DB for metadata backfill");
+    let db = DuckDbDivergenceDatabase::open(&db_path)?;
+    let fetcher = ProviderBytecodeFetcher { provider: ctx.components.provider().clone() };
+
+    info!(target: "reth::cli", "Starting contract-metadata backfill");
+    let stats = run_metadata_backfill(&db, &fetcher)?;
+    info!(
+        target: "reth::cli",
+        addresses_examined = stats.addresses_examined,
+        upserted = stats.upserted,
+        skipped_existing = stats.skipped_existing,
+        no_bytecode = stats.no_bytecode,
+        fetch_errors = stats.fetch_errors,
+        "Contract-metadata backfill complete; exiting"
+    );
+
+    // No graceful node-shutdown plumbing from inside an ExEx future, so
+    // terminate the process directly. The caller's expectation is a
+    // one-shot CLI tool, not a long-running daemon.
+    std::process::exit(0);
+}
+
 fn main() -> eyre::Result<()> {
     reth_ethereum::cli::Cli::<reth_ethereum::cli::chainspec::EthereumChainSpecParser, ResearchArgs>::parse()
         .run(|builder, research_args: ResearchArgs| async move {
-        // Check if any schedules are configured
+            // Special mode: one-shot contract-metadata backfill. Reads
+            // every distinct address from divergence_call_frames, fetches
+            // bytecode from reth state, parses the CBOR metadata trailer,
+            // and UPSERTs contract_metadata. Exits the process when done.
+            if research_args.metadata_backfill {
+                let db_path = research_args.db_path.clone();
+                let handle = builder
+                    .node(EthereumNode::default())
+                    .install_exex("contract-metadata-backfill", move |ctx| {
+                        let db_path = db_path.clone();
+                        async move { Ok(run_metadata_backfill_exex(ctx, db_path)) }
+                    })
+                    .launch()
+                    .await?;
+                return handle.wait_for_node_exit().await;
+            }
+
+            // Check if any schedules are configured
             if !research_args.has_schedules() {
                 return Err(eyre::eyre!(
                     "No research schedules configured. Use --research.eip2780, --research.eip8037, --research.csv, or --research.multiplier"
