@@ -750,6 +750,76 @@ impl DuckDbDivergenceDatabase {
             .ok();
         Ok(exists.is_some())
     }
+
+    /// UPSERT a parsed `contract_metadata` row keyed by codehash. Used by
+    /// the `contract-metadata-backfill` subcommand to record solc version /
+    /// metadata-hash presence per deployed contract. Idempotent.
+    pub fn upsert_contract_metadata(
+        &self,
+        codehash: [u8; 32],
+        representative_address: &str,
+        bytecode_len: u64,
+        metadata: &crate::contract_metadata::ContractMetadata,
+        extracted_at_unix: u64,
+    ) -> Result<(), DuckDbDatabaseError> {
+        let conn = self.conn.lock().expect("DuckDB connection mutex poisoned");
+        conn.execute(
+            "INSERT INTO contract_metadata (
+                codehash, representative_address, solc_version, solc_commit,
+                evm_target, cbor_present, has_metadata_hash,
+                bytecode_len, extracted_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (codehash) DO UPDATE SET
+                representative_address = excluded.representative_address,
+                solc_version           = excluded.solc_version,
+                solc_commit            = excluded.solc_commit,
+                evm_target             = excluded.evm_target,
+                cbor_present           = excluded.cbor_present,
+                has_metadata_hash      = excluded.has_metadata_hash,
+                bytecode_len           = excluded.bytecode_len,
+                extracted_at           = excluded.extracted_at",
+            params![
+                codehash.as_slice(),
+                representative_address,
+                metadata.solc_version,
+                metadata.solc_commit,
+                metadata.evm_target,
+                metadata.cbor_present,
+                metadata.has_metadata_hash,
+                bytecode_len as i64,
+                extracted_at_unix as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a `contract_metadata` row already exists for this codehash.
+    pub fn has_contract_metadata(&self, codehash: [u8; 32]) -> Result<bool, DuckDbDatabaseError> {
+        let conn = self.conn.lock().expect("DuckDB connection mutex poisoned");
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM contract_metadata WHERE codehash = ? LIMIT 1",
+                params![codehash.as_slice()],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(exists.is_some())
+    }
+
+    /// Distinct `to_address` values seen across `divergence_call_frames`.
+    /// Backfill iterates these, fetches bytecode from reth state, hashes
+    /// it, and upserts a `contract_metadata` row keyed by codehash.
+    pub fn distinct_call_frame_addresses(&self) -> Result<Vec<String>, DuckDbDatabaseError> {
+        let conn = self.conn.lock().expect("DuckDB connection mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT to_address FROM divergence_call_frames
+             WHERE to_address IS NOT NULL AND to_address <> ''
+             ORDER BY to_address",
+        )?;
+        let rows =
+            stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 }
 
 /// Per-table row counts returned by
@@ -1487,5 +1557,89 @@ mod tests {
         assert_eq!(rows[0].count, 5);
         assert_eq!(rows[0].gas_baseline, 150);
         assert_eq!(rows[0].gas_schedule, 180);
+    }
+
+    #[test]
+    fn contract_metadata_upsert_is_idempotent_per_codehash() {
+        use crate::contract_metadata::ContractMetadata;
+        let db = DuckDbDivergenceDatabase::in_memory().unwrap();
+        let codehash = [0xabu8; 32];
+        let meta = ContractMetadata {
+            solc_version: Some("0.8.21".to_string()),
+            solc_commit: None,
+            evm_target: None,
+            cbor_present: true,
+            has_metadata_hash: true,
+        };
+
+        assert!(!db.has_contract_metadata(codehash).unwrap());
+
+        db.upsert_contract_metadata(codehash, "0xdead", 1234, &meta, 1_700_000_000).unwrap();
+        assert!(db.has_contract_metadata(codehash).unwrap());
+
+        // Second upsert overwrites — bytecode_len updated, solc_version
+        // changed (e.g. a recompile under a different version landed at
+        // the same codehash, which can't actually happen but exercises
+        // the ON CONFLICT path).
+        let meta2 = ContractMetadata { solc_version: Some("0.8.25".to_string()), ..meta };
+        db.upsert_contract_metadata(codehash, "0xdead", 4321, &meta2, 1_700_000_500).unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let (sol, blen): (String, i64) = conn
+            .query_row(
+                "SELECT solc_version, bytecode_len FROM contract_metadata WHERE codehash = ?",
+                params![codehash.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(sol, "0.8.25");
+        assert_eq!(blen, 4321);
+    }
+
+    #[test]
+    fn distinct_call_frame_addresses_dedupes() {
+        use crate::divergence::Bucket;
+        let db = DuckDbDivergenceDatabase::in_memory().unwrap();
+        // Seed two drill-in records that share a callee address. The
+        // distinct query should return only the unique to_address values.
+        for tx_index in [0u32, 1u32] {
+            let drill_in = DrillInRecord {
+                divergence: fixture_divergence(99, tx_index, Bucket::ContractBroken, 0),
+                call_frames: vec![CallFrameRow {
+                    call_index: 0,
+                    parent_call_index: None,
+                    depth: 0,
+                    from_address: Address::ZERO,
+                    to_address: Address::repeat_byte(0xaa),
+                    code_address: None,
+                    codehash: None,
+                    call_type: "CALL".to_string(),
+                    selector: None,
+                    value_wei: None,
+                    gas_provided: 0,
+                    gas_used: 0,
+                    gas_margin: None,
+                    success: false,
+                    parent_gas_at_call: None,
+                    gas_requested_on_stack: None,
+                    eip150_cap_binding: None,
+                    state_gas_running: None,
+                }],
+                opcode_counts: vec![],
+                baseline_event_logs: vec![],
+                schedule_event_logs: vec![],
+            };
+            let output = BlockOutput {
+                coverage: fixture_coverage("test", 99, 1, 0),
+                summaries: vec![],
+                drill_ins: vec![drill_in],
+            };
+            db.record_block_output(&output).unwrap();
+        }
+
+        let addrs = db.distinct_call_frame_addresses().unwrap();
+        assert_eq!(addrs.len(), 1, "duplicate to_address should be de-duplicated");
+        // Address formatting matches `{addr:#x}` (lowercase hex, 0x prefix).
+        assert_eq!(addrs[0], format!("{:#x}", Address::repeat_byte(0xaa)));
     }
 }
