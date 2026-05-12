@@ -222,6 +222,7 @@ mod tests {
             input: None,
             output: None,
             repricing_gas_delta: 0,
+            value_wei: None,
             gas_requested_on_stack,
             parent_gas_at_call,
         }
