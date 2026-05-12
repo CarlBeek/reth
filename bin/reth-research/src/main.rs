@@ -114,6 +114,35 @@ fn eip150_cap_binding(stack_gas: Option<u64>, parent_gas: Option<u64>) -> Option
     Some(s >= cap.saturating_sub(100))
 }
 
+/// Reconstruct each frame's parent index from the post-order DFS sequence
+/// the inspector emits.
+///
+/// For a frame at array index `i` with depth `d > 0`, its parent is the
+/// first frame after `i` whose depth is exactly `d - 1`. Frames at depth 0
+/// (the root) have no parent, so the returned slot is `None`. The result
+/// is indexed by array position, not by `CallFrame.call_index` — the
+/// caller pairs them up via `frames.iter().enumerate()`.
+///
+/// Output: `parent_call_indices[i] = Some(frames[parent_array_idx].call_index)`,
+/// pre-mapped to the schema's `call_index` value so writers don't have to
+/// look it up again.
+fn derive_parent_call_indices(frames: &[reth_research::divergence::CallFrame]) -> Vec<Option<u32>> {
+    let mut parents = vec![None; frames.len()];
+    for i in 0..frames.len() {
+        let d = frames[i].depth;
+        if d == 0 {
+            continue;
+        }
+        for j in (i + 1)..frames.len() {
+            if frames[j].depth == d - 1 {
+                parents[i] = Some(frames[j].call_index as u32);
+                break;
+            }
+        }
+    }
+    parents
+}
+
 /// Analyzer state shared between the live arm and concurrent backfill workers.
 ///
 /// This struct holds everything needed to analyze a single block: the node
@@ -1783,18 +1812,27 @@ where
                             reservoir_exhausted: None,
                         };
 
+                        // Inspector emits frames in post-order DFS — children
+                        // come before their parent. The parent of a frame at
+                        // index `i` (with depth `d > 0`) is the first
+                        // subsequent frame at depth `d - 1`.
+                        let parent_call_indices = derive_parent_call_indices(frames_ref);
                         let call_frames_rows: Vec<CallFrameRow> = frames_ref
                             .iter()
-                            .map(|f| CallFrameRow {
+                            .enumerate()
+                            .map(|(i, f)| CallFrameRow {
                                 call_index: f.call_index as u32,
-                                // Parent reconstruction from the post-order
-                                // frame array isn't part of the inspector
-                                // output today — leave NULL and the
-                                // consumer joins on `depth` when needed.
-                                parent_call_index: None,
+                                parent_call_index: parent_call_indices[i],
                                 depth: f.depth as u32,
                                 from_address: f.from,
                                 to_address: f.to.unwrap_or_default(),
+                                // For non-DELEGATECALL frames this equals
+                                // `to_address`; once the inspector splits
+                                // storage-context vs code-holder for
+                                // DELEGATECALL, this column will carry the
+                                // code holder while `to_address` carries
+                                // the storage target. Today both come from
+                                // the same source.
                                 code_address: f.to,
                                 codehash: None,
                                 call_type: format_call_type(&f.call_type),
@@ -1830,10 +1868,30 @@ where
                     None
                 };
 
+                // Derive the runtime state-gas decomposition for the
+                // 8037 aggregates: `runtime_state_gas = state_gas_spent -
+                // initial_state_gas`, and the spillover is whatever
+                // exceeded the per-tx reservoir.
+                let runtime_state_gas =
+                    schedule_state_gas_spent.saturating_sub(schedule_initial_state_gas);
+                let state_gas_spillover =
+                    runtime_state_gas.saturating_sub(schedule_initial_reservoir);
+                let has_runtime_state = runtime_state_gas > 0;
+
                 aggregators
                     .get_mut(schedule_name)
                     .expect("aggregator exists for every schedule")
-                    .observe_tx(bucket, total_delta, drill_in);
+                    .observe_tx(reth_research::block_aggregator::TxObservation {
+                        bucket,
+                        gas_delta: total_delta,
+                        state_gas_spent: schedule_state_gas_spent,
+                        state_gas_spillover,
+                        min_multiplier_to_succeed,
+                        is_creation: is_create,
+                        has_authorization: authorization_count > 0,
+                        has_runtime_state,
+                        drill_in_record: drill_in,
+                    });
             }
         }
 
@@ -1956,10 +2014,92 @@ where
     .await
 }
 
+/// Adapter that turns the ExEx context's provider into a
+/// [`BytecodeFetcher`]. Uses the latest canonical state — codehashes of
+/// non-self-destructed contracts don't change, so "latest" is the right
+/// snapshot for a one-shot metadata backfill. Self-destructed accounts
+/// return `Ok(None)` and are skipped by the orchestration loop.
+struct ProviderBytecodeFetcher<P>
+where
+    P: StateProviderFactory,
+{
+    provider: P,
+}
+
+impl<P> reth_research::contract_metadata::BytecodeFetcher for ProviderBytecodeFetcher<P>
+where
+    P: StateProviderFactory,
+{
+    fn fetch_bytecode(
+        &self,
+        address: Address,
+    ) -> Result<Option<Vec<u8>>, reth_research::contract_metadata::BackfillError> {
+        let state = self.provider.latest().map_err(|e| {
+            reth_research::contract_metadata::BackfillError::Fetch { address, source: Box::new(e) }
+        })?;
+        let code = state.account_code(&address).map_err(|e| {
+            reth_research::contract_metadata::BackfillError::Fetch { address, source: Box::new(e) }
+        })?;
+        Ok(code.map(|bc| bc.bytes().to_vec()))
+    }
+}
+
+/// One-shot ExEx that opens the producer DuckDB, runs the contract-
+/// metadata backfill against the node's `latest` state, logs the
+/// resulting counters, and terminates the process. Idempotent — re-runs
+/// only fetch bytecode for codehashes that aren't already in
+/// `contract_metadata`.
+async fn run_metadata_backfill_exex<Node: FullNodeComponents>(
+    ctx: ExExContext<Node>,
+    db_path: std::path::PathBuf,
+) -> eyre::Result<()> {
+    use reth_research::{
+        contract_metadata::run_metadata_backfill, database_duckdb::DuckDbDivergenceDatabase,
+    };
+
+    info!(target: "reth::cli", path = ?db_path, "Opening producer DB for metadata backfill");
+    let db = DuckDbDivergenceDatabase::open(&db_path)?;
+    let fetcher = ProviderBytecodeFetcher { provider: ctx.components.provider().clone() };
+
+    info!(target: "reth::cli", "Starting contract-metadata backfill");
+    let stats = run_metadata_backfill(&db, &fetcher)?;
+    info!(
+        target: "reth::cli",
+        addresses_examined = stats.addresses_examined,
+        upserted = stats.upserted,
+        skipped_existing = stats.skipped_existing,
+        no_bytecode = stats.no_bytecode,
+        fetch_errors = stats.fetch_errors,
+        "Contract-metadata backfill complete; exiting"
+    );
+
+    // No graceful node-shutdown plumbing from inside an ExEx future, so
+    // terminate the process directly. The caller's expectation is a
+    // one-shot CLI tool, not a long-running daemon.
+    std::process::exit(0);
+}
+
 fn main() -> eyre::Result<()> {
     reth_ethereum::cli::Cli::<reth_ethereum::cli::chainspec::EthereumChainSpecParser, ResearchArgs>::parse()
         .run(|builder, research_args: ResearchArgs| async move {
-        // Check if any schedules are configured
+            // Special mode: one-shot contract-metadata backfill. Reads
+            // every distinct address from divergence_call_frames, fetches
+            // bytecode from reth state, parses the CBOR metadata trailer,
+            // and UPSERTs contract_metadata. Exits the process when done.
+            if research_args.metadata_backfill {
+                let db_path = research_args.db_path.clone();
+                let handle = builder
+                    .node(EthereumNode::default())
+                    .install_exex("contract-metadata-backfill", move |ctx| {
+                        let db_path = db_path.clone();
+                        async move { Ok(run_metadata_backfill_exex(ctx, db_path)) }
+                    })
+                    .launch()
+                    .await?;
+                return handle.wait_for_node_exit().await;
+            }
+
+            // Check if any schedules are configured
             if !research_args.has_schedules() {
                 return Err(eyre::eyre!(
                     "No research schedules configured. Use --research.eip2780, --research.eip8037, --research.csv, or --research.multiplier"
@@ -2016,4 +2156,87 @@ fn main() -> eyre::Result<()> {
 
             handle.wait_for_node_exit().await
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::Address;
+    use reth_research::divergence::{CallFrame, CallType};
+
+    fn frame_at(call_index: usize, depth: usize) -> CallFrame {
+        CallFrame {
+            call_index,
+            depth,
+            from: Address::ZERO,
+            to: None,
+            call_type: CallType::Call,
+            gas_provided: 0,
+            gas_used: 0,
+            success: true,
+            input: None,
+            output: None,
+            repricing_gas_delta: 0,
+            gas_requested_on_stack: None,
+            parent_gas_at_call: None,
+        }
+    }
+
+    /// Single-frame tx: root only. No parent.
+    #[test]
+    fn parent_call_indices_for_single_root() {
+        let frames = vec![frame_at(0, 0)];
+        let parents = derive_parent_call_indices(&frames);
+        assert_eq!(parents, vec![None]);
+    }
+
+    /// Post-order DFS for a tx that did one sub-call: child completes
+    /// first (call_index 0, depth 1), then root (call_index 1, depth 0).
+    /// The child's parent is the root's call_index (1).
+    #[test]
+    fn parent_call_indices_for_root_with_one_subcall() {
+        let frames = vec![frame_at(0, 1), frame_at(1, 0)];
+        let parents = derive_parent_call_indices(&frames);
+        assert_eq!(parents, vec![Some(1), None]);
+    }
+
+    /// Three-deep chain: leaf → middle → root. Post-order is
+    /// [leaf, middle, root]; call_indices are [0, 1, 2].
+    /// Leaf's parent is middle (call_index 1); middle's parent is root
+    /// (call_index 2); root has no parent.
+    #[test]
+    fn parent_call_indices_for_three_deep_chain() {
+        let frames = vec![frame_at(0, 2), frame_at(1, 1), frame_at(2, 0)];
+        let parents = derive_parent_call_indices(&frames);
+        assert_eq!(parents, vec![Some(1), Some(2), None]);
+    }
+
+    /// Two siblings under one root. Order of completion:
+    /// sibling A (idx 0, depth 1), sibling B (idx 1, depth 1), root (idx 2, depth 0).
+    /// Both siblings' parent = root.
+    #[test]
+    fn parent_call_indices_for_two_siblings() {
+        let frames = vec![frame_at(0, 1), frame_at(1, 1), frame_at(2, 0)];
+        let parents = derive_parent_call_indices(&frames);
+        assert_eq!(parents, vec![Some(2), Some(2), None]);
+    }
+
+    /// Mixed-depth tree:
+    /// root calls A; A calls A1; A returns; root calls B.
+    /// Completion order: A1 (depth 2), A (depth 1), B (depth 1), root (depth 0).
+    /// call_indices match completion: [0, 1, 2, 3].
+    /// A1's parent is A (the first subsequent depth-1 frame, idx 1, call_index 1).
+    /// A's parent is root (the first subsequent depth-0 frame, idx 3, call_index 3).
+    /// B's parent is also root (the first subsequent depth-0 frame, idx 3, call_index 3).
+    #[test]
+    fn parent_call_indices_for_mixed_tree() {
+        let frames = vec![
+            frame_at(0, 2), // A1
+            frame_at(1, 1), // A
+            frame_at(2, 1), // B
+            frame_at(3, 0), // root
+        ];
+        let parents = derive_parent_call_indices(&frames);
+        assert_eq!(parents, vec![Some(1), Some(3), Some(3), None]);
+    }
 }

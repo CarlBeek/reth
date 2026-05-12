@@ -103,6 +103,18 @@ pub struct ResearchArgs {
         help_heading = "Research"
     )]
     pub backfill_concurrency: usize,
+
+    /// Run the `contract-metadata-backfill` flow instead of the normal
+    /// research analysis.
+    ///
+    /// When set, the ExEx walks every distinct contract address recorded in
+    /// `divergence_call_frames`, fetches the deployed bytecode from reth
+    /// state, parses the Solidity CBOR metadata trailer, and UPSERTs a row
+    /// into `contract_metadata`. The process exits after the backfill
+    /// completes; no live analysis runs. Idempotent and resumable — re-runs
+    /// skip codehashes already in the DB.
+    #[arg(long = "research.metadata-backfill", help_heading = "Research")]
+    pub metadata_backfill: bool,
 }
 
 impl Default for ResearchArgs {
@@ -119,6 +131,7 @@ impl Default for ResearchArgs {
             backfill: false,
             backfill_min_block: 0,
             backfill_concurrency: 0,
+            metadata_backfill: false,
         }
     }
 }

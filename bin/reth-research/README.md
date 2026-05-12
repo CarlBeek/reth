@@ -46,6 +46,8 @@ same schedule.
 - `--research.backfill-concurrency N`
 - `--research.gas-limit-multiplier MULT`
 - `--research.max-divergences-per-block N`
+- `--research.metadata-backfill` (run the contract-metadata backfill in
+  one-shot mode instead of starting live analysis; see below)
 
 At least one schedule flag is required.
 
@@ -135,8 +137,30 @@ Static helpers:
 - `analysis_runs`: producer manifest (schema version, schedule config
   hash, reth commit, run start/end)
 - `contract_metadata`: bytecode-derived metadata (solc version, CBOR
-  marker), populated by the `contract-metadata-backfill` subcommand
-  (separate PR)
+  marker), populated by `--research.metadata-backfill` (see below)
+
+## Contract Metadata Backfill
+
+Once the producer has populated `divergence_call_frames` with some
+drill-in cohort, run:
+
+```bash
+cargo run --release -p reth-research-bin -- node \
+  --research.eip2780 \
+  --research.db-path ./divergences.duckdb \
+  --research.metadata-backfill
+```
+
+The binary opens the producer DB, walks every distinct `to_address` in
+`divergence_call_frames`, fetches deployed bytecode from reth state,
+hashes it for a codehash, parses the Solidity CBOR trailer, and UPSERTs
+a row into `contract_metadata`. It's idempotent and resumable — re-runs
+skip codehashes already in the DB.
+
+After the backfill completes the process exits; the node launch is just
+to get a provider handle on reth state. At least one schedule flag is
+still required because reth-research's CLI parser shares args with the
+live mode.
 
 ## Important Limits
 
