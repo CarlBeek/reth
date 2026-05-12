@@ -11,7 +11,9 @@ The current system is centered on the `reth-research` ExEx in
 1. It loads historical state at `block - 1`.
 2. It executes each transaction once under baseline gas pricing.
 3. It re-executes the same transaction once per configured execution schedule.
-4. It records schedule-specific divergences to SQLite.
+4. It classifies each (tx, schedule) into a storage bucket (see
+   [`docs/storage-redesign.md`](docs/storage-redesign.md)) and writes the
+   block's coverage + per-bucket summaries + drill-in rows to DuckDB.
 
 Execution schedules are isolated from one another: each configured schedule gets its own per-block
 state so schedule-induced failures can cascade across later transactions in the same block.
@@ -72,8 +74,6 @@ This crate is still research infrastructure, not decision-grade Ethereum analysi
   canonical parent state at the start of each new block. It is therefore not a cross-block forked
   chain simulation.
 - State-root or full state-diff persistence is not yet implemented in the live ExEx path.
-- The crate-level `ResearchExecutor` remains as a legacy API surface and does not implement the
-  full multi-schedule analysis path. Use the `reth-research` ExEx instead.
 - `cargo check -p reth-research-bin` is expected to pass; broader workspace health should be
   validated separately from research-specific checks.
 

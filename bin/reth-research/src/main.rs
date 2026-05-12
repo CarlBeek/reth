@@ -35,11 +35,18 @@ use reth_node_core::args::ResearchArgs;
 use reth_primitives_traits::BlockBody;
 use reth_provider::{BlockNumReader, BlockReader, StateProviderFactory, TransactionVariant};
 use reth_research::{
-    database::{DivergenceDatabase, ScheduleBlockCoverage},
-    divergence::{CallFrame, DivergenceLocation, DivergenceType, EventLog},
+    block_aggregator::{BlockAggregator, BlockMeta},
+    database_duckdb::{
+        BlockOutput, CallFrameRow, DivergenceRow, DrillInRecord, DuckDbDivergenceDatabase,
+        OpcodeCountRow,
+    },
+    divergence::{
+        classify_bucket, BucketInput, CallFrame, CallType as ResCallType, DivergenceLocation,
+        EventLog,
+    },
     oog_chain::classify_oog_chain,
     schedule::{GasSchedule, RecipientInfo, ScheduleKind, ScheduleRegistry, TxContext},
-    ScheduleDivergence, ScheduleInspector, TrackingInspector,
+    ScheduleInspector, TrackingInspector,
 };
 use reth_revm::{database::StateProviderDatabase, db::State, Database, DatabaseCommit};
 use reth_tracing::tracing::{debug, info, warn};
@@ -55,86 +62,56 @@ use std::{
 };
 use tokio::{sync::mpsc, task::JoinHandle as TokioJoinHandle};
 
+/// One unit of work for the DB writer thread. Each `BlockProcessed`
+/// command is a fully-built per-(schedule, block) output and gets written
+/// as a single DuckDB transaction. `DeleteRange` clears all per-block
+/// tables in a contiguous block range — used on chain reorg / revert.
 enum DbCommand {
-    Record(ScheduleDivergence),
-    RecordCoverage(ScheduleBlockCoverage),
+    BlockProcessed(BlockOutput),
     DeleteRange { from_block: u64, to_block: u64 },
 }
 
+/// Per-schedule metadata cached once at startup.
+///
+/// Previously also held kind / description / affected_opcodes /
+/// affected_precompiles, used by the legacy SQLite `ScheduleDivergence`
+/// rows. The DuckDB schema records those (where relevant) via
+/// `block_summaries` + `divergences.schedule_name`, so only the
+/// dedupe-keyed `config_hash` is still cached here.
 #[derive(Clone)]
 struct ScheduleMetadata {
-    kind: String,
-    description: String,
     config_hash: String,
-    affected_opcodes: Option<String>,
-    affected_precompiles: Option<String>,
 }
 
-#[derive(Default)]
-struct BlockCoverageAccumulator {
-    tx_count: u64,
-    divergence_count: u64,
-    status_divergence_count: u64,
-    gas_divergence_count: u64,
-    call_tree_divergence_count: u64,
-    event_log_divergence_count: u64,
-    output_divergence_count: u64,
-    created_address_divergence_count: u64,
-    logs_bloom_divergence_count: u64,
-    total_baseline_gas_used: u64,
-    total_schedule_gas_used: u64,
-    total_gas_delta: i64,
+/// Stable string form of the inspector's `CallType` enum, matching the
+/// values the consumer SQL expects in `divergence_call_frames.call_type`.
+fn format_call_type(ct: &ResCallType) -> String {
+    match ct {
+        ResCallType::Call => "CALL",
+        ResCallType::DelegateCall => "DELEGATECALL",
+        ResCallType::StaticCall => "STATICCALL",
+        ResCallType::CallCode => "CALLCODE",
+        ResCallType::Create => "CREATE",
+        ResCallType::Create2 => "CREATE2",
+    }
+    .to_string()
 }
 
-fn flush_pending_divergence_batch(
-    divergence_db: &DivergenceDatabase,
-    pending_records: &mut Vec<ScheduleDivergence>,
-    write_count: &mut u64,
-    context: &str,
-) {
-    if pending_records.is_empty() {
-        return;
-    }
+/// First four bytes of the call input, if present. NULL otherwise (e.g.
+/// value-only transfers, fallback function calls without selectors).
+fn extract_selector_bytes(input: &Option<Bytes>) -> Option<[u8; 4]> {
+    input.as_ref().filter(|b| b.len() >= 4).map(|b| [b[0], b[1], b[2], b[3]])
+}
 
-    match divergence_db.record_schedule_divergences_batch(pending_records) {
-        Ok(written) => {
-            *write_count += written as u64;
-            if *write_count % 100 == 0 {
-                debug!(
-                    target: "exex::research::db_writer",
-                    total_writes = *write_count,
-                    "Database writer progress"
-                );
-            }
-        }
-        Err(error) => {
-            warn!(
-                target: "exex::research::db_writer",
-                batch_len = pending_records.len(),
-                %error,
-                context
-            );
-            for divergence in pending_records.iter() {
-                match divergence_db.record_schedule_divergence(divergence) {
-                    Ok(_id) => {
-                        *write_count += 1;
-                    }
-                    Err(single_error) => {
-                        warn!(
-                            target: "exex::research::db_writer",
-                            block = divergence.block_number,
-                            tx_idx = divergence.tx_index,
-                            schedule = divergence.schedule_name,
-                            error = %single_error,
-                            "Failed to record divergence to database"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    pending_records.clear();
+/// Whether the EIP-150 63/64 cap was binding at a CALL: the caller's
+/// stack-gas request was at least the cap. `None` when the inputs aren't
+/// available (CREATE/CREATE2, root frame, or a baseline-only capture).
+fn eip150_cap_binding(stack_gas: Option<u64>, parent_gas: Option<u64>) -> Option<bool> {
+    let (s, p) = (stack_gas?, parent_gas?);
+    let cap = p.saturating_mul(63) / 64;
+    // Tolerance of 100 absorbs EIP-150 rounding + call-cost overhead;
+    // same constant the OOG-chain classifier uses.
+    Some(s >= cap.saturating_sub(100))
 }
 
 /// Analyzer state shared between the live arm and concurrent backfill workers.
@@ -182,7 +159,7 @@ struct ResearchExEx<Node: FullNodeComponents> {
     /// check whether a block is already covered under the current schedule
     /// configuration. Shares the underlying `Arc<Mutex<Connection>>` with the
     /// writer thread, so reads briefly block writes (and vice versa).
-    divergence_db: Option<DivergenceDatabase>,
+    divergence_db: Option<DuckDbDivergenceDatabase>,
     /// Start block for live analysis
     start_block: u64,
     /// Whether to backfill historical blocks during idle windows.
@@ -283,35 +260,6 @@ where
         })
     }
 
-    /// Format the schedule's affected-opcode list for storage.
-    ///
-    /// Returns `Some("[]")` when the schedule explicitly declares no affected
-    /// opcodes, mirroring [`Self::format_affected_precompiles`]. `NULL` is
-    /// reserved for "field never computed".
-    fn format_affected_opcodes(schedule: &dyn GasSchedule) -> Option<String> {
-        let mut opcodes = schedule.affected_opcodes();
-        opcodes.sort_unstable();
-        Some(format!("{opcodes:?}"))
-    }
-
-    /// Format the schedule's affected-precompile list for storage.
-    ///
-    /// Returns `Some("[]")` when the schedule explicitly declares no affected
-    /// precompiles (EIP-8037 is state-gas focused and doesn't reprice any
-    /// precompiles, so it falls through to the trait default), and a sorted
-    /// debug-formatted address list otherwise. Distinguishing "deliberately
-    /// empty" from `NULL` (= field never computed) lets downstream consumers
-    /// tell whether the schedule's coverage is known.
-    fn format_affected_precompiles(schedule: &dyn GasSchedule) -> Option<String> {
-        let mut addresses: Vec<_> = schedule
-            .affected_precompiles()
-            .into_iter()
-            .map(|address| format!("{address:#x}"))
-            .collect();
-        addresses.sort();
-        Some(format!("{addresses:?}"))
-    }
-
     fn output_hash_and_len<HR>(
         result: &revm::context_interface::result::ExecutionResult<HR>,
     ) -> (Option<String>, Option<u64>) {
@@ -384,29 +332,15 @@ where
         let schedule_metadata: HashMap<String, ScheduleMetadata> = all_schedules
             .iter()
             .map(|schedule| {
-                let affected_opcodes = Analyzer::<Node>::format_affected_opcodes(schedule.as_ref());
-                let affected_precompiles =
-                    Analyzer::<Node>::format_affected_precompiles(schedule.as_ref());
-                let kind = format!("{:?}", schedule.kind());
-                let description = schedule.description().to_string();
                 let config_hash =
                     Analyzer::<Node>::hash_bytes(schedule.config_fingerprint().as_bytes());
-                (
-                    schedule.name().to_string(),
-                    ScheduleMetadata {
-                        kind,
-                        description,
-                        config_hash,
-                        affected_opcodes,
-                        affected_precompiles,
-                    },
-                )
+                (schedule.name().to_string(), ScheduleMetadata { config_hash })
             })
             .collect();
 
         // Initialize database and async writer
         let (divergence_db, db_tx, db_writer_task) = if db_path.to_str() != Some(":memory:") {
-            let divergence_db = DivergenceDatabase::open(&db_path)?;
+            let divergence_db = DuckDbDivergenceDatabase::open(&db_path)?;
 
             info!(
                 target: "exex::research",
@@ -429,65 +363,54 @@ where
                 }
             }
 
-            // Spawn database writer task
+            // Spawn database writer task. Each `BlockProcessed` command
+            // lands in a single DuckDB transaction (per-block commit) so
+            // a crash mid-block doesn't leave half-written aggregates.
             let (tx, mut rx) = mpsc::unbounded_channel::<DbCommand>();
             let writer_db = divergence_db.clone();
             let writer_task = std::thread::Builder::new()
                 .name("reth-research-db-writer".to_string())
                 .spawn(move || {
-                let divergence_db = writer_db;
-                const DB_WRITE_BATCH_SIZE: usize = 256;
-                let mut write_count = 0u64;
-                let mut pending_records = Vec::with_capacity(DB_WRITE_BATCH_SIZE);
-                while let Some(cmd) = rx.blocking_recv() {
-                    match cmd {
-                            DbCommand::Record(divergence) => {
-                                pending_records.push(divergence);
-                                if pending_records.len() >= DB_WRITE_BATCH_SIZE {
-                                    flush_pending_divergence_batch(
-                                        &divergence_db,
-                                        &mut pending_records,
-                                        &mut write_count,
-                                        "Batch divergence write failed, retrying individually",
-                                    );
-                                }
-                            }
-                        DbCommand::RecordCoverage(coverage) => {
-                            flush_pending_divergence_batch(
-                                &divergence_db,
-                                &mut pending_records,
-                                &mut write_count,
-                                "Failed to flush pending divergence batch before coverage write, retrying individually",
-                            );
-                                if let Err(error) =
-                                    divergence_db.record_schedule_block_coverage(&coverage)
-                                {
+                    let divergence_db = writer_db;
+                    let mut blocks_written = 0u64;
+                    while let Some(cmd) = rx.blocking_recv() {
+                        match cmd {
+                            DbCommand::BlockProcessed(output) => {
+                                let block_number = output.coverage.block_number;
+                                let schedule_name = output.coverage.schedule_name.clone();
+                                if let Err(error) = divergence_db.record_block_output(&output) {
                                     warn!(
                                         target: "exex::research::db_writer",
-                                        block = coverage.block_number,
-                                        schedule = coverage.schedule_name,
+                                        block = block_number,
+                                        schedule = schedule_name,
                                         %error,
-                                        "Failed to record schedule block coverage"
+                                        "Failed to record block output"
+                                    );
+                                    continue;
+                                }
+                                blocks_written += 1;
+                                if blocks_written % 100 == 0 {
+                                    debug!(
+                                        target: "exex::research::db_writer",
+                                        blocks_written,
+                                        "Database writer progress"
                                     );
                                 }
                             }
-                        DbCommand::DeleteRange { from_block, to_block } => {
-                                flush_pending_divergence_batch(
-                                    &divergence_db,
-                                    &mut pending_records,
-                                    &mut write_count,
-                                    "Failed to flush pending divergence batch before delete, retrying individually",
-                                );
-                                match divergence_db
-                                    .delete_schedule_divergences_in_block_range(from_block, to_block)
-                                {
-                                    Ok(deleted) => {
+                            DbCommand::DeleteRange { from_block, to_block } => {
+                                match divergence_db.delete_block_range(from_block, to_block) {
+                                    Ok(counts) => {
                                         info!(
                                             target: "exex::research::db_writer",
                                             from_block,
                                             to_block,
-                                            deleted,
-                                            "Deleted schedule divergences for non-canonical block range"
+                                            coverage = counts.coverage,
+                                            summaries = counts.summaries,
+                                            divergences = counts.divergences,
+                                            call_frames = counts.call_frames,
+                                            opcode_counts = counts.opcode_counts,
+                                            event_logs = counts.event_logs,
+                                            "Deleted rows for non-canonical block range"
                                         );
                                     }
                                     Err(e) => {
@@ -496,48 +419,20 @@ where
                                             from_block,
                                             to_block,
                                             error = %e,
-                                            "Failed to delete non-canonical schedule divergences"
-                                        );
-                                    }
-                                }
-                                match divergence_db
-                                    .delete_schedule_block_coverage_in_block_range(from_block, to_block)
-                                {
-                                    Ok(deleted) => {
-                                        info!(
-                                            target: "exex::research::db_writer",
-                                            from_block,
-                                            to_block,
-                                            deleted,
-                                            "Deleted schedule coverage rows for non-canonical block range"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            target: "exex::research::db_writer",
-                                            from_block,
-                                            to_block,
-                                            error = %e,
-                                            "Failed to delete non-canonical schedule coverage"
+                                            "Failed to delete non-canonical rows"
                                         );
                                     }
                                 }
                             }
+                        }
                     }
-                }
-                flush_pending_divergence_batch(
-                    &divergence_db,
-                    &mut pending_records,
-                    &mut write_count,
-                    "Failed to flush pending divergence batch on shutdown, retrying individually",
-                );
-                info!(
-                    target: "exex::research::db_writer",
-                    total_writes = write_count,
-                    "Database writer task exiting"
-                );
-            })
-            .map_err(|err| eyre::eyre!("failed to spawn db writer thread: {err}"))?;
+                    info!(
+                        target: "exex::research::db_writer",
+                        blocks_written,
+                        "Database writer task exiting"
+                    );
+                })
+                .map_err(|err| eyre::eyre!("failed to spawn db writer thread: {err}"))?;
 
             (Some(divergence_db), Some(tx), Some(writer_task))
         } else {
@@ -814,7 +709,7 @@ where
                     .schedule_metadata
                     .get(schedule.name())
                     .expect("metadata exists for every schedule");
-                match divergence_db.has_schedule_block_coverage_with_config(
+                match divergence_db.has_block_coverage_with_config(
                     schedule.name(),
                     cursor,
                     &metadata.config_hash,
@@ -912,7 +807,7 @@ where
                 let from_block = (*range.start()).max(self.start_block);
                 let to_block = *range.end();
                 if from_block <= to_block {
-                    self.analyzer.delete_divergences_in_block_range(from_block, to_block);
+                    self.analyzer.send_delete_block_range(from_block, to_block);
                 }
 
                 info!(
@@ -962,7 +857,7 @@ where
                 let from_block = (*range.start()).max(self.start_block);
                 let to_block = *range.end();
                 if from_block <= to_block {
-                    self.analyzer.delete_divergences_in_block_range(from_block, to_block);
+                    self.analyzer.send_delete_block_range(from_block, to_block);
                 }
 
                 info!(
@@ -1044,6 +939,15 @@ where
     }
 
     /// Analyze a single block using multi-schedule execution.
+    ///
+    /// The per-schedule destructuring tuple still carries several locals
+    /// that were used by the legacy SQLite `ScheduleDivergence` builder
+    /// (formatted_op_counts, the *_json call-frame/event-log fields, the
+    /// hash fields, the output_* fields, etc.). They're kept in the tuple
+    /// so the existing per-schedule analysis remains a one-shot match
+    /// expression; future cleanup can drop them once the SQLite-shape
+    /// code is fully gone.
+    #[allow(unused_variables)]
     fn analyze_block(
         &self,
         block: &reth_primitives_traits::RecoveredBlock<BlockTy<Node::Types>>,
@@ -1093,12 +997,33 @@ where
         };
         let mut normal_db =
             State::builder().with_database(StateProviderDatabase::new(baseline_state)).build();
-        let mut block_coverage: HashMap<String, BlockCoverageAccumulator> = self
+
+        // One BlockAggregator per schedule. Each gets fed every tx's
+        // bucket classification + optional drill-in record, and we flush
+        // them at the end of the block as `BlockOutput` commands.
+        let mut aggregators: HashMap<String, BlockAggregator> = self
             .all_schedules
             .iter()
-            .map(|schedule| (schedule.name().to_string(), BlockCoverageAccumulator::default()))
+            .map(|schedule| {
+                let metadata = self
+                    .schedule_metadata
+                    .get(schedule.name())
+                    .expect("schedule metadata is populated for every schedule");
+                let meta = BlockMeta {
+                    schedule_name: schedule.name().to_string(),
+                    schedule_config_hash: metadata.config_hash.clone(),
+                    block_number,
+                    block_hash,
+                    parent_hash,
+                    timestamp: block_timestamp,
+                };
+                (
+                    schedule.name().to_string(),
+                    BlockAggregator::start_block(meta, block.body().transactions().len()),
+                )
+            })
             .collect();
-        let mut recorded_divergences = 0usize;
+        let mut drill_ins_recorded = 0usize;
 
         for (tx_idx, tx) in block.transactions_recovered().enumerate() {
             let tx_env = self.components.evm_config().tx_env(tx);
@@ -1241,6 +1166,24 @@ where
                 /// chain-walk classifier to find the OOG frame in
                 /// `call_frames`.
                 oog_call_depth: Option<usize>,
+                /// Structured divergence depth (1-based), captured from
+                /// `DivergenceLocation.call_depth` before string formatting.
+                /// Used by the bucket classifier's shallow heuristic.
+                divergence_call_depth: Option<usize>,
+                /// CALL/STATICCALL/DELEGATECALL/CALLCODE opcode count in this
+                /// schedule's run. Used by the bucket classifier's shallow
+                /// heuristic (`call_count == 0` + depth ≤ 1).
+                call_count: u64,
+                /// Structured `OutOfGasInfo` captured from the inspector so
+                /// the DivergenceRow can mirror its fields without parsing
+                /// the debug-formatted string.
+                oog_info_structured: Option<reth_research::divergence::OutOfGasInfo>,
+                /// Structured `DivergenceLocation`. Same rationale as above.
+                divergence_location_structured: Option<DivergenceLocation>,
+                /// Per-frame opcode counts captured by the inspector. Used
+                /// to populate `divergence_opcode_counts` rows for drill-in
+                /// buckets.
+                frame_opcode_counts: Vec<reth_research::divergence::FrameOpcodeCounts>,
                 call_frames: Vec<CallFrame>,
                 event_logs: Vec<EventLog>,
                 output_hash: Option<String>,
@@ -1410,6 +1353,11 @@ where
                             // `transact()` rejected before any frame ran, so
                             // we have no call tree to walk.
                             oog_call_depth: None,
+                            divergence_call_depth: None,
+                            call_count: 0,
+                            oog_info_structured: None,
+                            divergence_location_structured: None,
+                            frame_opcode_counts: Vec::new(),
                             call_frames: Vec::new(),
                             event_logs: Vec::new(),
                             output_hash: None,
@@ -1492,6 +1440,14 @@ where
                         .map(|loc| format!("{loc:?}")),
                     replay_halt_oog,
                     oog_call_depth: insp_result.oog_info.as_ref().map(|oog| oog.call_depth),
+                    divergence_call_depth: insp_result
+                        .divergence_location
+                        .as_ref()
+                        .map(|loc| loc.call_depth),
+                    call_count: inspector.operation_counts().call_count,
+                    oog_info_structured: insp_result.oog_info.clone(),
+                    divergence_location_structured: insp_result.divergence_location.clone(),
+                    frame_opcode_counts: inspector.frame_opcode_counts().frames.clone(),
                     call_frames_hash: Self::hash_serialized(&call_frames),
                     event_logs_hash: Self::hash_serialized(&event_logs),
                     call_frames,
@@ -1685,254 +1641,209 @@ where
                     }
                 };
 
-                // Use the actual gas difference as the total delta rather than
-                // the inspector's cumulative opcode deltas, since cascading
-                // effects (different execution paths) make the true difference
-                // diverge from the sum of per-opcode adjustments.
+                // Use the actual gas difference as the total delta rather
+                // than the inspector's cumulative opcode deltas, since
+                // cascading effects (different execution paths) make the
+                // true difference diverge from the sum of per-opcode
+                // adjustments.
                 let total_delta = schedule_gas as i64 - normal_gas_used as i64;
-                let would_oog = !schedule_success && normal_success;
-
-                // Record divergence if there's a gas delta or status change
                 let status_changed = schedule_success != normal_success;
-                let gas_changed = total_delta != 0;
-                if gas_changed ||
-                    would_oog ||
-                    status_changed ||
-                    call_tree_diverged ||
-                    event_logs_diverged ||
-                    output_changed ||
-                    created_address_changed ||
-                    logs_bloom_changed
-                {
-                    let divergence_type = if would_oog || schedule_success != normal_success {
-                        DivergenceType::Status
-                    } else if event_logs_diverged {
-                        DivergenceType::EventLogs
-                    } else if call_tree_diverged {
-                        DivergenceType::CallTree
-                    } else {
-                        DivergenceType::GasPattern
+
+                // Min gas-limit multiplier required for the schedule to
+                // succeed. Only meaningful when the replay actually
+                // completed under the (possibly inflated) replay limit;
+                // otherwise the gas_used we'd divide by is the OOG cap,
+                // not the true minimum.
+                let min_multiplier_to_succeed = if schedule_replay_success && gas_limit > 0 {
+                    Some(schedule_gas as f64 / gas_limit as f64)
+                } else {
+                    None
+                };
+
+                // Classify the OOG chain (root → OOG frame) so the
+                // dashboard can distinguish wallet-fixable failures (every
+                // hop received gas via the EIP-150 63/64 rule) from
+                // contract-bottlenecked ones (some frame throttled gas
+                // with `.transfer()` 2300 stipend, fixed constant, or
+                // fractional pattern). Only meaningful for OOG-class
+                // divergences — non-OOG rows leave these fields NULL.
+                let (oog_chain_proportional, oog_bottleneck_depth, oog_bottleneck_kind) =
+                    match exec_result.and_then(|r| {
+                        r.oog_call_depth.and_then(|depth| classify_oog_chain(&r.call_frames, depth))
+                    }) {
+                        Some(analysis) => (
+                            Some(analysis.proportional),
+                            analysis.bottleneck_depth,
+                            analysis.bottleneck_kind.map(|k| k.as_str().to_string()),
+                        ),
+                        None => (None, None, None),
                     };
 
-                    let gas_efficiency_ratio = if normal_gas_used > 0 {
-                        Some(schedule_gas as f64 / normal_gas_used as f64)
-                    } else {
-                        None
-                    };
-                    // Min gas-limit multiplier required for the schedule to succeed.
-                    // Only meaningful when the replay actually completed under the
-                    // (possibly inflated) replay limit; otherwise the gas_used we'd
-                    // divide by is the OOG cap, not the true minimum.
-                    let min_multiplier_to_succeed = if schedule_replay_success && gas_limit > 0 {
-                        Some(schedule_gas as f64 / gas_limit as f64)
-                    } else {
-                        None
-                    };
-                    let metadata = self
-                        .schedule_metadata
-                        .get(schedule_name)
-                        .cloned()
-                        .expect("all schedules should have static metadata");
+                // Classify the tx into one of the seven storage buckets.
+                let divergence_call_depth = exec_result.and_then(|r| r.divergence_call_depth);
+                let call_count = exec_result.map(|r| r.call_count).unwrap_or(0);
+                let bucket = classify_bucket(&BucketInput {
+                    status_changed,
+                    gas_delta: total_delta,
+                    event_logs_changed: event_logs_diverged,
+                    call_tree_changed: call_tree_diverged,
+                    output_changed,
+                    created_address_changed,
+                    logs_bloom_changed,
+                    divergence_call_depth,
+                    call_count,
+                    oog_chain_proportional,
+                });
 
-                    // Classify the OOG chain (root → OOG frame) so the
-                    // dashboard can distinguish wallet-fixable failures
-                    // (every hop received gas via the EIP-150 63/64 rule)
-                    // from contract-bottlenecked ones (some frame throttled
-                    // gas with `.transfer()` 2300 stipend, fixed constant,
-                    // or fractional pattern). Only meaningful for OOG-class
-                    // divergences — non-OOG rows leave these fields NULL.
-                    let (oog_chain_proportional, oog_bottleneck_depth, oog_bottleneck_kind) =
-                        match exec_result.and_then(|r| {
-                            r.oog_call_depth
-                                .and_then(|depth| classify_oog_chain(&r.call_frames, depth))
-                        }) {
-                            Some(analysis) => (
-                                Some(analysis.proportional),
-                                analysis.bottleneck_depth,
-                                analysis.bottleneck_kind.map(|k| k.as_str().to_string()),
-                            ),
-                            None => (None, None, None),
+                // For drill-in buckets, build the full per-tx record.
+                let drill_in = if bucket.is_drill_in() {
+                    let cap_reached = self
+                        .max_divergences_per_block
+                        .map(|max| drill_ins_recorded >= max)
+                        .unwrap_or(false);
+                    drill_ins_recorded += 1;
+                    if cap_reached {
+                        if drill_ins_recorded - 1 ==
+                            self.max_divergences_per_block.unwrap_or_default()
+                        {
+                            warn!(
+                                target: "exex::research",
+                                block = block_number,
+                                max_divergences_per_block = self.max_divergences_per_block,
+                                "Reached drill-in persistence limit for block; additional drill-ins are counted in coverage only"
+                            );
+                        }
+                        None
+                    } else {
+                        self.divergences_found.fetch_add(1, Ordering::Relaxed);
+                        let metadata = self
+                            .schedule_metadata
+                            .get(schedule_name)
+                            .cloned()
+                            .expect("all schedules should have static metadata");
+                        let div_loc =
+                            exec_result.and_then(|r| r.divergence_location_structured.clone());
+                        let oog_info_s = exec_result.and_then(|r| r.oog_info_structured.clone());
+                        let frames_ref: &[CallFrame] =
+                            exec_result.map(|r| r.call_frames.as_slice()).unwrap_or(&[]);
+                        let opcode_frames_ref =
+                            exec_result.map(|r| r.frame_opcode_counts.as_slice()).unwrap_or(&[]);
+                        let sched_logs_ref: &[EventLog] =
+                            exec_result.map(|r| r.event_logs.as_slice()).unwrap_or(&[]);
+
+                        let divergence_row = DivergenceRow {
+                            schedule_name: schedule_name.to_string(),
+                            schedule_config_hash: metadata.config_hash.clone(),
+                            block_number,
+                            tx_index: tx_idx as u32,
+                            tx_hash,
+                            timestamp: block_timestamp,
+                            bucket,
+                            sender,
+                            recipient,
+                            is_create,
+                            tx_gas_limit: gas_limit,
+                            baseline_success: normal_success,
+                            schedule_success,
+                            status_changed,
+                            event_logs_changed: event_logs_diverged,
+                            output_changed,
+                            logs_bloom_changed,
+                            baseline_gas_used: normal_gas_used,
+                            schedule_gas_used: schedule_gas,
+                            gas_delta: total_delta,
+                            baseline_total_gas_spent: Some(baseline_total_gas_spent),
+                            baseline_gas_refunded: Some(baseline_gas_refunded),
+                            schedule_total_gas_spent: Some(schedule_total_gas_spent),
+                            schedule_gas_refunded: Some(schedule_gas_refunded),
+                            schedule_intrinsic_gas,
+                            schedule_floor_gas: Some(schedule_floor_gas),
+                            would_fit_in_original_limit: Some(schedule_success),
+                            min_multiplier_to_succeed,
+                            divergence_contract: div_loc.as_ref().map(|l| l.contract),
+                            divergence_pc: div_loc.as_ref().map(|l| l.pc as u32),
+                            divergence_call_depth: div_loc.as_ref().map(|l| l.call_depth as i32),
+                            divergence_opcode: div_loc.as_ref().map(|l| l.opcode),
+                            oog_contract: oog_info_s.as_ref().map(|o| o.contract),
+                            oog_pc: oog_info_s.as_ref().map(|o| o.pc as u32),
+                            oog_call_depth: oog_info_s.as_ref().map(|o| o.call_depth as i32),
+                            oog_opcode: oog_info_s.as_ref().map(|o| o.opcode),
+                            oog_pattern: oog_info_s.as_ref().map(|o| o.pattern.to_string()),
+                            oog_gas_remaining: oog_info_s.as_ref().map(|o| o.gas_remaining),
+                            oog_chain_proportional,
+                            oog_bottleneck_depth: oog_bottleneck_depth.map(|d| d as i32),
+                            oog_bottleneck_kind: oog_bottleneck_kind.clone(),
+                            schedule_state_gas_spent: Some(schedule_state_gas_spent),
+                            schedule_initial_state_gas: Some(schedule_initial_state_gas),
+                            schedule_initial_reservoir: Some(schedule_initial_reservoir),
+                            // 8037 reservoir-derived fields land in a follow-up.
+                            runtime_state_gas: None,
+                            runtime_state_gas_spillover: None,
+                            state_gas_category: tx_category.map(|s| s.to_string()),
+                            reservoir_exhausted: None,
                         };
 
-                    let div = ScheduleDivergence {
-                        schedule_name: schedule_name.to_string(),
-                        block_number,
-                        tx_index: tx_idx as u64,
-                        tx_hash,
-                        timestamp: block_timestamp,
-                        divergence_type,
-                        schedule_kind: metadata.kind.clone(),
-                        schedule_description: metadata.description.clone(),
-                        schedule_config_hash: metadata.config_hash.clone(),
-                        block_hash,
-                        parent_hash,
-                        baseline_success: normal_success,
-                        baseline_gas_used: normal_gas_used,
-                        baseline_intrinsic_gas,
-                        schedule_success,
-                        schedule_gas_used: schedule_gas,
-                        schedule_intrinsic_gas,
-                        gas_delta: total_delta,
-                        gas_efficiency_ratio,
-                        tx_category: tx_category.map(|s| s.to_string()),
-                        affected_opcodes: metadata.affected_opcodes.clone(),
-                        affected_precompiles: metadata.affected_precompiles.clone(),
-                        oog_info,
-                        divergence_location,
-                        operation_counts: formatted_op_counts,
-                        baseline_call_frames: baseline_call_frames_json,
-                        schedule_call_frames: schedule_call_frames_json,
-                        baseline_event_logs: baseline_event_logs_json,
-                        schedule_event_logs: schedule_event_logs_json,
-                        baseline_call_frames_hash: baseline_call_frames_hash_row,
-                        schedule_call_frames_hash: schedule_call_frames_hash_row,
-                        baseline_event_logs_hash: baseline_event_logs_hash_row,
-                        schedule_event_logs_hash: schedule_event_logs_hash_row,
-                        status_changed,
-                        gas_changed,
-                        call_tree_changed: call_tree_diverged,
-                        event_logs_changed: event_logs_diverged,
-                        output_changed,
-                        created_address_changed,
-                        logs_bloom_changed,
-                        sender: Self::hex_address(sender),
-                        recipient: recipient.map(Self::hex_address),
-                        value_wei: value.to_string(),
-                        input_len: input.len() as u64,
-                        input_zero_bytes,
-                        input_nonzero_bytes,
-                        tx_gas_limit: gas_limit,
-                        access_list_accounts,
-                        access_list_storage_slots,
-                        authorization_count,
-                        is_create,
-                        baseline_output_len,
-                        schedule_output_len,
-                        baseline_output_hash: baseline_output_hash.clone(),
-                        schedule_output_hash,
-                        baseline_created_address: baseline_created_address.clone(),
-                        schedule_created_address,
-                        baseline_log_count,
-                        schedule_log_count,
-                        baseline_logs_bloom: baseline_logs_bloom.clone(),
-                        schedule_logs_bloom,
-                        would_fit_in_original_limit: schedule_success,
-                        min_multiplier_to_succeed,
-                        // Only emit a halt-class signal when
-                        // `min_multiplier_to_succeed` is unresolvable. Once
-                        // the replay succeeded the multiplier value is
-                        // authoritative, so the redundant halt info would
-                        // just confuse consumers.
-                        replay_halt_oog: if min_multiplier_to_succeed.is_some() {
-                            None
-                        } else {
-                            replay_halt_oog
-                        },
-                        baseline_total_gas_spent,
-                        baseline_gas_refunded,
-                        schedule_total_gas_spent,
-                        schedule_state_gas_spent,
-                        schedule_initial_state_gas,
-                        schedule_initial_reservoir,
-                        schedule_floor_gas,
-                        schedule_gas_refunded,
-                        oog_chain_proportional,
-                        oog_bottleneck_depth,
-                        oog_bottleneck_kind,
-                    };
+                        let call_frames_rows: Vec<CallFrameRow> = frames_ref
+                            .iter()
+                            .map(|f| CallFrameRow {
+                                call_index: f.call_index as u32,
+                                // Parent reconstruction from the post-order
+                                // frame array isn't part of the inspector
+                                // output today — leave NULL and the
+                                // consumer joins on `depth` when needed.
+                                parent_call_index: None,
+                                depth: f.depth as u32,
+                                from_address: f.from,
+                                to_address: f.to.unwrap_or_default(),
+                                code_address: f.to,
+                                codehash: None,
+                                call_type: format_call_type(&f.call_type),
+                                selector: extract_selector_bytes(&f.input),
+                                value_wei: None,
+                                gas_provided: f.gas_provided,
+                                gas_used: f.gas_used,
+                                gas_margin: Some(
+                                    (f.gas_provided as i64).saturating_sub(f.gas_used as i64),
+                                ),
+                                success: f.success,
+                                parent_gas_at_call: f.parent_gas_at_call,
+                                gas_requested_on_stack: f.gas_requested_on_stack,
+                                eip150_cap_binding: eip150_cap_binding(
+                                    f.gas_requested_on_stack,
+                                    f.parent_gas_at_call,
+                                ),
+                                state_gas_running: None,
+                            })
+                            .collect();
 
-                    let should_record = self
-                        .max_divergences_per_block
-                        .map(|max| recorded_divergences < max)
-                        .unwrap_or(true);
-                    if should_record {
-                        self.record_divergence(div);
-                        self.divergences_found.fetch_add(1, Ordering::Relaxed);
-                        recorded_divergences += 1;
-                    } else if recorded_divergences ==
-                        self.max_divergences_per_block.unwrap_or_default()
-                    {
-                        warn!(
-                            target: "exex::research",
-                            block = block_number,
-                            max_divergences_per_block = self.max_divergences_per_block,
-                            "Reached divergence persistence limit for block; additional divergences will be counted in coverage only"
-                        );
-                        recorded_divergences += 1;
-                    } else {
-                        recorded_divergences += 1;
+                        let opcode_count_rows = OpcodeCountRow::from_frames(opcode_frames_ref);
+
+                        Some(DrillInRecord {
+                            divergence: divergence_row,
+                            call_frames: call_frames_rows,
+                            opcode_counts: opcode_count_rows,
+                            baseline_event_logs: baseline_event_logs.clone(),
+                            schedule_event_logs: sched_logs_ref.to_vec(),
+                        })
                     }
-                }
+                } else {
+                    None
+                };
 
-                let coverage = block_coverage
+                aggregators
                     .get_mut(schedule_name)
-                    .expect("every schedule should have a coverage accumulator");
-                coverage.tx_count += 1;
-                coverage.total_baseline_gas_used += normal_gas_used;
-                coverage.total_schedule_gas_used += schedule_gas;
-                coverage.total_gas_delta += total_delta;
-                if gas_changed ||
-                    would_oog ||
-                    status_changed ||
-                    call_tree_diverged ||
-                    event_logs_diverged ||
-                    output_changed ||
-                    created_address_changed ||
-                    logs_bloom_changed
-                {
-                    coverage.divergence_count += 1;
-                }
-                if status_changed || would_oog {
-                    coverage.status_divergence_count += 1;
-                }
-                if gas_changed {
-                    coverage.gas_divergence_count += 1;
-                }
-                if call_tree_diverged {
-                    coverage.call_tree_divergence_count += 1;
-                }
-                if event_logs_diverged {
-                    coverage.event_log_divergence_count += 1;
-                }
-                if output_changed {
-                    coverage.output_divergence_count += 1;
-                }
-                if created_address_changed {
-                    coverage.created_address_divergence_count += 1;
-                }
-                if logs_bloom_changed {
-                    coverage.logs_bloom_divergence_count += 1;
-                }
+                    .expect("aggregator exists for every schedule")
+                    .observe_tx(bucket, total_delta, drill_in);
             }
         }
 
+        // Flush each per-schedule aggregator at block end. Coverage,
+        // summaries, and drill-ins go to DuckDB in a single transaction
+        // per (schedule, block).
         for schedule in &self.all_schedules {
-            if let Some(coverage) = block_coverage.remove(schedule.name()) {
-                let metadata = self
-                    .schedule_metadata
-                    .get(schedule.name())
-                    .expect("all schedules should have static metadata");
-                self.record_block_coverage(ScheduleBlockCoverage {
-                    schedule_name: schedule.name().to_string(),
-                    schedule_kind: metadata.kind.clone(),
-                    schedule_config_hash: metadata.config_hash.clone(),
-                    block_number,
-                    block_hash,
-                    parent_hash,
-                    timestamp: block_timestamp,
-                    tx_count: coverage.tx_count,
-                    divergence_count: coverage.divergence_count,
-                    status_divergence_count: coverage.status_divergence_count,
-                    gas_divergence_count: coverage.gas_divergence_count,
-                    call_tree_divergence_count: coverage.call_tree_divergence_count,
-                    event_log_divergence_count: coverage.event_log_divergence_count,
-                    output_divergence_count: coverage.output_divergence_count,
-                    created_address_divergence_count: coverage.created_address_divergence_count,
-                    logs_bloom_divergence_count: coverage.logs_bloom_divergence_count,
-                    total_baseline_gas_used: coverage.total_baseline_gas_used,
-                    total_schedule_gas_used: coverage.total_schedule_gas_used,
-                    total_gas_delta: coverage.total_gas_delta,
-                });
+            if let Some(agg) = aggregators.remove(schedule.name()) {
+                let output = agg.finish_block();
+                self.send_block_output(output);
             }
         }
 
@@ -1951,50 +1862,46 @@ where
         Ok(true)
     }
 
-    /// Record a divergence to database.
-    fn record_divergence(&self, divergence: ScheduleDivergence) {
-        if let Some(ref tx) = self.db_tx {
-            let block_number = divergence.block_number;
-            let tx_index = divergence.tx_index;
-            let gas_delta = divergence.gas_delta;
-            match tx.send(DbCommand::Record(divergence)) {
-                Ok(()) => {
-                    debug!(
-                        target: "exex::research",
-                        block = block_number,
-                        tx_idx = tx_index,
-                        gas_delta,
-                        "Divergence queued for database"
-                    );
-                }
-                Err(e) => {
-                    let error = e.to_string();
-                    let DbCommand::Record(divergence) = e.0 else {
-                        return;
-                    };
-                    warn!(
-                        target: "exex::research",
-                        block = divergence.block_number,
-                        tx_idx = divergence.tx_index,
-                        schedule = divergence.schedule_name,
-                        %error,
-                        "Failed to send divergence to database writer"
-                    );
-                }
-            }
-        } else {
+    /// Send a fully-built per-(schedule, block) output to the DuckDB
+    /// writer thread for atomic persistence.
+    fn send_block_output(&self, output: BlockOutput) {
+        let Some(ref tx) = self.db_tx else {
+            // No DB configured (e.g. `:memory:` mode) — log a one-liner.
             info!(
                 target: "exex::research",
-                block = divergence.block_number,
-                tx_idx = divergence.tx_index,
-                schedule = divergence.schedule_name,
-                gas_delta = divergence.gas_delta,
-                "Divergence detected (no database configured)"
+                block = output.coverage.block_number,
+                schedule = output.coverage.schedule_name,
+                tx_count = output.coverage.tx_count,
+                drill_ins = output.drill_ins.len(),
+                "Block output produced (no database configured)"
+            );
+            return;
+        };
+        let block_number = output.coverage.block_number;
+        let schedule_name = output.coverage.schedule_name.clone();
+        let drill_ins = output.drill_ins.len();
+        if let Err(e) = tx.send(DbCommand::BlockProcessed(output)) {
+            warn!(
+                target: "exex::research",
+                block = block_number,
+                schedule = schedule_name,
+                error = %e,
+                "Failed to send block output to database writer"
+            );
+        } else {
+            debug!(
+                target: "exex::research",
+                block = block_number,
+                schedule = schedule_name,
+                drill_ins,
+                "Block output queued for database"
             );
         }
     }
 
-    fn delete_divergences_in_block_range(&self, from_block: u64, to_block: u64) {
+    /// Queue a delete of every per-block row in the inclusive range.
+    /// Used on chain reorg / revert.
+    fn send_delete_block_range(&self, from_block: u64, to_block: u64) {
         if let Some(ref tx) = self.db_tx {
             if let Err(e) = tx.send(DbCommand::DeleteRange { from_block, to_block }) {
                 warn!(
@@ -2002,26 +1909,14 @@ where
                     from_block,
                     to_block,
                     error = %e,
-                    "Failed to queue non-canonical divergence cleanup"
+                    "Failed to queue non-canonical cleanup"
                 );
             } else {
                 info!(
                     target: "exex::research",
                     from_block,
                     to_block,
-                    "Queued non-canonical divergence cleanup"
-                );
-            }
-        }
-    }
-
-    fn record_block_coverage(&self, coverage: ScheduleBlockCoverage) {
-        if let Some(ref tx) = self.db_tx {
-            if let Err(e) = tx.send(DbCommand::RecordCoverage(coverage)) {
-                warn!(
-                    target: "exex::research",
-                    error = %e,
-                    "Failed to queue schedule coverage for database writer"
+                    "Queued non-canonical cleanup"
                 );
             }
         }

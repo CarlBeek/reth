@@ -191,40 +191,23 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-pub mod analyzer;
-#[cfg(feature = "research-duckdb")]
 pub mod block_aggregator;
 pub mod cli;
-pub mod comparison;
-pub mod config;
-pub mod database;
-#[cfg(feature = "research-duckdb")]
 pub mod database_duckdb;
 pub mod divergence;
-pub mod executor;
-pub mod export;
-pub mod inspector;
-pub mod metrics;
 pub mod multi_schedule_inspector;
 pub mod oog_chain;
 pub mod schedule;
 pub mod tracking_inspector;
 
-pub use analyzer::{AnalyzerError, AnalyzerStats, ExecutionSummaryBuilder, MultiScheduleAnalyzer};
 pub use cli::{CliError, NamedCsvSchedule, NamedMultiplierSchedule, ResearchArgs};
-pub use comparison::{
-    ExecutionComparison, ExecutionSummary, IntrinsicComparison, MultiScheduleComparisonResult,
-    ScheduleComparisonResult,
+pub use divergence::{
+    Bucket, BucketInput, CallTrees, Divergence, DivergenceType, EventLog, EventLogs,
+    OperationCounts,
 };
-pub use config::{ResearchConfig, TraceDetail};
-pub use database::{DivergenceDatabase, ScheduleBlockCoverage, ScheduleDivergence};
-pub use divergence::{CallTrees, Divergence, DivergenceType, EventLog, EventLogs, OperationCounts};
-pub use export::{export_sqlite_to_parquet, ExportError, ExportStats};
-pub use inspector::GasResearchInspector;
 pub use multi_schedule_inspector::{ScheduleInspector, ScheduleResult};
 pub use tracking_inspector::{EventLogEntry, TrackingInspector};
 
 /// Re-export error types
-pub use database::DatabaseError;
-pub use executor::ResearchError;
+pub use database_duckdb::DuckDbDatabaseError;
 pub use schedule::ScheduleError;
