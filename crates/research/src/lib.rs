@@ -192,6 +192,8 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 pub mod analyzer;
+#[cfg(feature = "research-duckdb")]
+pub mod block_aggregator;
 pub mod cli;
 pub mod comparison;
 pub mod config;

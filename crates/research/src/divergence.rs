@@ -496,7 +496,7 @@ impl PerFrameCapture {
 /// or `ContractBroken`; non-status-changed divergences are classified by the
 /// next available signal (event logs, gas, other-trace), and otherwise come
 /// out as `Unchanged`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Bucket {
     /// Outcome + traces match. Counted in `block_coverage.tx_count` only.
