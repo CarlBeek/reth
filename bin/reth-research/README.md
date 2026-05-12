@@ -1,12 +1,15 @@
 # `reth-research` ExEx
 
-This binary runs an execution extension that replays committed canonical blocks under one or more
-alternate gas schedules and writes schedule divergences to SQLite.
+This binary runs an execution extension that replays committed canonical
+blocks under one or more alternate gas schedules and writes per-schedule
+results to a DuckDB lake. See
+[`crates/research/docs/storage-redesign.md`](../../crates/research/docs/storage-redesign.md)
+for the schema.
 
 ## Status
 
-Experimental. The ExEx is usable for historical replay research, but it is not production-ready
-evidence for Ethereum EIP ship decisions.
+Experimental. The ExEx is usable for historical replay research, but it is
+not production-ready evidence for Ethereum EIP ship decisions.
 
 ## How It Works
 
@@ -14,154 +17,135 @@ For each committed block at or above `--research.start-block`:
 
 1. Build the block EVM environment.
 2. Load historical state at `block - 1`.
-3. Execute each transaction once under baseline pricing with `TrackingInspector`.
-4. Re-execute the same transaction once per configured execution schedule with
-   `ScheduleInspector`.
-5. Record any divergence in gas, status, call tree, or emitted logs.
+3. Execute each transaction once under baseline pricing with
+   `TrackingInspector`.
+4. Re-execute the same transaction once per configured execution schedule
+   with `ScheduleInspector`.
+5. Classify each (tx, schedule) pair into one of seven buckets
+   (`unchanged` / `trace_only` / `gas_only` / `event_logs_changed` /
+   `wallet_fixable_shallow` / `wallet_fixable_deep_chain` /
+   `contract_broken`).
+6. Aggregate-only buckets roll into per-block summaries; drill-in buckets
+   (`event_logs_changed`, `contract_broken`) get the full per-tx record
+   (call frames, per-frame opcode counts, event logs).
 
-Each execution-modifying schedule gets its own state view for the block, so schedule-induced
-failures can affect later transactions under that same schedule.
+Each execution-modifying schedule gets its own state view for the block,
+so schedule-induced failures can affect later transactions under that
+same schedule.
 
 ## Supported Flags
 
 - `--research.eip2780`
+- `--research.eip8037`
 - `--research.csv NAME=PATH`
 - `--research.multiplier NAME=MULT`
-- `--research.db-path PATH`
+- `--research.db-path PATH` (DuckDB file)
 - `--research.start-block BLOCK`
+- `--research.backfill`
+- `--research.backfill-min-block BLOCK`
+- `--research.backfill-concurrency N`
+- `--research.gas-limit-multiplier MULT`
+- `--research.max-divergences-per-block N`
 
 At least one schedule flag is required.
 
 ## Example
 
 ```bash
-cargo run --release -p reth-research -- node \
+cargo run --release -p reth-research-bin -- node \
   --research.eip2780 \
   --research.csv 7904-prelim=./schedules/7904_prelim.csv \
   --research.multiplier 4x=4 \
-  --research.db-path ./divergences.db \
+  --research.db-path ./divergences.duckdb \
   --research.start-block 18000000
 ```
 
-## Export To Parquet
-
-For analytics, export the SQLite database to Parquet and query it with DuckDB:
-
-```bash
-cargo run --release -p reth-research-bin --bin reth-research-export-parquet -- \
-  --db-path ./divergences.db \
-  --out-dir ./research_lake \
-  --block-bucket-size 100000
-```
-
-This produces:
-
-- `block_coverage/`
-- `divergences_hot/`
-- `divergence_artifacts/`
-- `_manifest.json`
-- `_checkpoint.json`
-
-Each dataset is partitioned by encoded `schedule_name` and `block_bucket`, so common
-schedule-scoped and block-range analysis can avoid full table scans. Partition values escape
-special characters, for example `foo/bar` becomes `schedule_name=foo~2Fbar`.
-
-By default the exporter is incremental and snapshot-correct: each run rewrites the current
-schedule partitions from SQLite, so updated or deleted rows are reflected without leaving stale
-Parquet files behind. Use `--full-refresh` to rebuild the entire output tree from scratch.
-
 ## Analyze With DuckDB
 
-The intended analysis path is DuckDB over the exported Parquet datasets, not ad hoc scans over the
-SQLite write store.
-
-Open DuckDB:
+Attach the producer DB directly from the DuckDB shell:
 
 ```bash
-duckdb
+duckdb -readonly ./divergences.duckdb
 ```
 
-Inspect block-level incidence and gas impact:
+Block-level incidence and gas impact:
 
 ```sql
-SELECT
-    schedule_name,
-    sum(tx_count) AS txs,
-    sum(divergence_count) AS divergent_txs,
-    sum(total_gas_delta) AS total_gas_delta
-FROM read_parquet('research_lake/block_coverage/schedule_name=*/block_bucket=*/*.parquet')
+SELECT schedule_name,
+       sum(tx_count) AS txs,
+       sum(tx_count_contract_broken) AS broken,
+       sum(tx_count_wallet_fixable_shallow + tx_count_wallet_fixable_deep_chain) AS wallet_fixable
+FROM block_coverage
 GROUP BY 1
 ORDER BY 1;
 ```
 
-Find the highest-impact divergences for one schedule:
+Highest-impact divergences for one schedule:
 
 ```sql
-SELECT
-    block_number,
-    tx_index,
-    divergence_type,
-    gas_delta,
-    tx_hash
-FROM read_parquet('research_lake/divergences_hot/schedule_name=4x/block_bucket=*/*.parquet')
+SELECT block_number, tx_index, bucket, gas_delta, tx_hash
+FROM divergences
+WHERE schedule_name = '4x'
 ORDER BY abs(gas_delta) DESC
 LIMIT 100;
 ```
 
-Measure divergence mix by type:
+Bucket mix by schedule:
 
 ```sql
-SELECT
-    schedule_name,
-    divergence_type,
-    count(*) AS rows
-FROM read_parquet('research_lake/divergences_hot/schedule_name=*/block_bucket=*/*.parquet')
+SELECT schedule_name, bucket, count(*) AS rows
+FROM divergences
 GROUP BY 1, 2
 ORDER BY 1, 3 DESC;
 ```
 
-Drill into full artifacts only when needed:
+Drill into call-frame data for forensics:
 
 ```sql
-SELECT
-    h.schedule_name,
-    h.block_number,
-    h.tx_index,
-    a.operation_counts,
-    a.oog_info,
-    a.divergence_location
-FROM read_parquet('research_lake/divergences_hot/schedule_name=*/block_bucket=*/*.parquet') h
-JOIN read_parquet('research_lake/divergence_artifacts/schedule_name=*/block_bucket=*/*.parquet') a
-  USING (divergence_id)
-WHERE h.status_changed
-ORDER BY h.block_number, h.tx_index
-LIMIT 50;
+SELECT d.schedule_name, d.block_number, d.tx_index,
+       f.depth, f.call_type, f.to_address, f.gas_provided, f.gas_used
+FROM divergences d
+JOIN divergence_call_frames f USING (divergence_id)
+WHERE d.bucket = 'contract_broken'
+ORDER BY d.block_number, d.tx_index, f.call_index
+LIMIT 100;
 ```
-
-Recommended workflow:
-
-- use `block_coverage` for schedule-level rates and block-range summaries
-- use `divergences_hot` for tx-level filtering and ranking
-- join `divergence_artifacts` only for forensic inspection
-- keep exports incremental during replay, then run `--full-refresh` when you need a clean rebuild
 
 ## What Gets Stored
 
-The SQLite `schedule_divergences` table stores, per schedule and transaction:
+Per (schedule, block):
 
-- baseline and schedule success
-- baseline and schedule gas used
-- intrinsic gas data
-- gas delta and gas efficiency ratio
-- tx category for intrinsic schedules
-- affected opcode / precompile metadata
-- OOG and first-divergence metadata
-- serialized call frames when the call tree diverges
-- serialized event logs when emitted logs diverge
+- `block_coverage`: tx counts split by bucket
+- `block_summaries`: per-bucket aggregates (gas-delta histograms,
+  sums/min/max, eventually 8037 state-gas metrics)
+
+Per drill-in transaction (event-logs-changed or contract-broken only):
+
+- `divergences`: outcome flags, gas figures, OOG / divergence location,
+  chain-walk classification (`oog_chain_proportional`,
+  `oog_bottleneck_depth`, `oog_bottleneck_kind`)
+- `divergence_call_frames`: one row per call frame with depth, addresses,
+  gas, parent-gas / stack-gas / EIP-150 binding
+- `divergence_opcode_counts`: sparse per-(frame, opcode) counts plus
+  baseline and schedule gas charged for each opcode
+- `divergence_event_logs`: baseline and schedule logs
+
+Static helpers:
+
+- `analysis_runs`: producer manifest (schema version, schedule config
+  hash, reth commit, run start/end)
+- `contract_metadata`: bytecode-derived metadata (solc version, CBOR
+  marker), populated by the `contract-metadata-backfill` subcommand
+  (separate PR)
 
 ## Important Limits
 
-- This is canonical historical replay, not a simulation of how users or builders would adapt.
-- State-root comparison is not yet persisted in the live ExEx path.
-- A schedule that lowers intrinsic gas can still be conservatively modeled in the execution replay
-  because the baseline EVM transaction pipeline is being reused.
+- This is canonical historical replay, not a simulation of how users or
+  builders would adapt.
+- State-root comparison is not yet persisted.
+- A schedule that lowers intrinsic gas is conservatively modelled in the
+  execution replay because the baseline EVM transaction pipeline is being
+  reused.
+- DuckDB foreign-key enforcement isn't a great fit for the producer's
+  per-block transactional delete pattern; referential integrity across
+  the drill-in tables is maintained at the application layer.

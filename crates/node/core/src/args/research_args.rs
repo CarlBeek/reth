@@ -188,12 +188,14 @@ impl ResearchArgs {
         args.build_registry()
     }
 
-    /// Opens the divergence database.
+    /// Opens the divergence database (DuckDB).
     pub fn open_database(
         &self,
-    ) -> Result<reth_research::database::DivergenceDatabase, reth_research::database::DatabaseError>
-    {
-        reth_research::database::DivergenceDatabase::open(&self.db_path)
+    ) -> Result<
+        reth_research::database_duckdb::DuckDbDivergenceDatabase,
+        reth_research::DuckDbDatabaseError,
+    > {
+        reth_research::database_duckdb::DuckDbDivergenceDatabase::open(&self.db_path)
     }
 
     /// Convert to the research crate's [`reth_research::ResearchArgs`] type.

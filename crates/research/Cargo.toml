@@ -13,8 +13,6 @@ workspace = true
 [dependencies]
 # Reth dependencies
 reth-evm.workspace = true
-reth-primitives-traits.workspace = true
-reth-execution-types.workspace = true
 
 # Revm dependencies
 revm.workspace = true
@@ -22,27 +20,18 @@ revm-interpreter.workspace = true
 
 # Alloy dependencies
 alloy-primitives.workspace = true
-alloy-consensus.workspace = true
 
-# Database
-rusqlite = { version = "0.32", features = ["bundled"] }
-# DuckDB — gated behind `research-duckdb` feature. `bundled` ships a
-# vendored DuckDB so there's no system dep. Used by the new storage path
-# being built per `docs/storage-redesign.md`; the SQLite path stays the
-# default until the consumer is fully migrated.
-duckdb = { version = "1.4", features = ["bundled"], optional = true }
-
-# Columnar export
-arrow-array = "54.2"
-arrow-schema = "54.2"
-parquet = { version = "54.2", default-features = false, features = ["arrow", "zstd"] }
+# Database — DuckDB with vendored build (`bundled` feature) so no
+# system dep is needed. The legacy SQLite (rusqlite) and Parquet
+# (arrow / parquet) deps were dropped when the storage redesign
+# landed; see `docs/storage-redesign.md`.
+duckdb = { version = "1.4", features = ["bundled"] }
 
 # CSV parsing
 csv = "1.3"
 
 # Serialization
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
 
 # Logging and metrics
 tracing.workspace = true
@@ -51,18 +40,9 @@ metrics.workspace = true
 # Error handling
 thiserror.workspace = true
 
-# System info
-num_cpus = "1.16"
-
 [dev-dependencies]
 tempfile = "3.0"
-reth-db = { workspace = true, features = ["test-utils"] }
-revm-database.workspace = true
 
 [features]
 default = []
 test-utils = []
-# Enables the new DuckDB-backed storage layer (see
-# `docs/storage-redesign.md`). When off, only the legacy SQLite path
-# compiles.
-research-duckdb = ["dep:duckdb"]
