@@ -11,7 +11,7 @@
 //! storage rules and the schema.
 
 use crate::{
-    database_duckdb::{BlockCoverageRow, BlockOutput, BlockSummaryRow, DrillInRecord},
+    database::{BlockCoverageRow, BlockOutput, BlockSummaryRow, DrillInRecord},
     divergence::Bucket,
 };
 use alloy_primitives::B256;
@@ -521,7 +521,7 @@ mod tests {
     }
 
     fn dummy_drill_in() -> DrillInRecord {
-        use crate::database_duckdb::DivergenceRow;
+        use crate::database::DivergenceRow;
         use alloy_primitives::Address;
         DrillInRecord {
             divergence: DivergenceRow {

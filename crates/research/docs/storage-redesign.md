@@ -3,23 +3,29 @@
 Companion to `docs/storage-redesign.md` in the `repricing-forensics`
 repo. This doc covers what changes in the producer (this crate).
 
+> **Engine update (post-deploy)**: we tried DuckDB as the single
+> writer+reader file. It hit DuckDB's hard cross-process lock — when
+> reth holds the writer no other process can attach, even read-only.
+> Pivoted to **SQLite (writer) + DuckDB sqlite_scanner (consumer
+> reader)**: SQLite WAL handles 1 writer + N readers natively, and
+> DuckDB's vectorized engine runs the consumer's analytical queries
+> through the SQLite storage. Same logical schema, different writer
+> engine. `SCHEMA_VERSION` bumped to 2 for the SQLite incarnation.
+
 ## Why
 
 Three things land together:
 
-1. **Engine swap: SQLite → DuckDB.** The consumer (`repricing-forensics`)
-   needs columnar analytics over the same data the producer writes.
-   Today we maintain SQLite on this side, parquet exports in the
-   middle, and a derived DuckDB on the consumer side — three copies
-   of the same data on disk. Switching this crate to DuckDB makes
-   reth's DB the single source of truth that the consumer can read
-   directly.
+1. **One on-disk file, no lock conflict.** Producer writes
+   `divergences.sqlite` in WAL mode; consumer attaches the same file
+   read-only via DuckDB's `sqlite_scanner`. SQLite WAL is the gold
+   standard for OLTP-write + OLAP-read concurrency at our scale.
 
-2. **Bucket assignment moves into the producer.** The current consumer
-   derives "wallet-fixable vs contract-broken" from
-   `oog_chain_proportional` plus a SQL heuristic. With the new schema
-   the producer tags each tx at write time and the consumer trusts
-   the tag.
+2. **Bucket assignment moves into the producer.** The legacy consumer
+   derived "wallet-fixable vs contract-broken" from
+   `oog_chain_proportional` plus a SQL heuristic. The new schema has
+   the producer tag each tx at write time; the consumer trusts the
+   tag.
 
 3. **Granularity rebalance.** Per-tx data for wallet-fixable / gas-only
    / trace-only txs (most of the volume) collapses into per-block
@@ -30,13 +36,13 @@ Three things land together:
 
 | Module | Change |
 |---|---|
-| `database.rs` | rewritten against DuckDB (or new `database_duckdb.rs` alongside; SQLite version retired in step 6 below) |
-| `multi_schedule_inspector.rs` | inspector now emits per-(frame, opcode) counts in addition to per-tx totals |
-| `oog_chain.rs` | unchanged behavior; consumed by the new bucket classifier |
-| `export.rs` | retired — parquet export is no longer the consumer's input format. Keep a thin `snapshot_to_parquet` helper for offline distribution |
-| `cli.rs` | new subcommand `contract-metadata-backfill` |
-| `divergence.rs` | new `Bucket` enum and per-tx classifier function |
-| `analyzer.rs` / `comparison.rs` | wire bucket assignment into the write path; for aggregate-only buckets, write only to the in-memory block aggregator, not to `divergences` |
+| `database.rs` | now rusqlite-backed. WAL pragmas at open time, JSON for array/struct columns (histograms, per-opcode totals), INTEGER PRIMARY KEY AUTOINCREMENT for surrogate IDs. Public type renamed `DivergenceDatabase` (was `DuckDbDivergenceDatabase`); error renamed `DatabaseError`. |
+| `multi_schedule_inspector.rs` | inspector emits per-(frame, opcode) counts in addition to per-tx totals |
+| `oog_chain.rs` | unchanged behavior; consumed by the bucket classifier |
+| `export.rs` | retired — parquet export is no longer the consumer's input format |
+| `cli.rs` | adds `contract-metadata-backfill` subcommand |
+| `divergence.rs` | `Bucket` enum + per-tx classifier function |
+| `analyzer.rs` / `comparison.rs` | wires bucket assignment into the write path; aggregate-only buckets only update the in-memory block aggregator, not `divergences` |
 
 ## Bucket classifier
 
@@ -74,211 +80,72 @@ bucket, since the bucket isn't known until both traces complete. When
 the tx classifies as aggregate-only, the per-frame data is summed into
 the block aggregator's running opcode totals and discarded.
 
-## DuckDB schema
+## Schema
 
-DDL sketch. Use this as the column-level spec; types are DuckDB native.
+Canonical DDL lives in `crates/research/src/database.rs` (function
+`initialize_schema`). Tables:
 
-```sql
--- One row per (schedule, block). Always emitted, even for blocks with
--- zero divergences, so coverage joins work.
-CREATE TABLE block_coverage (
-    schedule_name        VARCHAR NOT NULL,
-    schedule_config_hash VARCHAR NOT NULL,
-    block_number         UBIGINT NOT NULL,
-    block_hash           BLOB    NOT NULL,
-    parent_hash          BLOB    NOT NULL,
-    timestamp            UBIGINT NOT NULL,
-    tx_count             UINTEGER NOT NULL,
-    -- counts per bucket for fast headline queries
-    tx_count_unchanged                   UINTEGER NOT NULL,
-    tx_count_trace_only                  UINTEGER NOT NULL,
-    tx_count_gas_only                    UINTEGER NOT NULL,
-    tx_count_event_logs_changed          UINTEGER NOT NULL,
-    tx_count_wallet_fixable_shallow      UINTEGER NOT NULL,
-    tx_count_wallet_fixable_deep_chain   UINTEGER NOT NULL,
-    tx_count_contract_broken             UINTEGER NOT NULL,
-    PRIMARY KEY (schedule_name, block_number, block_hash)
-);
+- `block_coverage(schedule_name, schedule_config_hash, block_number,
+  block_hash, parent_hash, timestamp, tx_count, tx_count_unchanged,
+  tx_count_trace_only, tx_count_gas_only, tx_count_event_logs_changed,
+  tx_count_wallet_fixable_shallow, tx_count_wallet_fixable_deep_chain,
+  tx_count_contract_broken)`
+- `block_summaries(schedule_name, block_number, bucket, tx_count,
+  gas_delta_sum, gas_delta_sum_sq REAL, gas_delta_min, gas_delta_max,
+  gas_delta_log2_hist TEXT/JSON, opcode_count_totals_7904 TEXT/JSON,
+  opcode_gas_delta_totals_7904 TEXT/JSON, state_gas_sum,
+  state_gas_spillover_sum, multiplier_log2_hist TEXT/JSON,
+  tx_count_creation, tx_count_authorization, tx_count_runtime_state,
+  tx_count_no_state)`
+- `divergences(divergence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  schedule_name, schedule_config_hash, block_number, tx_index,
+  tx_hash BLOB, timestamp, bucket, sender, recipient, is_create,
+  tx_gas_limit, baseline_success, schedule_success, status_changed,
+  event_logs_changed, output_changed, logs_bloom_changed,
+  baseline_gas_used, schedule_gas_used, gas_delta,
+  baseline_total_gas_spent, baseline_gas_refunded,
+  schedule_total_gas_spent, schedule_gas_refunded,
+  schedule_intrinsic_gas, schedule_floor_gas,
+  would_fit_in_original_limit, min_multiplier_to_succeed REAL,
+  divergence_contract, divergence_pc, divergence_call_depth,
+  divergence_opcode, oog_contract, oog_pc, oog_call_depth, oog_opcode,
+  oog_pattern, oog_gas_remaining, oog_chain_proportional,
+  oog_bottleneck_depth, oog_bottleneck_kind,
+  schedule_state_gas_spent, schedule_initial_state_gas,
+  schedule_initial_reservoir, runtime_state_gas,
+  runtime_state_gas_spillover, state_gas_category,
+  reservoir_exhausted, UNIQUE(schedule_name, block_number, tx_index,
+  schedule_config_hash))`
+- `divergence_call_frames(divergence_id, call_index,
+  parent_call_index, depth, from_address, to_address, code_address,
+  codehash BLOB, call_type, selector BLOB, value_wei, gas_provided,
+  gas_used, gas_margin, success, parent_gas_at_call,
+  gas_requested_on_stack, eip150_cap_binding, state_gas_running,
+  PRIMARY KEY (divergence_id, call_index))`
+- `divergence_opcode_counts(divergence_id, call_index, opcode, count,
+  gas_baseline, gas_schedule, PRIMARY KEY (divergence_id, call_index,
+  opcode))` — sparse; zero rows omitted at insert time
+- `divergence_event_logs(divergence_id, trace_kind, log_index,
+  address, topic0..topic3 BLOB, data_bytes BLOB, data_hash BLOB,
+  PRIMARY KEY (divergence_id, trace_kind, log_index))`
+- `contract_metadata(codehash BLOB PRIMARY KEY,
+  representative_address, solc_version, solc_commit, evm_target,
+  cbor_present, has_metadata_hash, bytecode_len, extracted_at)`
+- `analysis_runs(run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  schema_version, schedule_name, schedule_config_hash, reth_commit,
+  run_started_at, run_finished_at, blocks_processed, notes)`
 
--- One row per (schedule, block, bucket). Only emitted for buckets that
--- had at least one tx in the block.
-CREATE TABLE block_summaries (
-    schedule_name VARCHAR NOT NULL,
-    block_number  UBIGINT NOT NULL,
-    bucket        VARCHAR NOT NULL,         -- one of the Bucket values
-    tx_count      UINTEGER NOT NULL,
-    -- gas-delta moments + histogram
-    gas_delta_sum         BIGINT,
-    gas_delta_sum_sq      HUGEINT,           -- BIGINT can overflow for big aggregates
-    gas_delta_min         BIGINT,
-    gas_delta_max         BIGINT,
-    gas_delta_log2_hist   INTEGER[12],       -- bins for 0,1,2..2^11+ gas
-    -- 7904: opcode totals across this bucket in this block (sparse list)
-    opcode_count_totals_7904 STRUCT(opcode UTINYINT, count UBIGINT)[],
-    opcode_gas_delta_totals_7904 STRUCT(opcode UTINYINT, delta BIGINT)[],
-    -- 8037: state-gas totals + per-category tx counts
-    state_gas_sum           UBIGINT,
-    state_gas_spillover_sum UBIGINT,
-    multiplier_log2_hist    INTEGER[12],     -- bins for 1.0x, 1.25x, 1.5x, 2x, ... > 8x
-    tx_count_creation              UINTEGER,
-    tx_count_authorization         UINTEGER,
-    tx_count_runtime_state         UINTEGER,
-    tx_count_no_state              UINTEGER,
-    PRIMARY KEY (schedule_name, block_number, bucket)
-);
-
--- One row per drill-in divergence. event_logs_changed + contract_broken
--- only. Identity is the surrogate divergence_id (sequence); the natural
--- key is (schedule_name, block_number, tx_index).
-CREATE SEQUENCE seq_divergence_id START 1;
-CREATE TABLE divergences (
-    divergence_id        UBIGINT PRIMARY KEY DEFAULT nextval('seq_divergence_id'),
-    schedule_name        VARCHAR NOT NULL,
-    schedule_config_hash VARCHAR NOT NULL,
-    block_number         UBIGINT NOT NULL,
-    tx_index             UINTEGER NOT NULL,
-    tx_hash              BLOB NOT NULL,
-    timestamp            UBIGINT NOT NULL,
-    bucket               VARCHAR NOT NULL,
-
-    -- Parties
-    sender    VARCHAR NOT NULL,
-    recipient VARCHAR,
-    is_create BOOLEAN NOT NULL,
-    tx_gas_limit UBIGINT NOT NULL,
-
-    -- Outcomes
-    baseline_success BOOLEAN NOT NULL,
-    schedule_success BOOLEAN NOT NULL,
-    status_changed       BOOLEAN NOT NULL,
-    event_logs_changed   BOOLEAN NOT NULL,
-    output_changed       BOOLEAN NOT NULL,
-    logs_bloom_changed   BOOLEAN NOT NULL,
-
-    -- Gas
-    baseline_gas_used     UBIGINT NOT NULL,
-    schedule_gas_used     UBIGINT NOT NULL,
-    gas_delta             BIGINT NOT NULL,
-    baseline_total_gas_spent UBIGINT,
-    baseline_gas_refunded    UBIGINT,
-    schedule_total_gas_spent UBIGINT,
-    schedule_gas_refunded    UBIGINT,
-    schedule_intrinsic_gas   UBIGINT,
-    schedule_floor_gas       UBIGINT,
-    would_fit_in_original_limit BOOLEAN,
-    min_multiplier_to_succeed   DOUBLE,
-
-    -- 7904 OOG
-    divergence_contract  VARCHAR,
-    divergence_pc        UINTEGER,
-    divergence_call_depth INTEGER,
-    divergence_opcode    UTINYINT,
-    oog_contract         VARCHAR,
-    oog_pc               UINTEGER,
-    oog_call_depth       INTEGER,
-    oog_opcode           UTINYINT,
-    oog_pattern          VARCHAR,
-    oog_gas_remaining    UBIGINT,
-    oog_chain_proportional BOOLEAN,
-    oog_bottleneck_depth   INTEGER,
-    oog_bottleneck_kind    VARCHAR,
-
-    -- 8037 state gas
-    schedule_state_gas_spent     UBIGINT,
-    schedule_initial_state_gas   UBIGINT,
-    schedule_initial_reservoir   UBIGINT,
-    runtime_state_gas            UBIGINT,
-    runtime_state_gas_spillover  UBIGINT,
-    state_gas_category           VARCHAR,
-    reservoir_exhausted          BOOLEAN,
-
-    UNIQUE (schedule_name, block_number, tx_index, schedule_config_hash)
-);
-
--- One row per call frame in the schedule trace of a drill-in
--- divergence. Baseline frames are NOT stored separately — derived
--- counts (gas_baseline) live in divergence_opcode_counts.
-CREATE TABLE divergence_call_frames (
-    divergence_id        UBIGINT NOT NULL REFERENCES divergences(divergence_id),
-    call_index           UINTEGER NOT NULL,   -- 0 = root
-    parent_call_index    UINTEGER,            -- NULL for root
-    depth                UINTEGER NOT NULL,
-    from_address         VARCHAR NOT NULL,
-    to_address           VARCHAR NOT NULL,
-    code_address         VARCHAR,              -- != to for DELEGATECALL
-    codehash             BLOB,                 -- for joining to contract_metadata
-    call_type            VARCHAR NOT NULL,     -- CALL/DELEGATECALL/STATICCALL/CALLCODE/CREATE/CREATE2
-    selector             BLOB,                 -- first 4 bytes of input, NULL for create
-    value_wei            VARCHAR,              -- u256 as text
-    gas_provided         UBIGINT NOT NULL,
-    gas_used             UBIGINT NOT NULL,
-    gas_margin           BIGINT,               -- gas_provided - gas_used under baseline
-    success              BOOLEAN NOT NULL,
-    -- EIP-150 chain-walk inputs
-    parent_gas_at_call       UBIGINT,
-    gas_requested_on_stack   UBIGINT,
-    eip150_cap_binding       BOOLEAN,
-    -- 8037: running state gas at frame exit (cumulative across the tx)
-    state_gas_running    UBIGINT,
-    PRIMARY KEY (divergence_id, call_index)
-);
-
--- Sparse opcode counts keyed by frame. Zero rows omitted. Keys are
--- per-frame so we can answer "which contract burned the KECCAKs".
-CREATE TABLE divergence_opcode_counts (
-    divergence_id   UBIGINT NOT NULL,
-    call_index      UINTEGER NOT NULL,
-    opcode          UTINYINT NOT NULL,
-    count           UBIGINT NOT NULL,
-    gas_baseline    UBIGINT NOT NULL,        -- gas this opcode would have cost under baseline
-    gas_schedule    UBIGINT NOT NULL,        -- gas it actually cost under the schedule
-    PRIMARY KEY (divergence_id, call_index, opcode),
-    FOREIGN KEY (divergence_id, call_index)
-        REFERENCES divergence_call_frames(divergence_id, call_index)
-);
-
-CREATE TABLE divergence_event_logs (
-    divergence_id  UBIGINT NOT NULL REFERENCES divergences(divergence_id),
-    trace_kind     VARCHAR NOT NULL,         -- 'baseline' | 'schedule'
-    log_index      UINTEGER NOT NULL,
-    address        VARCHAR NOT NULL,
-    topic0         BLOB,
-    topic1         BLOB,
-    topic2         BLOB,
-    topic3         BLOB,
-    data_bytes     BLOB,
-    data_hash      BLOB,                     -- keccak(data) for fast diff
-    PRIMARY KEY (divergence_id, trace_kind, log_index)
-);
-
--- Static contract metadata, keyed by codehash so identical
--- implementations dedupe across addresses.
-CREATE TABLE contract_metadata (
-    codehash         BLOB PRIMARY KEY,
-    representative_address VARCHAR,           -- one address with this codehash
-    solc_version     VARCHAR,                 -- e.g. "0.8.21"
-    solc_commit      VARCHAR,                 -- from CBOR if present
-    evm_target       VARCHAR,                 -- "london", "shanghai", etc., when extractable
-    cbor_present     BOOLEAN NOT NULL,
-    has_metadata_hash BOOLEAN NOT NULL,       -- ipfs/bzzr hash in CBOR
-    bytecode_len     UINTEGER NOT NULL,
-    extracted_at     UBIGINT NOT NULL
-);
-
--- One row per analysis run. Lets a consumer detect "is this lake
--- written by the current code or do I need to migrate?".
-CREATE TABLE analysis_runs (
-    run_id               UBIGINT PRIMARY KEY,
-    schema_version       UINTEGER NOT NULL,   -- bumped on any schema change
-    schedule_name        VARCHAR NOT NULL,
-    schedule_config_hash VARCHAR NOT NULL,
-    reth_commit          VARCHAR,
-    run_started_at       UBIGINT NOT NULL,
-    run_finished_at      UBIGINT,
-    blocks_processed     UBIGINT,
-    notes                VARCHAR
-);
-```
+Column-type notes:
+- SQLite is dynamically typed. Affinity hints in the DDL document
+  intent. All numeric values bind as INTEGER/REAL.
+- BOOLEAN columns store INTEGER 0/1; rusqlite's `ToSql for bool`
+  handles the conversion.
+- Array/struct columns (histograms, per-opcode totals) serialize as
+  JSON TEXT. The consumer reads them via DuckDB's `json_each` /
+  `json_extract` over `sqlite_scanner`.
+- `gas_delta_sum_sq` is REAL (loses precision past 2^53). The dashboard
+  derives variance/stddev from it; precision loss is acceptable for
+  display.
 
 Indexes:
 
@@ -293,9 +160,15 @@ CREATE INDEX idx_doc_opcode         ON divergence_opcode_counts(opcode);
 CREATE INDEX idx_bs_schedule_block  ON block_summaries(schedule_name, block_number);
 ```
 
-DuckDB doesn't strictly need indexes for analytical scans, but the
-per-recipient and per-codehash lookups (contract page, clustering
-queries) benefit.
+PRAGMAs set at `Connection::open` time (see
+`DivergenceDatabase::initialize`):
+
+```
+journal_mode = WAL          -- 1 writer + N readers across processes
+synchronous  = NORMAL       -- durable on commit, no per-page fsync
+foreign_keys = OFF          -- producer manages referential integrity at app layer
+temp_store   = MEMORY
+```
 
 ## Schema versioning
 
@@ -376,28 +249,15 @@ Common keys: `solc` (3 bytes: major, minor, patch), `ipfs` or
 `bzzr1` (metadata hash). EVM target is sometimes encoded; when
 absent, fall back to "unknown".
 
-## Migration order
+## Migration order (historical)
 
-Same sequence as in the consumer doc:
-
-1. Implement new DuckDB module in this crate (behind feature flag).
-2. Wire the `Bucket` classifier into the inspector pipeline.
-3. Add per-frame opcode capture.
-4. Add `contract-metadata-backfill` subcommand.
-5. Smoke-test a single schedule end-to-end on a small block range
-   (e.g. the 100-block reservoir we use in tests).
-6. Once the consumer has ported its endpoints, retire the SQLite
-   module and the parquet exporter.
+The producer side has been migrated (DuckDB attempt → SQLite). The
+remaining work is on the consumer side: deploy reth-research with the
+new `database.rs`, then verify the consumer dashboard reads correctly
+against the live SQLite file via `sqlite_scanner`.
 
 ## Risks & open issues
 
-- **DuckDB Rust client maturity.** The `duckdb` crate (v1.x) is
-  reasonable but has fewer eyes than `rusqlite`. Validate
-  concurrent read-while-write before committing.
-- **MVCC during long replays.** A multi-day replay holding a single
-  long-running transaction will pin temp space. Need to commit per-
-  block (or per N blocks) and confirm DuckDB releases checkpoints
-  cleanly.
 - **Per-frame counters on memory-heavy txs.** 200-frame txs at 6 KB
   per frame is fine; a malicious 10K-frame tx would be 60 MB. Cap
   the frame buffer and emit an `OperationCountsTruncated` flag
@@ -406,14 +266,19 @@ Same sequence as in the consumer doc:
   handles every byte value, so EOF additions are free. EOF function
   references inside a single contract don't open new frames, so the
   frame stack remains a sound model.
-- **Storage size of `divergence_opcode_counts`.** Sparse sparse:
-  ~5-20 nonzero opcodes per frame, ~10-50 frames per drill-in tx,
-  ~100K drill-in txs across the dataset = 5–100M rows. DuckDB
-  compresses this aggressively (long runs of same opcode int).
-  Estimate < 5 GB at the upper bound.
+- **Storage size of `divergence_opcode_counts`.** Sparse: ~5-20
+  nonzero opcodes per frame, ~10-50 frames per drill-in tx, ~100K
+  drill-in txs across the dataset = 5–100M rows. SQLite's WAL +
+  row-oriented storage will be larger on disk than a columnar
+  alternative, but for our scale (tens of millions of rows) it's well
+  within "single-file workable".
 - **Bytecode availability for old contracts.** Some self-destructed
   contracts no longer have bytecode in state. `contract_metadata`
   has a NULL row for them; consumer should handle gracefully.
+- **WAL file checkpointing.** WAL grows as writes accumulate; SQLite
+  auto-checkpoints by default on commit when WAL exceeds ~1000 pages
+  (`PRAGMA wal_autocheckpoint`). For long-running replays we may want
+  to explicitly checkpoint between block batches to keep WAL bounded.
 
 ## Out of scope (intentionally)
 

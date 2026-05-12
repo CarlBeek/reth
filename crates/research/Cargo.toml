@@ -21,17 +21,24 @@ revm-interpreter.workspace = true
 # Alloy dependencies
 alloy-primitives.workspace = true
 
-# Database — DuckDB with vendored build (`bundled` feature) so no
-# system dep is needed. The legacy SQLite (rusqlite) and Parquet
-# (arrow / parquet) deps were dropped when the storage redesign
-# landed; see `docs/storage-redesign.md`.
-duckdb = { version = "1.4", features = ["bundled"] }
+# Database — SQLite with vendored build (`bundled` feature) so no
+# system dep is needed. We switched back from DuckDB after running
+# into its single-process writer-lock constraint: reth holds the
+# writer for replay, but a consumer process can't read the same file
+# while a writer is active. SQLite WAL handles 1 writer + N readers
+# across processes natively. The consumer attaches via DuckDB's
+# `sqlite_scanner` extension to get vectorized analytical query
+# performance over the SQLite storage. See `docs/storage-redesign.md`.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # CSV parsing
 csv = "1.3"
 
-# Serialization
+# Serialization. serde_json is used to encode array / struct columns
+# (block_summaries histograms, opcode-totals lists) as TEXT in SQLite —
+# DuckDB's sqlite_scanner can json_each() them on the read side.
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 
 # Logging and metrics
 tracing.workspace = true

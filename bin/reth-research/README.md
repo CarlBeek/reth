@@ -58,7 +58,7 @@ cargo run --release -p reth-research-bin -- node \
   --research.eip2780 \
   --research.csv 7904-prelim=./schedules/7904_prelim.csv \
   --research.multiplier 4x=4 \
-  --research.db-path ./divergences.duckdb \
+  --research.db-path ./divergences.sqlite \
   --research.start-block 18000000
 ```
 
@@ -67,7 +67,7 @@ cargo run --release -p reth-research-bin -- node \
 Attach the producer DB directly from the DuckDB shell:
 
 ```bash
-duckdb -readonly ./divergences.duckdb
+sqlite3 -readonly ./divergences.sqlite
 ```
 
 Block-level incidence and gas impact:
@@ -147,7 +147,7 @@ drill-in cohort, run:
 ```bash
 cargo run --release -p reth-research-bin -- node \
   --research.eip2780 \
-  --research.db-path ./divergences.duckdb \
+  --research.db-path ./divergences.sqlite \
   --research.metadata-backfill
 ```
 

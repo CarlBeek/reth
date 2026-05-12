@@ -1,25 +1,39 @@
-//! DuckDB-backed storage for the new research data model.
+//! SQLite-backed storage for the research data model.
 //!
 //! Implements the schema described in `crates/research/docs/storage-redesign.md`:
 //! per-block aggregates for the bucketed cohort (wallet-fixable / gas-only /
 //! trace-only / unchanged) and per-tx drill-in rows for the event-logs-changed
-//! and contract-broken cohorts. The legacy SQLite database in
-//! [`super::database`] stays the default path until the consumer dashboard has
-//! migrated; this module is gated behind the `research-duckdb` feature.
+//! and contract-broken cohorts.
 //!
-//! This module currently lands the **schema only** — `open` initialises every
-//! table, sequence, and index, and stamps an `analysis_runs` row recording the
-//! producer version. Write methods for `block_coverage`, `block_summaries`,
-//! `divergences`, etc. land in a follow-up PR once the producer pipeline
-//! switches over.
+//! Why SQLite, not DuckDB: we tried DuckDB first for its analytical query
+//! performance, but ran into its single-process writer-lock — the dashboard
+//! couldn't read while reth held the writer. SQLite WAL handles 1 writer + N
+//! readers across processes natively. The consumer (the Python FastAPI app in
+//! the sibling repo) attaches via DuckDB's `sqlite_scanner` extension and runs
+//! analytical queries through DuckDB's vectorized engine over the SQLite
+//! storage. Best of both worlds.
 //!
 //! Schema-version policy (per the doc): the producer refuses to open a DB
 //! whose latest `analysis_runs.schema_version` doesn't match its compiled-in
 //! version. No migration shims — a major schema change is a full re-replay.
+//!
+//! Type translation from the DuckDB attempt:
+//! - All numeric DuckDB types (UBIGINT, UINTEGER, UTINYINT, BIGINT) collapse
+//!   to SQLite INTEGER. SQLite is dynamically typed; the affinity hints in
+//!   the DDL are documentation as much as enforcement.
+//! - BOOLEAN becomes INTEGER 0/1. rusqlite's ToSql for bool handles the
+//!   conversion automatically; consumers read it back through DuckDB which
+//!   treats nonzero INTEGER as truthy.
+//! - HUGEINT (i128, used for gas_delta_sum_sq) becomes REAL. Loses precision
+//!   past 2^53, but variance/stddev computed from it are already approximate.
+//! - INTEGER[12] arrays and STRUCT(...)[] lists become JSON TEXT. The
+//!   consumer json_each() them on read.
+//! - DuckDB sequences (`CREATE SEQUENCE`, `DEFAULT nextval('seq')`) become
+//!   `INTEGER PRIMARY KEY AUTOINCREMENT`.
 
 use crate::divergence::{Bucket, EventLog, FrameOpcodeCounts};
 use alloy_primitives::{keccak256, Address, B256};
-use duckdb::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::{
     path::Path,
     sync::{Arc, Mutex},
@@ -31,17 +45,22 @@ use thiserror::Error;
 /// Stored on each `analysis_runs` row; on open we verify the latest row
 /// matches and reject DB files written by a different version (the doc's
 /// "no migration shims; major schema change is a full re-replay" rule).
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2 is the SQLite incarnation. v1 was the DuckDB attempt that we retired.
+pub const SCHEMA_VERSION: u32 = 2;
 
-/// Errors raised by the DuckDB-backed storage layer.
+/// Errors raised by the storage layer.
 #[derive(Debug, Error)]
-pub enum DuckDbDatabaseError {
-    /// Underlying DuckDB driver error.
-    #[error("DuckDB error: {0}")]
-    Duck(#[from] duckdb::Error),
+pub enum DatabaseError {
+    /// Underlying SQLite driver error.
+    #[error("SQLite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
     /// I/O error opening or creating the database file.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// JSON encode error when serializing array / struct columns.
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
     /// The on-disk schema version doesn't match the compiled-in
     /// `SCHEMA_VERSION`. Replay is required.
     #[error(
@@ -56,33 +75,44 @@ pub enum DuckDbDatabaseError {
     },
 }
 
-/// DuckDB-backed divergence storage.
+/// SQLite-backed divergence storage.
 ///
 /// `Clone` is cheap — the underlying connection is wrapped in
-/// `Arc<Mutex<_>>`, mirroring the SQLite path. Backfill workers and the live
-/// arm can hold their own handles to the same DB without contending on
-/// open/close.
+/// `Arc<Mutex<_>>`. Backfill workers and the live arm can hold their own
+/// handles to the same DB without contending on open/close. External
+/// readers (the dashboard) get their own connections to the same file
+/// via SQLite WAL.
 #[derive(Debug, Clone)]
-pub struct DuckDbDivergenceDatabase {
+pub struct DivergenceDatabase {
     conn: Arc<Mutex<Connection>>,
 }
 
-impl DuckDbDivergenceDatabase {
-    /// Open (or create) a DuckDB database at `path`. Initialises the schema
-    /// if the file is new and verifies the version of any existing data.
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, DuckDbDatabaseError> {
+impl DivergenceDatabase {
+    /// Open (or create) a SQLite database at `path`. Initialises the schema
+    /// if the file is new, sets WAL pragmas, and verifies the version of any
+    /// existing data.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, DatabaseError> {
         let conn = Connection::open(path.as_ref())?;
         Self::initialize(conn)
     }
 
-    /// Open an in-memory DuckDB database. Used in tests; on shutdown the
+    /// Open an in-memory SQLite database. Used in tests; on shutdown the
     /// data is discarded.
-    pub fn in_memory() -> Result<Self, DuckDbDatabaseError> {
+    pub fn in_memory() -> Result<Self, DatabaseError> {
         let conn = Connection::open_in_memory()?;
         Self::initialize(conn)
     }
 
-    fn initialize(conn: Connection) -> Result<Self, DuckDbDatabaseError> {
+    fn initialize(conn: Connection) -> Result<Self, DatabaseError> {
+        // WAL mode is the bedrock of the producer/consumer concurrency
+        // model: one writer + many readers across processes without
+        // blocking. synchronous=NORMAL is the standard trade-off for WAL —
+        // durable on commit, no fsync per page write. `:memory:` doesn't
+        // honor WAL (returns "memory"), which is fine for tests.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "OFF")?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
         initialize_schema(&conn)?;
         verify_schema_version(&conn)?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
@@ -99,15 +129,14 @@ impl DuckDbDivergenceDatabase {
         schedule_config_hash: &str,
         reth_commit: Option<&str>,
         notes: Option<&str>,
-    ) -> Result<u64, DuckDbDatabaseError> {
-        let conn = self.conn.lock().expect("DuckDB connection mutex poisoned");
+    ) -> Result<u64, DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
         let started_at = current_unix_seconds();
-        let run_id: i64 = conn.query_row(
+        conn.execute(
             "INSERT INTO analysis_runs (
                 schema_version, schedule_name, schedule_config_hash,
                 reth_commit, run_started_at, notes
-             ) VALUES (?, ?, ?, ?, ?, ?)
-             RETURNING run_id",
+             ) VALUES (?, ?, ?, ?, ?, ?)",
             params![
                 SCHEMA_VERSION,
                 schedule_name,
@@ -116,9 +145,8 @@ impl DuckDbDivergenceDatabase {
                 started_at as i64,
                 notes,
             ],
-            |row| row.get(0),
         )?;
-        Ok(run_id as u64)
+        Ok(conn.last_insert_rowid() as u64)
     }
 
     /// Mark an analysis run as finished, recording the wall-clock end time
@@ -127,8 +155,8 @@ impl DuckDbDivergenceDatabase {
         &self,
         run_id: u64,
         blocks_processed: u64,
-    ) -> Result<(), DuckDbDatabaseError> {
-        let conn = self.conn.lock().expect("DuckDB connection mutex poisoned");
+    ) -> Result<(), DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
         let finished_at = current_unix_seconds();
         conn.execute(
             "UPDATE analysis_runs
@@ -149,8 +177,8 @@ fn current_unix_seconds() -> u64 {
 ///
 /// A freshly initialised DB has zero rows in `analysis_runs` and passes
 /// trivially; the version is stamped the first time
-/// [`DuckDbDivergenceDatabase::record_analysis_run_start`] is called.
-fn verify_schema_version(conn: &Connection) -> Result<(), DuckDbDatabaseError> {
+/// [`DivergenceDatabase::record_analysis_run_start`] is called.
+fn verify_schema_version(conn: &Connection) -> Result<(), DatabaseError> {
     let latest: Option<u32> = conn
         .query_row(
             "SELECT schema_version FROM analysis_runs
@@ -161,36 +189,36 @@ fn verify_schema_version(conn: &Connection) -> Result<(), DuckDbDatabaseError> {
                 Ok(v as u32)
             },
         )
-        .ok();
+        .optional()?;
     match latest {
         Some(found) if found != SCHEMA_VERSION => {
-            Err(DuckDbDatabaseError::SchemaVersionMismatch { expected: SCHEMA_VERSION, found })
+            Err(DatabaseError::SchemaVersionMismatch { expected: SCHEMA_VERSION, found })
         }
         _ => Ok(()),
     }
 }
 
 /// Apply the full DDL. Idempotent via `CREATE TABLE IF NOT EXISTS` and
-/// matching guards for sequences and indexes.
-fn initialize_schema(conn: &Connection) -> Result<(), DuckDbDatabaseError> {
+/// matching `CREATE INDEX IF NOT EXISTS` guards.
+fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
     // One row per (schedule, block). Always emitted, even for blocks with
     // zero divergences, so coverage joins work.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS block_coverage (
-            schedule_name        VARCHAR NOT NULL,
-            schedule_config_hash VARCHAR NOT NULL,
-            block_number         UBIGINT NOT NULL,
+            schedule_name        TEXT    NOT NULL,
+            schedule_config_hash TEXT    NOT NULL,
+            block_number         INTEGER NOT NULL,
             block_hash           BLOB    NOT NULL,
             parent_hash          BLOB    NOT NULL,
-            timestamp            UBIGINT NOT NULL,
-            tx_count             UINTEGER NOT NULL,
-            tx_count_unchanged                 UINTEGER NOT NULL,
-            tx_count_trace_only                UINTEGER NOT NULL,
-            tx_count_gas_only                  UINTEGER NOT NULL,
-            tx_count_event_logs_changed        UINTEGER NOT NULL,
-            tx_count_wallet_fixable_shallow    UINTEGER NOT NULL,
-            tx_count_wallet_fixable_deep_chain UINTEGER NOT NULL,
-            tx_count_contract_broken           UINTEGER NOT NULL,
+            timestamp            INTEGER NOT NULL,
+            tx_count             INTEGER NOT NULL,
+            tx_count_unchanged                 INTEGER NOT NULL,
+            tx_count_trace_only                INTEGER NOT NULL,
+            tx_count_gas_only                  INTEGER NOT NULL,
+            tx_count_event_logs_changed        INTEGER NOT NULL,
+            tx_count_wallet_fixable_shallow    INTEGER NOT NULL,
+            tx_count_wallet_fixable_deep_chain INTEGER NOT NULL,
+            tx_count_contract_broken           INTEGER NOT NULL,
             PRIMARY KEY (schedule_name, block_number, block_hash)
         );",
     )?;
@@ -198,95 +226,98 @@ fn initialize_schema(conn: &Connection) -> Result<(), DuckDbDatabaseError> {
     // One row per (schedule, block, bucket). Only emitted for buckets that
     // had at least one tx in the block.
     //
-    // `opcode_count_totals_7904` / `opcode_gas_delta_totals_7904` are
-    // sparse — a tx that ran 5 unique opcodes contributes 5 entries.
-    // `multiplier_log2_hist` and `gas_delta_log2_hist` are fixed 12-bin
-    // arrays so the CDF charts read pre-binned data.
+    // `opcode_count_totals_7904` / `opcode_gas_delta_totals_7904` are sparse
+    // JSON arrays of {opcode, count|delta} objects — a tx that ran 5 unique
+    // opcodes contributes 5 entries. `multiplier_log2_hist` and
+    // `gas_delta_log2_hist` are JSON arrays of exactly 12 ints (fixed-size
+    // log2 bins) so the CDF charts read pre-binned data.
+    //
+    // `gas_delta_sum_sq` is REAL (loses precision past 2^53) rather than
+    // a hypothetical i128: variance/stddev derived from it are already
+    // approximate.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS block_summaries (
-            schedule_name VARCHAR NOT NULL,
-            block_number  UBIGINT NOT NULL,
-            bucket        VARCHAR NOT NULL,
-            tx_count      UINTEGER NOT NULL,
-            gas_delta_sum         BIGINT,
-            gas_delta_sum_sq      HUGEINT,
-            gas_delta_min         BIGINT,
-            gas_delta_max         BIGINT,
-            gas_delta_log2_hist   INTEGER[12],
-            opcode_count_totals_7904 STRUCT(opcode UTINYINT, count UBIGINT)[],
-            opcode_gas_delta_totals_7904 STRUCT(opcode UTINYINT, delta BIGINT)[],
-            state_gas_sum           UBIGINT,
-            state_gas_spillover_sum UBIGINT,
-            multiplier_log2_hist    INTEGER[12],
-            tx_count_creation              UINTEGER,
-            tx_count_authorization         UINTEGER,
-            tx_count_runtime_state         UINTEGER,
-            tx_count_no_state              UINTEGER,
+            schedule_name TEXT    NOT NULL,
+            block_number  INTEGER NOT NULL,
+            bucket        TEXT    NOT NULL,
+            tx_count      INTEGER NOT NULL,
+            gas_delta_sum       INTEGER,
+            gas_delta_sum_sq    REAL,
+            gas_delta_min       INTEGER,
+            gas_delta_max       INTEGER,
+            gas_delta_log2_hist TEXT,
+            opcode_count_totals_7904     TEXT,
+            opcode_gas_delta_totals_7904 TEXT,
+            state_gas_sum           INTEGER,
+            state_gas_spillover_sum INTEGER,
+            multiplier_log2_hist    TEXT,
+            tx_count_creation       INTEGER,
+            tx_count_authorization  INTEGER,
+            tx_count_runtime_state  INTEGER,
+            tx_count_no_state       INTEGER,
             PRIMARY KEY (schedule_name, block_number, bucket)
         );",
     )?;
 
-    // Surrogate divergence_id (sequence-based) so child tables can FK to a
+    // Surrogate divergence_id (auto-increment) so child tables can FK to a
     // single column. Natural key is (schedule_name, block_number, tx_index,
     // schedule_config_hash); a UNIQUE constraint enforces it.
-    conn.execute_batch("CREATE SEQUENCE IF NOT EXISTS seq_divergence_id START 1;")?;
-
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS divergences (
-            divergence_id        UBIGINT PRIMARY KEY DEFAULT nextval('seq_divergence_id'),
-            schedule_name        VARCHAR NOT NULL,
-            schedule_config_hash VARCHAR NOT NULL,
-            block_number         UBIGINT NOT NULL,
-            tx_index             UINTEGER NOT NULL,
-            tx_hash              BLOB NOT NULL,
-            timestamp            UBIGINT NOT NULL,
-            bucket               VARCHAR NOT NULL,
+            divergence_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            schedule_name        TEXT    NOT NULL,
+            schedule_config_hash TEXT    NOT NULL,
+            block_number         INTEGER NOT NULL,
+            tx_index             INTEGER NOT NULL,
+            tx_hash              BLOB    NOT NULL,
+            timestamp            INTEGER NOT NULL,
+            bucket               TEXT    NOT NULL,
 
-            sender    VARCHAR NOT NULL,
-            recipient VARCHAR,
-            is_create BOOLEAN NOT NULL,
-            tx_gas_limit UBIGINT NOT NULL,
+            sender       TEXT    NOT NULL,
+            recipient    TEXT,
+            is_create    INTEGER NOT NULL,
+            tx_gas_limit INTEGER NOT NULL,
 
-            baseline_success BOOLEAN NOT NULL,
-            schedule_success BOOLEAN NOT NULL,
-            status_changed       BOOLEAN NOT NULL,
-            event_logs_changed   BOOLEAN NOT NULL,
-            output_changed       BOOLEAN NOT NULL,
-            logs_bloom_changed   BOOLEAN NOT NULL,
+            baseline_success   INTEGER NOT NULL,
+            schedule_success   INTEGER NOT NULL,
+            status_changed     INTEGER NOT NULL,
+            event_logs_changed INTEGER NOT NULL,
+            output_changed     INTEGER NOT NULL,
+            logs_bloom_changed INTEGER NOT NULL,
 
-            baseline_gas_used     UBIGINT NOT NULL,
-            schedule_gas_used     UBIGINT NOT NULL,
-            gas_delta             BIGINT NOT NULL,
-            baseline_total_gas_spent UBIGINT,
-            baseline_gas_refunded    UBIGINT,
-            schedule_total_gas_spent UBIGINT,
-            schedule_gas_refunded    UBIGINT,
-            schedule_intrinsic_gas   UBIGINT,
-            schedule_floor_gas       UBIGINT,
-            would_fit_in_original_limit BOOLEAN,
-            min_multiplier_to_succeed   DOUBLE,
+            baseline_gas_used        INTEGER NOT NULL,
+            schedule_gas_used        INTEGER NOT NULL,
+            gas_delta                INTEGER NOT NULL,
+            baseline_total_gas_spent INTEGER,
+            baseline_gas_refunded    INTEGER,
+            schedule_total_gas_spent INTEGER,
+            schedule_gas_refunded    INTEGER,
+            schedule_intrinsic_gas   INTEGER,
+            schedule_floor_gas       INTEGER,
+            would_fit_in_original_limit INTEGER,
+            min_multiplier_to_succeed   REAL,
 
-            divergence_contract  VARCHAR,
-            divergence_pc        UINTEGER,
+            divergence_contract   TEXT,
+            divergence_pc         INTEGER,
             divergence_call_depth INTEGER,
-            divergence_opcode    UTINYINT,
-            oog_contract         VARCHAR,
-            oog_pc               UINTEGER,
-            oog_call_depth       INTEGER,
-            oog_opcode           UTINYINT,
-            oog_pattern          VARCHAR,
-            oog_gas_remaining    UBIGINT,
-            oog_chain_proportional BOOLEAN,
+            divergence_opcode     INTEGER,
+            oog_contract          TEXT,
+            oog_pc                INTEGER,
+            oog_call_depth        INTEGER,
+            oog_opcode            INTEGER,
+            oog_pattern           TEXT,
+            oog_gas_remaining     INTEGER,
+            oog_chain_proportional INTEGER,
             oog_bottleneck_depth   INTEGER,
-            oog_bottleneck_kind    VARCHAR,
+            oog_bottleneck_kind    TEXT,
 
-            schedule_state_gas_spent     UBIGINT,
-            schedule_initial_state_gas   UBIGINT,
-            schedule_initial_reservoir   UBIGINT,
-            runtime_state_gas            UBIGINT,
-            runtime_state_gas_spillover  UBIGINT,
-            state_gas_category           VARCHAR,
-            reservoir_exhausted          BOOLEAN,
+            schedule_state_gas_spent    INTEGER,
+            schedule_initial_state_gas  INTEGER,
+            schedule_initial_reservoir  INTEGER,
+            runtime_state_gas           INTEGER,
+            runtime_state_gas_spillover INTEGER,
+            state_gas_category          TEXT,
+            reservoir_exhausted         INTEGER,
 
             UNIQUE (schedule_name, block_number, tx_index, schedule_config_hash)
         );",
@@ -296,35 +327,31 @@ fn initialize_schema(conn: &Connection) -> Result<(), DuckDbDatabaseError> {
     // divergence. Baseline frames are NOT stored separately — derived
     // baseline costs live in divergence_opcode_counts.gas_baseline.
     //
-    // FK constraints from child tables to `divergences` / this table are
-    // documented in the design doc but omitted at the DDL level because
-    // DuckDB's FK enforcement disallows the producer's per-block transactional
-    // delete pattern (`delete_block_range` walks children then parent within
-    // the same transaction; DuckDB raises "key still referenced" even after
-    // the child rows are removed). The producer maintains referential
-    // integrity at the application layer; the consumer relies on the
-    // implicit (divergence_id, call_index) and divergence_id keys via JOINs.
+    // FK constraints from child tables to `divergences` are documented in
+    // the design doc but omitted at the DDL level; the producer maintains
+    // referential integrity at the application layer via the per-block
+    // transactional delete pattern.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS divergence_call_frames (
-            divergence_id        UBIGINT NOT NULL,
-            call_index           UINTEGER NOT NULL,
-            parent_call_index    UINTEGER,
-            depth                UINTEGER NOT NULL,
-            from_address         VARCHAR NOT NULL,
-            to_address           VARCHAR NOT NULL,
-            code_address         VARCHAR,
-            codehash             BLOB,
-            call_type            VARCHAR NOT NULL,
-            selector             BLOB,
-            value_wei            VARCHAR,
-            gas_provided         UBIGINT NOT NULL,
-            gas_used             UBIGINT NOT NULL,
-            gas_margin           BIGINT,
-            success              BOOLEAN NOT NULL,
-            parent_gas_at_call       UBIGINT,
-            gas_requested_on_stack   UBIGINT,
-            eip150_cap_binding       BOOLEAN,
-            state_gas_running    UBIGINT,
+            divergence_id          INTEGER NOT NULL,
+            call_index             INTEGER NOT NULL,
+            parent_call_index      INTEGER,
+            depth                  INTEGER NOT NULL,
+            from_address           TEXT    NOT NULL,
+            to_address             TEXT    NOT NULL,
+            code_address           TEXT,
+            codehash               BLOB,
+            call_type              TEXT    NOT NULL,
+            selector               BLOB,
+            value_wei              TEXT,
+            gas_provided           INTEGER NOT NULL,
+            gas_used               INTEGER NOT NULL,
+            gas_margin             INTEGER,
+            success                INTEGER NOT NULL,
+            parent_gas_at_call     INTEGER,
+            gas_requested_on_stack INTEGER,
+            eip150_cap_binding     INTEGER,
+            state_gas_running      INTEGER,
             PRIMARY KEY (divergence_id, call_index)
         );",
     )?;
@@ -333,28 +360,28 @@ fn initialize_schema(conn: &Connection) -> Result<(), DuckDbDatabaseError> {
     // producer at insert time.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS divergence_opcode_counts (
-            divergence_id   UBIGINT NOT NULL,
-            call_index      UINTEGER NOT NULL,
-            opcode          UTINYINT NOT NULL,
-            count           UBIGINT NOT NULL,
-            gas_baseline    UBIGINT NOT NULL,
-            gas_schedule    UBIGINT NOT NULL,
+            divergence_id INTEGER NOT NULL,
+            call_index    INTEGER NOT NULL,
+            opcode        INTEGER NOT NULL,
+            count         INTEGER NOT NULL,
+            gas_baseline  INTEGER NOT NULL,
+            gas_schedule  INTEGER NOT NULL,
             PRIMARY KEY (divergence_id, call_index, opcode)
         );",
     )?;
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS divergence_event_logs (
-            divergence_id  UBIGINT NOT NULL,
-            trace_kind     VARCHAR NOT NULL,
-            log_index      UINTEGER NOT NULL,
-            address        VARCHAR NOT NULL,
-            topic0         BLOB,
-            topic1         BLOB,
-            topic2         BLOB,
-            topic3         BLOB,
-            data_bytes     BLOB,
-            data_hash      BLOB,
+            divergence_id INTEGER NOT NULL,
+            trace_kind    TEXT    NOT NULL,
+            log_index     INTEGER NOT NULL,
+            address       TEXT    NOT NULL,
+            topic0        BLOB,
+            topic1        BLOB,
+            topic2        BLOB,
+            topic3        BLOB,
+            data_bytes    BLOB,
+            data_hash     BLOB,
             PRIMARY KEY (divergence_id, trace_kind, log_index)
         );",
     )?;
@@ -365,37 +392,35 @@ fn initialize_schema(conn: &Connection) -> Result<(), DuckDbDatabaseError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS contract_metadata (
             codehash               BLOB PRIMARY KEY,
-            representative_address VARCHAR,
-            solc_version           VARCHAR,
-            solc_commit            VARCHAR,
-            evm_target             VARCHAR,
-            cbor_present           BOOLEAN NOT NULL,
-            has_metadata_hash      BOOLEAN NOT NULL,
-            bytecode_len           UINTEGER NOT NULL,
-            extracted_at           UBIGINT NOT NULL
+            representative_address TEXT,
+            solc_version           TEXT,
+            solc_commit            TEXT,
+            evm_target             TEXT,
+            cbor_present           INTEGER NOT NULL,
+            has_metadata_hash      INTEGER NOT NULL,
+            bytecode_len           INTEGER NOT NULL,
+            extracted_at           INTEGER NOT NULL
         );",
     )?;
 
     // Per-replay-run manifest. A consumer reads the latest row to detect
     // "is this lake written by the current code or do I need to migrate?".
     conn.execute_batch(
-        "CREATE SEQUENCE IF NOT EXISTS seq_analysis_run_id START 1;
-        CREATE TABLE IF NOT EXISTS analysis_runs (
-            run_id               UBIGINT PRIMARY KEY DEFAULT nextval('seq_analysis_run_id'),
-            schema_version       UINTEGER NOT NULL,
-            schedule_name        VARCHAR NOT NULL,
-            schedule_config_hash VARCHAR NOT NULL,
-            reth_commit          VARCHAR,
-            run_started_at       UBIGINT NOT NULL,
-            run_finished_at      UBIGINT,
-            blocks_processed     UBIGINT,
-            notes                VARCHAR
+        "CREATE TABLE IF NOT EXISTS analysis_runs (
+            run_id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            schema_version       INTEGER NOT NULL,
+            schedule_name        TEXT    NOT NULL,
+            schedule_config_hash TEXT    NOT NULL,
+            reth_commit          TEXT,
+            run_started_at       INTEGER NOT NULL,
+            run_finished_at      INTEGER,
+            blocks_processed     INTEGER,
+            notes                TEXT
         );",
     )?;
 
-    // Indexes. DuckDB doesn't strictly need indexes for analytical scans,
-    // but the per-recipient / per-codehash / per-bucket lookups (contract
-    // pages, clustering queries) benefit.
+    // Indexes for the per-recipient / per-codehash / per-bucket lookups
+    // the dashboard hits.
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_div_schedule      ON divergences(schedule_name);
          CREATE INDEX IF NOT EXISTS idx_div_block         ON divergences(schedule_name, block_number);
@@ -416,7 +441,7 @@ fn initialize_schema(conn: &Connection) -> Result<(), DuckDbDatabaseError> {
 
 /// One-shot output for a single (schedule, block): coverage row + zero or
 /// more bucket-summary rows + zero or more drill-in records. Built by the
-/// `BlockAggregator` and consumed by [`DuckDbDivergenceDatabase::record_block_output`]
+/// `BlockAggregator` and consumed by [`DivergenceDatabase::record_block_output`]
 /// in a single transaction so the per-block state lands atomically.
 #[derive(Debug, Clone)]
 pub struct BlockOutput {
@@ -451,8 +476,8 @@ pub struct BlockCoverageRow {
 }
 
 /// Aggregate summary for one (schedule, block, bucket). The 7904 / 8037
-/// fields stay `None` / zero until the per-frame data is plumbed into the
-/// aggregator (deferred to a follow-up).
+/// per-opcode struct lists are not built yet — the aggregator emits empty
+/// JSON arrays for now (deferred follow-up).
 #[allow(missing_docs)]
 #[derive(Debug, Clone)]
 pub struct BlockSummaryRow {
@@ -461,15 +486,14 @@ pub struct BlockSummaryRow {
     pub bucket: Bucket,
     pub tx_count: u32,
     pub gas_delta_sum: Option<i64>,
-    /// Sum of squared `gas_delta` for the bucket. Stored under DuckDB's
-    /// HUGEINT column type, but bound as `i64`: a single block's
-    /// sum-of-squares fits comfortably (per-tx delta < 30M, ~200 txs/block
-    /// → ~1.8 × 10^17, well below `i64::MAX`).
+    /// Sum of squared `gas_delta` for the bucket. Stored under SQLite's
+    /// REAL column type, so values past 2^53 lose precision — fine for the
+    /// approximate variance/stddev the dashboard renders.
     pub gas_delta_sum_sq: Option<i64>,
     pub gas_delta_min: Option<i64>,
     pub gas_delta_max: Option<i64>,
     /// 12-bin log2 histogram of `abs(gas_delta)`. `None` for buckets where
-    /// no gas delta makes sense.
+    /// no gas delta makes sense. Serialized as JSON.
     pub gas_delta_log2_hist: Option<[i32; 12]>,
     pub state_gas_sum: Option<u64>,
     pub state_gas_spillover_sum: Option<u64>,
@@ -621,12 +645,12 @@ impl OpcodeCountRow {
 // Write API
 // ─────────────────────────────────────────────────────────────────────────────
 
-impl DuckDbDivergenceDatabase {
+impl DivergenceDatabase {
     /// Persist all per-block state in a single transaction so the
     /// coverage row, summaries, and drill-in records land together. Any
     /// failure leaves the DB untouched.
-    pub fn record_block_output(&self, output: &BlockOutput) -> Result<(), DuckDbDatabaseError> {
-        let mut conn = self.conn.lock().expect("DuckDB connection mutex poisoned");
+    pub fn record_block_output(&self, output: &BlockOutput) -> Result<(), DatabaseError> {
+        let mut conn = self.conn.lock().expect("SQLite connection mutex poisoned");
         let tx = conn.transaction()?;
 
         insert_block_coverage(&tx, &output.coverage)?;
@@ -663,24 +687,9 @@ impl DuckDbDivergenceDatabase {
         &self,
         from_block: u64,
         to_block: u64,
-    ) -> Result<BlockRangeDeleteCounts, DuckDbDatabaseError> {
-        let mut conn = self.conn.lock().expect("DuckDB connection mutex poisoned");
+    ) -> Result<BlockRangeDeleteCounts, DatabaseError> {
+        let mut conn = self.conn.lock().expect("SQLite connection mutex poisoned");
         let tx = conn.transaction()?;
-        // Collect divergence_ids first so child-table deletes can target them.
-        let mut stmt = tx.prepare(
-            "SELECT divergence_id FROM divergences
-             WHERE block_number >= ? AND block_number <= ?",
-        )?;
-        let div_ids: Vec<i64> = stmt
-            .query_map(params![from_block as i64, to_block as i64], |row| row.get::<_, i64>(0))?
-            .collect::<Result<_, _>>()?;
-        drop(stmt);
-
-        // FKs are deliberately omitted from the DDL (see comment in
-        // `initialize_schema`), so we can issue a single ranged DELETE per
-        // child table instead of walking per-id. Each statement returns
-        // the row count for logging.
-        let _ = &div_ids; // collected for parity with prior FK-aware path
 
         let event_logs_deleted = tx.execute(
             "DELETE FROM divergence_event_logs
@@ -735,8 +744,8 @@ impl DuckDbDivergenceDatabase {
         schedule_name: &str,
         block_number: u64,
         schedule_config_hash: &str,
-    ) -> Result<bool, DuckDbDatabaseError> {
-        let conn = self.conn.lock().expect("DuckDB connection mutex poisoned");
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
         let exists: Option<i64> = conn
             .query_row(
                 "SELECT 1 FROM block_coverage
@@ -747,7 +756,7 @@ impl DuckDbDivergenceDatabase {
                 params![schedule_name, block_number as i64, schedule_config_hash],
                 |row| row.get(0),
             )
-            .ok();
+            .optional()?;
         Ok(exists.is_some())
     }
 
@@ -761,8 +770,8 @@ impl DuckDbDivergenceDatabase {
         bytecode_len: u64,
         metadata: &crate::contract_metadata::ContractMetadata,
         extracted_at_unix: u64,
-    ) -> Result<(), DuckDbDatabaseError> {
-        let conn = self.conn.lock().expect("DuckDB connection mutex poisoned");
+    ) -> Result<(), DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
         conn.execute(
             "INSERT INTO contract_metadata (
                 codehash, representative_address, solc_version, solc_commit,
@@ -794,23 +803,23 @@ impl DuckDbDivergenceDatabase {
     }
 
     /// Whether a `contract_metadata` row already exists for this codehash.
-    pub fn has_contract_metadata(&self, codehash: [u8; 32]) -> Result<bool, DuckDbDatabaseError> {
-        let conn = self.conn.lock().expect("DuckDB connection mutex poisoned");
+    pub fn has_contract_metadata(&self, codehash: [u8; 32]) -> Result<bool, DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
         let exists: Option<i64> = conn
             .query_row(
                 "SELECT 1 FROM contract_metadata WHERE codehash = ? LIMIT 1",
                 params![codehash.as_slice()],
                 |row| row.get(0),
             )
-            .ok();
+            .optional()?;
         Ok(exists.is_some())
     }
 
     /// Distinct `to_address` values seen across `divergence_call_frames`.
     /// Backfill iterates these, fetches bytecode from reth state, hashes
     /// it, and upserts a `contract_metadata` row keyed by codehash.
-    pub fn distinct_call_frame_addresses(&self) -> Result<Vec<String>, DuckDbDatabaseError> {
-        let conn = self.conn.lock().expect("DuckDB connection mutex poisoned");
+    pub fn distinct_call_frame_addresses(&self) -> Result<Vec<String>, DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
         let mut stmt = conn.prepare(
             "SELECT DISTINCT to_address FROM divergence_call_frames
              WHERE to_address IS NOT NULL AND to_address <> ''
@@ -823,7 +832,7 @@ impl DuckDbDivergenceDatabase {
 }
 
 /// Per-table row counts returned by
-/// [`DuckDbDivergenceDatabase::delete_block_range`]. Used for logging.
+/// [`DivergenceDatabase::delete_block_range`]. Used for logging.
 #[allow(missing_docs)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BlockRangeDeleteCounts {
@@ -836,9 +845,9 @@ pub struct BlockRangeDeleteCounts {
 }
 
 fn insert_block_coverage(
-    tx: &duckdb::Transaction<'_>,
+    tx: &Transaction<'_>,
     row: &BlockCoverageRow,
-) -> Result<(), DuckDbDatabaseError> {
+) -> Result<(), DatabaseError> {
     tx.execute(
         "INSERT INTO block_coverage (
             schedule_name, schedule_config_hash, block_number, block_hash,
@@ -880,30 +889,26 @@ fn insert_block_coverage(
 }
 
 fn insert_block_summary(
-    tx: &duckdb::Transaction<'_>,
+    tx: &Transaction<'_>,
     row: &BlockSummaryRow,
-) -> Result<(), DuckDbDatabaseError> {
-    // The 12-bin histograms are passed as SQL-literal arrays because the
-    // duckdb-rust driver doesn't bind fixed-size `INTEGER[12]` params
-    // through ToSql. We inline them into the statement; all other values
-    // ride the regular `params!` path. `gas_delta_sum_sq` is bound as
-    // `i64` and CAST to HUGEINT at column-write time.
-    let gas_delta_log2_hist_sql = match row.gas_delta_log2_hist {
-        Some(arr) => format!(
-            "[{}]::INTEGER[12]",
-            arr.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
-        ),
-        None => "NULL".to_string(),
+) -> Result<(), DatabaseError> {
+    // SQLite has no native arrays — we JSON-encode the histograms and
+    // the (currently empty) struct lists. gas_delta_sum_sq is bound as
+    // a REAL (f64).
+    let gas_delta_log2_hist = match row.gas_delta_log2_hist {
+        Some(arr) => Some(serde_json::to_string(&arr)?),
+        None => None,
     };
-    let multiplier_log2_hist_sql = match row.multiplier_log2_hist {
-        Some(arr) => format!(
-            "[{}]::INTEGER[12]",
-            arr.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
-        ),
-        None => "NULL".to_string(),
+    let multiplier_log2_hist = match row.multiplier_log2_hist {
+        Some(arr) => Some(serde_json::to_string(&arr)?),
+        None => None,
     };
+    // Per-opcode totals aren't computed yet — emit an empty JSON array so
+    // the consumer's view-of-totals query sees a parseable column.
+    let empty_struct_list = "[]";
+    let gas_delta_sum_sq_real = row.gas_delta_sum_sq.map(|v| v as f64);
 
-    let stmt = format!(
+    tx.execute(
         "INSERT INTO block_summaries (
             schedule_name, block_number, bucket, tx_count,
             gas_delta_sum, gas_delta_sum_sq, gas_delta_min, gas_delta_max,
@@ -914,12 +919,11 @@ fn insert_block_summary(
             tx_count_creation, tx_count_authorization,
             tx_count_runtime_state, tx_count_no_state
         ) VALUES (?, ?, ?, ?,
-                  ?, CAST(? AS HUGEINT), ?, ?,
-                  {gas_delta_log2_hist_sql},
-                  []::STRUCT(opcode UTINYINT, count UBIGINT)[],
-                  []::STRUCT(opcode UTINYINT, delta BIGINT)[],
+                  ?, ?, ?, ?,
+                  ?,
                   ?, ?,
-                  {multiplier_log2_hist_sql},
+                  ?, ?,
+                  ?,
                   ?, ?, ?, ?)
         ON CONFLICT (schedule_name, block_number, bucket) DO UPDATE SET
             tx_count                = excluded.tx_count,
@@ -934,22 +938,22 @@ fn insert_block_summary(
             tx_count_creation       = excluded.tx_count_creation,
             tx_count_authorization  = excluded.tx_count_authorization,
             tx_count_runtime_state  = excluded.tx_count_runtime_state,
-            tx_count_no_state       = excluded.tx_count_no_state"
-    );
-
-    tx.execute(
-        &stmt,
+            tx_count_no_state       = excluded.tx_count_no_state",
         params![
             row.schedule_name,
             row.block_number as i64,
             row.bucket.as_str(),
             row.tx_count as i64,
             row.gas_delta_sum,
-            row.gas_delta_sum_sq,
+            gas_delta_sum_sq_real,
             row.gas_delta_min,
             row.gas_delta_max,
+            gas_delta_log2_hist,
+            empty_struct_list,
+            empty_struct_list,
             row.state_gas_sum.map(|v| v as i64),
             row.state_gas_spillover_sum.map(|v| v as i64),
+            multiplier_log2_hist,
             row.tx_count_creation.map(|v| v as i64),
             row.tx_count_authorization.map(|v| v as i64),
             row.tx_count_runtime_state.map(|v| v as i64),
@@ -960,10 +964,10 @@ fn insert_block_summary(
 }
 
 fn insert_divergence(
-    tx: &duckdb::Transaction<'_>,
+    tx: &Transaction<'_>,
     row: &DivergenceRow,
-) -> Result<u64, DuckDbDatabaseError> {
-    let id: i64 = tx.query_row(
+) -> Result<u64, DatabaseError> {
+    tx.execute(
         "INSERT INTO divergences (
             schedule_name, schedule_config_hash, block_number, tx_index, tx_hash,
             timestamp, bucket,
@@ -992,8 +996,7 @@ fn insert_divergence(
                   ?, ?, ?, ?,
                   ?, ?, ?, ?, ?, ?,
                   ?, ?, ?,
-                  ?, ?, ?, ?, ?, ?, ?)
-        RETURNING divergence_id",
+                  ?, ?, ?, ?, ?, ?, ?)",
         params![
             row.schedule_name,
             row.schedule_config_hash,
@@ -1044,16 +1047,15 @@ fn insert_divergence(
             row.state_gas_category,
             row.reservoir_exhausted,
         ],
-        |r| r.get(0),
     )?;
-    Ok(id as u64)
+    Ok(tx.last_insert_rowid() as u64)
 }
 
 fn insert_call_frame(
-    tx: &duckdb::Transaction<'_>,
+    tx: &Transaction<'_>,
     divergence_id: u64,
     row: &CallFrameRow,
-) -> Result<(), DuckDbDatabaseError> {
+) -> Result<(), DatabaseError> {
     tx.execute(
         "INSERT INTO divergence_call_frames (
             divergence_id, call_index, parent_call_index, depth,
@@ -1088,10 +1090,10 @@ fn insert_call_frame(
 }
 
 fn insert_opcode_count(
-    tx: &duckdb::Transaction<'_>,
+    tx: &Transaction<'_>,
     divergence_id: u64,
     row: &OpcodeCountRow,
-) -> Result<(), DuckDbDatabaseError> {
+) -> Result<(), DatabaseError> {
     tx.execute(
         "INSERT INTO divergence_opcode_counts (
             divergence_id, call_index, opcode, count, gas_baseline, gas_schedule
@@ -1109,11 +1111,11 @@ fn insert_opcode_count(
 }
 
 fn insert_event_log(
-    tx: &duckdb::Transaction<'_>,
+    tx: &Transaction<'_>,
     divergence_id: u64,
     trace_kind: &str,
     log: &EventLog,
-) -> Result<(), DuckDbDatabaseError> {
+) -> Result<(), DatabaseError> {
     let topic = |i: usize| log.topics.get(i).map(|t| t.as_slice().to_vec());
     let data_hash = keccak256(&log.data);
     tx.execute(
@@ -1145,16 +1147,16 @@ mod tests {
     /// re-opening (re-running the DDL) is a no-op.
     #[test]
     fn in_memory_open_creates_all_tables() {
-        let db = DuckDbDivergenceDatabase::in_memory().unwrap();
+        let db = DivergenceDatabase::in_memory().unwrap();
         let conn = db.conn.lock().unwrap();
 
         // The DDL is idempotent — calling initialize_schema again should
         // succeed without errors.
         initialize_schema(&conn).expect("initialize_schema is idempotent");
 
-        // Every expected table is present in `duckdb_tables()`.
+        // Every expected table is present.
         let mut stmt =
-            conn.prepare("SELECT table_name FROM duckdb_tables() ORDER BY table_name").unwrap();
+            conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").unwrap();
         let mut rows = stmt.query([]).unwrap();
         let mut tables = Vec::new();
         while let Some(row) = rows.next().unwrap() {
@@ -1180,7 +1182,7 @@ mod tests {
 
     #[test]
     fn analysis_run_records_round_trip() {
-        let db = DuckDbDivergenceDatabase::in_memory().unwrap();
+        let db = DivergenceDatabase::in_memory().unwrap();
         let run_id = db
             .record_analysis_run_start(
                 "eip-8037",
@@ -1221,11 +1223,8 @@ mod tests {
         assert_eq!(blocks, Some(42));
     }
 
-    /// DuckDB refuses to open an empty file (it treats one as a corrupt
-    /// existing DB), so on-disk tests need a path that doesn't yet exist
-    /// inside a TempDir.
     fn fresh_db_path(dir: &tempfile::TempDir) -> std::path::PathBuf {
-        dir.path().join("test.duckdb")
+        dir.path().join("test.sqlite")
     }
 
     #[test]
@@ -1236,7 +1235,7 @@ mod tests {
         let path = fresh_db_path(&dir);
 
         {
-            let db = DuckDbDivergenceDatabase::open(&path).unwrap();
+            let db = DivergenceDatabase::open(&path).unwrap();
             let conn = db.conn.lock().unwrap();
             conn.execute(
                 "INSERT INTO analysis_runs (
@@ -1248,9 +1247,9 @@ mod tests {
             .unwrap();
         }
 
-        let err = DuckDbDivergenceDatabase::open(&path).unwrap_err();
+        let err = DivergenceDatabase::open(&path).unwrap_err();
         match err {
-            DuckDbDatabaseError::SchemaVersionMismatch { expected, found } => {
+            DatabaseError::SchemaVersionMismatch { expected, found } => {
                 assert_eq!(expected, SCHEMA_VERSION);
                 assert_eq!(found, SCHEMA_VERSION + 1);
             }
@@ -1262,7 +1261,7 @@ mod tests {
     fn fresh_open_passes_version_check() {
         // No analysis_runs rows means no version constraint to violate.
         let dir = tempfile::tempdir().unwrap();
-        let _db = DuckDbDivergenceDatabase::open(fresh_db_path(&dir)).unwrap();
+        let _db = DivergenceDatabase::open(fresh_db_path(&dir)).unwrap();
     }
 
     /// Minimal `BlockCoverageRow` fixture for write-path tests.
@@ -1352,7 +1351,7 @@ mod tests {
 
     #[test]
     fn record_block_output_writes_coverage_summaries_and_drill_in() {
-        let db = DuckDbDivergenceDatabase::in_memory().unwrap();
+        let db = DivergenceDatabase::in_memory().unwrap();
 
         let drill_in = DrillInRecord {
             divergence: fixture_divergence(100, 0, Bucket::ContractBroken, 12_345),
@@ -1419,7 +1418,6 @@ mod tests {
 
         let conn = db.conn.lock().unwrap();
 
-        // Coverage row landed.
         let (tx_count, broken): (i64, i64) = conn
             .query_row(
                 "SELECT tx_count, tx_count_contract_broken
@@ -1431,7 +1429,6 @@ mod tests {
         assert_eq!(tx_count, 1);
         assert_eq!(broken, 1);
 
-        // Summary row landed.
         let summary_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM block_summaries WHERE block_number = 100", [], |row| {
                 row.get(0)
@@ -1439,7 +1436,17 @@ mod tests {
             .unwrap();
         assert_eq!(summary_count, 1);
 
-        // Divergence + child tables landed.
+        // Verify the JSON-encoded histogram round-trips through SQLite.
+        let hist_json: String = conn
+            .query_row(
+                "SELECT gas_delta_log2_hist FROM block_summaries WHERE block_number = 100",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let hist: Vec<i32> = serde_json::from_str(&hist_json).unwrap();
+        assert_eq!(hist.len(), 12);
+
         let div_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM divergences", [], |row| row.get(0)).unwrap();
         assert_eq!(div_count, 1);
@@ -1462,9 +1469,8 @@ mod tests {
 
     #[test]
     fn delete_block_range_clears_all_per_block_tables() {
-        let db = DuckDbDivergenceDatabase::in_memory().unwrap();
+        let db = DivergenceDatabase::in_memory().unwrap();
 
-        // Seed two blocks; delete only one.
         for block in [100u64, 200u64] {
             let drill_in = DrillInRecord {
                 divergence: fixture_divergence(block, 0, Bucket::ContractBroken, 100),
@@ -1500,7 +1506,6 @@ mod tests {
             db.record_block_output(&output).unwrap();
         }
 
-        // Sanity: two rows in coverage, two in divergences.
         {
             let conn = db.conn.lock().unwrap();
             let n: i64 = conn
@@ -1526,7 +1531,7 @@ mod tests {
 
     #[test]
     fn has_block_coverage_with_config_matches_strict() {
-        let db = DuckDbDivergenceDatabase::in_memory().unwrap();
+        let db = DivergenceDatabase::in_memory().unwrap();
         let output = BlockOutput {
             coverage: fixture_coverage("test", 42, 0, 0),
             summaries: vec![],
@@ -1535,8 +1540,6 @@ mod tests {
         db.record_block_output(&output).unwrap();
 
         assert!(db.has_block_coverage_with_config("test", 42, "config").unwrap());
-        // Different config_hash → uncovered (matches the strict dedupe
-        // semantics from the SQLite path).
         assert!(!db.has_block_coverage_with_config("test", 42, "config-v2").unwrap());
         assert!(!db.has_block_coverage_with_config("test", 43, "config").unwrap());
         assert!(!db.has_block_coverage_with_config("other", 42, "config").unwrap());
@@ -1544,8 +1547,6 @@ mod tests {
 
     #[test]
     fn opcode_count_row_from_frames_skips_zero_opcodes() {
-        // A frame with one nonzero opcode (KECCAK256) and 255 zero-count
-        // opcodes should produce a single row.
         let mut frame = FrameOpcodeCounts::new(0);
         frame.counts[0x20] = 5;
         frame.gas_baseline[0x20] = 150;
@@ -1562,7 +1563,7 @@ mod tests {
     #[test]
     fn contract_metadata_upsert_is_idempotent_per_codehash() {
         use crate::contract_metadata::ContractMetadata;
-        let db = DuckDbDivergenceDatabase::in_memory().unwrap();
+        let db = DivergenceDatabase::in_memory().unwrap();
         let codehash = [0xabu8; 32];
         let meta = ContractMetadata {
             solc_version: Some("0.8.21".to_string()),
@@ -1577,10 +1578,6 @@ mod tests {
         db.upsert_contract_metadata(codehash, "0xdead", 1234, &meta, 1_700_000_000).unwrap();
         assert!(db.has_contract_metadata(codehash).unwrap());
 
-        // Second upsert overwrites — bytecode_len updated, solc_version
-        // changed (e.g. a recompile under a different version landed at
-        // the same codehash, which can't actually happen but exercises
-        // the ON CONFLICT path).
         let meta2 = ContractMetadata { solc_version: Some("0.8.25".to_string()), ..meta };
         db.upsert_contract_metadata(codehash, "0xdead", 4321, &meta2, 1_700_000_500).unwrap();
 
@@ -1598,10 +1595,7 @@ mod tests {
 
     #[test]
     fn distinct_call_frame_addresses_dedupes() {
-        use crate::divergence::Bucket;
-        let db = DuckDbDivergenceDatabase::in_memory().unwrap();
-        // Seed two drill-in records that share a callee address. The
-        // distinct query should return only the unique to_address values.
+        let db = DivergenceDatabase::in_memory().unwrap();
         for tx_index in [0u32, 1u32] {
             let drill_in = DrillInRecord {
                 divergence: fixture_divergence(99, tx_index, Bucket::ContractBroken, 0),
@@ -1639,7 +1633,6 @@ mod tests {
 
         let addrs = db.distinct_call_frame_addresses().unwrap();
         assert_eq!(addrs.len(), 1, "duplicate to_address should be de-duplicated");
-        // Address formatting matches `{addr:#x}` (lowercase hex, 0x prefix).
         assert_eq!(addrs[0], format!("{:#x}", Address::repeat_byte(0xaa)));
     }
 }

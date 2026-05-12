@@ -194,7 +194,7 @@
 pub mod block_aggregator;
 pub mod cli;
 pub mod contract_metadata;
-pub mod database_duckdb;
+pub mod database;
 pub mod divergence;
 pub mod multi_schedule_inspector;
 pub mod oog_chain;
@@ -210,5 +210,5 @@ pub use multi_schedule_inspector::{ScheduleInspector, ScheduleResult};
 pub use tracking_inspector::{EventLogEntry, TrackingInspector};
 
 /// Re-export error types
-pub use database_duckdb::DuckDbDatabaseError;
+pub use database::DatabaseError;
 pub use schedule::ScheduleError;

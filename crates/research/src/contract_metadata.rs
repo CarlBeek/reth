@@ -15,7 +15,7 @@
 //! (`contract-metadata-backfill` subcommand, run out-of-band against the
 //! producer DB).
 
-use crate::database_duckdb::{DuckDbDatabaseError, DuckDbDivergenceDatabase};
+use crate::database::{DatabaseError, DivergenceDatabase};
 use alloy_primitives::{keccak256, Address};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -287,7 +287,7 @@ pub trait BytecodeFetcher {
 pub enum BackfillError {
     /// DuckDB read/write failed.
     #[error("DuckDB error: {0}")]
-    Db(#[from] DuckDbDatabaseError),
+    Db(#[from] DatabaseError),
     /// `to_address` column held a value that didn't parse as 0x-prefixed
     /// hex. Indicates a producer-side bug since the producer always
     /// formats addresses with `{addr:#x}`.
@@ -333,7 +333,7 @@ pub struct BackfillStats {
 /// Aborts only on DB errors or malformed-address strings — both of
 /// which indicate a producer-side bug rather than an external failure.
 pub fn run_metadata_backfill(
-    db: &DuckDbDivergenceDatabase,
+    db: &DivergenceDatabase,
     fetcher: &dyn BytecodeFetcher,
 ) -> Result<BackfillStats, BackfillError> {
     let addresses = db.distinct_call_frame_addresses()?;
@@ -520,7 +520,7 @@ mod tests {
     }
 
     use crate::{
-        database_duckdb::{
+        database::{
             BlockCoverageRow, BlockOutput, CallFrameRow, DivergenceRow, DrillInRecord,
         },
         divergence::Bucket,
@@ -559,7 +559,7 @@ mod tests {
         }
     }
 
-    fn seed_drill_in(db: &DuckDbDivergenceDatabase, tx_index: u32, addr: Address) {
+    fn seed_drill_in(db: &DivergenceDatabase, tx_index: u32, addr: Address) {
         let drill_in = DrillInRecord {
             divergence: DivergenceRow {
                 schedule_name: "test".to_string(),
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn run_metadata_backfill_upserts_per_distinct_codehash() {
-        let db = DuckDbDivergenceDatabase::in_memory().unwrap();
+        let db = DivergenceDatabase::in_memory().unwrap();
         let fetcher = MockFetcher::new();
 
         // Two distinct addresses pointing at the SAME bytecode → one
@@ -696,7 +696,7 @@ mod tests {
 
     #[test]
     fn run_metadata_backfill_counts_missing_and_failing_fetches() {
-        let db = DuckDbDivergenceDatabase::in_memory().unwrap();
+        let db = DivergenceDatabase::in_memory().unwrap();
         let fetcher = MockFetcher::new();
 
         let missing = Address::repeat_byte(0x11);

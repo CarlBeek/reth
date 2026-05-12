@@ -37,8 +37,9 @@ pub struct ResearchArgs {
     #[arg(long = "research.multiplier", value_name = "NAME=MULT", help_heading = "Research")]
     pub multiplier_schedules: Vec<String>,
 
-    /// Path to divergence database file.
-    #[arg(long = "research.db-path", default_value = "./divergence.db", help_heading = "Research")]
+    /// Path to the SQLite divergence database file. Opened in WAL mode so
+    /// the consumer dashboard (DuckDB sqlite_scanner) can read concurrently.
+    #[arg(long = "research.db-path", default_value = "./divergences.sqlite", help_heading = "Research")]
     pub db_path: PathBuf,
 
     /// Block number to start research analysis.
@@ -205,10 +206,10 @@ impl ResearchArgs {
     pub fn open_database(
         &self,
     ) -> Result<
-        reth_research::database_duckdb::DuckDbDivergenceDatabase,
-        reth_research::DuckDbDatabaseError,
+        reth_research::database::DivergenceDatabase,
+        reth_research::DatabaseError,
     > {
-        reth_research::database_duckdb::DuckDbDivergenceDatabase::open(&self.db_path)
+        reth_research::database::DivergenceDatabase::open(&self.db_path)
     }
 
     /// Convert to the research crate's [`reth_research::ResearchArgs`] type.

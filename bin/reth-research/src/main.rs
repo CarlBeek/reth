@@ -36,8 +36,8 @@ use reth_primitives_traits::BlockBody;
 use reth_provider::{BlockNumReader, BlockReader, StateProviderFactory, TransactionVariant};
 use reth_research::{
     block_aggregator::{BlockAggregator, BlockMeta},
-    database_duckdb::{
-        BlockOutput, CallFrameRow, DivergenceRow, DrillInRecord, DuckDbDivergenceDatabase,
+    database::{
+        BlockOutput, CallFrameRow, DivergenceRow, DrillInRecord, DivergenceDatabase,
         OpcodeCountRow,
     },
     divergence::{
@@ -188,7 +188,7 @@ struct ResearchExEx<Node: FullNodeComponents> {
     /// check whether a block is already covered under the current schedule
     /// configuration. Shares the underlying `Arc<Mutex<Connection>>` with the
     /// writer thread, so reads briefly block writes (and vice versa).
-    divergence_db: Option<DuckDbDivergenceDatabase>,
+    divergence_db: Option<DivergenceDatabase>,
     /// Start block for live analysis
     start_block: u64,
     /// Whether to backfill historical blocks during idle windows.
@@ -369,7 +369,7 @@ where
 
         // Initialize database and async writer
         let (divergence_db, db_tx, db_writer_task) = if db_path.to_str() != Some(":memory:") {
-            let divergence_db = DuckDbDivergenceDatabase::open(&db_path)?;
+            let divergence_db = DivergenceDatabase::open(&db_path)?;
 
             info!(
                 target: "exex::research",
@@ -2092,11 +2092,11 @@ async fn run_metadata_backfill_exex<Node: FullNodeComponents>(
     db_path: std::path::PathBuf,
 ) -> eyre::Result<()> {
     use reth_research::{
-        contract_metadata::run_metadata_backfill, database_duckdb::DuckDbDivergenceDatabase,
+        contract_metadata::run_metadata_backfill, database::DivergenceDatabase,
     };
 
     info!(target: "reth::cli", path = ?db_path, "Opening producer DB for metadata backfill");
-    let db = DuckDbDivergenceDatabase::open(&db_path)?;
+    let db = DivergenceDatabase::open(&db_path)?;
     let fetcher = ProviderBytecodeFetcher { provider: ctx.components.provider().clone() };
 
     info!(target: "reth::cli", "Starting contract-metadata backfill");
