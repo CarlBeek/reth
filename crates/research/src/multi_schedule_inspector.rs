@@ -93,8 +93,8 @@
 
 use crate::{
     divergence::{
-        CallFrame, CallType, DivergenceLocation, EventLog, OogPattern, OperationCounts,
-        OutOfGasInfo,
+        CallFrame, CallType, DivergenceLocation, EventLog, FrameOpcodeCounts, OogPattern,
+        OperationCounts, OutOfGasInfo, PerFrameCapture, MAX_TRACKED_FRAMES,
     },
     schedule::{GasSchedule, OpcodeContext},
 };
@@ -167,6 +167,25 @@ pub struct ScheduleInspector {
     /// populate the child frame's `gas_requested_on_stack`. Cleared after
     /// each consumption.
     pending_call_stack_gas: Option<u64>,
+
+    /// Per-frame opcode counters, indexed by frame-open order. Root frame
+    /// is lazily pushed on the first `step()` so we capture root-frame
+    /// opcodes without depending on a `call()` hook (root never gets one).
+    frame_capture: PerFrameCapture,
+
+    /// Stack of indices into `frame_capture.frames` for the currently
+    /// active frame chain. `usize::MAX` means "this frame's index would
+    /// have exceeded `MAX_TRACKED_FRAMES`; skip per-opcode increments".
+    active_frame_stack: Vec<usize>,
+
+    /// Next frame-open index to assign (also = pre-cap frame count).
+    next_frame_index: u32,
+
+    /// Per-opcode gas delta the inspector pre-applied in `step()` for a
+    /// CALL/CREATE opcode. Read and reset in the matching `step_end()` so
+    /// we can subtract it from `actual_gas_cost` to recover the EVM's
+    /// natural baseline cost.
+    pending_pre_applied_delta: i64,
 
     /// Call stack for tracking depth
     call_stack: Vec<CallStackEntry>,
@@ -318,6 +337,10 @@ impl ScheduleInspector {
             cached_keccak_msg_size: None,
             cached_exp_byte_size: None,
             pending_call_stack_gas: None,
+            frame_capture: PerFrameCapture::new(),
+            active_frame_stack: Vec::new(),
+            next_frame_index: 0,
+            pending_pre_applied_delta: 0,
             call_stack: Vec::new(),
             call_frames: Vec::new(),
             event_logs: Vec::new(),
@@ -352,6 +375,17 @@ impl ScheduleInspector {
     /// Get the event logs captured during execution.
     pub fn event_logs(&self) -> &[EventLog] {
         &self.event_logs
+    }
+
+    /// Get the per-frame opcode capture for this transaction.
+    ///
+    /// Returns the frames in frame-open order (root at index 0), each with
+    /// its counts, baseline gas, and schedule gas keyed by opcode byte.
+    /// `truncated == true` indicates the tx exceeded
+    /// [`crate::divergence::MAX_TRACKED_FRAMES`] and later frames' counts
+    /// were dropped — execution still ran to completion.
+    pub fn frame_opcode_counts(&self) -> &PerFrameCapture {
+        &self.frame_capture
     }
 
     /// Get the schedule name.
@@ -554,6 +588,64 @@ impl ScheduleInspector {
         matches!(opcode, 0xF0 | 0xF1 | 0xF2 | 0xF4 | 0xF5 | 0xFA)
     }
 
+    /// Push a new per-frame opcode counter and return its stack index.
+    ///
+    /// Returns `usize::MAX` when the [`MAX_TRACKED_FRAMES`] cap has been
+    /// reached; the caller still pushes this sentinel onto
+    /// `active_frame_stack` so `call_end` / `create_end` can pop in the
+    /// usual way. `record_opcode_in_active_frame` ignores the sentinel.
+    fn push_frame_counter(&mut self) -> usize {
+        if self.next_frame_index >= MAX_TRACKED_FRAMES {
+            self.frame_capture.truncated = true;
+            return usize::MAX;
+        }
+        let idx = self.frame_capture.frames.len();
+        self.frame_capture.frames.push(FrameOpcodeCounts::new(self.next_frame_index));
+        self.next_frame_index += 1;
+        idx
+    }
+
+    /// Ensure the root frame's per-opcode counter exists before any opcode
+    /// is recorded. The root frame never enters `call()`, so we lazily
+    /// initialise on first use from `step()`.
+    fn ensure_root_frame_counter(&mut self) {
+        if self.active_frame_stack.is_empty() {
+            let idx = self.push_frame_counter();
+            self.active_frame_stack.push(idx);
+        }
+    }
+
+    /// Increment the count for `opcode` on the current frame's counter.
+    fn record_opcode_count_in_active_frame(&mut self, opcode: u8) {
+        let Some(&idx) = self.active_frame_stack.last() else { return };
+        if idx == usize::MAX {
+            return;
+        }
+        if let Some(frame) = self.frame_capture.frames.get_mut(idx) {
+            frame.counts[opcode as usize] = frame.counts[opcode as usize].saturating_add(1);
+        }
+    }
+
+    /// Add gas-baseline and gas-schedule amounts to the active frame's
+    /// counters. Called once per opcode in `step_end()` after the EVM has
+    /// charged the natural cost and any per-opcode delta has been resolved.
+    fn record_opcode_gas_in_active_frame(
+        &mut self,
+        opcode: u8,
+        gas_baseline: u64,
+        gas_schedule: u64,
+    ) {
+        let Some(&idx) = self.active_frame_stack.last() else { return };
+        if idx == usize::MAX {
+            return;
+        }
+        if let Some(frame) = self.frame_capture.frames.get_mut(idx) {
+            let i = opcode as usize;
+            frame.gas_baseline[i] = frame.gas_baseline[i].saturating_add(gas_baseline);
+            frame.gas_schedule[i] = frame.gas_schedule[i].saturating_add(gas_schedule);
+        }
+    }
+
     /// Record a gas delta against the per-opcode counters in OperationCounts.
     fn record_opcode_gas_delta(op_counts: &mut OperationCounts, opcode: u8, delta: i64) {
         match opcode {
@@ -728,6 +820,13 @@ where
             _ => {}
         }
 
+        // Per-frame opcode bookkeeping. `call()` and `create()` push a new
+        // frame counter when a sub-frame opens; the root frame never receives
+        // those hooks, so we lazily initialise it here on the first opcode.
+        // Gas baseline/schedule is recorded later in `step_end()`.
+        self.ensure_root_frame_counter();
+        self.record_opcode_count_in_active_frame(self.current_opcode);
+
         // Count repriced opcodes
         match self.current_opcode {
             0x04 => self.op_counts.div_count += 1,
@@ -747,6 +846,12 @@ where
             self.op_counts.memory_words_allocated = memory_words as u64;
         }
 
+        // Reset the pending pre-applied delta for this opcode. If the
+        // CALL/CREATE branch below applies a delta, we'll set it; otherwise
+        // step_end() will see 0 and treat `actual_gas_cost` as the natural
+        // baseline cost.
+        self.pending_pre_applied_delta = 0;
+
         // For CALL/CREATE opcodes, apply the gas delta BEFORE execution so it
         // feeds into the 63/64 gas forwarding rule for the subcall.
         if Self::is_call_or_create(self.current_opcode) {
@@ -754,6 +859,7 @@ where
             let gas_delta = self.schedule.opcode_gas_delta(self.current_opcode, &opcode_ctx);
             if gas_delta != 0 {
                 self.call_delta_pre_applied = true;
+                self.pending_pre_applied_delta = gas_delta;
                 Self::record_opcode_gas_delta(&mut self.op_counts, self.current_opcode, gas_delta);
                 if !self.apply_gas_delta(interp, gas_delta, self.current_opcode) {
                     return; // OOG — interpreter is halted, don't continue
@@ -788,6 +894,24 @@ where
         let multiplier_gas_delta = self.multiplier_gas_delta(actual_gas_cost);
         let gas_delta = explicit_gas_delta.saturating_add(multiplier_gas_delta);
 
+        // Per-frame gas accounting. `actual_gas_cost` includes any delta
+        // pre-applied in `step()` (CALL/CREATE pre-deduction); subtract it
+        // so `gas_baseline` reflects only the EVM's natural charge. The
+        // total schedule cost is the natural charge plus all deltas
+        // (pre-applied + step_end additions).
+        let pre_applied = self.pending_pre_applied_delta;
+        self.pending_pre_applied_delta = 0;
+        let gas_baseline_increment =
+            (actual_gas_cost as i64).saturating_sub(pre_applied).max(0) as u64;
+        let total_opcode_delta = pre_applied.saturating_add(gas_delta);
+        let gas_schedule_increment =
+            (gas_baseline_increment as i64).saturating_add(total_opcode_delta).max(0) as u64;
+        self.record_opcode_gas_in_active_frame(
+            current_opcode,
+            gas_baseline_increment,
+            gas_schedule_increment,
+        );
+
         if gas_delta != 0 {
             Self::record_opcode_gas_delta(&mut self.op_counts, current_opcode, gas_delta);
             self.apply_gas_delta(interp, gas_delta, current_opcode);
@@ -815,6 +939,12 @@ where
         let gas_requested_on_stack = self.pending_call_stack_gas.take();
         let parent_gas_at_call = self.gas_before_step;
 
+        // Open a new per-frame opcode counter for the sub-call. The root
+        // frame was lazily initialised in `step()`; this `call()` always
+        // corresponds to a sub-call, so we push unconditionally.
+        let frame_capture_idx = self.push_frame_counter();
+        self.active_frame_stack.push(frame_capture_idx);
+
         self.call_stack.push(CallStackEntry {
             depth: self.call_stack.len(),
             contract: inputs.bytecode_address,
@@ -835,6 +965,12 @@ where
     }
 
     fn call_end(&mut self, _context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
+        // Pop the per-frame opcode counter stack to match the matching call()
+        // push. The counts stay in `frame_capture.frames` for later
+        // emission; only the active-frame index is unwound. Done regardless
+        // of how the frame ended so we never leave the stack out of sync.
+        self.active_frame_stack.pop();
+
         if let Some(entry) = self.call_stack.pop() {
             let mut frame_repricing_delta = entry.repricing_gas_delta;
 
@@ -996,6 +1132,11 @@ where
         let parent_has_positive_delta =
             self.call_stack.last().map_or(false, |p| p.any_positive_delta_in_subtree);
 
+        // Open a per-frame opcode counter for the CREATE/CREATE2 sub-frame.
+        // Mirrors `call()` — the root frame is lazy-init in `step()`.
+        let frame_capture_idx = self.push_frame_counter();
+        self.active_frame_stack.push(frame_capture_idx);
+
         self.call_stack.push(CallStackEntry {
             depth: self.call_stack.len(),
             contract: Address::ZERO,
@@ -1023,6 +1164,10 @@ where
         inputs: &CreateInputs,
         outcome: &mut CreateOutcome,
     ) {
+        // Pop the per-frame opcode counter stack to match the matching
+        // `create()` push (parallel to `call_end()`).
+        self.active_frame_stack.pop();
+
         if let Some(entry) = self.call_stack.pop() {
             let created_address = outcome.address.unwrap_or(Address::ZERO);
             let create_success = outcome.result.result.is_ok();
@@ -1141,5 +1286,104 @@ DIV,constant,5,15
             ScheduleInspector::new(Arc::new(BaselineSchedule)).with_gas_loop_detection(false);
 
         assert!(!inspector.detect_gas_loops);
+    }
+
+    #[test]
+    fn frame_capture_starts_empty() {
+        let inspector = ScheduleInspector::new(Arc::new(BaselineSchedule));
+        let capture = inspector.frame_opcode_counts();
+        assert_eq!(capture.frames.len(), 0);
+        assert!(!capture.truncated);
+    }
+
+    #[test]
+    fn frame_capture_ensure_root_creates_single_frame() {
+        let mut inspector = ScheduleInspector::new(Arc::new(BaselineSchedule));
+        inspector.ensure_root_frame_counter();
+        let capture = inspector.frame_opcode_counts();
+        assert_eq!(capture.frames.len(), 1);
+        assert_eq!(capture.frames[0].call_index, 0);
+        assert_eq!(inspector.active_frame_stack, vec![0]);
+        // Idempotent — a second call doesn't double-push.
+        inspector.ensure_root_frame_counter();
+        assert_eq!(inspector.frame_opcode_counts().frames.len(), 1);
+    }
+
+    #[test]
+    fn frame_capture_records_opcode_count_on_active_frame() {
+        let mut inspector = ScheduleInspector::new(Arc::new(BaselineSchedule));
+        inspector.ensure_root_frame_counter();
+        // Simulate two opcodes in root.
+        inspector.record_opcode_count_in_active_frame(0x01); // ADD
+        inspector.record_opcode_count_in_active_frame(0x01);
+        inspector.record_opcode_count_in_active_frame(0x20); // KECCAK256
+        let root = &inspector.frame_opcode_counts().frames[0];
+        assert_eq!(root.counts[0x01], 2);
+        assert_eq!(root.counts[0x20], 1);
+        // Verify nonzero() filtering yields only the touched opcodes.
+        let nonzero: Vec<_> = root.nonzero().map(|(op, c, _, _)| (op, c)).collect();
+        assert_eq!(nonzero, vec![(0x01, 2), (0x20, 1)]);
+    }
+
+    #[test]
+    fn frame_capture_records_gas_for_baseline_and_schedule() {
+        let mut inspector = ScheduleInspector::new(Arc::new(BaselineSchedule));
+        inspector.ensure_root_frame_counter();
+        // 50 baseline / 60 schedule = a +10 delta the inspector applied.
+        inspector.record_opcode_gas_in_active_frame(0x01, 50, 60);
+        inspector.record_opcode_gas_in_active_frame(0x01, 30, 35);
+        let root = &inspector.frame_opcode_counts().frames[0];
+        assert_eq!(root.gas_baseline[0x01], 80);
+        assert_eq!(root.gas_schedule[0x01], 95);
+    }
+
+    #[test]
+    fn frame_capture_pushes_and_pops_via_helpers() {
+        // Simulate the lifecycle: root opens, sub-call opens, sub-call closes.
+        let mut inspector = ScheduleInspector::new(Arc::new(BaselineSchedule));
+        inspector.ensure_root_frame_counter();
+        // Sub-call 1.
+        let sub_idx = inspector.push_frame_counter();
+        inspector.active_frame_stack.push(sub_idx);
+        assert_eq!(inspector.frame_opcode_counts().frames.len(), 2);
+        assert_eq!(inspector.frame_opcode_counts().frames[1].call_index, 1);
+        assert_eq!(inspector.active_frame_stack, vec![0, sub_idx]);
+        // Increment within sub-call.
+        inspector.record_opcode_count_in_active_frame(0x55); // SSTORE
+        assert_eq!(inspector.frame_opcode_counts().frames[1].counts[0x55], 1);
+        assert_eq!(inspector.frame_opcode_counts().frames[0].counts[0x55], 0);
+        // Pop back to root.
+        inspector.active_frame_stack.pop();
+        assert_eq!(inspector.active_frame_stack, vec![0]);
+        inspector.record_opcode_count_in_active_frame(0x55);
+        assert_eq!(inspector.frame_opcode_counts().frames[0].counts[0x55], 1);
+        // The sub-frame's counts persist after it's popped — that's the
+        // point of keeping them in `frame_capture.frames`.
+        assert_eq!(inspector.frame_opcode_counts().frames[1].counts[0x55], 1);
+    }
+
+    #[test]
+    fn frame_capture_truncates_at_cap() {
+        let mut inspector = ScheduleInspector::new(Arc::new(BaselineSchedule));
+        inspector.ensure_root_frame_counter();
+        // Open MAX_TRACKED_FRAMES - 1 more sub-frames to hit the cap exactly.
+        for _ in 1..MAX_TRACKED_FRAMES {
+            let idx = inspector.push_frame_counter();
+            inspector.active_frame_stack.push(idx);
+        }
+        assert!(!inspector.frame_opcode_counts().truncated);
+        assert_eq!(inspector.frame_opcode_counts().frames.len() as u32, MAX_TRACKED_FRAMES);
+        // One more pushes the truncated flag and returns the sentinel.
+        let overflow_idx = inspector.push_frame_counter();
+        assert_eq!(overflow_idx, usize::MAX);
+        assert!(inspector.frame_opcode_counts().truncated);
+        // Recording on the sentinel is a no-op (doesn't panic, doesn't
+        // affect any existing frame).
+        inspector.active_frame_stack.push(overflow_idx);
+        let pre_counts = inspector.frame_opcode_counts().frames[0].counts[0x01];
+        inspector.record_opcode_count_in_active_frame(0x01);
+        inspector.record_opcode_gas_in_active_frame(0x01, 10, 12);
+        let post_counts = inspector.frame_opcode_counts().frames[0].counts[0x01];
+        assert_eq!(pre_counts, post_counts, "sentinel should not bleed into root");
     }
 }
