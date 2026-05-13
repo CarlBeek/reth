@@ -92,8 +92,9 @@ Canonical DDL lives in `crates/research/src/database.rs` (function
   tx_count_contract_broken)`
 - `block_summaries(schedule_name, block_number, bucket, tx_count,
   gas_delta_sum, gas_delta_sum_sq REAL, gas_delta_min, gas_delta_max,
-  gas_delta_log2_hist TEXT/JSON, opcode_count_totals_7904 TEXT/JSON,
-  opcode_gas_delta_totals_7904 TEXT/JSON, state_gas_sum,
+  gas_delta_log2_hist TEXT/JSON, opcode_totals_7904 TEXT/JSON
+  (sparse list of {opcode, count, gas_baseline, gas_schedule}),
+  state_gas_sum,
   state_gas_spillover_sum, multiplier_log2_hist TEXT/JSON,
   tx_count_creation, tx_count_authorization, tx_count_runtime_state,
   tx_count_no_state)`

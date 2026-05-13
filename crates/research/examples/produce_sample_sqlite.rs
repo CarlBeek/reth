@@ -13,7 +13,7 @@ use alloy_primitives::{Address, Bytes, B256};
 use reth_research::{
     database::{
         BlockCoverageRow, BlockOutput, BlockSummaryRow, CallFrameRow, DivergenceDatabase,
-        DivergenceRow, DrillInRecord, OpcodeCountRow,
+        DivergenceRow, DrillInRecord, OpcodeBucketTotal, OpcodeCountRow,
     },
     divergence::{Bucket, EventLog},
 };
@@ -145,6 +145,12 @@ fn main() {
             gas_delta_min: Some(20_000),
             gas_delta_max: Some(20_000),
             gas_delta_log2_hist: Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            opcode_totals_7904: vec![OpcodeBucketTotal {
+                opcode: 0x55,
+                count: 3,
+                gas_baseline: 60_000,
+                gas_schedule: 75_000,
+            }],
             state_gas_sum: None,
             state_gas_spillover_sum: None,
             multiplier_log2_hist: None,

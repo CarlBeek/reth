@@ -11,8 +11,8 @@
 //! storage rules and the schema.
 
 use crate::{
-    database::{BlockCoverageRow, BlockOutput, BlockSummaryRow, DrillInRecord},
-    divergence::Bucket,
+    database::{BlockCoverageRow, BlockOutput, BlockSummaryRow, DrillInRecord, OpcodeBucketTotal},
+    divergence::{Bucket, FrameOpcodeCounts},
 };
 use alloy_primitives::B256;
 use std::collections::BTreeMap;
@@ -50,7 +50,7 @@ pub struct BlockAggregator {
     drill_ins: Vec<DrillInRecord>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct BucketAccumulator {
     tx_count: u32,
     gas_delta_sum: i64,
@@ -88,6 +88,42 @@ struct BucketAccumulator {
     tx_count_authorization: u32,
     tx_count_runtime_state: u32,
     tx_count_no_state: u32,
+
+    // Per-opcode totals — counts + baseline / schedule gas — summed
+    // across every frame of every tx in this bucket for this block.
+    // Stored dense (256 wide) for cache-friendly accumulation; emitted
+    // sparse (nonzero only) in `finish_block` so the JSON column stays
+    // compact.
+    //
+    // Default isn't auto-derived for arrays larger than 32 elements;
+    // we provide a manual impl below.
+    opcode_counts: [u64; 256],
+    opcode_gas_baseline: [u64; 256],
+    opcode_gas_schedule: [u64; 256],
+}
+
+impl Default for BucketAccumulator {
+    fn default() -> Self {
+        Self {
+            tx_count: 0,
+            gas_delta_sum: 0,
+            gas_delta_sum_sq: 0,
+            gas_delta_min: None,
+            gas_delta_max: None,
+            gas_delta_log2_hist: [0; 12],
+            state_gas_sum: 0,
+            state_gas_spillover_sum: 0,
+            multiplier_log2_hist: [0; 12],
+            multiplier_observations: 0,
+            tx_count_creation: 0,
+            tx_count_authorization: 0,
+            tx_count_runtime_state: 0,
+            tx_count_no_state: 0,
+            opcode_counts: [0; 256],
+            opcode_gas_baseline: [0; 256],
+            opcode_gas_schedule: [0; 256],
+        }
+    }
 }
 
 impl BucketAccumulator {
@@ -199,10 +235,18 @@ impl BlockAggregator {
         }
     }
 
-    /// Record a single tx's classification + per-tx metrics. Drill-in
-    /// records are kept only for `bucket.is_drill_in()`; aggregate
-    /// buckets discard them after rolling the metric counters.
-    pub fn observe_tx(&mut self, obs: TxObservation) {
+    /// Record a single tx's classification + per-tx metrics + per-frame
+    /// opcode counts. Drill-in records are kept only for
+    /// `bucket.is_drill_in()`; aggregate buckets discard them after
+    /// rolling the metric counters.
+    ///
+    /// `opcode_frames` is the inspector's per-frame opcode counter; we
+    /// fold every frame's nonzero opcodes into the bucket's running
+    /// totals so `block_summaries.opcode_totals_7904` ends up with the
+    /// full opcode-level gas profile of each bucket. Pass an empty
+    /// slice when there's no per-frame data (e.g. a baseline-only
+    /// observation or a test).
+    pub fn observe_tx(&mut self, obs: TxObservation, opcode_frames: &[FrameOpcodeCounts]) {
         self.tx_count += 1;
         let acc = self.buckets.entry(obs.bucket).or_default();
         acc.tx_count += 1;
@@ -232,6 +276,21 @@ impl BlockAggregator {
             acc.tx_count_runtime_state += 1;
         } else {
             acc.tx_count_no_state += 1;
+        }
+
+        // Per-opcode totals. Sum across every frame; the bucket's dense
+        // 256-wide arrays absorb everything. saturating_add guards the
+        // pathological case of a single opcode running ~2^64 times in
+        // one block, which can't happen but is cheap insurance.
+        for frame in opcode_frames {
+            for (opcode_byte, count, gas_baseline, gas_schedule) in frame.nonzero() {
+                let i = opcode_byte as usize;
+                acc.opcode_counts[i] = acc.opcode_counts[i].saturating_add(count);
+                acc.opcode_gas_baseline[i] =
+                    acc.opcode_gas_baseline[i].saturating_add(gas_baseline);
+                acc.opcode_gas_schedule[i] =
+                    acc.opcode_gas_schedule[i].saturating_add(gas_schedule);
+            }
         }
 
         if obs.bucket.is_drill_in() {
@@ -288,6 +347,24 @@ impl BlockAggregator {
             let multiplier_log2_hist =
                 (acc.multiplier_observations > 0).then_some(acc.multiplier_log2_hist);
 
+            // Collapse the dense 256-wide opcode arrays into a sparse
+            // list of `OpcodeBucketTotal`. Skip entries where every
+            // counter is zero so the JSON column stays compact.
+            let mut opcode_totals_7904 = Vec::new();
+            for i in 0..256 {
+                let count = acc.opcode_counts[i];
+                let gas_baseline = acc.opcode_gas_baseline[i];
+                let gas_schedule = acc.opcode_gas_schedule[i];
+                if count != 0 || gas_baseline != 0 || gas_schedule != 0 {
+                    opcode_totals_7904.push(OpcodeBucketTotal {
+                        opcode: i as u8,
+                        count,
+                        gas_baseline,
+                        gas_schedule,
+                    });
+                }
+            }
+
             summaries.push(BlockSummaryRow {
                 schedule_name: self.meta.schedule_name.clone(),
                 block_number: self.meta.block_number,
@@ -298,6 +375,7 @@ impl BlockAggregator {
                 gas_delta_min: acc.gas_delta_min,
                 gas_delta_max: acc.gas_delta_max,
                 gas_delta_log2_hist: Some(acc.gas_delta_log2_hist),
+                opcode_totals_7904,
                 state_gas_sum,
                 state_gas_spillover_sum,
                 multiplier_log2_hist,
@@ -354,10 +432,10 @@ mod tests {
     #[test]
     fn coverage_counts_split_by_bucket() {
         let mut agg = BlockAggregator::start_block(meta(), 4);
-        agg.observe_tx(obs(Bucket::Unchanged, 0));
-        agg.observe_tx(obs(Bucket::GasOnly, 100));
-        agg.observe_tx(obs(Bucket::WalletFixableShallow, 5_000));
-        agg.observe_tx(obs(Bucket::ContractBroken, 50_000));
+        agg.observe_tx(obs(Bucket::Unchanged, 0), &[]);
+        agg.observe_tx(obs(Bucket::GasOnly, 100), &[]);
+        agg.observe_tx(obs(Bucket::WalletFixableShallow, 5_000), &[]);
+        agg.observe_tx(obs(Bucket::ContractBroken, 50_000), &[]);
 
         let out = agg.finish_block();
         assert_eq!(out.coverage.tx_count, 4);
@@ -377,11 +455,11 @@ mod tests {
         // Aggregate bucket — drill_in_record is ignored even if passed.
         let mut o = obs(Bucket::GasOnly, 100);
         o.drill_in_record = Some(dummy_drill_in());
-        agg.observe_tx(o);
+        agg.observe_tx(o, &[]);
         // Drill-in bucket with a record — kept.
         let mut o = obs(Bucket::ContractBroken, -50);
         o.drill_in_record = Some(dummy_drill_in());
-        agg.observe_tx(o);
+        agg.observe_tx(o, &[]);
 
         let out = agg.finish_block();
         assert_eq!(out.drill_ins.len(), 1, "only ContractBroken should retain its record");
@@ -390,9 +468,9 @@ mod tests {
     #[test]
     fn gas_delta_aggregates_per_bucket() {
         let mut agg = BlockAggregator::start_block(meta(), 3);
-        agg.observe_tx(obs(Bucket::GasOnly, 100));
-        agg.observe_tx(obs(Bucket::GasOnly, -50));
-        agg.observe_tx(obs(Bucket::GasOnly, 200));
+        agg.observe_tx(obs(Bucket::GasOnly, 100), &[]);
+        agg.observe_tx(obs(Bucket::GasOnly, -50), &[]);
+        agg.observe_tx(obs(Bucket::GasOnly, 200), &[]);
 
         let out = agg.finish_block();
         let summary = out.summaries.iter().find(|s| s.bucket == Bucket::GasOnly).unwrap();
@@ -410,9 +488,9 @@ mod tests {
         let mut o = obs(Bucket::GasOnly, 0);
         o.state_gas_spent = 5_000;
         o.state_gas_spillover = 1_500;
-        agg.observe_tx(o);
+        agg.observe_tx(o, &[]);
         // Bucket B: no state gas activity → state_gas_sum should be None.
-        agg.observe_tx(obs(Bucket::Unchanged, 0));
+        agg.observe_tx(obs(Bucket::Unchanged, 0), &[]);
 
         let out = agg.finish_block();
         let gas_only = out.summaries.iter().find(|s| s.bucket == Bucket::GasOnly).unwrap();
@@ -438,7 +516,7 @@ mod tests {
             has_authorization: true,
             has_runtime_state: true,
             drill_in_record: None,
-        });
+        }, &[]);
         let out = agg.finish_block();
         let summary = &out.summaries[0];
         assert_eq!(summary.tx_count_creation, Some(1));
@@ -451,7 +529,7 @@ mod tests {
     #[test]
     fn no_state_counter_fires_when_no_runtime_state_gas() {
         let mut agg = BlockAggregator::start_block(meta(), 1);
-        agg.observe_tx(obs(Bucket::Unchanged, 0));
+        agg.observe_tx(obs(Bucket::Unchanged, 0), &[]);
         let out = agg.finish_block();
         let summary = &out.summaries[0];
         assert_eq!(summary.tx_count_no_state, Some(1));
@@ -483,13 +561,13 @@ mod tests {
         let mut agg = BlockAggregator::start_block(meta(), 3);
         let mut o = obs(Bucket::GasOnly, 0);
         o.min_multiplier_to_succeed = Some(1.0); // bin 1
-        agg.observe_tx(o);
+        agg.observe_tx(o, &[]);
         let mut o = obs(Bucket::GasOnly, 0);
         o.min_multiplier_to_succeed = Some(1.4); // bin 3 (1.25 < 1.4 ≤ 1.5)
-        agg.observe_tx(o);
+        agg.observe_tx(o, &[]);
         let mut o = obs(Bucket::GasOnly, 0);
         o.min_multiplier_to_succeed = None; // bin 0
-        agg.observe_tx(o);
+        agg.observe_tx(o, &[]);
 
         let out = agg.finish_block();
         let summary = &out.summaries[0];
@@ -579,5 +657,70 @@ mod tests {
             baseline_event_logs: vec![],
             schedule_event_logs: vec![],
         }
+    }
+
+    /// The per-frame opcode counts produced by the inspector should
+    /// fold cleanly into the bucket's aggregate `opcode_totals_7904`,
+    /// summed across every frame of every tx in the same bucket. Zero-
+    /// count opcodes shouldn't appear in the emitted sparse list.
+    #[test]
+    fn opcode_totals_aggregate_across_frames_and_txs() {
+        let mut agg = BlockAggregator::start_block(meta(), 2);
+
+        // tx 1: two frames each running KECCAK256 (0x20) and SLOAD (0x54).
+        let mut frame_a = FrameOpcodeCounts::new(0);
+        frame_a.counts[0x20] = 3;
+        frame_a.gas_baseline[0x20] = 90;
+        frame_a.gas_schedule[0x20] = 135;
+        frame_a.counts[0x54] = 1;
+        frame_a.gas_baseline[0x54] = 800;
+        frame_a.gas_schedule[0x54] = 800;
+
+        let mut frame_b = FrameOpcodeCounts::new(1);
+        frame_b.counts[0x20] = 5;
+        frame_b.gas_baseline[0x20] = 150;
+        frame_b.gas_schedule[0x20] = 225;
+
+        agg.observe_tx(obs(Bucket::ContractBroken, 100), &[frame_a, frame_b]);
+
+        // tx 2 (same bucket): one frame with SSTORE (0x55).
+        let mut frame_c = FrameOpcodeCounts::new(0);
+        frame_c.counts[0x55] = 2;
+        frame_c.gas_baseline[0x55] = 40_000;
+        frame_c.gas_schedule[0x55] = 50_000;
+        agg.observe_tx(obs(Bucket::ContractBroken, 200), &[frame_c]);
+
+        // tx 3 (different bucket): should NOT mix into ContractBroken.
+        let mut frame_d = FrameOpcodeCounts::new(0);
+        frame_d.counts[0x20] = 99; // unrelated KECCAK count
+        agg.observe_tx(obs(Bucket::GasOnly, 5), &[frame_d]);
+
+        let out = agg.finish_block();
+        let broken = out
+            .summaries
+            .iter()
+            .find(|s| s.bucket == Bucket::ContractBroken)
+            .expect("ContractBroken summary emitted");
+
+        // Sparse list — KECCAK256 (8 = 3+5), SLOAD (1), SSTORE (2). No 0-count rows.
+        assert_eq!(broken.opcode_totals_7904.len(), 3);
+        let by_op: std::collections::BTreeMap<u8, _> = broken
+            .opcode_totals_7904
+            .iter()
+            .map(|t| (t.opcode, (t.count, t.gas_baseline, t.gas_schedule)))
+            .collect();
+        assert_eq!(by_op[&0x20], (8, 240, 360));
+        assert_eq!(by_op[&0x54], (1, 800, 800));
+        assert_eq!(by_op[&0x55], (2, 40_000, 50_000));
+
+        // GasOnly bucket's KECCAK total is isolated.
+        let gas_only = out
+            .summaries
+            .iter()
+            .find(|s| s.bucket == Bucket::GasOnly)
+            .expect("GasOnly summary emitted");
+        assert_eq!(gas_only.opcode_totals_7904.len(), 1);
+        assert_eq!(gas_only.opcode_totals_7904[0].opcode, 0x20);
+        assert_eq!(gas_only.opcode_totals_7904[0].count, 99);
     }
 }

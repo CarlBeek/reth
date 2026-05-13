@@ -48,8 +48,14 @@ use thiserror::Error;
 /// matches and reject DB files written by a different version (the doc's
 /// "no migration shims; major schema change is a full re-replay" rule).
 ///
-/// v2 is the SQLite incarnation. v1 was the DuckDB attempt that we retired.
-pub const SCHEMA_VERSION: u32 = 2;
+/// History:
+/// - v1: DuckDB attempt (retired — single-process writer-lock issue).
+/// - v2: SQLite + DuckDB sqlite_scanner. Initial production schema.
+/// - v3: collapsed the two placeholder opcode-totals JSON columns
+///       (`opcode_count_totals_7904`, `opcode_gas_delta_totals_7904`)
+///       into a single `opcode_totals_7904` populated with sparse
+///       (opcode, count, gas_baseline, gas_schedule) tuples per bucket.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Errors raised by the storage layer.
 #[derive(Debug, Error)]
@@ -257,10 +263,13 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
     // One row per (schedule, block, bucket). Only emitted for buckets that
     // had at least one tx in the block.
     //
-    // `opcode_count_totals_7904` / `opcode_gas_delta_totals_7904` are sparse
-    // JSON arrays of {opcode, count|delta} objects — a tx that ran 5 unique
-    // opcodes contributes 5 entries. `multiplier_log2_hist` and
-    // `gas_delta_log2_hist` are JSON arrays of exactly 12 ints (fixed-size
+    // `opcode_totals_7904` is a sparse JSON array of
+    // `{opcode, count, gas_baseline, gas_schedule}` objects — one entry per
+    // distinct opcode the bucket touched in this block, summed across every
+    // frame of every tx. Lets the dashboard compute both the share of gas
+    // each opcode burned and the delta the schedule introduced.
+    // `multiplier_log2_hist` and `gas_delta_log2_hist` are JSON arrays of
+    // exactly 12 ints (fixed-size
     // log2 bins) so the CDF charts read pre-binned data.
     //
     // `gas_delta_sum_sq` is REAL (loses precision past 2^53) rather than
@@ -277,8 +286,7 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             gas_delta_min       INTEGER,
             gas_delta_max       INTEGER,
             gas_delta_log2_hist TEXT,
-            opcode_count_totals_7904     TEXT,
-            opcode_gas_delta_totals_7904 TEXT,
+            opcode_totals_7904      TEXT,
             state_gas_sum           INTEGER,
             state_gas_spillover_sum INTEGER,
             multiplier_log2_hist    TEXT,
@@ -506,9 +514,25 @@ pub struct BlockCoverageRow {
     pub tx_count_contract_broken: u32,
 }
 
-/// Aggregate summary for one (schedule, block, bucket). The 7904 / 8037
-/// per-opcode struct lists are not built yet — the aggregator emits empty
-/// JSON arrays for now (deferred follow-up).
+/// Per-opcode totals for one (block, bucket) row in `block_summaries`,
+/// emitted as JSON array. Sparse — only opcodes that actually executed
+/// in this bucket on this block appear.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OpcodeBucketTotal {
+    pub opcode: u8,
+    /// Total executions of this opcode across every tx in the bucket
+    /// for this block (summed across every call frame).
+    pub count: u64,
+    /// Sum of baseline gas cost (what the original schedule charged).
+    pub gas_baseline: u64,
+    /// Sum of schedule gas cost (what the replay schedule charged).
+    /// Subtract `gas_baseline` for the per-opcode delta the schedule
+    /// introduced.
+    pub gas_schedule: u64,
+}
+
+/// Aggregate summary for one (schedule, block, bucket).
 #[allow(missing_docs)]
 #[derive(Debug, Clone)]
 pub struct BlockSummaryRow {
@@ -526,6 +550,10 @@ pub struct BlockSummaryRow {
     /// 12-bin log2 histogram of `abs(gas_delta)`. `None` for buckets where
     /// no gas delta makes sense. Serialized as JSON.
     pub gas_delta_log2_hist: Option<[i32; 12]>,
+    /// Per-opcode totals across this bucket in this block. Empty when
+    /// no opcodes ran (e.g. the aggregator has nothing to fold in).
+    /// JSON-encoded in the DB as a sparse list.
+    pub opcode_totals_7904: Vec<OpcodeBucketTotal>,
     pub state_gas_sum: Option<u64>,
     pub state_gas_spillover_sum: Option<u64>,
     pub multiplier_log2_hist: Option<[i32; 12]>,
@@ -945,8 +973,8 @@ fn insert_block_coverage(
 
 fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(), DatabaseError> {
     // SQLite has no native arrays — we JSON-encode the histograms and
-    // the (currently empty) struct lists. gas_delta_sum_sq is bound as
-    // a REAL (f64).
+    // the sparse per-opcode struct list. gas_delta_sum_sq is bound as a
+    // REAL (f64).
     let gas_delta_log2_hist = match row.gas_delta_log2_hist {
         Some(arr) => Some(serde_json::to_string(&arr)?),
         None => None,
@@ -955,9 +983,7 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
         Some(arr) => Some(serde_json::to_string(&arr)?),
         None => None,
     };
-    // Per-opcode totals aren't computed yet — emit an empty JSON array so
-    // the consumer's view-of-totals query sees a parseable column.
-    let empty_struct_list = "[]";
+    let opcode_totals_7904 = serde_json::to_string(&row.opcode_totals_7904)?;
     let gas_delta_sum_sq_real = row.gas_delta_sum_sq.map(|v| v as f64);
 
     tx.execute(
@@ -965,7 +991,7 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             schedule_name, block_number, bucket, tx_count,
             gas_delta_sum, gas_delta_sum_sq, gas_delta_min, gas_delta_max,
             gas_delta_log2_hist,
-            opcode_count_totals_7904, opcode_gas_delta_totals_7904,
+            opcode_totals_7904,
             state_gas_sum, state_gas_spillover_sum,
             multiplier_log2_hist,
             tx_count_creation, tx_count_authorization,
@@ -973,7 +999,7 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
         ) VALUES (?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?,
-                  ?, ?,
+                  ?,
                   ?, ?,
                   ?,
                   ?, ?, ?, ?)
@@ -984,6 +1010,7 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             gas_delta_min           = excluded.gas_delta_min,
             gas_delta_max           = excluded.gas_delta_max,
             gas_delta_log2_hist     = excluded.gas_delta_log2_hist,
+            opcode_totals_7904      = excluded.opcode_totals_7904,
             state_gas_sum           = excluded.state_gas_sum,
             state_gas_spillover_sum = excluded.state_gas_spillover_sum,
             multiplier_log2_hist    = excluded.multiplier_log2_hist,
@@ -1001,8 +1028,7 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             row.gas_delta_min,
             row.gas_delta_max,
             gas_delta_log2_hist,
-            empty_struct_list,
-            empty_struct_list,
+            opcode_totals_7904,
             row.state_gas_sum.map(|v| v as i64),
             row.state_gas_spillover_sum.map(|v| v as i64),
             multiplier_log2_hist,
@@ -1453,6 +1479,12 @@ mod tests {
                 gas_delta_min: Some(12_345),
                 gas_delta_max: Some(12_345),
                 gas_delta_log2_hist: Some([0; 12]),
+                opcode_totals_7904: vec![OpcodeBucketTotal {
+                    opcode: 0x55,
+                    count: 3,
+                    gas_baseline: 60_000,
+                    gas_schedule: 75_000,
+                }],
                 state_gas_sum: None,
                 state_gas_spillover_sum: None,
                 multiplier_log2_hist: None,
