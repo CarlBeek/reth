@@ -48,6 +48,18 @@ pub struct TrackingInspector {
 
     /// Opcode currently being executed (captured in `step()`).
     current_opcode: u8,
+
+    /// Gas used by the callee that just returned. Set in
+    /// `call_end()` / `create_end()`, consumed and cleared in the
+    /// matching `step_end()` for the outer CALL/CREATE opcode.
+    ///
+    /// Without this, `step_end()`'s `gas_before - gas_remaining_after`
+    /// for a CALL/CREATE opcode double-counts the callee: the callee's
+    /// per-opcode gas is already attributed to its leaf opcodes via
+    /// step/step_end inside the sub-frame, so attributing it again to
+    /// the outer CALL/CREATE inflates totals (a tx whose root just
+    /// CALLs a heavy contract would report twice its real gas).
+    pending_callee_gas_used: u64,
 }
 
 /// Entry in the call stack.
@@ -78,7 +90,15 @@ impl TrackingInspector {
             next_frame_index: 0,
             gas_before_step: None,
             current_opcode: 0,
+            pending_callee_gas_used: 0,
         }
+    }
+
+    /// Whether `opcode` opens a sub-frame (CALL family + CREATE/CREATE2),
+    /// i.e. one whose `step_end()` cost needs the callee's gas subtracted
+    /// to avoid double-counting.
+    fn is_call_or_create(opcode: u8) -> bool {
+        matches!(opcode, 0xF0 | 0xF1 | 0xF2 | 0xF4 | 0xF5 | 0xFA)
     }
 
     /// Get the operation counts.
@@ -206,7 +226,18 @@ where
         // baseline inspector applies no schedule deltas, so `gas_baseline`
         // and `gas_schedule` both receive the same value.
         let Some(gas_before) = self.gas_before_step.take() else { return };
-        let actual_gas_cost = gas_before.saturating_sub(interp.gas.remaining());
+        let mut actual_gas_cost = gas_before.saturating_sub(interp.gas.remaining());
+        // For CALL/CREATE opcodes, `gas_before - gas_remaining_after`
+        // includes the callee's net consumption (the EVM forwards gas
+        // into the sub-frame, then refunds whatever it didn't burn).
+        // The callee's own opcodes already accrued in its sub-frame
+        // counters via step/step_end, so we subtract the callee's gas
+        // here to leave only the intrinsic CALL/CREATE charge on the
+        // outer opcode.
+        let pending = std::mem::take(&mut self.pending_callee_gas_used);
+        if pending > 0 && Self::is_call_or_create(self.current_opcode) {
+            actual_gas_cost = actual_gas_cost.saturating_sub(pending);
+        }
         self.record_opcode_in_active_frame(self.current_opcode, actual_gas_cost);
     }
 
@@ -257,6 +288,14 @@ where
 
             // Calculate gas used (gas_provided - gas_remaining)
             let gas_used = entry.gas_provided.saturating_sub(outcome.result.gas.remaining());
+            // Hand the callee's net gas to the next step_end() so it can
+            // subtract it from the parent CALL opcode's recorded cost.
+            // Skipped for precompile calls (no step events fire in the
+            // sub-frame, so the precompile's gas wouldn't get attributed
+            // anywhere else — leave it under the outer CALL).
+            if !outcome.was_precompile_called {
+                self.pending_callee_gas_used = gas_used;
+            }
 
             // Assign `call_index` at completion time to match
             // `ScheduleInspector` (sequential by completion order rather than
@@ -319,6 +358,10 @@ where
         if let Some(entry) = self.call_stack.pop() {
             let created_address = outcome.address.unwrap_or(Address::ZERO);
             let gas_used = entry.gas_provided.saturating_sub(outcome.result.gas.remaining());
+            // Same double-count fix as call_end: hand the callee's gas
+            // to the next step_end() so the outer CREATE/CREATE2 opcode
+            // gets credited only for its intrinsic charge.
+            self.pending_callee_gas_used = gas_used;
 
             self.call_frames.push(CallFrame {
                 call_index: self.call_frames.len(),

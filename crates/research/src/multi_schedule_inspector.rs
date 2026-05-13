@@ -187,6 +187,14 @@ pub struct ScheduleInspector {
     /// natural baseline cost.
     pending_pre_applied_delta: i64,
 
+    /// Gas the most-recently-returned callee consumed. Set in
+    /// `call_end()` / `create_end()` (we already compute it for the
+    /// CallFrame record), read and cleared in the matching `step_end()`
+    /// for the outer CALL/CREATE opcode so its per-opcode total doesn't
+    /// double-count the callee's gas (which is already attributed to
+    /// the callee's leaf opcodes via step/step_end inside the sub-frame).
+    pending_callee_gas_used: u64,
+
     /// Call stack for tracking depth
     call_stack: Vec<CallStackEntry>,
 
@@ -341,6 +349,7 @@ impl ScheduleInspector {
             active_frame_stack: Vec::new(),
             next_frame_index: 0,
             pending_pre_applied_delta: 0,
+            pending_callee_gas_used: 0,
             call_stack: Vec::new(),
             call_frames: Vec::new(),
             event_logs: Vec::new(),
@@ -879,7 +888,18 @@ where
 
         let current_opcode = self.current_opcode;
         let gas_before = self.gas_before_step.expect("checked above");
-        let actual_gas_cost = gas_before.saturating_sub(interp.gas.remaining());
+        // `gas_before - gas_remaining_after` for a CALL/CREATE includes
+        // the callee's net consumption; the callee's gas is already
+        // accounted for by step/step_end inside its sub-frame, so
+        // subtract it here to leave only the intrinsic CALL/CREATE
+        // charge on the outer opcode (avoids double-counting).
+        let pending_callee = std::mem::take(&mut self.pending_callee_gas_used);
+        let raw_cost = gas_before.saturating_sub(interp.gas.remaining());
+        let actual_gas_cost = if pending_callee > 0 && Self::is_call_or_create(current_opcode) {
+            raw_cost.saturating_sub(pending_callee)
+        } else {
+            raw_cost
+        };
 
         let opcode_ctx = self.build_opcode_context(interp);
         let explicit_gas_delta = if self.call_delta_pre_applied {
@@ -1054,6 +1074,23 @@ where
                 revm::interpreter::CallValue::Apparent(_) => None,
             };
 
+            // Hand the callee's net gas to the next step_end() for the
+            // parent's CALL opcode so its per-opcode total isn't
+            // double-counted. Uses gas_limit (forwarded to the callee),
+            // not `entry.gas_at_start` (caller's gas before the CALL
+            // intrinsic was charged) — we want exactly the callee's
+            // consumption, not the intrinsic CALL cost.
+            //
+            // Skipped for precompile calls: revm runs precompiles
+            // inline without firing step()/step_end() in the sub-frame,
+            // so the precompile's gas isn't attributed to any leaf
+            // opcode. Leaving it under the outer CALL keeps it visible
+            // in the per-opcode breakdown.
+            if !outcome.was_precompile_called {
+                self.pending_callee_gas_used =
+                    inputs.gas_limit.saturating_sub(outcome.result.gas.remaining());
+            }
+
             self.call_frames.push(CallFrame {
                 call_index: self.call_frames.len(),
                 depth: entry.depth,
@@ -1184,6 +1221,12 @@ where
             // CREATE/CREATE2 endow the new contract with `inputs.value`;
             // we capture it in the same column as CALL's transfer value.
             let value_wei = Some(inputs.value().saturating_to::<u128>());
+
+            // Same double-count fix as call_end: feed the callee's net
+            // gas (forwarded - returned) into the next step_end so the
+            // outer CREATE/CREATE2 opcode gets only the intrinsic charge.
+            self.pending_callee_gas_used =
+                inputs.gas_limit().saturating_sub(outcome.result.gas.remaining());
 
             self.call_frames.push(CallFrame {
                 call_index: self.call_frames.len(),
