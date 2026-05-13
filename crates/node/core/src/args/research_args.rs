@@ -39,7 +39,11 @@ pub struct ResearchArgs {
 
     /// Path to the SQLite divergence database file. Opened in WAL mode so
     /// the consumer dashboard (DuckDB sqlite_scanner) can read concurrently.
-    #[arg(long = "research.db-path", default_value = "./divergences.sqlite", help_heading = "Research")]
+    #[arg(
+        long = "research.db-path",
+        default_value = "./divergences.sqlite",
+        help_heading = "Research"
+    )]
     pub db_path: PathBuf,
 
     /// Block number to start research analysis.
@@ -205,10 +209,7 @@ impl ResearchArgs {
     /// Opens the divergence database (DuckDB).
     pub fn open_database(
         &self,
-    ) -> Result<
-        reth_research::database::DivergenceDatabase,
-        reth_research::DatabaseError,
-    > {
+    ) -> Result<reth_research::database::DivergenceDatabase, reth_research::DatabaseError> {
         reth_research::database::DivergenceDatabase::open(&self.db_path)
     }
 

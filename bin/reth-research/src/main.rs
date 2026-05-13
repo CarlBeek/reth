@@ -37,8 +37,7 @@ use reth_provider::{BlockNumReader, BlockReader, StateProviderFactory, Transacti
 use reth_research::{
     block_aggregator::{BlockAggregator, BlockMeta},
     database::{
-        BlockOutput, CallFrameRow, DivergenceRow, DrillInRecord, DivergenceDatabase,
-        OpcodeCountRow,
+        BlockOutput, CallFrameRow, DivergenceDatabase, DivergenceRow, DrillInRecord, OpcodeCountRow,
     },
     divergence::{
         classify_bucket, BucketInput, CallFrame, CallType as ResCallType, DivergenceLocation,
@@ -2118,9 +2117,7 @@ async fn run_metadata_backfill_exex<Node: FullNodeComponents>(
     ctx: ExExContext<Node>,
     db_path: std::path::PathBuf,
 ) -> eyre::Result<()> {
-    use reth_research::{
-        contract_metadata::run_metadata_backfill, database::DivergenceDatabase,
-    };
+    use reth_research::{contract_metadata::run_metadata_backfill, database::DivergenceDatabase};
 
     info!(target: "reth::cli", path = ?db_path, "Opening producer DB for metadata backfill");
     let db = DivergenceDatabase::open(&db_path)?;
