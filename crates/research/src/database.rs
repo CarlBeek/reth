@@ -35,7 +35,10 @@ use alloy_primitives::{keccak256, Address, B256};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::{
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 use thiserror::Error;
 
@@ -84,7 +87,28 @@ pub enum DatabaseError {
 #[derive(Debug, Clone)]
 pub struct DivergenceDatabase {
     conn: Arc<Mutex<Connection>>,
+    /// Counter for `record_block_output` calls, used to trigger
+    /// periodic WAL checkpoints (see `record_block_output`). Wraps
+    /// rather than overflowing.
+    blocks_since_checkpoint: Arc<AtomicU64>,
 }
+
+/// How many `record_block_output` calls between explicit
+/// `wal_checkpoint(RESTART)` runs. With one block per call and
+/// roughly 200-500 tx-rows per block writing to ~5 tables each, this
+/// keeps the WAL bounded to roughly the size of a thousand-block
+/// batch (a few hundred MB), even with a long-lived reader that's
+/// preventing TRUNCATE checkpoints from succeeding.
+const CHECKPOINT_EVERY_N_BLOCKS: u64 = 1_000;
+
+/// Cap on WAL size before SQLite recycles it. SQLite normally
+/// auto-checkpoints when WAL crosses 1000 frames (~4MB) but the
+/// PASSIVE checkpoints it runs can be defeated by a long-lived
+/// reader — the WAL keeps growing forever. journal_size_limit forces
+/// SQLite to truncate the WAL down to this size after every
+/// successful checkpoint regardless of who else is reading. 1 GB is a
+/// generous cap that won't fire mid-block.
+const WAL_SIZE_LIMIT_BYTES: i64 = 1024 * 1024 * 1024;
 
 impl DivergenceDatabase {
     /// Open (or create) a SQLite database at `path`. Initialises the schema
@@ -112,9 +136,17 @@ impl DivergenceDatabase {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "OFF")?;
         conn.pragma_update(None, "temp_store", "MEMORY")?;
+        // Cap WAL size: when the WAL grows past this on a checkpoint,
+        // SQLite truncates it. Without this, a long-lived reader (the
+        // consumer dashboard) can keep WAL_pages "in use" indefinitely
+        // and the WAL grows past the database size, slowing every read.
+        conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
         initialize_schema(&conn)?;
         verify_schema_version(&conn)?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            blocks_since_checkpoint: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     /// Record a new analysis run. Stamps the current schema version so
@@ -648,6 +680,14 @@ impl DivergenceDatabase {
     /// Persist all per-block state in a single transaction so the
     /// coverage row, summaries, and drill-in records land together. Any
     /// failure leaves the DB untouched.
+    ///
+    /// Every `CHECKPOINT_EVERY_N_BLOCKS` calls, we also run
+    /// `PRAGMA wal_checkpoint(RESTART)` to bound the WAL file size.
+    /// RESTART (not TRUNCATE) lets the checkpoint recycle the WAL even
+    /// when a long-lived reader is attached (e.g. the dashboard
+    /// holding a DuckDB sqlite_scanner session); TRUNCATE would block
+    /// until the reader released. We don't error on a failed
+    /// checkpoint — it's best-effort and the next call will retry.
     pub fn record_block_output(&self, output: &BlockOutput) -> Result<(), DatabaseError> {
         let mut conn = self.conn.lock().expect("SQLite connection mutex poisoned");
         let tx = conn.transaction()?;
@@ -672,6 +712,22 @@ impl DivergenceDatabase {
             }
         }
         tx.commit()?;
+
+        // Periodic explicit checkpoint. Reset the counter on every
+        // checkpoint attempt — even if the checkpoint partial-completes
+        // (reader holding WAL pages), we don't want to thrash the file
+        // on every block.
+        if self.blocks_since_checkpoint.fetch_add(1, Ordering::Relaxed) + 1
+            >= CHECKPOINT_EVERY_N_BLOCKS
+        {
+            self.blocks_since_checkpoint.store(0, Ordering::Relaxed);
+            // Best-effort. The pragma returns three counters
+            // (busy, log, checkpointed); we ignore them. If the
+            // checkpoint fails or partials, the next iteration will
+            // try again.
+            let _ = conn.pragma_update(None, "wal_checkpoint", "RESTART");
+        }
+
         Ok(())
     }
 
