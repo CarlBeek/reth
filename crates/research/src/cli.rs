@@ -165,8 +165,11 @@ pub struct ResearchArgs {
     /// Maximum divergences to record per block
     pub max_divergences_per_block: Option<usize>,
 
-    /// Inflate schedule replay transaction gas limits by this factor.
-    pub gas_limit_multiplier: Option<u64>,
+    /// Tiered gas-limit-multiplier sweep applied during schedule replay.
+    /// `None` falls back to the single-tier `[1]` default at the call
+    /// site; `Some(vec![1, 2, 4, 8])` runs the replay at each tier in
+    /// order, accepting the first that succeeds.
+    pub gas_limit_multipliers: Option<Vec<u64>>,
 }
 
 impl ResearchArgs {
@@ -247,9 +250,13 @@ impl ResearchArgs {
         self
     }
 
-    /// Set the schedule replay gas limit multiplier.
-    pub fn with_gas_limit_multiplier(mut self, multiplier: u64) -> Self {
-        self.gas_limit_multiplier = Some(multiplier);
+    /// Set the schedule replay gas-limit-multiplier sweep tiers.
+    ///
+    /// Replay runs at `tx_gas_limit × tier` for each tier in order;
+    /// the first that succeeds is accepted. Pass `vec![1]` for legacy
+    /// single-shot behavior.
+    pub fn with_gas_limit_multipliers(mut self, multipliers: Vec<u64>) -> Self {
+        self.gas_limit_multipliers = Some(multipliers);
         self
     }
 
@@ -391,14 +398,14 @@ mod tests {
             .with_multiplier("128x", 128)
             .unwrap()
             .with_start_block(1000000)
-            .with_gas_limit_multiplier(8)
+            .with_gas_limit_multipliers(vec![1, 2, 4, 8])
             .with_db_path(PathBuf::from("./test.db"));
 
         assert!(args.eip2780_enabled);
         assert!(args.eip8037_enabled);
         assert_eq!(args.multiplier_schedules.len(), 1);
         assert_eq!(args.start_block, 1000000);
-        assert_eq!(args.gas_limit_multiplier, Some(8));
+        assert_eq!(args.gas_limit_multipliers, Some(vec![1, 2, 4, 8]));
         assert_eq!(args.db_path, PathBuf::from("./test.db"));
     }
 

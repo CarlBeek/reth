@@ -166,8 +166,10 @@ struct Analyzer<Node: FullNodeComponents> {
     schedule_metadata: HashMap<String, ScheduleMetadata>,
     /// Maximum divergence rows to persist per block.
     max_divergences_per_block: Option<usize>,
-    /// Inflate schedule replay gas limits by this factor.
-    gas_limit_multiplier: u64,
+    /// Tiered gas-limit-multiplier sweep applied during schedule replay.
+    /// Each tier is tried in order; the first tier whose replay succeeds is
+    /// accepted. Defaults to `[1, 2, 4, 8]` from the CLI layer.
+    gas_limit_multipliers: Vec<u64>,
     /// Channel sender for async database writes
     db_tx: Option<mpsc::UnboundedSender<DbCommand>>,
     /// Total divergences emitted across all workers. Atomic because backfill
@@ -342,7 +344,7 @@ where
         db_path: std::path::PathBuf,
         start_block: u64,
         max_divergences_per_block: Option<usize>,
-        gas_limit_multiplier: u64,
+        gas_limit_multipliers: Vec<u64>,
         backfill: bool,
         backfill_min_block: u64,
         backfill_concurrency: usize,
@@ -497,7 +499,22 @@ where
             has_intrinsic_schedules,
             schedule_metadata,
             max_divergences_per_block,
-            gas_limit_multiplier: gas_limit_multiplier.max(1),
+            // Guarantee at least one tier and that every tier is ≥ 1, so
+            // the replay loop never multiplies by zero and always
+            // executes at least the original-limit attempt.
+            gas_limit_multipliers: {
+                let mut tiers: Vec<u64> = gas_limit_multipliers
+                    .into_iter()
+                    .map(|m| m.max(1))
+                    .collect();
+                if tiers.is_empty() {
+                    tiers.push(1);
+                }
+                // Ascending so we accept the smallest successful tier.
+                tiers.sort_unstable();
+                tiers.dedup();
+                tiers
+            },
             db_tx,
             divergences_found: AtomicU64::new(0),
         });
@@ -1070,7 +1087,8 @@ where
             let access_list_storage_slots =
                 tx.access_list().map(|list| list.storage_keys_count()).unwrap_or_default() as u64;
             let authorization_count = tx.authorization_count().unwrap_or_default();
-            let schedule_execution_gas_limit = gas_limit.saturating_mul(self.gas_limit_multiplier);
+            // `schedule_execution_gas_limit` is now per-tier; computed inside
+            // the tier-sweep loop in the schedule replay block below.
             let baseline_intrinsic_gas = Self::baseline_intrinsic_gas(
                 &input,
                 is_create,
@@ -1283,236 +1301,252 @@ where
                         (0, 0)
                     };
 
-                if self.gas_limit_multiplier > 1 {
-                    schedule_evm_env.cfg_env.disable_block_gas_limit = true;
-                    schedule_evm_env.cfg_env.disable_balance_check = true;
-                    if !schedule_evm_env.cfg_env.is_amsterdam_eip8037_enabled() {
-                        schedule_evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
-                    }
-                }
+                // Tier-sweep loop. Try each multiplier in
+                // `self.gas_limit_multipliers` (sorted ascending in the
+                // constructor) and accept the first whose replay succeeds.
+                // If none succeed, keep the highest tier's result so the
+                // call tree / OOG info / replay_halt_oog all reflect the
+                // most-funded attempt — that's the most-informative failure
+                // signature for downstream forensics.
+                //
+                // `schedule_evm_env` was set up above with schedule-specific
+                // flags; we clone it per tier so each attempt is
+                // independent. The `disable_block_gas_limit /
+                // disable_balance_check / tx_gas_limit_cap` overrides only
+                // apply at tiers > 1, mirroring the legacy single-shot
+                // behavior.
+                let mut accepted: Option<PerScheduleResult> = None;
+                let mut last_attempt: Option<PerScheduleResult> = None;
+                for &tier in &self.gas_limit_multipliers {
+                    let schedule_execution_gas_limit = gas_limit.saturating_mul(tier);
 
-                // For "Both" schedules (intrinsic + execution), adjust gas_limit
-                // so execution gets the correct gas budget under the new intrinsic.
-                // The EVM always deducts baseline intrinsic, so we offset gas_limit
-                // to compensate: if schedule intrinsic is higher, execution gets less
-                // gas (and vice versa).
-                //
-                // When the schedule lowers intrinsic (negative delta), the adjusted
-                // gas_limit can exceed the original. We cap at the replay gas limit.
-                // If the replay limit is inflated, balance checks are disabled above
-                // so increased max cost does not mask the schedule result.
-                //
-                // Gas total reconstruction (below) is still correct: it replaces
-                // baseline intrinsic with schedule intrinsic in the reported total,
-                // so the gas delta accounts for the intrinsic difference.
-                //
-                // If `intrinsic_delta` is large enough to drive `adjusted` below the
-                // EVM's baseline intrinsic cost, `transact()` will fail (the EVM
-                // rejects the tx before execution begins). This is caught below and
-                // recorded as a definitive schedule-induced failure.
-                let mut sched_tx_env = tx_env.clone();
-                sched_tx_env.set_gas_limit(schedule_execution_gas_limit);
-                if schedule.modifies_intrinsic() && !schedule.uses_native_intrinsic_gas() {
-                    if let Some(ref ctx) = tx_context {
-                        if let Some(schedule_intrinsic) = schedule.intrinsic_gas(ctx) {
-                            let intrinsic_delta =
-                                i128::from(schedule_intrinsic) - i128::from(baseline_intrinsic_gas);
-                            let replay_limit = i128::from(schedule_execution_gas_limit);
-                            let raw_adjusted = replay_limit - intrinsic_delta;
-                            let adjusted = raw_adjusted.clamp(0, replay_limit) as u64;
-                            if raw_adjusted < 0 || raw_adjusted > replay_limit {
-                                debug!(
-                                    target: "exex::research",
-                                    block = block_number,
-                                    tx_idx,
-                                    schedule = schedule.name(),
-                                    %intrinsic_delta,
-                                    %gas_limit,
-                                    %schedule_execution_gas_limit,
-                                    %adjusted,
-                                    "Gas limit clamped for 'Both' schedule — execution \
-                                     budget may be conservative"
-                                );
-                            }
-                            sched_tx_env.set_gas_limit(adjusted);
+                    let mut tier_evm_env = schedule_evm_env.clone();
+                    if tier > 1 {
+                        tier_evm_env.cfg_env.disable_block_gas_limit = true;
+                        tier_evm_env.cfg_env.disable_balance_check = true;
+                        if !tier_evm_env.cfg_env.is_amsterdam_eip8037_enabled() {
+                            tier_evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
                         }
                     }
+
+                    // For "Both" schedules (intrinsic + execution), adjust
+                    // gas_limit so execution gets the correct budget under
+                    // the new intrinsic. The EVM always deducts baseline
+                    // intrinsic, so we offset gas_limit to compensate: if
+                    // schedule intrinsic is higher, execution gets less gas
+                    // (and vice versa). Cap at the replay limit; if the
+                    // adjusted budget falls below baseline intrinsic the
+                    // EVM rejects the tx and the error path below records
+                    // it as a (potentially gas-fixable) failure.
+                    let mut sched_tx_env = tx_env.clone();
+                    sched_tx_env.set_gas_limit(schedule_execution_gas_limit);
+                    if schedule.modifies_intrinsic() && !schedule.uses_native_intrinsic_gas() {
+                        if let Some(ref ctx) = tx_context {
+                            if let Some(schedule_intrinsic) = schedule.intrinsic_gas(ctx) {
+                                let intrinsic_delta = i128::from(schedule_intrinsic)
+                                    - i128::from(baseline_intrinsic_gas);
+                                let replay_limit = i128::from(schedule_execution_gas_limit);
+                                let raw_adjusted = replay_limit - intrinsic_delta;
+                                let adjusted = raw_adjusted.clamp(0, replay_limit) as u64;
+                                if raw_adjusted < 0 || raw_adjusted > replay_limit {
+                                    debug!(
+                                        target: "exex::research",
+                                        block = block_number,
+                                        tx_idx,
+                                        schedule = schedule.name(),
+                                        tier,
+                                        %intrinsic_delta,
+                                        %gas_limit,
+                                        %schedule_execution_gas_limit,
+                                        %adjusted,
+                                        "Gas limit clamped for 'Both' schedule — execution \
+                                         budget may be conservative"
+                                    );
+                                }
+                                sched_tx_env.set_gas_limit(adjusted);
+                            }
+                        }
+                    }
+
+                    let mut inspector = ScheduleInspector::new(schedule.clone());
+                    let mut evm = self.components.evm_config().evm_with_env_and_inspector(
+                        &mut normal_db,
+                        tier_evm_env,
+                        &mut inspector,
+                    );
+                    let transact_result = evm.transact(sched_tx_env);
+                    drop(evm);
+                    let result = match transact_result {
+                        Ok(result) => result,
+                        Err(e) => {
+                            debug!(
+                                target: "exex::research",
+                                block = block_number,
+                                tx_idx,
+                                schedule = schedule.name(),
+                                tier,
+                                native_env_configured,
+                                error = ?e,
+                                "Schedule execution failed at tier"
+                            );
+                            // EVM rejected the tx outright (e.g. adjusted
+                            // gas_limit < baseline intrinsic at this tier).
+                            // Treat as a gas-class halt — a higher tier
+                            // might still let it run, so keep sweeping.
+                            last_attempt = Some(PerScheduleResult {
+                                success: false,
+                                gas_used: gas_limit,
+                                total_gas_spent: 0,
+                                state_gas_spent: 0,
+                                initial_state_gas: schedule_initial_state_gas,
+                                initial_reservoir: schedule_initial_reservoir,
+                                floor_gas: 0,
+                                gas_refunded: 0,
+                                operation_counts: None,
+                                oog_info: Some(format!("EVM transact failed: {e:?}")),
+                                divergence_location: None,
+                                replay_halt_oog: Some(true),
+                                oog_call_depth: None,
+                                divergence_call_depth: None,
+                                call_count: 0,
+                                oog_info_structured: None,
+                                divergence_location_structured: None,
+                                frame_opcode_counts: Vec::new(),
+                                call_frames: Vec::new(),
+                                event_logs: Vec::new(),
+                                output_hash: None,
+                                output_len: None,
+                                created_address: None,
+                                log_count: 0,
+                                logs_bloom: Self::hex_bloom(Bloom::ZERO),
+                                call_frames_hash: None,
+                                event_logs_hash: None,
+                            });
+                            continue;
+                        }
+                    };
+
+                    let sched_success = result.result.is_success();
+                    let sched_gas_used = result.result.tx_gas_used();
+                    let sched_total_gas_spent = result.result.gas().total_gas_spent();
+                    let sched_state_gas_spent = result.result.gas().state_gas_spent();
+                    let sched_floor_gas = result.result.gas().floor_gas();
+                    let sched_gas_refunded = result.result.gas().inner_refunded();
+                    let op_counts = Self::serialize_trace(inspector.operation_counts());
+                    let insp_result = inspector.result();
+                    let halt_reason_debug = match &result.result {
+                        revm::context_interface::result::ExecutionResult::Halt { reason, .. } => {
+                            Some(format!("{reason:?}"))
+                        }
+                        _ => None,
+                    };
+                    let halt_info = halt_reason_debug
+                        .as_ref()
+                        .map(|reason| format!("Execution halted: {reason}"));
+                    // Halt classification at this tier:
+                    //   Halt { OutOfGas* } → Some(true)  (more gas might help)
+                    //   Halt { other }     → Some(false) (no amount of gas helps)
+                    //   Revert             → Some(false)
+                    //   Success            → None        (no halt at all)
+                    let replay_halt_oog = match &result.result {
+                        revm::context_interface::result::ExecutionResult::Halt { .. } => {
+                            let is_oog = halt_reason_debug
+                                .as_deref()
+                                .is_some_and(|reason| reason.starts_with("OutOfGas"));
+                            Some(is_oog)
+                        }
+                        revm::context_interface::result::ExecutionResult::Revert { .. } => {
+                            Some(false)
+                        }
+                        revm::context_interface::result::ExecutionResult::Success { .. } => None,
+                    };
+                    let (output_hash, output_len) = Self::output_hash_and_len(&result.result);
+                    let created_address = result.result.created_address().map(Self::hex_address);
+                    let log_count = result.result.logs().len() as u64;
+                    let logs_bloom = Self::logs_bloom_hex(&result.result);
+                    let call_frames = inspector.call_frames().to_vec();
+                    let event_logs = inspector.event_logs().to_vec();
+
+                    // Synthesize a root-frame OOG record when the tx halted with
+                    // OutOfGas but the inspector didn't capture any per-frame
+                    // oog_info. See the equivalent legacy comment for the full
+                    // motivation; nothing tier-specific.
+                    let inspector_oog_info = insp_result.oog_info.clone().or_else(|| {
+                        if replay_halt_oog == Some(true) {
+                            Some(OutOfGasInfo {
+                                opcode: 0,
+                                opcode_name: "root_halt".to_string(),
+                                pc: 0,
+                                contract: Address::ZERO,
+                                call_depth: 1,
+                                gas_remaining: 0,
+                                pattern: OogPattern::Unknown,
+                            })
+                        } else {
+                            None
+                        }
+                    });
+
+                    let psr = PerScheduleResult {
+                        success: sched_success,
+                        gas_used: sched_gas_used,
+                        total_gas_spent: sched_total_gas_spent,
+                        state_gas_spent: sched_state_gas_spent,
+                        initial_state_gas: schedule_initial_state_gas,
+                        initial_reservoir: schedule_initial_reservoir,
+                        floor_gas: sched_floor_gas,
+                        gas_refunded: sched_gas_refunded,
+                        operation_counts: op_counts,
+                        oog_info: inspector_oog_info
+                            .as_ref()
+                            .map(|oog| format!("{oog:?}"))
+                            .or(halt_info),
+                        divergence_location: insp_result
+                            .divergence_location
+                            .clone()
+                            .or_else(|| Self::derive_divergence_location(&call_frames))
+                            .as_ref()
+                            .map(|loc| format!("{loc:?}")),
+                        replay_halt_oog,
+                        oog_call_depth: inspector_oog_info.as_ref().map(|oog| oog.call_depth),
+                        divergence_call_depth: insp_result
+                            .divergence_location
+                            .as_ref()
+                            .map(|loc| loc.call_depth),
+                        call_count: inspector.operation_counts().call_count,
+                        oog_info_structured: inspector_oog_info.clone(),
+                        divergence_location_structured: insp_result.divergence_location.clone(),
+                        frame_opcode_counts: inspector.frame_opcode_counts().frames.clone(),
+                        call_frames_hash: Self::hash_serialized(&call_frames),
+                        event_logs_hash: Self::hash_serialized(&event_logs),
+                        call_frames,
+                        event_logs,
+                        output_hash,
+                        output_len,
+                        created_address,
+                        log_count,
+                        logs_bloom,
+                    };
+
+                    if sched_success {
+                        // Smallest tier that succeeded — accept and stop.
+                        // `replay_halt_oog` is None for a successful tier,
+                        // matching the DB-column contract.
+                        accepted = Some(psr);
+                        break;
+                    }
+                    // Keep the highest-tier failed attempt as the fallback
+                    // (loop tries tiers in ascending order, so each
+                    // assignment overwrites a lower-tier failure).
+                    last_attempt = Some(psr);
                 }
 
-                let mut inspector = ScheduleInspector::new(schedule.clone());
-                let mut evm = self.components.evm_config().evm_with_env_and_inspector(
-                    &mut normal_db,
-                    schedule_evm_env,
-                    &mut inspector,
+                // At least one tier always runs (constructor enforces non-empty),
+                // so unwrapping is safe. Successful sweep wins; otherwise we
+                // keep the highest-tier failure to carry the OOG / halt signal.
+                schedule_results.push(
+                    accepted.or(last_attempt).expect("tier loop ran at least once"),
                 );
-                let result = match evm.transact(sched_tx_env) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        debug!(
-                            target: "exex::research",
-                            block = block_number,
-                            tx_idx,
-                            schedule = schedule.name(),
-                            native_env_configured,
-                            error = ?e,
-                            "Schedule execution failed"
-                        );
-                        drop(evm);
-                        // Record as definitive failure — the schedule's gas changes
-                        // (e.g., adjusted gas_limit falling below baseline intrinsic)
-                        // caused the EVM to reject the transaction entirely.
-                        schedule_results.push(PerScheduleResult {
-                            success: false,
-                            gas_used: gas_limit,
-                            total_gas_spent: 0,
-                            state_gas_spent: 0,
-                            initial_state_gas: schedule_initial_state_gas,
-                            initial_reservoir: schedule_initial_reservoir,
-                            floor_gas: 0,
-                            gas_refunded: 0,
-                            operation_counts: None,
-                            oog_info: Some(format!("EVM transact failed: {e:?}")),
-                            divergence_location: None,
-                            // `transact()` rejected the tx outright (e.g.
-                            // gas_limit below baseline intrinsic). This is a
-                            // schedule-induced gas failure — bumping the
-                            // replay multiplier could let it run.
-                            replay_halt_oog: Some(true),
-                            // `transact()` rejected before any frame ran, so
-                            // we have no call tree to walk.
-                            oog_call_depth: None,
-                            divergence_call_depth: None,
-                            call_count: 0,
-                            oog_info_structured: None,
-                            divergence_location_structured: None,
-                            frame_opcode_counts: Vec::new(),
-                            call_frames: Vec::new(),
-                            event_logs: Vec::new(),
-                            output_hash: None,
-                            output_len: None,
-                            created_address: None,
-                            log_count: 0,
-                            logs_bloom: Self::hex_bloom(Bloom::ZERO),
-                            call_frames_hash: None,
-                            event_logs_hash: None,
-                        });
-                        continue;
-                    }
-                };
-                drop(evm);
-
-                let sched_success = result.result.is_success();
-                let sched_gas_used = result.result.tx_gas_used();
-                let sched_total_gas_spent = result.result.gas().total_gas_spent();
-                let sched_state_gas_spent = result.result.gas().state_gas_spent();
-                let sched_floor_gas = result.result.gas().floor_gas();
-                let sched_gas_refunded = result.result.gas().inner_refunded();
-                let op_counts = Self::serialize_trace(inspector.operation_counts());
-                let insp_result = inspector.result();
-                let halt_reason_debug = match &result.result {
-                    revm::context_interface::result::ExecutionResult::Halt { reason, .. } => {
-                        Some(format!("{reason:?}"))
-                    }
-                    _ => None,
-                };
-                let halt_info =
-                    halt_reason_debug.as_ref().map(|reason| format!("Execution halted: {reason}"));
-                // Distinguish search-exhausted (replay OOG'd at inflated
-                // budget — needs more than `gas_limit_multiplier`) from
-                // non-gas failures (revert, stack errors, etc.). `None` when
-                // the replay succeeded so consumers can ignore the field.
-                //
-                // The `EvmFactory::HaltReason` associated type is generic, so
-                // we can't pattern-match the concrete revm `HaltReason` enum
-                // here. Match against the `Debug` representation instead —
-                // any spec-conformant `HaltReason` includes a `From<HaltReason>`
-                // bound and renders OOG variants with the literal `OutOfGas`
-                // prefix.
-                let replay_halt_oog = match &result.result {
-                    revm::context_interface::result::ExecutionResult::Halt { .. } => {
-                        let is_oog = halt_reason_debug
-                            .as_deref()
-                            .is_some_and(|reason| reason.starts_with("OutOfGas"));
-                        Some(is_oog)
-                    }
-                    revm::context_interface::result::ExecutionResult::Revert { .. } => Some(false),
-                    revm::context_interface::result::ExecutionResult::Success { .. } => None,
-                };
-                let (output_hash, output_len) = Self::output_hash_and_len(&result.result);
-                let created_address = result.result.created_address().map(Self::hex_address);
-                let log_count = result.result.logs().len() as u64;
-                let logs_bloom = Self::logs_bloom_hex(&result.result);
-                let call_frames = inspector.call_frames().to_vec();
-                let event_logs = inspector.event_logs().to_vec();
-
-                // Synthesize a root-frame OOG record when the tx halted with
-                // OutOfGas but the inspector didn't capture any per-frame
-                // oog_info. This happens for OOGs that bubble all the way to
-                // the top-level frame: revm's `call`/`call_end` hooks fire
-                // for sub-calls only, and `apply_gas_delta` only runs on the
-                // EIP-7904 (opcode repricing) path — so EIP-8037 root-frame
-                // OOGs get missed entirely. Without this, the chain-walk
-                // classifier has nothing to work with and the row ends up
-                // bucketed as ContractBroken when it's actually wallet-
-                // fixable (more wallet gas would propagate to every frame
-                // via the 63/64 cap and clear the OOG).
-                let inspector_oog_info = insp_result.oog_info.clone().or_else(|| {
-                    if replay_halt_oog == Some(true) {
-                        Some(OutOfGasInfo {
-                            opcode: 0,
-                            opcode_name: "root_halt".to_string(),
-                            pc: 0,
-                            contract: Address::ZERO,
-                            // 1-based: root frame = depth 1.
-                            call_depth: 1,
-                            gas_remaining: 0,
-                            pattern: OogPattern::Unknown,
-                        })
-                    } else {
-                        None
-                    }
-                });
-
-                schedule_results.push(PerScheduleResult {
-                    success: sched_success,
-                    gas_used: sched_gas_used,
-                    total_gas_spent: sched_total_gas_spent,
-                    state_gas_spent: sched_state_gas_spent,
-                    initial_state_gas: schedule_initial_state_gas,
-                    initial_reservoir: schedule_initial_reservoir,
-                    floor_gas: sched_floor_gas,
-                    gas_refunded: sched_gas_refunded,
-                    operation_counts: op_counts,
-                    oog_info: inspector_oog_info
-                        .as_ref()
-                        .map(|oog| format!("{oog:?}"))
-                        .or(halt_info),
-                    divergence_location: insp_result
-                        .divergence_location
-                        .clone()
-                        .or_else(|| Self::derive_divergence_location(&call_frames))
-                        .as_ref()
-                        .map(|loc| format!("{loc:?}")),
-                    replay_halt_oog,
-                    oog_call_depth: inspector_oog_info.as_ref().map(|oog| oog.call_depth),
-                    divergence_call_depth: insp_result
-                        .divergence_location
-                        .as_ref()
-                        .map(|loc| loc.call_depth),
-                    call_count: inspector.operation_counts().call_count,
-                    oog_info_structured: inspector_oog_info.clone(),
-                    divergence_location_structured: insp_result.divergence_location.clone(),
-                    frame_opcode_counts: inspector.frame_opcode_counts().frames.clone(),
-                    call_frames_hash: Self::hash_serialized(&call_frames),
-                    event_logs_hash: Self::hash_serialized(&event_logs),
-                    call_frames,
-                    event_logs,
-                    output_hash,
-                    output_len,
-                    created_address,
-                    log_count,
-                    logs_bloom,
-                });
             }
 
             // Commit baseline state AFTER all schedule re-executions so that
@@ -1852,6 +1886,9 @@ where
                                     .saturating_sub(schedule_initial_reservoir) >
                                     0,
                             ),
+                            // Set from the tier-sweep loop above: Some(true/false)
+                            // when no tier succeeded, None when at least one did.
+                            replay_halt_oog,
                         };
 
                         // Inspector emits frames in post-order DFS — children
@@ -2060,7 +2097,7 @@ async fn research_exex<Node: FullNodeComponents>(
     db_path: std::path::PathBuf,
     start_block: u64,
     max_divergences_per_block: Option<usize>,
-    gas_limit_multiplier: u64,
+    gas_limit_multipliers: Vec<u64>,
     backfill: bool,
     backfill_min_block: u64,
     backfill_concurrency: usize,
@@ -2078,7 +2115,7 @@ where
         db_path,
         start_block,
         max_divergences_per_block,
-        gas_limit_multiplier,
+        gas_limit_multipliers,
         backfill,
         backfill_min_block,
         backfill_concurrency,
@@ -2185,7 +2222,7 @@ fn main() -> eyre::Result<()> {
             let db_path = research_args.db_path.clone();
             let start_block = research_args.start_block;
             let max_divergences_per_block = research_args.max_divergences_per_block;
-            let gas_limit_multiplier = research_args.gas_limit_multiplier;
+            let gas_limit_multipliers = research_args.gas_limit_multipliers.clone();
             let backfill = research_args.backfill;
             let backfill_min_block = research_args.backfill_min_block;
             let backfill_concurrency = research_args.backfill_concurrency;
@@ -2196,7 +2233,7 @@ fn main() -> eyre::Result<()> {
                 db_path = ?db_path,
                 start_block,
                 max_divergences_per_block,
-                gas_limit_multiplier,
+                gas_limit_multipliers = ?gas_limit_multipliers,
                 backfill,
                 backfill_min_block,
                 backfill_concurrency,
@@ -2208,6 +2245,7 @@ fn main() -> eyre::Result<()> {
                 .install_exex("research", move |ctx| {
                     let registry = registry.clone();
                     let db_path = db_path.clone();
+                    let gas_limit_multipliers = gas_limit_multipliers.clone();
                     async move {
                         Ok(research_exex(
                             ctx,
@@ -2215,7 +2253,7 @@ fn main() -> eyre::Result<()> {
                             db_path,
                             start_block,
                             max_divergences_per_block,
-                            gas_limit_multiplier,
+                            gas_limit_multipliers,
                             backfill,
                             backfill_min_block,
                             backfill_concurrency,

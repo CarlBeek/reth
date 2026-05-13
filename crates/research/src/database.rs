@@ -55,7 +55,7 @@ use thiserror::Error;
 ///       (`opcode_count_totals_7904`, `opcode_gas_delta_totals_7904`)
 ///       into a single `opcode_totals_7904` populated with sparse
 ///       (opcode, count, gas_baseline, gas_schedule) tuples per bucket.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Errors raised by the storage layer.
 #[derive(Debug, Error)]
@@ -358,6 +358,18 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             state_gas_category          TEXT,
             reservoir_exhausted         INTEGER,
 
+            -- Outcome of the schedule replays final attempted multiplier
+            -- tier (see --research.gas-limit-multipliers):
+            --   1    = halted OOG at the highest tried tier; the true
+            --          minimum multiplier exceeds the configured ceiling.
+            --   0    = halted for a non-gas reason (revert, stack,
+            --          intrinsic rejection); more gas would not help.
+            --   NULL = at least one tier succeeded; consumers should use
+            --          min_multiplier_to_succeed for the magnitude.
+            -- Lets the consumer split unresolved replay failures into
+            -- needs-more-gas vs permanently-broken-under-this-schedule.
+            replay_halt_oog             INTEGER,
+
             UNIQUE (schedule_name, block_number, tx_index, schedule_config_hash)
         );",
     )?;
@@ -639,6 +651,12 @@ pub struct DivergenceRow {
     pub runtime_state_gas_spillover: Option<u64>,
     pub state_gas_category: Option<String>,
     pub reservoir_exhausted: Option<bool>,
+
+    /// Outcome of the schedule replay's *final* attempted multiplier
+    /// tier. `Some(true)` when the highest tier halted OOG (true min
+    /// multiplier exceeds the ceiling); `Some(false)` for non-gas
+    /// halts/reverts; `None` when at least one tier succeeded.
+    pub replay_halt_oog: Option<bool>,
 }
 
 /// One frame row destined for `divergence_call_frames`. `call_index` and
@@ -1059,7 +1077,8 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             oog_chain_proportional, oog_bottleneck_depth, oog_bottleneck_kind,
             schedule_state_gas_spent, schedule_initial_state_gas, schedule_initial_reservoir,
             runtime_state_gas, runtime_state_gas_spillover,
-            state_gas_category, reservoir_exhausted
+            state_gas_category, reservoir_exhausted,
+            replay_halt_oog
         ) VALUES (?, ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?,
@@ -1071,7 +1090,8 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
                   ?, ?, ?, ?,
                   ?, ?, ?, ?, ?, ?,
                   ?, ?, ?,
-                  ?, ?, ?, ?, ?, ?, ?)",
+                  ?, ?, ?, ?, ?, ?, ?,
+                  ?)",
         params![
             row.schedule_name,
             row.schedule_config_hash,
@@ -1121,6 +1141,7 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             row.runtime_state_gas_spillover.map(|v| v as i64),
             row.state_gas_category,
             row.reservoir_exhausted,
+            row.replay_halt_oog,
         ],
     )?;
     Ok(tx.last_insert_rowid() as u64)
@@ -1422,6 +1443,7 @@ mod tests {
             runtime_state_gas_spillover: None,
             state_gas_category: None,
             reservoir_exhausted: None,
+            replay_halt_oog: None,
         }
     }
 

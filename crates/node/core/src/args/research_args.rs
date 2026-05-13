@@ -58,21 +58,30 @@ pub struct ResearchArgs {
     )]
     pub max_divergences_per_block: Option<usize>,
 
-    /// Inflate transaction gas limits during schedule replay.
+    /// Tiered sweep of gas-limit multipliers to try during schedule replay.
     ///
-    /// The final success comparison still uses the transaction's original gas
-    /// limit, so this can reveal how much gas would be needed without masking
-    /// that the original transaction would fail under the schedule. Replays
-    /// that still hit OOG at the inflated budget are recorded with
-    /// `replay_halt_oog = true` and `min_multiplier_to_succeed = NULL` —
-    /// re-run with a higher value to recover the true minimum for those rows.
+    /// The replay runs at `tx_gas_limit × multiplier` for each tier in order;
+    /// the first tier whose replay succeeds is accepted, and
+    /// `min_multiplier_to_succeed = schedule_gas_used / tx_gas_limit` is
+    /// recorded (a continuous value, not the tier itself). If no tier
+    /// succeeds, `min_multiplier_to_succeed = NULL` and `replay_halt_oog`
+    /// captures whether the highest tier OOG'd (`1` — could still benefit
+    /// from more gas beyond the ceiling) vs halted for a non-gas reason
+    /// (`0` — no amount of gas would resolve it).
+    ///
+    /// The success comparison still uses the transaction's original gas
+    /// limit, so this only reveals how much more gas would be needed without
+    /// masking the fact that the original transaction would fail under the
+    /// schedule. Default `1,2,4,8` covers the common range; pass `1` to
+    /// disable the sweep entirely (legacy behavior).
     #[arg(
-        long = "research.gas-limit-multiplier",
-        value_name = "MULT",
-        default_value_t = 1,
+        long = "research.gas-limit-multipliers",
+        value_name = "MULTS",
+        value_delimiter = ',',
+        default_value = "1,2,4,8",
         help_heading = "Research"
     )]
-    pub gas_limit_multiplier: u64,
+    pub gas_limit_multipliers: Vec<u64>,
 
     /// Enable historical backfill during idle periods.
     ///
@@ -132,7 +141,7 @@ impl Default for ResearchArgs {
             db_path: PathBuf::from("./divergence.db"),
             start_block: 0,
             max_divergences_per_block: None,
-            gas_limit_multiplier: 1,
+            gas_limit_multipliers: vec![1, 2, 4, 8],
             backfill: false,
             backfill_min_block: 0,
             backfill_concurrency: 0,
@@ -189,9 +198,7 @@ impl ResearchArgs {
             args = args.with_eip8037();
         }
 
-        if self.gas_limit_multiplier > 1 {
-            args = args.with_gas_limit_multiplier(self.gas_limit_multiplier);
-        }
+        args = args.with_gas_limit_multipliers(self.gas_limit_multipliers.clone());
 
         for csv_spec in &self.csv_schedules {
             let schedule = NamedCsvSchedule::parse(csv_spec)?;
@@ -233,9 +240,7 @@ impl ResearchArgs {
             args = args.with_eip8037();
         }
 
-        if self.gas_limit_multiplier > 1 {
-            args = args.with_gas_limit_multiplier(self.gas_limit_multiplier);
-        }
+        args = args.with_gas_limit_multipliers(self.gas_limit_multipliers.clone());
 
         for csv_spec in &self.csv_schedules {
             let schedule = NamedCsvSchedule::parse(csv_spec)?;
@@ -340,8 +345,8 @@ mod tests {
             "18000000",
             "--research.max-divergences-per-block",
             "25",
-            "--research.gas-limit-multiplier",
-            "8",
+            "--research.gas-limit-multipliers",
+            "1,2,4,8",
         ])
         .args;
         assert!(args.eip2780);
@@ -350,7 +355,25 @@ mod tests {
         assert_eq!(args.db_path, PathBuf::from("./results.db"));
         assert_eq!(args.start_block, 18000000);
         assert_eq!(args.max_divergences_per_block, Some(25));
-        assert_eq!(args.gas_limit_multiplier, 8);
+        assert_eq!(args.gas_limit_multipliers, vec![1, 2, 4, 8]);
         assert_eq!(args.schedule_count(), 3);
+    }
+
+    #[test]
+    fn test_parse_research_args_gas_limit_multipliers_default() {
+        let args = CommandParser::<ResearchArgs>::parse_from(["reth"]).args;
+        assert_eq!(args.gas_limit_multipliers, vec![1, 2, 4, 8]);
+    }
+
+    #[test]
+    fn test_parse_research_args_gas_limit_multipliers_single() {
+        let args = CommandParser::<ResearchArgs>::parse_from([
+            "reth",
+            "--research.gas-limit-multipliers",
+            "1",
+        ])
+        .args;
+        // Single value = legacy "no sweep" behavior.
+        assert_eq!(args.gas_limit_multipliers, vec![1]);
     }
 }
