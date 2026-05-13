@@ -608,6 +608,7 @@ mod tests {
                 runtime_state_gas_spillover: None,
                 state_gas_category: None,
                 reservoir_exhausted: None,
+                replay_halt_oog: None,
             },
             call_frames: vec![CallFrameRow {
                 call_index: 0,
