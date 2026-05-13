@@ -18,18 +18,17 @@
 //! version. No migration shims — a major schema change is a full re-replay.
 //!
 //! Type translation from the DuckDB attempt:
-//! - All numeric DuckDB types (UBIGINT, UINTEGER, UTINYINT, BIGINT) collapse
-//!   to SQLite INTEGER. SQLite is dynamically typed; the affinity hints in
-//!   the DDL are documentation as much as enforcement.
-//! - BOOLEAN becomes INTEGER 0/1. rusqlite's ToSql for bool handles the
-//!   conversion automatically; consumers read it back through DuckDB which
-//!   treats nonzero INTEGER as truthy.
-//! - HUGEINT (i128, used for gas_delta_sum_sq) becomes REAL. Loses precision
-//!   past 2^53, but variance/stddev computed from it are already approximate.
-//! - INTEGER[12] arrays and STRUCT(...)[] lists become JSON TEXT. The
-//!   consumer json_each() them on read.
-//! - DuckDB sequences (`CREATE SEQUENCE`, `DEFAULT nextval('seq')`) become
-//!   `INTEGER PRIMARY KEY AUTOINCREMENT`.
+//! - All numeric DuckDB types (UBIGINT, UINTEGER, UTINYINT, BIGINT) collapse to SQLite INTEGER.
+//!   SQLite is dynamically typed; the affinity hints in the DDL are documentation as much as
+//!   enforcement.
+//! - BOOLEAN becomes INTEGER 0/1. rusqlite's ToSql for bool handles the conversion automatically;
+//!   consumers read it back through DuckDB which treats nonzero INTEGER as truthy.
+//! - HUGEINT (i128, used for gas_delta_sum_sq) becomes REAL. Loses precision past 2^53, but
+//!   variance/stddev computed from it are already approximate.
+//! - INTEGER[12] arrays and STRUCT(...)[] lists become JSON TEXT. The consumer json_each() them on
+//!   read.
+//! - DuckDB sequences (`CREATE SEQUENCE`, `DEFAULT nextval('seq')`) become `INTEGER PRIMARY KEY
+//!   AUTOINCREMENT`.
 
 use crate::divergence::{Bucket, EventLog, FrameOpcodeCounts};
 use alloy_primitives::{keccak256, Address, B256};
@@ -888,10 +887,7 @@ fn insert_block_coverage(
     Ok(())
 }
 
-fn insert_block_summary(
-    tx: &Transaction<'_>,
-    row: &BlockSummaryRow,
-) -> Result<(), DatabaseError> {
+fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(), DatabaseError> {
     // SQLite has no native arrays — we JSON-encode the histograms and
     // the (currently empty) struct lists. gas_delta_sum_sq is bound as
     // a REAL (f64).
@@ -963,10 +959,7 @@ fn insert_block_summary(
     Ok(())
 }
 
-fn insert_divergence(
-    tx: &Transaction<'_>,
-    row: &DivergenceRow,
-) -> Result<u64, DatabaseError> {
+fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, DatabaseError> {
     tx.execute(
         "INSERT INTO divergences (
             schedule_name, schedule_config_hash, block_number, tx_index, tx_hash,
@@ -1155,8 +1148,9 @@ mod tests {
         initialize_schema(&conn).expect("initialize_schema is idempotent");
 
         // Every expected table is present.
-        let mut stmt =
-            conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
         let mut rows = stmt.query([]).unwrap();
         let mut tables = Vec::new();
         while let Some(row) = rows.next().unwrap() {

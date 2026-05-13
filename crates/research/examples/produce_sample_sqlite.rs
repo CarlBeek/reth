@@ -10,11 +10,13 @@
 //!   cargo run -p reth-research --example produce_sample_sqlite -- /tmp/sample.sqlite
 
 use alloy_primitives::{Address, Bytes, B256};
-use reth_research::database::{
-    BlockCoverageRow, BlockOutput, BlockSummaryRow, CallFrameRow, DivergenceDatabase,
-    DivergenceRow, DrillInRecord, OpcodeCountRow,
+use reth_research::{
+    database::{
+        BlockCoverageRow, BlockOutput, BlockSummaryRow, CallFrameRow, DivergenceDatabase,
+        DivergenceRow, DrillInRecord, OpcodeCountRow,
+    },
+    divergence::{Bucket, EventLog},
 };
-use reth_research::divergence::{Bucket, EventLog};
 
 fn main() {
     let path = std::env::args().nth(1).unwrap_or_else(|| "/tmp/sample.sqlite".into());

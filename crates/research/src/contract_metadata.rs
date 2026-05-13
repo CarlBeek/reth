@@ -520,9 +520,7 @@ mod tests {
     }
 
     use crate::{
-        database::{
-            BlockCoverageRow, BlockOutput, CallFrameRow, DivergenceRow, DrillInRecord,
-        },
+        database::{BlockCoverageRow, BlockOutput, CallFrameRow, DivergenceRow, DrillInRecord},
         divergence::Bucket,
     };
     use alloy_primitives::B256;
