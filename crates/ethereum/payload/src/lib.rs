@@ -9,7 +9,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use alloy_consensus::Transaction;
-use alloy_primitives::U256;
+use alloy_primitives::{Bytes, U256};
 use alloy_rlp::Encodable;
 use alloy_rpc_types_engine::PayloadAttributes as EthPayloadAttributes;
 use reth_basic_payload_builder::{
@@ -131,7 +131,7 @@ where
             self.pool.clone(),
             self.builder_config.clone(),
             args,
-            |attributes| self.pool.best_transactions_with_attributes(attributes),
+            |_| -> BestTransactionsIter<Pool> { Box::new(std::iter::empty()) },
         )?
         .into_payload()
         .ok_or_else(|| PayloadBuilderError::MissingPayload)
@@ -278,17 +278,17 @@ where
             // continue
             best_txs.mark_invalid(
                 &pool_tx,
-                &InvalidPoolTransactionError::ExceedsGasLimit(
+                InvalidPoolTransactionError::ExceedsGasLimit(
                     transaction_gas_limit,
                     block_available_gas,
                 ),
             );
-            continue;
+            continue
         }
 
         // check if the job was cancelled, if so we can exit early
         if cancel.is_cancelled() {
-            return Ok(BuildOutcome::Cancelled);
+            return Ok(BuildOutcome::Cancelled)
         }
 
         // convert tx to a signed transaction
@@ -302,12 +302,12 @@ where
         if is_osaka && estimated_block_size_with_tx > MAX_RLP_BLOCK_SIZE {
             best_txs.mark_invalid(
                 &pool_tx,
-                &InvalidPoolTransactionError::OversizedData {
+                InvalidPoolTransactionError::OversizedData {
                     size: estimated_block_size_with_tx,
                     limit: MAX_RLP_BLOCK_SIZE,
                 },
             );
-            continue;
+            continue
         }
 
         // There's only limited amount of blob space available per block, so we need to check if
@@ -324,21 +324,21 @@ where
                 trace!(target: "payload_builder", tx=?tx.hash(), ?block_blob_count, "skipping blob transaction because it would exceed the max blob count per block");
                 best_txs.mark_invalid(
                     &pool_tx,
-                    &InvalidPoolTransactionError::Eip4844(
+                    InvalidPoolTransactionError::Eip4844(
                         Eip4844PoolTransactionError::TooManyEip4844Blobs {
                             have: block_blob_count + tx_blob_count,
                             permitted: max_blob_count,
                         },
                     ),
                 );
-                continue;
+                continue
             }
 
             let blob_sidecar_result = 'sidecar: {
                 let Some(sidecar) =
                     pool.get_blob(*tx.hash()).map_err(PayloadBuilderError::other)?
                 else {
-                    break 'sidecar Err(Eip4844PoolTransactionError::MissingEip4844BlobSidecar);
+                    break 'sidecar Err(Eip4844PoolTransactionError::MissingEip4844BlobSidecar)
                 };
 
                 if is_osaka {
@@ -357,8 +357,8 @@ where
             blob_tx_sidecar = match blob_sidecar_result {
                 Ok(sidecar) => Some(sidecar),
                 Err(error) => {
-                    best_txs.mark_invalid(&pool_tx, &InvalidPoolTransactionError::Eip4844(error));
-                    continue;
+                    best_txs.mark_invalid(&pool_tx, InvalidPoolTransactionError::Eip4844(error));
+                    continue
                 }
             };
         }
@@ -383,12 +383,12 @@ where
                     trace!(target: "payload_builder", %error, ?tx_hash, "skipping invalid transaction and its descendants");
                     best_txs.mark_invalid(
                         &pool_tx,
-                        &InvalidPoolTransactionError::Consensus(
+                        InvalidPoolTransactionError::Consensus(
                             InvalidTransactionError::TxTypeNotSupported,
                         ),
                     );
                 }
-                continue;
+                continue
             }
             // The executor is the source of truth for block gas availability. Keep this
             // non-fatal in case local builder accounting diverges from executor rules.
@@ -401,7 +401,7 @@ where
                 trace!(target: "payload_builder", %transaction_gas_limit, %block_available_gas, ?tx_hash, "skipping transaction exceeding block gas limit");
                 best_txs.mark_invalid(
                     &pool_tx,
-                    &InvalidPoolTransactionError::ExceedsGasLimit(
+                    InvalidPoolTransactionError::ExceedsGasLimit(
                         transaction_gas_limit,
                         block_available_gas,
                     ),
@@ -443,10 +443,12 @@ where
         // Release db
         drop(builder);
         // can skip building the block
-        return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads });
+        return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads })
     }
 
-    let BlockBuilderOutcome { execution_result, block, .. } = if let Some(mut handle) = trie_handle
+    let BlockBuilderOutcome { execution_result, block, block_access_list, .. } = if let Some(
+        mut handle,
+    ) = trie_handle
     {
         // Drop the state hook, which drops the StateHookSender and triggers
         // FinishedStateUpdates via its Drop impl, signaling the trie task to finalize.
@@ -486,7 +488,9 @@ where
         }));
     }
 
-    let payload = EthBuiltPayload::new(sealed_block, total_fees, requests, None)
+    let block_access_list: Option<Bytes> =
+        block_access_list.map(|block_access_list| alloy_rlp::encode(&block_access_list).into());
+    let payload = EthBuiltPayload::new(sealed_block, total_fees, requests, block_access_list)
         // add blob sidecars from the executed txs
         .with_sidecars(blob_sidecars);
 
