@@ -503,10 +503,8 @@ where
             // the replay loop never multiplies by zero and always
             // executes at least the original-limit attempt.
             gas_limit_multipliers: {
-                let mut tiers: Vec<u64> = gas_limit_multipliers
-                    .into_iter()
-                    .map(|m| m.max(1))
-                    .collect();
+                let mut tiers: Vec<u64> =
+                    gas_limit_multipliers.into_iter().map(|m| m.max(1)).collect();
                 if tiers.is_empty() {
                     tiers.push(1);
                 }
@@ -1343,8 +1341,8 @@ where
                     if schedule.modifies_intrinsic() && !schedule.uses_native_intrinsic_gas() {
                         if let Some(ref ctx) = tx_context {
                             if let Some(schedule_intrinsic) = schedule.intrinsic_gas(ctx) {
-                                let intrinsic_delta = i128::from(schedule_intrinsic)
-                                    - i128::from(baseline_intrinsic_gas);
+                                let intrinsic_delta = i128::from(schedule_intrinsic) -
+                                    i128::from(baseline_intrinsic_gas);
                                 let replay_limit = i128::from(schedule_execution_gas_limit);
                                 let raw_adjusted = replay_limit - intrinsic_delta;
                                 let adjusted = raw_adjusted.clamp(0, replay_limit) as u64;
@@ -1435,9 +1433,9 @@ where
                     let op_counts = Self::serialize_trace(inspector.operation_counts());
                     let insp_result = inspector.result();
                     let halt_reason_debug = match &result.result {
-                        revm::context_interface::result::ExecutionResult::Halt { reason, .. } => {
-                            Some(format!("{reason:?}"))
-                        }
+                        revm::context_interface::result::ExecutionResult::Halt {
+                            reason, ..
+                        } => Some(format!("{reason:?}")),
                         _ => None,
                     };
                     let halt_info = halt_reason_debug
@@ -1544,9 +1542,8 @@ where
                 // At least one tier always runs (constructor enforces non-empty),
                 // so unwrapping is safe. Successful sweep wins; otherwise we
                 // keep the highest-tier failure to carry the OOG / halt signal.
-                schedule_results.push(
-                    accepted.or(last_attempt).expect("tier loop ran at least once"),
-                );
+                schedule_results
+                    .push(accepted.or(last_attempt).expect("tier loop ran at least once"));
             }
 
             // Commit baseline state AFTER all schedule re-executions so that

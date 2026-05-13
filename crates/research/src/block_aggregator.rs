@@ -506,17 +506,20 @@ mod tests {
         // A tx can be a contract creation AND carry an authorization AND
         // burn runtime state gas. All three counters should fire.
         let mut agg = BlockAggregator::start_block(meta(), 1);
-        agg.observe_tx(TxObservation {
-            bucket: Bucket::GasOnly,
-            gas_delta: 0,
-            state_gas_spent: 1_000,
-            state_gas_spillover: 0,
-            min_multiplier_to_succeed: None,
-            is_creation: true,
-            has_authorization: true,
-            has_runtime_state: true,
-            drill_in_record: None,
-        }, &[]);
+        agg.observe_tx(
+            TxObservation {
+                bucket: Bucket::GasOnly,
+                gas_delta: 0,
+                state_gas_spent: 1_000,
+                state_gas_spillover: 0,
+                min_multiplier_to_succeed: None,
+                is_creation: true,
+                has_authorization: true,
+                has_runtime_state: true,
+                drill_in_record: None,
+            },
+            &[],
+        );
         let out = agg.finish_block();
         let summary = &out.summaries[0];
         assert_eq!(summary.tx_count_creation, Some(1));

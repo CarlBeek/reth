@@ -51,10 +51,9 @@ use thiserror::Error;
 /// History:
 /// - v1: DuckDB attempt (retired — single-process writer-lock issue).
 /// - v2: SQLite + DuckDB sqlite_scanner. Initial production schema.
-/// - v3: collapsed the two placeholder opcode-totals JSON columns
-///       (`opcode_count_totals_7904`, `opcode_gas_delta_totals_7904`)
-///       into a single `opcode_totals_7904` populated with sparse
-///       (opcode, count, gas_baseline, gas_schedule) tuples per bucket.
+/// - v3: collapsed the two placeholder opcode-totals JSON columns (`opcode_count_totals_7904`,
+///   `opcode_gas_delta_totals_7904`) into a single `opcode_totals_7904` populated with sparse
+///   (opcode, count, gas_baseline, gas_schedule) tuples per bucket.
 pub const SCHEMA_VERSION: u32 = 4;
 
 /// Errors raised by the storage layer.
@@ -763,8 +762,8 @@ impl DivergenceDatabase {
         // checkpoint attempt — even if the checkpoint partial-completes
         // (reader holding WAL pages), we don't want to thrash the file
         // on every block.
-        if self.blocks_since_checkpoint.fetch_add(1, Ordering::Relaxed) + 1
-            >= CHECKPOINT_EVERY_N_BLOCKS
+        if self.blocks_since_checkpoint.fetch_add(1, Ordering::Relaxed) + 1 >=
+            CHECKPOINT_EVERY_N_BLOCKS
         {
             self.blocks_since_checkpoint.store(0, Ordering::Relaxed);
             // Best-effort. The pragma returns three counters
