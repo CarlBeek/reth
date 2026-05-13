@@ -117,6 +117,10 @@ impl StageId {
 
     /// Get a pre-encoded raw Vec, for example, to be used as the DB key for
     /// `tables::StageCheckpoints` and `tables::StageCheckpointProgresses`
+    // The `std` branch calls `OnceLock::get_or_init` and isn't const-eligible,
+    // but nightly clippy only sees one cfg branch at a time and flags the
+    // no_std-only path as a missing const fn opportunity.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn get_pre_encoded(&self) -> Option<&Vec<u8>> {
         #[cfg(not(feature = "std"))]
         {

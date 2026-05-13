@@ -28,7 +28,12 @@ pub enum MetadataParseError {
     BytecodeTooShort(usize),
     /// The length prefix points outside the bytecode range.
     #[error("metadata length {len} doesn't fit in {bytecode_len} bytes of bytecode")]
-    LengthOutOfRange { len: usize, bytecode_len: usize },
+    LengthOutOfRange {
+        /// The (oversized) length the trailing 2-byte prefix declared.
+        len: usize,
+        /// The bytecode's actual length, in bytes.
+        bytecode_len: usize,
+    },
     /// CBOR decode failure (truncated input, unsupported type, etc.).
     #[error("CBOR decode failed: {0}")]
     CborDecode(&'static str),
@@ -135,7 +140,7 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self {
+    const fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
@@ -257,7 +262,7 @@ impl<'a> Cursor<'a> {
             // simple / float / break: only the no-content variants are
             // expected for Solidity (true/false/null).
             7 => match initial {
-                0xf4 | 0xf5 | 0xf6 | 0xf7 => {}
+                0xf4..=0xf7 => {}
                 _ => return Err(MetadataParseError::CborDecode("unsupported simple value")),
             },
             _ => return Err(MetadataParseError::CborDecode("unsupported major type")),
@@ -285,7 +290,7 @@ pub trait BytecodeFetcher {
 /// a DB write error or address-parse error short-circuits.
 #[derive(Debug, Error)]
 pub enum BackfillError {
-    /// DuckDB read/write failed.
+    /// `DuckDB` read/write failed.
     #[error("DuckDB error: {0}")]
     Db(#[from] DatabaseError),
     /// `to_address` column held a value that didn't parse as 0x-prefixed
@@ -310,7 +315,7 @@ pub enum BackfillError {
 pub struct BackfillStats {
     /// Number of distinct addresses considered.
     pub addresses_examined: u64,
-    /// Addresses where `contract_metadata` was UPSERTed (new codehash).
+    /// Addresses where `contract_metadata` was `UPSERTed` (new codehash).
     pub upserted: u64,
     /// Addresses skipped because their codehash already had a row.
     pub skipped_existing: u64,

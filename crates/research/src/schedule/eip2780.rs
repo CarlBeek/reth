@@ -202,7 +202,7 @@ impl Eip2780Schedule {
     }
 
     /// Create a schedule that only analyzes specific categories.
-    pub fn with_categories(categories: Vec<Eip2780Category>) -> Self {
+    pub const fn with_categories(categories: Vec<Eip2780Category>) -> Self {
         Self { categories_filter: Some(categories) }
     }
 

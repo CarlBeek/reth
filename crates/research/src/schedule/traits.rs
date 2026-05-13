@@ -3,7 +3,7 @@
 use super::context::{OpcodeContext, TxContext};
 use alloy_primitives::Address;
 use reth_evm::EvmEnv;
-use revm::primitives::hardfork::SpecId;
+use revm::{context_interface::cfg::gas::InitialAndFloorGas, primitives::hardfork::SpecId};
 use std::fmt::Debug;
 
 /// The kind of modifications a schedule makes.
@@ -83,6 +83,14 @@ pub trait GasSchedule: Send + Sync + Debug {
     fn intrinsic_gas(&self, ctx: &TxContext) -> Option<u64> {
         let _ = ctx;
         None
+    }
+
+    /// Calculate the full initial/floor gas split for a transaction.
+    ///
+    /// Schedules that override intrinsic gas but also need to preserve the
+    /// regular-gas / state-gas split can return the full calculation here.
+    fn initial_and_floor_gas(&self, ctx: &TxContext) -> Option<InitialAndFloorGas> {
+        self.intrinsic_gas(ctx).map(|intrinsic| InitialAndFloorGas::new(intrinsic, 0))
     }
 
     /// Get the additional gas to charge for an opcode beyond the EVM's own cost.
@@ -209,6 +217,10 @@ impl GasSchedule for Box<dyn GasSchedule> {
 
     fn intrinsic_gas(&self, ctx: &TxContext) -> Option<u64> {
         (**self).intrinsic_gas(ctx)
+    }
+
+    fn initial_and_floor_gas(&self, ctx: &TxContext) -> Option<InitialAndFloorGas> {
+        (**self).initial_and_floor_gas(ctx)
     }
 
     fn opcode_gas_delta(&self, opcode: u8, ctx: &OpcodeContext) -> i64 {

@@ -42,7 +42,7 @@ pub struct OperationPricing {
     pub current_variable: Option<u64>,
     /// New variable cost per unit
     pub new_variable: Option<u64>,
-    /// Type of variable cost (e.g., "num_rounds", "msg_size", "num_pairs")
+    /// Type of variable cost (e.g., "`num_rounds`", "`msg_size`", "`num_pairs`")
     pub variable_type: Option<String>,
 }
 
@@ -372,7 +372,7 @@ pub struct CsvPricingSchedule {
 
 impl CsvPricingSchedule {
     /// Create a new CSV pricing schedule from a pricing table.
-    pub fn new(name: String, pricing_table: GasPricingTable) -> Self {
+    pub const fn new(name: String, pricing_table: GasPricingTable) -> Self {
         Self { name, pricing_table }
     }
 
@@ -389,7 +389,7 @@ impl CsvPricingSchedule {
     }
 
     /// Get the pricing table.
-    pub fn pricing_table(&self) -> &GasPricingTable {
+    pub const fn pricing_table(&self) -> &GasPricingTable {
         &self.pricing_table
     }
 
@@ -411,12 +411,8 @@ impl CsvPricingSchedule {
             // ECPAIRING: num_pairs = input.len() / 192
             0x08 => (input.len() / 192) as u64,
             // BLAKE2F: num_rounds from first 4 bytes
-            0x09 => {
-                if input.len() >= 4 {
-                    u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as u64
-                } else {
-                    0
-                }
+            0x09 if input.len() >= 4 => {
+                u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as u64
             }
             // MODEXP and others: constant cost
             _ => 0,

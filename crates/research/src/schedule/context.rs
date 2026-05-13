@@ -65,19 +65,19 @@ impl RecipientInfo {
     }
 
     /// Check if this is an EOA (externally owned account - no code).
-    pub fn is_eoa(&self) -> bool {
+    pub const fn is_eoa(&self) -> bool {
         !self.has_code
     }
 
     /// Check if this is a contract (has code).
-    pub fn is_contract(&self) -> bool {
+    pub const fn is_contract(&self) -> bool {
         self.has_code
     }
 }
 
 impl TxContext {
     /// Create a new transaction context.
-    pub fn new(
+    pub const fn new(
         baseline_intrinsic_gas: u64,
         sender: Address,
         recipient: Option<Address>,
@@ -102,7 +102,7 @@ impl TxContext {
     }
 
     /// Add recipient account info to the context.
-    pub fn with_recipient_info(mut self, info: RecipientInfo) -> Self {
+    pub const fn with_recipient_info(mut self, info: RecipientInfo) -> Self {
         self.recipient_info = Some(info);
         self
     }
@@ -118,6 +118,9 @@ impl TxContext {
     }
 
     /// Calculate calldata gas cost (4 per zero byte, 16 per non-zero byte).
+    // Pulling in the `bytecount` crate just to count zeros isn't worth the
+    // dependency for this single call.
+    #[allow(clippy::naive_bytecount)]
     pub fn calldata_gas(&self) -> u64 {
         let zero_bytes = self.input.iter().filter(|&&b| b == 0).count() as u64;
         let nonzero_bytes = self.input.len() as u64 - zero_bytes;
@@ -161,7 +164,7 @@ pub struct OpcodeContext {
 
 impl OpcodeContext {
     /// Create a new opcode context.
-    pub fn new(contract: Address, pc: usize, call_depth: usize, gas_remaining: u64) -> Self {
+    pub const fn new(contract: Address, pc: usize, call_depth: usize, gas_remaining: u64) -> Self {
         Self {
             contract,
             pc,
@@ -176,19 +179,19 @@ impl OpcodeContext {
     }
 
     /// Set KECCAK256 message size.
-    pub fn with_keccak_msg_size(mut self, size: usize) -> Self {
+    pub const fn with_keccak_msg_size(mut self, size: usize) -> Self {
         self.keccak_msg_size = Some(size);
         self
     }
 
     /// Set EXP exponent byte size.
-    pub fn with_exp_byte_size(mut self, size: usize) -> Self {
+    pub const fn with_exp_byte_size(mut self, size: usize) -> Self {
         self.exp_byte_size = Some(size);
         self
     }
 
     /// Set memory access info.
-    pub fn with_memory_access(mut self, offset: usize, size: usize) -> Self {
+    pub const fn with_memory_access(mut self, offset: usize, size: usize) -> Self {
         self.memory_offset = Some(offset);
         self.memory_access_size = Some(size);
         self

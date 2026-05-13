@@ -26,7 +26,7 @@
 //! `NewFrame` action and marks the bytecode as ended; `step_end()` still fires for
 //! that same opcode in the same loop iteration, *before* the subcall frame is
 //! created. The subcall then runs in its own `frame_run()` invocation with its own
-//! `inspect_instructions` loop, so step/step_end pairs from the subcall never
+//! `inspect_instructions` loop, so `step/step_end` pairs from the subcall never
 //! interleave with the parent's CALL opcode. This is why a flat
 //! `call_delta_pre_applied` flag (rather than a per-frame stack) is sufficient.
 //!
@@ -34,8 +34,8 @@
 //!
 //! The gas delta for CALL/CREATE opcodes is applied in `step()` *before* the EVM
 //! charges its own base cost for the opcode. This is safe because
-//! [`GasSchedule::opcode_gas_delta`] returns an *additive* delta (new_cost -
-//! current_cost), not an absolute replacement. The EVM still charges its own base
+//! [`GasSchedule::opcode_gas_delta`] returns an *additive* delta (`new_cost` -
+//! `current_cost`), not an absolute replacement. The EVM still charges its own base
 //! cost separately. The total gas consumed is the same regardless of deduction
 //! order, but the intermediate `remaining` value between the inspector's charge and
 //! the EVM's charge differs. This intermediate value matters: if `record_regular_cost(delta)`
@@ -118,7 +118,7 @@ use std::{collections::VecDeque, sync::Arc};
 /// NOTE: if revm adds new OOG-class `InstructionResult` variants, this
 /// function must be updated to include them. Check revm's `InstructionResult`
 /// enum after dependency upgrades.
-fn is_oog_error(result: InstructionResult) -> bool {
+const fn is_oog_error(result: InstructionResult) -> bool {
     matches!(
         result,
         InstructionResult::OutOfGas |
@@ -189,10 +189,10 @@ pub struct ScheduleInspector {
 
     /// Gas the most-recently-returned callee consumed. Set in
     /// `call_end()` / `create_end()` (we already compute it for the
-    /// CallFrame record), read and cleared in the matching `step_end()`
+    /// `CallFrame` record), read and cleared in the matching `step_end()`
     /// for the outer CALL/CREATE opcode so its per-opcode total doesn't
     /// double-count the callee's gas (which is already attributed to
-    /// the callee's leaf opcodes via step/step_end inside the sub-frame).
+    /// the callee's leaf opcodes via `step/step_end` inside the sub-frame).
     pending_callee_gas_used: u64,
 
     /// Call stack for tracking depth
@@ -227,7 +227,7 @@ pub struct ScheduleInspector {
     /// skipped in `step_end()`.
     ///
     /// Safe as a flat flag (not a per-frame stack) because revm's
-    /// `inspect_instructions` calls step → execute → step_end within a single
+    /// `inspect_instructions` calls step → execute → `step_end` within a single
     /// loop iteration; the subcall frame runs in a separate `frame_run()`
     /// invocation, so no interleaving occurs. A debug assertion in `step()`
     /// validates that the flag is always reset before each opcode.
@@ -366,13 +366,13 @@ impl ScheduleInspector {
     }
 
     /// Enable or disable gas loop detection.
-    pub fn with_gas_loop_detection(mut self, enabled: bool) -> Self {
+    pub const fn with_gas_loop_detection(mut self, enabled: bool) -> Self {
         self.detect_gas_loops = enabled;
         self
     }
 
     /// Get the operation counts.
-    pub fn operation_counts(&self) -> &OperationCounts {
+    pub const fn operation_counts(&self) -> &OperationCounts {
         &self.op_counts
     }
 
@@ -393,7 +393,7 @@ impl ScheduleInspector {
     /// `truncated == true` indicates the tx exceeded
     /// [`crate::divergence::MAX_TRACKED_FRAMES`] and later frames' counts
     /// were dropped — execution still ran to completion.
-    pub fn frame_opcode_counts(&self) -> &PerFrameCapture {
+    pub const fn frame_opcode_counts(&self) -> &PerFrameCapture {
         &self.frame_capture
     }
 
@@ -553,7 +553,7 @@ impl ScheduleInspector {
         match opcode {
             0x54 | 0x55 => OogPattern::StorageHeavy, // SLOAD, SSTORE
             0xF1 | 0xF2 | 0xF4 | 0xFA => OogPattern::CallChain, // CALL variants
-            0x51 | 0x52 | 0x53 => OogPattern::MemoryExpansion, // MLOAD, MSTORE, MSTORE8
+            0x51..=0x53 => OogPattern::MemoryExpansion, // MLOAD, MSTORE, MSTORE8
             _ if self.has_gas_loop_pattern() => OogPattern::Loop,
             _ => OogPattern::Unknown,
         }
@@ -593,7 +593,7 @@ impl ScheduleInspector {
     /// Whether this opcode dispatches a subcall whose gas allocation depends on
     /// the caller's remaining gas (CALL, CALLCODE, DELEGATECALL, STATICCALL,
     /// CREATE, CREATE2).
-    fn is_call_or_create(opcode: u8) -> bool {
+    const fn is_call_or_create(opcode: u8) -> bool {
         matches!(opcode, 0xF0 | 0xF1 | 0xF2 | 0xF4 | 0xF5 | 0xFA)
     }
 
@@ -655,8 +655,8 @@ impl ScheduleInspector {
         }
     }
 
-    /// Record a gas delta against the per-opcode counters in OperationCounts.
-    fn record_opcode_gas_delta(op_counts: &mut OperationCounts, opcode: u8, delta: i64) {
+    /// Record a gas delta against the per-opcode counters in `OperationCounts`.
+    const fn record_opcode_gas_delta(op_counts: &mut OperationCounts, opcode: u8, delta: i64) {
         match opcode {
             0x04 => op_counts.div_gas_delta += delta,
             0x05 => op_counts.sdiv_gas_delta += delta,
@@ -796,7 +796,7 @@ where
                 if exp.is_zero() {
                     0usize
                 } else {
-                    (exp.bit_len() + 7) / 8
+                    exp.bit_len().div_ceil(8)
                 }
             })
         } else {
@@ -850,7 +850,7 @@ where
         }
 
         // Track memory usage
-        let memory_words = (interp.memory.len() + 31) / 32;
+        let memory_words = interp.memory.len().div_ceil(32);
         if memory_words as u64 > self.op_counts.memory_words_allocated {
             self.op_counts.memory_words_allocated = memory_words as u64;
         }
@@ -870,8 +870,7 @@ where
                 self.call_delta_pre_applied = true;
                 self.pending_pre_applied_delta = gas_delta;
                 Self::record_opcode_gas_delta(&mut self.op_counts, self.current_opcode, gas_delta);
-                if !self.apply_gas_delta(interp, gas_delta, self.current_opcode) {
-                    return; // OOG — interpreter is halted, don't continue
+                if !self.apply_gas_delta(interp, gas_delta, self.current_opcode) { // OOG — interpreter is halted, don't continue
                 }
             }
         }
@@ -952,7 +951,7 @@ where
         // positive deltas (reducing forwarded gas), the callee knows it may
         // OOG as a consequence.
         let parent_has_positive_delta =
-            self.call_stack.last().map_or(false, |p| p.any_positive_delta_in_subtree);
+            self.call_stack.last().is_some_and(|p| p.any_positive_delta_in_subtree);
 
         // Take the stack-gas captured in step() (None if call() fired without
         // a preceding step, e.g. the root frame).
@@ -1109,10 +1108,10 @@ where
             });
 
             // Propagate per-frame positive delta flag to parent.
-            if entry.any_positive_delta_in_subtree {
-                if let Some(parent) = self.call_stack.last_mut() {
-                    parent.any_positive_delta_in_subtree = true;
-                }
+            if entry.any_positive_delta_in_subtree &&
+                let Some(parent) = self.call_stack.last_mut()
+            {
+                parent.any_positive_delta_in_subtree = true;
             }
 
             // Indirect OOG detection: only flag when the subcall hit an OOG-class
@@ -1176,7 +1175,7 @@ where
         };
 
         let parent_has_positive_delta =
-            self.call_stack.last().map_or(false, |p| p.any_positive_delta_in_subtree);
+            self.call_stack.last().is_some_and(|p| p.any_positive_delta_in_subtree);
 
         // Open a per-frame opcode counter for the CREATE/CREATE2 sub-frame.
         // Mirrors `call()` — the root frame is lazy-init in `step()`.
@@ -1246,10 +1245,10 @@ where
             });
 
             // Propagate per-frame positive delta flag to parent.
-            if entry.any_positive_delta_in_subtree {
-                if let Some(parent) = self.call_stack.last_mut() {
-                    parent.any_positive_delta_in_subtree = true;
-                }
+            if entry.any_positive_delta_in_subtree &&
+                let Some(parent) = self.call_stack.last_mut()
+            {
+                parent.any_positive_delta_in_subtree = true;
             }
 
             // Indirect OOG detection for CREATE (same per-subtree logic as call_end).
@@ -1276,7 +1275,7 @@ where
             // resolved created address so downstream forensics can attribute
             // the failure to a specific deploy.
             if is_oog_error(outcome.result.result) && entry.last_step_opcode != 0 {
-                let mut popped = entry.clone();
+                let mut popped = entry;
                 popped.contract = created_address;
                 if self.divergence_location.is_none() {
                     self.record_frame_divergence(&popped);

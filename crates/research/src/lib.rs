@@ -60,8 +60,8 @@
 //!   - [`ScheduleComparisonResult`]: Per-schedule results
 //!   - [`IntrinsicComparison`], [`ExecutionComparison`]: Detailed comparisons
 //!
-//! - [`database`]: Persistence
-//!   - [`DivergenceDatabase`]: SQLite storage for divergences
+//! - [`database`][]: Persistence
+//!   - [`DivergenceDatabase`]: `SQLite` storage for divergences
 //!
 //! # Example: Configure via CLI
 //!
@@ -169,7 +169,7 @@
 //!
 //! # Database Queries
 //!
-//! Results are stored in SQLite for analysis:
+//! Results are stored in `SQLite` for analysis:
 //!
 //! ```sql
 //! -- Divergences by schedule

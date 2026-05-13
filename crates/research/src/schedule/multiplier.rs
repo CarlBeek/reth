@@ -27,7 +27,7 @@ impl MultiplierSchedule {
     /// # Arguments
     /// * `name` - Unique name for this schedule
     /// * `multiplier` - Factor to multiply gas costs by
-    pub fn new(name: String, multiplier: u64) -> Self {
+    pub const fn new(name: String, multiplier: u64) -> Self {
         Self { name, multiplier }
     }
 
@@ -37,7 +37,7 @@ impl MultiplierSchedule {
     }
 
     /// Get the multiplier value.
-    pub fn multiplier(&self) -> u64 {
+    pub const fn multiplier(&self) -> u64 {
         self.multiplier
     }
 }

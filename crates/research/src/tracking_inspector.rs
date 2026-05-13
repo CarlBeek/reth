@@ -56,7 +56,7 @@ pub struct TrackingInspector {
     /// Without this, `step_end()`'s `gas_before - gas_remaining_after`
     /// for a CALL/CREATE opcode double-counts the callee: the callee's
     /// per-opcode gas is already attributed to its leaf opcodes via
-    /// step/step_end inside the sub-frame, so attributing it again to
+    /// `step/step_end` inside the sub-frame, so attributing it again to
     /// the outer CALL/CREATE inflates totals (a tx whose root just
     /// CALLs a heavy contract would report twice its real gas).
     pending_callee_gas_used: u64,
@@ -97,12 +97,12 @@ impl TrackingInspector {
     /// Whether `opcode` opens a sub-frame (CALL family + CREATE/CREATE2),
     /// i.e. one whose `step_end()` cost needs the callee's gas subtracted
     /// to avoid double-counting.
-    fn is_call_or_create(opcode: u8) -> bool {
+    const fn is_call_or_create(opcode: u8) -> bool {
         matches!(opcode, 0xF0 | 0xF1 | 0xF2 | 0xF4 | 0xF5 | 0xFA)
     }
 
     /// Get the operation counts.
-    pub fn operation_counts(&self) -> &OperationCounts {
+    pub const fn operation_counts(&self) -> &OperationCounts {
         &self.op_counts
     }
 
@@ -119,7 +119,7 @@ impl TrackingInspector {
     /// Get the per-frame opcode capture. On the baseline path
     /// `gas_baseline == gas_schedule` for every opcode, since this
     /// inspector applies no schedule deltas.
-    pub fn frame_opcode_counts(&self) -> &PerFrameCapture {
+    pub const fn frame_opcode_counts(&self) -> &PerFrameCapture {
         &self.frame_capture
     }
 

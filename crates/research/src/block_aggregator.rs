@@ -1,4 +1,4 @@
-//! Per-block bucket aggregator for the DuckDB write path.
+//! Per-block bucket aggregator for the `DuckDB` write path.
 //!
 //! `BlockAggregator` buffers every tx's classification across a single
 //! (schedule, block) and flushes the result as a [`BlockOutput`] at
@@ -25,8 +25,11 @@ pub struct BlockMeta {
     /// Schedule's `config_fingerprint` hashed — same value the dedupe
     /// query keys on.
     pub schedule_config_hash: String,
+    /// Block number being aggregated.
     pub block_number: u64,
+    /// Block hash being aggregated.
     pub block_hash: B256,
+    /// Parent block hash (used to detect reorgs at write time).
     pub parent_hash: B256,
     /// Block timestamp (Unix seconds).
     pub timestamp: u64,
@@ -36,7 +39,7 @@ pub struct BlockMeta {
 ///
 /// Construct with [`BlockAggregator::start_block`], feed each tx via
 /// [`BlockAggregator::observe_tx`], and call [`BlockAggregator::finish_block`]
-/// to materialise the [`BlockOutput`] for the DuckDB writer.
+/// to materialise the [`BlockOutput`] for the `DuckDB` writer.
 #[derive(Debug)]
 pub struct BlockAggregator {
     meta: BlockMeta,
@@ -58,10 +61,10 @@ struct BucketAccumulator {
     gas_delta_min: Option<i64>,
     gas_delta_max: Option<i64>,
     /// 12-bin log2 histogram of `abs(gas_delta)`:
-    ///   bin 0 → gas_delta == 0
-    ///   bin i (1..=10) → 2^(i-1) <= |gas_delta| < 2^i, except bin 1 also
-    ///                    counts 1 ≤ |gas_delta| < 2.
-    ///   bin 11 → |gas_delta| >= 2^10 (1024)
+    ///   bin 0 → `gas_delta` == 0
+    ///   bin i (1..=10) → 2^(i-1) <= |`gas_delta`| < 2^i, except bin 1 also
+    ///                    counts 1 ≤ |`gas_delta`| < 2.
+    ///   bin 11 → |`gas_delta`| >= 2^10 (1024)
     gas_delta_log2_hist: [i32; 12],
 
     // EIP-8037 state-gas aggregates. Zero for schedules that don't track
@@ -293,10 +296,10 @@ impl BlockAggregator {
             }
         }
 
-        if obs.bucket.is_drill_in() {
-            if let Some(record) = obs.drill_in_record {
-                self.drill_ins.push(record);
-            }
+        if obs.bucket.is_drill_in() &&
+            let Some(record) = obs.drill_in_record
+        {
+            self.drill_ins.push(record);
         }
     }
 

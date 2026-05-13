@@ -5,29 +5,29 @@
 //! trace-only / unchanged) and per-tx drill-in rows for the event-logs-changed
 //! and contract-broken cohorts.
 //!
-//! Why SQLite, not DuckDB: we tried DuckDB first for its analytical query
+//! Why `SQLite`, not `DuckDB`: we tried `DuckDB` first for its analytical query
 //! performance, but ran into its single-process writer-lock — the dashboard
-//! couldn't read while reth held the writer. SQLite WAL handles 1 writer + N
-//! readers across processes natively. The consumer (the Python FastAPI app in
-//! the sibling repo) attaches via DuckDB's `sqlite_scanner` extension and runs
-//! analytical queries through DuckDB's vectorized engine over the SQLite
+//! couldn't read while reth held the writer. `SQLite` WAL handles 1 writer + N
+//! readers across processes natively. The consumer (the Python `FastAPI` app in
+//! the sibling repo) attaches via `DuckDB`'s `sqlite_scanner` extension and runs
+//! analytical queries through `DuckDB`'s vectorized engine over the `SQLite`
 //! storage. Best of both worlds.
 //!
 //! Schema-version policy (per the doc): the producer refuses to open a DB
 //! whose latest `analysis_runs.schema_version` doesn't match its compiled-in
 //! version. No migration shims — a major schema change is a full re-replay.
 //!
-//! Type translation from the DuckDB attempt:
-//! - All numeric DuckDB types (UBIGINT, UINTEGER, UTINYINT, BIGINT) collapse to SQLite INTEGER.
-//!   SQLite is dynamically typed; the affinity hints in the DDL are documentation as much as
+//! Type translation from the `DuckDB` attempt:
+//! - All numeric `DuckDB` types (UBIGINT, UINTEGER, UTINYINT, BIGINT) collapse to `SQLite` INTEGER.
+//!   `SQLite` is dynamically typed; the affinity hints in the DDL are documentation as much as
 //!   enforcement.
-//! - BOOLEAN becomes INTEGER 0/1. rusqlite's ToSql for bool handles the conversion automatically;
-//!   consumers read it back through DuckDB which treats nonzero INTEGER as truthy.
-//! - HUGEINT (i128, used for gas_delta_sum_sq) becomes REAL. Loses precision past 2^53, but
+//! - BOOLEAN becomes INTEGER 0/1. rusqlite's `ToSql` for bool handles the conversion automatically;
+//!   consumers read it back through `DuckDB` which treats nonzero INTEGER as truthy.
+//! - HUGEINT (i128, used for `gas_delta_sum_sq`) becomes REAL. Loses precision past 2^53, but
 //!   variance/stddev computed from it are already approximate.
-//! - INTEGER[12] arrays and STRUCT(...)[] lists become JSON TEXT. The consumer json_each() them on
-//!   read.
-//! - DuckDB sequences (`CREATE SEQUENCE`, `DEFAULT nextval('seq')`) become `INTEGER PRIMARY KEY
+//! - INTEGER[12] arrays and STRUCT(...)[] lists become JSON TEXT. The consumer `json_each()` them
+//!   on read.
+//! - `DuckDB` sequences (`CREATE SEQUENCE`, `DEFAULT nextval('seq')`) become `INTEGER PRIMARY KEY
 //!   AUTOINCREMENT`.
 
 use crate::divergence::{Bucket, EventLog, FrameOpcodeCounts};
@@ -49,17 +49,17 @@ use thiserror::Error;
 /// "no migration shims; major schema change is a full re-replay" rule).
 ///
 /// History:
-/// - v1: DuckDB attempt (retired — single-process writer-lock issue).
-/// - v2: SQLite + DuckDB sqlite_scanner. Initial production schema.
+/// - v1: `DuckDB` attempt (retired — single-process writer-lock issue).
+/// - v2: `SQLite` + `DuckDB` `sqlite_scanner`. Initial production schema.
 /// - v3: collapsed the two placeholder opcode-totals JSON columns (`opcode_count_totals_7904`,
 ///   `opcode_gas_delta_totals_7904`) into a single `opcode_totals_7904` populated with sparse
-///   (opcode, count, gas_baseline, gas_schedule) tuples per bucket.
+///   (opcode, count, `gas_baseline`, `gas_schedule`) tuples per bucket.
 pub const SCHEMA_VERSION: u32 = 4;
 
 /// Errors raised by the storage layer.
 #[derive(Debug, Error)]
 pub enum DatabaseError {
-    /// Underlying SQLite driver error.
+    /// Underlying `SQLite` driver error.
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     /// I/O error opening or creating the database file.
@@ -88,7 +88,7 @@ pub enum DatabaseError {
 /// `Arc<Mutex<_>>`. Backfill workers and the live arm can hold their own
 /// handles to the same DB without contending on open/close. External
 /// readers (the dashboard) get their own connections to the same file
-/// via SQLite WAL.
+/// via `SQLite` WAL.
 #[derive(Debug, Clone)]
 pub struct DivergenceDatabase {
     conn: Arc<Mutex<Connection>>,
@@ -106,17 +106,17 @@ pub struct DivergenceDatabase {
 /// preventing TRUNCATE checkpoints from succeeding.
 const CHECKPOINT_EVERY_N_BLOCKS: u64 = 1_000;
 
-/// Cap on WAL size before SQLite recycles it. SQLite normally
+/// Cap on WAL size before `SQLite` recycles it. `SQLite` normally
 /// auto-checkpoints when WAL crosses 1000 frames (~4MB) but the
 /// PASSIVE checkpoints it runs can be defeated by a long-lived
-/// reader — the WAL keeps growing forever. journal_size_limit forces
-/// SQLite to truncate the WAL down to this size after every
+/// reader — the WAL keeps growing forever. `journal_size_limit` forces
+/// `SQLite` to truncate the WAL down to this size after every
 /// successful checkpoint regardless of who else is reading. 1 GB is a
 /// generous cap that won't fire mid-block.
 const WAL_SIZE_LIMIT_BYTES: i64 = 1024 * 1024 * 1024;
 
 impl DivergenceDatabase {
-    /// Open (or create) a SQLite database at `path`. Initialises the schema
+    /// Open (or create) a `SQLite` database at `path`. Initialises the schema
     /// if the file is new, sets WAL pragmas, and verifies the version of any
     /// existing data.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, DatabaseError> {
@@ -124,7 +124,7 @@ impl DivergenceDatabase {
         Self::initialize(conn)
     }
 
-    /// Open an in-memory SQLite database. Used in tests; on shutdown the
+    /// Open an in-memory `SQLite` database. Used in tests; on shutdown the
     /// data is discarded.
     pub fn in_memory() -> Result<Self, DatabaseError> {
         let conn = Connection::open_in_memory()?;
@@ -503,7 +503,7 @@ pub struct BlockOutput {
     pub drill_ins: Vec<DrillInRecord>,
 }
 
-/// Counts per bucket for one (schedule, block, block_hash). Always emitted
+/// Counts per bucket for one (schedule, block, `block_hash`). Always emitted
 /// regardless of divergence count so coverage joins work even for fully-
 /// matching blocks.
 #[allow(missing_docs)]
@@ -552,7 +552,7 @@ pub struct BlockSummaryRow {
     pub bucket: Bucket,
     pub tx_count: u32,
     pub gas_delta_sum: Option<i64>,
-    /// Sum of squared `gas_delta` for the bucket. Stored under SQLite's
+    /// Sum of squared `gas_delta` for the bucket. Stored under `SQLite`'s
     /// REAL column type, so values past 2^53 lose precision — fine for the
     /// approximate variance/stddev the dashboard renders.
     pub gas_delta_sum_sq: Option<i64>,
@@ -592,7 +592,7 @@ pub struct DrillInRecord {
 }
 
 /// One row destined for `divergences`. Most fields mirror the column
-/// names; the schema_version / divergence_id / timestamp are filled in by
+/// names; the `schema_version` / `divergence_id` / timestamp are filled in by
 /// the writer.
 #[allow(missing_docs)]
 #[derive(Debug, Clone)]
@@ -730,7 +730,7 @@ impl DivergenceDatabase {
     /// `PRAGMA wal_checkpoint(RESTART)` to bound the WAL file size.
     /// RESTART (not TRUNCATE) lets the checkpoint recycle the WAL even
     /// when a long-lived reader is attached (e.g. the dashboard
-    /// holding a DuckDB sqlite_scanner session); TRUNCATE would block
+    /// holding a `DuckDB` `sqlite_scanner` session); TRUNCATE would block
     /// until the reader released. We don't error on a failed
     /// checkpoint — it's best-effort and the next call will retry.
     pub fn record_block_output(&self, output: &BlockOutput) -> Result<(), DatabaseError> {

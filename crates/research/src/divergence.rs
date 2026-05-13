@@ -88,7 +88,7 @@ pub struct GasAnalysis {
     /// Gas consumed in experimental execution
     pub experimental_gas_used: u64,
 
-    /// Gas efficiency ratio: (experimental_gas / multiplier) / normal_gas
+    /// Gas efficiency ratio: (`experimental_gas` / multiplier) / `normal_gas`
     /// Values near 1.0 indicate same execution path, just more expensive
     /// Values != 1.0 indicate different execution path taken
     pub gas_efficiency_ratio: f64,
@@ -534,7 +534,7 @@ pub enum Bucket {
 impl Bucket {
     /// Stable lowercase identifier for storage and the dashboard layer.
     /// Order kept identical to the consumer-side doc's enum.
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Unchanged => "unchanged",
             Self::TraceOnly => "trace_only",
@@ -548,7 +548,7 @@ impl Bucket {
 
     /// Whether divergences in this bucket are written per-tx (drill-in) or
     /// rolled into per-block aggregates.
-    pub fn is_drill_in(&self) -> bool {
+    pub const fn is_drill_in(&self) -> bool {
         matches!(self, Self::EventLogsChanged | Self::ContractBroken)
     }
 }
@@ -648,7 +648,7 @@ pub fn classify_bucket(input: &BucketInput) -> Bucket {
 /// root frame is the canonical "wallets just need to estimate more gas" case
 /// — kept distinct from `WalletFixableDeepChain` for the dashboard's
 /// breakdown view.
-fn is_shallow_oog(divergence_call_depth: Option<usize>, call_count: u64) -> bool {
+const fn is_shallow_oog(divergence_call_depth: Option<usize>, call_count: u64) -> bool {
     matches!(divergence_call_depth, Some(d) if d <= 1) && call_count == 0
 }
 

@@ -25,7 +25,10 @@ use super::{
 use reth_evm::EvmEnv;
 use revm::{
     context_interface::{
-        cfg::gas_params::{GasId, GasParams},
+        cfg::{
+            gas::InitialAndFloorGas,
+            gas_params::{GasId, GasParams},
+        },
         Cfg,
     },
     primitives::hardfork::SpecId,
@@ -142,6 +145,18 @@ fn apply_pr11616_overrides(params: &mut GasParams) {
     ]);
 }
 
+fn pr11616_initial_and_floor_gas(ctx: &TxContext) -> InitialAndFloorGas {
+    let mut params = GasParams::new_spec(SpecId::AMSTERDAM);
+    apply_pr11616_overrides(&mut params);
+    params.initial_tx_gas(
+        &ctx.input,
+        ctx.is_create,
+        ctx.access_list_accounts,
+        ctx.access_list_storage_slots,
+        ctx.authorization_count,
+    )
+}
+
 /// EIP-8037 schedule backed by native revm state-gas accounting with
 /// PR-11616 constants overlayed on top.
 #[derive(Debug, Clone, Copy, Default)]
@@ -195,19 +210,11 @@ impl GasSchedule for Eip8037Schedule {
         // top-level helper `calculate_initial_tx_gas` allocates its own
         // GasParams from the spec — no hook for overrides — so we walk
         // the per-instance path instead.
-        let mut params = GasParams::new_spec(SpecId::AMSTERDAM);
-        apply_pr11616_overrides(&mut params);
-        Some(
-            params
-                .initial_tx_gas(
-                    &ctx.input,
-                    ctx.is_create,
-                    ctx.access_list_accounts,
-                    ctx.access_list_storage_slots,
-                    ctx.authorization_count,
-                )
-                .initial_total_gas,
-        )
+        Some(pr11616_initial_and_floor_gas(ctx).initial_total_gas)
+    }
+
+    fn initial_and_floor_gas(&self, ctx: &TxContext) -> Option<InitialAndFloorGas> {
+        Some(pr11616_initial_and_floor_gas(ctx))
     }
 
     fn configure_evm_env(&self, env: &mut EvmEnv<SpecId>) -> bool {
@@ -295,6 +302,10 @@ mod tests {
         let expected =
             21_000 + Eip8037Constants::CREATE_ACCESS + Eip8037Constants::NEW_ACCOUNT_STATE_GAS;
         assert_eq!(intrinsic, expected);
+        assert_eq!(
+            schedule.initial_and_floor_gas(&ctx).unwrap().initial_state_gas,
+            Eip8037Constants::NEW_ACCOUNT_STATE_GAS
+        );
     }
 
     #[test]
@@ -321,6 +332,10 @@ mod tests {
             Eip8037Constants::REGULAR_PER_AUTH_BASE_COST +
             Eip8037Constants::AUTH_STATE_GAS;
         assert_eq!(intrinsic, expected);
+        assert_eq!(
+            schedule.initial_and_floor_gas(&ctx).unwrap().initial_state_gas,
+            Eip8037Constants::AUTH_STATE_GAS
+        );
     }
 
     #[test]

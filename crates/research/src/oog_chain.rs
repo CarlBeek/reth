@@ -47,7 +47,7 @@ pub enum OogBottleneckKind {
 
 impl OogBottleneckKind {
     /// Stable string form for the `oog_bottleneck_kind` DB column.
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Stipend2300 => "Stipend2300",
             Self::FractionalGas => "FractionalGas",
@@ -76,11 +76,11 @@ impl OogChainAnalysis {
     /// All-proportional result. Trivially returned for OOGs at depth 0
     /// (single-frame transactions) where there are no parent→child hops to
     /// classify.
-    fn proportional() -> Self {
+    const fn proportional() -> Self {
         Self { proportional: true, bottleneck_depth: None, bottleneck_kind: None }
     }
 
-    fn throttled(depth: u64, kind: Option<OogBottleneckKind>) -> Self {
+    const fn throttled(depth: u64, kind: Option<OogBottleneckKind>) -> Self {
         Self { proportional: false, bottleneck_depth: Some(depth), bottleneck_kind: kind }
     }
 }
@@ -140,7 +140,7 @@ pub fn classify_oog_chain(
 /// root-first order. Call frames are emitted in post-order DFS by the
 /// inspector — children's `call_end` fires before the parent's — so an
 /// ancestor of `frames[oog_idx]` is the FIRST subsequent frame whose depth
-/// equals (current_depth - 1), iterating forward from oog_idx.
+/// equals (`current_depth` - 1), iterating forward from `oog_idx`.
 fn ancestor_chain(frames: &[CallFrame], oog_idx: usize) -> Vec<&CallFrame> {
     let oog = &frames[oog_idx];
     let mut chain = vec![oog];

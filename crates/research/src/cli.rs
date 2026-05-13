@@ -184,13 +184,13 @@ impl ResearchArgs {
     }
 
     /// Enable EIP-2780 schedule.
-    pub fn with_eip2780(mut self) -> Self {
+    pub const fn with_eip2780(mut self) -> Self {
         self.eip2780_enabled = true;
         self
     }
 
     /// Enable EIP-8037 schedule.
-    pub fn with_eip8037(mut self) -> Self {
+    pub const fn with_eip8037(mut self) -> Self {
         self.eip8037_enabled = true;
         self
     }
@@ -227,13 +227,13 @@ impl ResearchArgs {
     }
 
     /// Set the start block.
-    pub fn with_start_block(mut self, block: u64) -> Self {
+    pub const fn with_start_block(mut self, block: u64) -> Self {
         self.start_block = block;
         self
     }
 
     /// Set parallel transaction count.
-    pub fn with_parallel_txs(mut self, count: usize) -> Self {
+    pub const fn with_parallel_txs(mut self, count: usize) -> Self {
         self.parallel_txs = Some(count);
         self
     }
@@ -245,7 +245,7 @@ impl ResearchArgs {
     }
 
     /// Set the maximum divergences to persist per block.
-    pub fn with_max_divergences_per_block(mut self, count: usize) -> Self {
+    pub const fn with_max_divergences_per_block(mut self, count: usize) -> Self {
         self.max_divergences_per_block = Some(count);
         self
     }
@@ -261,7 +261,7 @@ impl ResearchArgs {
     }
 
     /// Check if any schedules are configured.
-    pub fn has_schedules(&self) -> bool {
+    pub const fn has_schedules(&self) -> bool {
         self.eip2780_enabled ||
             self.eip8037_enabled ||
             !self.csv_schedules.is_empty() ||
@@ -269,7 +269,7 @@ impl ResearchArgs {
     }
 
     /// Get the number of configured schedules.
-    pub fn schedule_count(&self) -> usize {
+    pub const fn schedule_count(&self) -> usize {
         let mut count = 0;
         if self.eip2780_enabled {
             count += 1;
@@ -342,12 +342,12 @@ impl ResearchArgs {
     }
 }
 
-/// Parse a CSV schedule string (for use with clap value_parser).
+/// Parse a CSV schedule string (for use with clap `value_parser`).
 pub fn parse_csv_schedule(s: &str) -> Result<NamedCsvSchedule, String> {
     NamedCsvSchedule::parse(s).map_err(|e| e.to_string())
 }
 
-/// Parse a multiplier schedule string (for use with clap value_parser).
+/// Parse a multiplier schedule string (for use with clap `value_parser`).
 pub fn parse_multiplier_schedule(s: &str) -> Result<NamedMultiplierSchedule, String> {
     NamedMultiplierSchedule::parse(s).map_err(|e| e.to_string())
 }
