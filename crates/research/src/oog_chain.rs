@@ -97,13 +97,25 @@ pub fn classify_oog_chain(
     schedule_call_frames: &[CallFrame],
     oog_call_depth: usize,
 ) -> Option<OogChainAnalysis> {
-    if schedule_call_frames.is_empty() {
-        return None;
-    }
     // Convert 1-based OOG depth to 0-based frame depth. An OOG at the root
     // frame is reported with call_depth = 1 by the inspector but corresponds
     // to a CallFrame with depth = 0.
     let oog_frame_depth = oog_call_depth.checked_sub(1)?;
+
+    // OOG at the root frame is trivially proportional: there are no
+    // parent→child hops on the path. More wallet gas would simply raise
+    // the root's budget (and, by 63/64, every descendant frame's budget),
+    // so the OOG is wallet-fixable regardless of what happened in any
+    // subcalls. Short-circuit here so we don't depend on the root frame
+    // appearing in `schedule_call_frames` — revm's `call`/`call_end`
+    // hooks fire for sub-calls only, so the root frame is rarely present.
+    if oog_frame_depth == 0 {
+        return Some(OogChainAnalysis::proportional());
+    }
+
+    if schedule_call_frames.is_empty() {
+        return None;
+    }
 
     // Locate the OOG frame: the LAST frame in the array (post-order DFS) at
     // exactly oog_frame_depth that did not succeed. We use `rposition`
@@ -232,8 +244,23 @@ mod tests {
     /// `frames[0]` is the deepest-completed; `frames.last()` is the root.
 
     #[test]
-    fn empty_call_frames_returns_none() {
-        assert!(classify_oog_chain(&[], 1).is_none());
+    fn empty_call_frames_with_subcall_oog_returns_none() {
+        // OOG at depth 1 (sub-call) but no call frames captured — can't
+        // walk the chain. Stays unclassified.
+        assert!(classify_oog_chain(&[], 2).is_none());
+    }
+
+    #[test]
+    fn empty_call_frames_with_root_oog_is_proportional() {
+        // Root-frame OOG that the inspector didn't capture per-frame:
+        // there are no hops to throttle, so trivially proportional. This
+        // covers the common case where reth's `call_end` hook doesn't
+        // fire for the root frame and we synthesize a root-OOG record on
+        // the producer side.
+        let res = classify_oog_chain(&[], 1).expect("root OOG always classifies");
+        assert!(res.proportional);
+        assert_eq!(res.bottleneck_depth, None);
+        assert_eq!(res.bottleneck_kind, None);
     }
 
     #[test]

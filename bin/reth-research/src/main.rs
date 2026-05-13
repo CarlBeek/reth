@@ -42,7 +42,7 @@ use reth_research::{
     },
     divergence::{
         classify_bucket, BucketInput, CallFrame, CallType as ResCallType, DivergenceLocation,
-        EventLog,
+        EventLog, OogPattern, OutOfGasInfo,
     },
     oog_chain::classify_oog_chain,
     schedule::{GasSchedule, RecipientInfo, ScheduleKind, ScheduleRegistry, TxContext},
@@ -1446,6 +1446,34 @@ where
                 let call_frames = inspector.call_frames().to_vec();
                 let event_logs = inspector.event_logs().to_vec();
 
+                // Synthesize a root-frame OOG record when the tx halted with
+                // OutOfGas but the inspector didn't capture any per-frame
+                // oog_info. This happens for OOGs that bubble all the way to
+                // the top-level frame: revm's `call`/`call_end` hooks fire
+                // for sub-calls only, and `apply_gas_delta` only runs on the
+                // EIP-7904 (opcode repricing) path — so EIP-8037 root-frame
+                // OOGs get missed entirely. Without this, the chain-walk
+                // classifier has nothing to work with and the row ends up
+                // bucketed as ContractBroken when it's actually wallet-
+                // fixable (more wallet gas would propagate to every frame
+                // via the 63/64 cap and clear the OOG).
+                let inspector_oog_info = insp_result.oog_info.clone().or_else(|| {
+                    if replay_halt_oog == Some(true) {
+                        Some(OutOfGasInfo {
+                            opcode: 0,
+                            opcode_name: "root_halt".to_string(),
+                            pc: 0,
+                            contract: Address::ZERO,
+                            // 1-based: root frame = depth 1.
+                            call_depth: 1,
+                            gas_remaining: 0,
+                            pattern: OogPattern::Unknown,
+                        })
+                    } else {
+                        None
+                    }
+                });
+
                 schedule_results.push(PerScheduleResult {
                     success: sched_success,
                     gas_used: sched_gas_used,
@@ -1456,8 +1484,7 @@ where
                     floor_gas: sched_floor_gas,
                     gas_refunded: sched_gas_refunded,
                     operation_counts: op_counts,
-                    oog_info: insp_result
-                        .oog_info
+                    oog_info: inspector_oog_info
                         .as_ref()
                         .map(|oog| format!("{oog:?}"))
                         .or(halt_info),
@@ -1468,13 +1495,13 @@ where
                         .as_ref()
                         .map(|loc| format!("{loc:?}")),
                     replay_halt_oog,
-                    oog_call_depth: insp_result.oog_info.as_ref().map(|oog| oog.call_depth),
+                    oog_call_depth: inspector_oog_info.as_ref().map(|oog| oog.call_depth),
                     divergence_call_depth: insp_result
                         .divergence_location
                         .as_ref()
                         .map(|loc| loc.call_depth),
                     call_count: inspector.operation_counts().call_count,
-                    oog_info_structured: insp_result.oog_info.clone(),
+                    oog_info_structured: inspector_oog_info.clone(),
                     divergence_location_structured: insp_result.divergence_location.clone(),
                     frame_opcode_counts: inspector.frame_opcode_counts().frames.clone(),
                     call_frames_hash: Self::hash_serialized(&call_frames),
