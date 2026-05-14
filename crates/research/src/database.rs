@@ -989,7 +989,7 @@ impl DivergenceDatabase {
 
     /// Distinct addresses seen as either `to_address` or `code_address` in
     /// `divergence_call_frames` that don't yet have a `contract_labels`
-    /// row. UNIONing in `code_address` catches implementations of proxy
+    /// row. `UNION`ing in `code_address` catches implementations of proxy
     /// contracts that are never directly called but appear in the
     /// delegate-call code position. Drives the external-label backfill.
     pub fn distinct_unlabeled_addresses_for_labels(&self) -> Result<Vec<String>, DatabaseError> {

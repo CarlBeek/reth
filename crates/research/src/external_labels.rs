@@ -1,13 +1,13 @@
 //! External-API contract-label and function-signature backfill.
 //!
-//! Periodic tasks that enrich the research SQLite DB with labels that
+//! Periodic tasks that enrich the research `SQLite` DB with labels that
 //! can't be derived from on-chain bytecode alone:
 //!
 //! - `contract_labels`: per-address contract names and curated protocol tags (e.g. "USDC", "Uniswap
 //!   V3: Router"). Fetched from Blockscout v2 → Sourcify → Etherscan v2, in that order, on a
 //!   per-address fallback chain.
 //! - `function_signatures`: per-selector Solidity signatures (e.g. `transfer(address,uint256)`).
-//!   Fetched from OpenChain's signature database in batches.
+//!   Fetched from `OpenChain`'s signature database in batches.
 //!
 //! Each fetcher rate-limits itself to the documented free-tier ceiling
 //! of its source so the orchestrator can sustain the maximum allowed
@@ -37,7 +37,7 @@ pub const SOURCE_ETHERSCAN: &str = "etherscan";
 /// `source` column value when every source missed; the row is a
 /// negative-cache marker so future ticks don't re-query the address.
 pub const SOURCE_NONE: &str = "none";
-/// `source` column value when OpenChain resolved the selector.
+/// `source` column value when `OpenChain` resolved the selector.
 pub const SOURCE_OPENCHAIN: &str = "openchain";
 
 /// Default Blockscout v2 endpoint for Ethereum mainnet.
@@ -48,7 +48,7 @@ pub const DEFAULT_SOURCIFY_BASE: &str = "https://sourcify.dev/server";
 /// Default Etherscan v2 endpoint (one URL serves all chains via
 /// `?chainid=`).
 pub const DEFAULT_ETHERSCAN_BASE: &str = "https://api.etherscan.io/v2/api";
-/// Default OpenChain signature-database v1 endpoint.
+/// Default `OpenChain` signature-database v1 endpoint.
 pub const DEFAULT_OPENCHAIN_BASE: &str = "https://api.openchain.xyz/signature-database/v1";
 /// Default chain id for the label lookup (Ethereum mainnet).
 pub const DEFAULT_CHAIN_ID: u64 = 1;
@@ -63,7 +63,7 @@ const BLOCKSCOUT_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const SOURCIFY_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const OPENCHAIN_MIN_INTERVAL: Duration = Duration::from_millis(200);
 
-/// OpenChain accepts comma-separated selectors in a single GET. Cap
+/// `OpenChain` accepts comma-separated selectors in a single GET. Cap
 /// batches so request URLs stay well under typical 8 KB limits — each
 /// selector is 11 bytes including the comma.
 const OPENCHAIN_BATCH_SIZE: usize = 64;
@@ -75,7 +75,7 @@ const OPENCHAIN_BATCH_SIZE: usize = 64;
 /// Decoded label for one contract address.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContractLabel {
-    /// Solidity contract class name (e.g. "FiatTokenV2_2"). Populated
+    /// Solidity contract class name (e.g. `FiatTokenV2_2`). Populated
     /// by any source that surfaces verified-source metadata.
     pub contract_name: Option<String>,
     /// Curated protocol / brand label (e.g. "USDC", "Uniswap V3
@@ -140,7 +140,7 @@ pub struct LabelBackfillStats {
 pub struct SignatureBackfillStats {
     /// Selectors considered this tick.
     pub selectors_examined: u64,
-    /// Selectors where OpenChain returned at least one signature.
+    /// Selectors where `OpenChain` returned at least one signature.
     pub resolved: u64,
     /// Selectors recorded as misses (still upserted so subsequent ticks
     /// skip them).
@@ -172,7 +172,7 @@ pub struct LabelBackfillConfig {
     /// Chain id supplied to Etherscan v2 and Sourcify path. Defaults
     /// to 1 (Ethereum mainnet).
     pub chain_id: Option<u64>,
-    /// Override the OpenChain v1 base URL.
+    /// Override the `OpenChain` v1 base URL.
     pub openchain_base_url: Option<String>,
 }
 
@@ -369,7 +369,7 @@ impl ContractLabelFetcher {
     }
 }
 
-/// Fetcher for OpenChain's signature-database v1 endpoint. Looks up
+/// Fetcher for `OpenChain`'s signature-database v1 endpoint. Looks up
 /// up to [`OPENCHAIN_BATCH_SIZE`] selectors per request.
 #[derive(Debug)]
 pub struct OpenChainFetcher {
@@ -677,7 +677,7 @@ pub fn parse_etherscan_getsourcecode_response(body: &str) -> Option<ContractLabe
     }
 }
 
-/// Subset of the OpenChain signature-database response.
+/// Subset of the `OpenChain` signature-database response.
 #[derive(Debug, Deserialize)]
 struct OpenChainLookupResponse {
     #[serde(default)]
@@ -700,7 +700,7 @@ struct OpenChainEntry {
     filtered: Option<bool>,
 }
 
-/// Parse an OpenChain lookup response into a `selector_hex →
+/// Parse an `OpenChain` lookup response into a `selector_hex →
 /// Option<signature>` map. Picks the first non-filtered entry per
 /// selector. Public for unit testing.
 pub fn parse_openchain_lookup_response(
@@ -776,7 +776,7 @@ pub async fn run_contract_label_backfill_incremental(
     Ok(stats)
 }
 
-/// Walks the unresolved-selector set once, queries OpenChain in
+/// Walks the unresolved-selector set once, queries `OpenChain` in
 /// batches, and UPSERTs a `function_signatures` row per selector
 /// (including misses as negative-cache).
 pub async fn run_function_signature_backfill_incremental(
