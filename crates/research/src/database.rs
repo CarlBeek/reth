@@ -453,6 +453,42 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
         );",
     )?;
 
+    // Per-address contract labels backfilled out-of-band by the
+    // external-label task (Blockscout → Sourcify → Etherscan fallback
+    // chain). Keyed by address, not codehash: proxy contracts share a
+    // codehash across many products, so the human-readable label has
+    // to follow the address. `protocol_tag` is the curated brand name
+    // ("USDC", "Uniswap V3: Router") — only Blockscout's API
+    // currently surfaces these. `contract_name` is the Solidity class
+    // name (e.g. "FiatTokenV2_2") and tends to be present on any
+    // verified contract.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS contract_labels (
+            address        TEXT    PRIMARY KEY,
+            contract_name  TEXT,
+            protocol_tag   TEXT,
+            is_proxy       INTEGER NOT NULL DEFAULT 0,
+            impl_address   TEXT,
+            source         TEXT    NOT NULL,
+            fetched_at     INTEGER NOT NULL
+        );",
+    )?;
+
+    // Per-selector function signatures backfilled from OpenChain /
+    // 4byte.directory. Selectors are address- and chain-independent so
+    // the table has no chain/address columns. `signature` is the
+    // canonical Solidity signature string (e.g.
+    // "transfer(address,uint256)"); collisions across multiple known
+    // names are resolved at write time by the orchestrator.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS function_signatures (
+            selector    BLOB    PRIMARY KEY,
+            signature   TEXT,
+            source      TEXT    NOT NULL,
+            fetched_at  INTEGER NOT NULL
+        );",
+    )?;
+
     // Per-replay-run manifest. A consumer reads the latest row to detect
     // "is this lake written by the current code or do I need to migrate?".
     conn.execute_batch(
@@ -949,6 +985,115 @@ impl DivergenceDatabase {
         let rows =
             stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Distinct addresses seen as either `to_address` or `code_address` in
+    /// `divergence_call_frames` that don't yet have a `contract_labels`
+    /// row. UNIONing in `code_address` catches implementations of proxy
+    /// contracts that are never directly called but appear in the
+    /// delegate-call code position. Drives the external-label backfill.
+    pub fn distinct_unlabeled_addresses_for_labels(&self) -> Result<Vec<String>, DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT addr FROM (
+               SELECT to_address   AS addr FROM divergence_call_frames
+                 WHERE to_address   IS NOT NULL AND to_address   <> ''
+               UNION
+               SELECT code_address AS addr FROM divergence_call_frames
+                 WHERE code_address IS NOT NULL AND code_address <> ''
+             ) a
+             WHERE NOT EXISTS (
+               SELECT 1 FROM contract_labels cl WHERE cl.address = a.addr
+             )
+             ORDER BY addr",
+        )?;
+        let rows =
+            stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// UPSERT a `contract_labels` row. Idempotent on `address`. `source`
+    /// records which fallback rung (`blockscout` / `sourcify` /
+    /// `etherscan` / `none`) actually populated the row so the consumer
+    /// can attribute coverage. A `none` row with all NULL fields is
+    /// written when every source missed, so future ticks skip the
+    /// address.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_contract_label(
+        &self,
+        address: &str,
+        contract_name: Option<&str>,
+        protocol_tag: Option<&str>,
+        is_proxy: bool,
+        impl_address: Option<&str>,
+        source: &str,
+        fetched_at_unix: u64,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
+        conn.execute(
+            "INSERT INTO contract_labels (
+                address, contract_name, protocol_tag, is_proxy,
+                impl_address, source, fetched_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (address) DO UPDATE SET
+                contract_name = excluded.contract_name,
+                protocol_tag  = excluded.protocol_tag,
+                is_proxy      = excluded.is_proxy,
+                impl_address  = excluded.impl_address,
+                source        = excluded.source,
+                fetched_at    = excluded.fetched_at",
+            params![
+                address,
+                contract_name,
+                protocol_tag,
+                if is_proxy { 1i64 } else { 0i64 },
+                impl_address,
+                source,
+                fetched_at_unix as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Distinct call-frame selectors not yet present in
+    /// `function_signatures`. Returned as 4-byte vectors so the caller
+    /// can format them as hex for the lookup API without re-querying.
+    pub fn distinct_unresolved_selectors(&self) -> Result<Vec<Vec<u8>>, DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT dcf.selector
+             FROM divergence_call_frames dcf
+             LEFT JOIN function_signatures fs ON fs.selector = dcf.selector
+             WHERE dcf.selector IS NOT NULL
+               AND fs.selector IS NULL
+             ORDER BY dcf.selector",
+        )?;
+        let rows =
+            stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// UPSERT a `function_signatures` row. `signature` is `NULL` when the
+    /// lookup ran but found no match — recording the miss prevents the
+    /// orchestrator from re-querying the same dead selectors every tick.
+    pub fn upsert_function_signature(
+        &self,
+        selector: &[u8],
+        signature: Option<&str>,
+        source: &str,
+        fetched_at_unix: u64,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
+        conn.execute(
+            "INSERT INTO function_signatures (selector, signature, source, fetched_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT (selector) DO UPDATE SET
+                signature  = excluded.signature,
+                source     = excluded.source,
+                fetched_at = excluded.fetched_at",
+            params![selector, signature, source, fetched_at_unix as i64],
+        )?;
+        Ok(())
     }
 }
 
@@ -1835,5 +1980,120 @@ mod tests {
         assert!(unlabeled.contains(&format!("{unlabeled_addr:#x}")));
         assert!(unlabeled.contains(&format!("{null_codehash_addr:#x}")));
         assert!(!unlabeled.contains(&format!("{labeled_addr:#x}")));
+    }
+
+    #[test]
+    fn unlabeled_addresses_for_labels_unions_to_and_code_address() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        let proxy = Address::repeat_byte(0xaa);
+        let implementation = Address::repeat_byte(0xbb);
+        let drill_in = DrillInRecord {
+            divergence: fixture_divergence(99, 0, Bucket::ContractBroken, 0),
+            call_frames: vec![CallFrameRow {
+                call_index: 0,
+                parent_call_index: None,
+                depth: 0,
+                from_address: Address::ZERO,
+                to_address: proxy,
+                code_address: Some(implementation),
+                codehash: None,
+                call_type: "DELEGATECALL".to_string(),
+                selector: Some([0xa9, 0x05, 0x9c, 0xbb]),
+                value_wei: None,
+                gas_provided: 0,
+                gas_used: 0,
+                gas_margin: None,
+                success: true,
+                parent_gas_at_call: None,
+                gas_requested_on_stack: None,
+                eip150_cap_binding: None,
+                state_gas_running: None,
+            }],
+            opcode_counts: vec![],
+            baseline_event_logs: vec![],
+            schedule_event_logs: vec![],
+        };
+        db.record_block_output(&BlockOutput {
+            coverage: fixture_coverage("test", 99, 1, 0),
+            summaries: vec![],
+            drill_ins: vec![drill_in],
+        })
+        .unwrap();
+
+        let unlabeled = db.distinct_unlabeled_addresses_for_labels().unwrap();
+        assert_eq!(unlabeled.len(), 2, "both proxy and impl should be queued");
+        assert!(unlabeled.contains(&format!("{proxy:#x}")));
+        assert!(unlabeled.contains(&format!("{implementation:#x}")));
+
+        // Once the proxy is labeled, only the implementation remains.
+        db.upsert_contract_label(
+            &format!("{proxy:#x}"),
+            Some("FiatTokenProxy"),
+            Some("USDC"),
+            true,
+            Some(&format!("{implementation:#x}")),
+            "blockscout",
+            1_700_000_000,
+        )
+        .unwrap();
+        let unlabeled = db.distinct_unlabeled_addresses_for_labels().unwrap();
+        assert_eq!(unlabeled.len(), 1);
+        assert_eq!(unlabeled[0], format!("{implementation:#x}"));
+    }
+
+    #[test]
+    fn unresolved_selectors_skips_already_resolved() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        let transfer = [0xa9u8, 0x05, 0x9c, 0xbb];
+        let approve = [0x09u8, 0x5e, 0xa7, 0xb3];
+        for (i, sel) in [transfer, approve].iter().enumerate() {
+            let drill_in = DrillInRecord {
+                divergence: fixture_divergence(99, i as u32, Bucket::ContractBroken, 0),
+                call_frames: vec![CallFrameRow {
+                    call_index: 0,
+                    parent_call_index: None,
+                    depth: 0,
+                    from_address: Address::ZERO,
+                    to_address: Address::repeat_byte(0xcc),
+                    code_address: None,
+                    codehash: None,
+                    call_type: "CALL".to_string(),
+                    selector: Some(*sel),
+                    value_wei: None,
+                    gas_provided: 0,
+                    gas_used: 0,
+                    gas_margin: None,
+                    success: true,
+                    parent_gas_at_call: None,
+                    gas_requested_on_stack: None,
+                    eip150_cap_binding: None,
+                    state_gas_running: None,
+                }],
+                opcode_counts: vec![],
+                baseline_event_logs: vec![],
+                schedule_event_logs: vec![],
+            };
+            db.record_block_output(&BlockOutput {
+                coverage: fixture_coverage("test", 99, 1, 0),
+                summaries: vec![],
+                drill_ins: vec![drill_in],
+            })
+            .unwrap();
+        }
+
+        let unresolved = db.distinct_unresolved_selectors().unwrap();
+        assert_eq!(unresolved.len(), 2);
+
+        db.upsert_function_signature(
+            &transfer,
+            Some("transfer(address,uint256)"),
+            "openchain",
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let unresolved = db.distinct_unresolved_selectors().unwrap();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0], approve.to_vec());
     }
 }

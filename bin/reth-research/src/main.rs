@@ -346,6 +346,7 @@ where
     >,
 {
     /// Create a new research ExEx.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         ctx: ExExContext<Node>,
         registry: ScheduleRegistry,
@@ -357,6 +358,9 @@ where
         backfill_min_block: u64,
         backfill_concurrency: usize,
         metadata_backfill_interval_secs: u64,
+        contract_labels_interval_secs: u64,
+        function_signatures_interval_secs: u64,
+        label_config_path: Option<std::path::PathBuf>,
     ) -> eyre::Result<Self> {
         let registry = Arc::new(registry);
         let all_schedules = registry.all();
@@ -539,6 +543,51 @@ where
                     target: "exex::research",
                     interval_secs = metadata_backfill_interval_secs,
                     "Periodic contract-metadata backfill enabled"
+                );
+            }
+        }
+
+        // Load the external-label config once. Missing path / file is
+        // tolerated: defaults give a Blockscout + Sourcify chain with no
+        // Etherscan rung.
+        let label_config = match label_config_path.as_ref() {
+            Some(p) => reth_research::external_labels::LabelBackfillConfig::from_path(p)
+                .map_err(|e| eyre::eyre!("failed to load label config from {p:?}: {e}"))?,
+            None => reth_research::external_labels::LabelBackfillConfig::default(),
+        };
+
+        // Periodic external contract-label backfill (Blockscout → Sourcify
+        // → Etherscan). Network-bound, so runs entirely in the async
+        // runtime with no spawn_blocking.
+        if contract_labels_interval_secs > 0 {
+            if let Some(db) = divergence_db.clone() {
+                let fetcher = std::sync::Arc::new(
+                    reth_research::external_labels::ContractLabelFetcher::new(&label_config),
+                );
+                let interval = std::time::Duration::from_secs(contract_labels_interval_secs);
+                tokio::spawn(periodic_contract_label_backfill(db, fetcher, interval));
+                info!(
+                    target: "exex::research",
+                    interval_secs = contract_labels_interval_secs,
+                    etherscan_enabled = label_config.etherscan_api_key.is_some(),
+                    "Periodic contract-label backfill enabled"
+                );
+            }
+        }
+
+        // Periodic function-signature backfill (OpenChain).
+        if function_signatures_interval_secs > 0 {
+            if let Some(db) = divergence_db.clone() {
+                let fetcher =
+                    std::sync::Arc::new(reth_research::external_labels::OpenChainFetcher::new(
+                        label_config.openchain_base_url.as_deref(),
+                    ));
+                let interval = std::time::Duration::from_secs(function_signatures_interval_secs);
+                tokio::spawn(periodic_function_signature_backfill(db, fetcher, interval));
+                info!(
+                    target: "exex::research",
+                    interval_secs = function_signatures_interval_secs,
+                    "Periodic function-signature backfill enabled"
                 );
             }
         }
@@ -2176,6 +2225,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn research_exex<Node: FullNodeComponents>(
     ctx: ExExContext<Node>,
     registry: ScheduleRegistry,
@@ -2187,6 +2237,9 @@ async fn research_exex<Node: FullNodeComponents>(
     backfill_min_block: u64,
     backfill_concurrency: usize,
     metadata_backfill_interval_secs: u64,
+    contract_labels_interval_secs: u64,
+    function_signatures_interval_secs: u64,
+    label_config_path: Option<std::path::PathBuf>,
 ) -> eyre::Result<()>
 where
     Node::Evm: ConfigureEvm<
@@ -2206,6 +2259,9 @@ where
         backfill_min_block,
         backfill_concurrency,
         metadata_backfill_interval_secs,
+        contract_labels_interval_secs,
+        function_signatures_interval_secs,
+        label_config_path,
     )?
     .run()
     .await
@@ -2303,6 +2359,94 @@ async fn periodic_metadata_backfill<P>(
     }
 }
 
+/// Periodically walk the unlabeled-address set and fill `contract_labels`
+/// via the Blockscout → Sourcify → Etherscan fallback chain. Runs
+/// entirely in the async runtime (HTTP I/O), with no `spawn_blocking`.
+async fn periodic_contract_label_backfill(
+    db: reth_research::database::DivergenceDatabase,
+    fetcher: std::sync::Arc<reth_research::external_labels::ContractLabelFetcher>,
+    interval: std::time::Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        match reth_research::external_labels::run_contract_label_backfill_incremental(&db, &fetcher)
+            .await
+        {
+            Ok(stats) if stats.upserted_with_label > 0 || stats.fetch_errors > 0 => {
+                info!(
+                    target: "exex::research::contract_labels",
+                    addresses_examined = stats.addresses_examined,
+                    upserted_with_label = stats.upserted_with_label,
+                    upserted_empty = stats.upserted_empty,
+                    fetch_errors = stats.fetch_errors,
+                    "Periodic contract-label backfill tick"
+                );
+            }
+            Ok(stats) => {
+                debug!(
+                    target: "exex::research::contract_labels",
+                    addresses_examined = stats.addresses_examined,
+                    "Periodic contract-label backfill tick (no new labels)"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    target: "exex::research::contract_labels",
+                    error = %e,
+                    "Periodic contract-label backfill failed"
+                );
+            }
+        }
+    }
+}
+
+/// Periodically walk the unresolved-selector set and fill
+/// `function_signatures` via OpenChain. Single batched HTTP call per
+/// tick keeps the load tiny.
+async fn periodic_function_signature_backfill(
+    db: reth_research::database::DivergenceDatabase,
+    fetcher: std::sync::Arc<reth_research::external_labels::OpenChainFetcher>,
+    interval: std::time::Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        match reth_research::external_labels::run_function_signature_backfill_incremental(
+            &db, &fetcher,
+        )
+        .await
+        {
+            Ok(stats) if stats.resolved > 0 || stats.fetch_errors > 0 => {
+                info!(
+                    target: "exex::research::function_signatures",
+                    selectors_examined = stats.selectors_examined,
+                    resolved = stats.resolved,
+                    unresolved = stats.unresolved,
+                    fetch_errors = stats.fetch_errors,
+                    "Periodic function-signature backfill tick"
+                );
+            }
+            Ok(stats) => {
+                debug!(
+                    target: "exex::research::function_signatures",
+                    selectors_examined = stats.selectors_examined,
+                    "Periodic function-signature backfill tick (no new resolutions)"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    target: "exex::research::function_signatures",
+                    error = %e,
+                    "Periodic function-signature backfill failed"
+                );
+            }
+        }
+    }
+}
+
 /// One-shot ExEx that opens the producer DuckDB, runs the contract-
 /// metadata backfill against the node's `latest` state, logs the
 /// resulting counters, and terminates the process. Idempotent — re-runs
@@ -2377,6 +2521,11 @@ fn main() -> eyre::Result<()> {
             let backfill_concurrency = research_args.backfill_concurrency;
             let metadata_backfill_interval_secs =
                 research_args.metadata_backfill_interval_secs;
+            let contract_labels_interval_secs =
+                research_args.contract_labels_interval_secs;
+            let function_signatures_interval_secs =
+                research_args.function_signatures_interval_secs;
+            let label_config_path = research_args.label_config_path.clone();
 
             info!(
                 target: "reth::cli",
@@ -2389,6 +2538,9 @@ fn main() -> eyre::Result<()> {
                 backfill_min_block,
                 backfill_concurrency,
                 metadata_backfill_interval_secs,
+                contract_labels_interval_secs,
+                function_signatures_interval_secs,
+                label_config_path = ?label_config_path,
                 "Starting multi-schedule research mode"
             );
 
@@ -2398,6 +2550,7 @@ fn main() -> eyre::Result<()> {
                     let registry = registry.clone();
                     let db_path = db_path.clone();
                     let gas_limit_multipliers = gas_limit_multipliers.clone();
+                    let label_config_path = label_config_path.clone();
                     async move {
                         Ok(research_exex(
                             ctx,
@@ -2410,6 +2563,9 @@ fn main() -> eyre::Result<()> {
                             backfill_min_block,
                             backfill_concurrency,
                             metadata_backfill_interval_secs,
+                            contract_labels_interval_secs,
+                            function_signatures_interval_secs,
+                            label_config_path,
                         ))
                     }
                 })

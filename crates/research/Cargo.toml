@@ -46,6 +46,17 @@ tracing.workspace = true
 # Error handling
 thiserror.workspace = true
 
+# Async HTTP for the external contract-label / function-signature
+# backfill paths (Blockscout / Sourcify / Etherscan v2 / OpenChain).
+# `default-features = false` mirrors the workspace declaration (rustls
+# + stream features only — no native-tls baggage).
+reqwest = { workspace = true, features = ["json", "query"] }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+
+# Config-file parsing for the optional label-backfill credentials
+# (Etherscan API key, URL overrides).
+toml = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3.0"
 

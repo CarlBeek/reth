@@ -196,6 +196,7 @@ pub mod cli;
 pub mod contract_metadata;
 pub mod database;
 pub mod divergence;
+pub mod external_labels;
 pub mod multi_schedule_inspector;
 pub mod oog_chain;
 pub mod schedule;

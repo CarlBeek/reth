@@ -142,6 +142,38 @@ pub struct ResearchArgs {
         help_heading = "Research"
     )]
     pub metadata_backfill_interval_secs: u64,
+
+    /// Interval (seconds) for the periodic contract-label backfill that
+    /// fetches per-address contract names and protocol tags from
+    /// external APIs (Blockscout → Sourcify → Etherscan fallback chain).
+    /// Set `0` to disable. Requires `--research.label-config-path` for
+    /// the Etherscan rung; Blockscout + Sourcify work key-less.
+    #[arg(
+        long = "research.contract-labels-interval-secs",
+        value_name = "SECS",
+        default_value_t = 0,
+        help_heading = "Research"
+    )]
+    pub contract_labels_interval_secs: u64,
+
+    /// Interval (seconds) for the periodic function-signature backfill
+    /// that fetches 4-byte selector → signature mappings from OpenChain.
+    /// Set `0` to disable.
+    #[arg(
+        long = "research.function-signatures-interval-secs",
+        value_name = "SECS",
+        default_value_t = 0,
+        help_heading = "Research"
+    )]
+    pub function_signatures_interval_secs: u64,
+
+    /// Path to a TOML config file holding optional credentials and URL
+    /// overrides for the external-label backfill (`etherscan_api_key`,
+    /// `blockscout_base_url`, `sourcify_base_url`, `etherscan_base_url`,
+    /// `openchain_base_url`, `chain_id`). When absent, the backfill runs
+    /// with default mainnet endpoints and no Etherscan rung.
+    #[arg(long = "research.label-config-path", value_name = "PATH", help_heading = "Research")]
+    pub label_config_path: Option<PathBuf>,
 }
 
 impl Default for ResearchArgs {
@@ -160,6 +192,9 @@ impl Default for ResearchArgs {
             backfill_concurrency: 0,
             metadata_backfill: false,
             metadata_backfill_interval_secs: 60,
+            contract_labels_interval_secs: 0,
+            function_signatures_interval_secs: 0,
+            label_config_path: None,
         }
     }
 }
