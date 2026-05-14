@@ -260,22 +260,48 @@ struct BlockGasTracker {
     is_amsterdam: bool,
     cumulative_tx_gas_used: u64,
     block_regular_gas_used: u64,
+    block_state_gas_used: u64,
 }
 
 impl BlockGasTracker {
     const fn new(block_gas_limit: u64, is_amsterdam: bool) -> Self {
-        Self { block_gas_limit, is_amsterdam, cumulative_tx_gas_used: 0, block_regular_gas_used: 0 }
+        Self {
+            block_gas_limit,
+            is_amsterdam,
+            cumulative_tx_gas_used: 0,
+            block_regular_gas_used: 0,
+            block_state_gas_used: 0,
+        }
     }
 
     fn validate_tx_limit(&self, tx_gas_limit: u64) -> Result<(), BlockExecutionError> {
-        let block_gas_used = if self.is_amsterdam {
-            self.block_regular_gas_used
-        } else {
-            self.cumulative_tx_gas_used
-        };
-        let block_available_gas = self.block_gas_limit.saturating_sub(block_gas_used);
         let tx_min_gas_limit = tx_gas_limit.min(TX_GAS_LIMIT_CAP);
 
+        if self.is_amsterdam {
+            let regular_available_gas =
+                self.block_gas_limit.saturating_sub(self.block_regular_gas_used);
+            if tx_min_gas_limit > regular_available_gas {
+                return Err(BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
+                    transaction_gas_limit: tx_gas_limit,
+                    block_available_gas: regular_available_gas,
+                }
+                .into());
+            }
+
+            let state_available_gas =
+                self.block_gas_limit.saturating_sub(self.block_state_gas_used);
+            if tx_gas_limit > state_available_gas {
+                return Err(BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
+                    transaction_gas_limit: tx_gas_limit,
+                    block_available_gas: state_available_gas,
+                }
+                .into());
+            }
+
+            return Ok(());
+        }
+
+        let block_available_gas = self.block_gas_limit.saturating_sub(self.cumulative_tx_gas_used);
         if tx_min_gas_limit > block_available_gas {
             return Err(BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
                 transaction_gas_limit: tx_gas_limit,
@@ -292,6 +318,8 @@ impl BlockGasTracker {
         self.cumulative_tx_gas_used = self.cumulative_tx_gas_used.saturating_add(gas.tx_gas_used());
         self.block_regular_gas_used =
             self.block_regular_gas_used.saturating_add(gas.block_regular_gas_used());
+        self.block_state_gas_used =
+            self.block_state_gas_used.saturating_add(gas.block_state_gas_used());
     }
 }
 
@@ -1132,10 +1160,9 @@ mod tests {
     }
 
     #[test]
-    fn gas_tracker_non_amsterdam_uses_cumulative_gas() {
-        // All-state-gas results keep block_regular_gas_used at 0, so a second tx that fits
-        // within the block limit but not the remaining cumulative budget proves that
-        // non-Amsterdam reads cumulative_tx_gas_used while Amsterdam does not.
+    fn gas_tracker_amsterdam_checks_state_dimension() {
+        // All-state-gas results keep block_regular_gas_used at 0, but they still consume
+        // block_state_gas_used. Amsterdam admission must check both dimensions.
         use revm::context::result::{
             ExecResultAndState, ExecutionResult, Output, ResultGas, SuccessReason,
         };
@@ -1165,12 +1192,12 @@ mod tests {
             "non-Amsterdam tracker must reject tx that exceeds remaining cumulative gas",
         );
 
-        // Amsterdam: block_available_gas = 1_000_000 - 0 = 1_000_000 → accept 500_000.
+        // Amsterdam: regular capacity is available, but state capacity is only 400_000.
         let mut amsterdam = BlockGasTracker::new(block_gas_limit, true);
         amsterdam.record_result(&fake_result);
         assert!(
-            amsterdam.validate_tx_limit(second_tx_gas_limit).is_ok(),
-            "Amsterdam tracker must accept the same tx since block_regular_gas_used stays 0",
+            amsterdam.validate_tx_limit(second_tx_gas_limit).is_err(),
+            "Amsterdam tracker must reject txs that exceed remaining state gas capacity",
         );
     }
 

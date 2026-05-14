@@ -315,8 +315,6 @@ dependencies = [
 [[package]]
 name = "alloy-evm"
 version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1ceeea6dcbbcd4e546b27700763a6f6c3b3fee30054209884f521078b6fda4f"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
@@ -10765,8 +10763,6 @@ dependencies = [
 [[package]]
 name = "revm-context-interface"
 version = "17.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f3758e6167c4ba7a59a689c519a047edaefcd4c37d74f279b93ed87bc8aece4"
 dependencies = [
  "alloy-eip2930",
  "alloy-eip7702",
@@ -10809,8 +10805,6 @@ dependencies = [
 [[package]]
 name = "revm-handler"
 version = "18.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "783e903d6922b7f5f9a940d1bb229530502d2924b1aed9d5ca5a94ebf065d460"
 dependencies = [
  "auto_impl",
  "derive-where",
@@ -10866,8 +10860,6 @@ dependencies = [
 [[package]]
 name = "revm-interpreter"
 version = "35.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ece9f41b69658c15d748288a4dbdfc06a63f3ce93d983af440de3f1631dce6a"
 dependencies = [
  "revm-bytecode",
  "revm-context-interface",

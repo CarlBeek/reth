@@ -11,9 +11,8 @@
 //! Implementation notes:
 //! - `configure_evm_env` switches the EVM to `SpecId::AMSTERDAM` (which gives us revm's native
 //!   EIP-8037 reservoir / state-gas accounting) and then *overrides* the relevant entries of revm's
-//!   gas-param table with the PR-11616 constants. revm ships hardcoded `CPSB = 1174`,
-//!   `STATE_BYTES_PER_STORAGE_SET = 32`, `STATE_BYTES_PER_NEW_ACCOUNT = 112`, so without the
-//!   override the runtime would silently use the older numbers.
+//!   gas-param table with the PR-11616 constants. This keeps the research schedule explicit even
+//!   when the patched local revm table already contains the same values.
 //! - `intrinsic_gas` mirrors the same overrides on a fresh `GasParams::new_spec(AMSTERDAM)` and
 //!   calls `initial_tx_gas` directly, since the top-level `calculate_initial_tx_gas` helper builds
 //!   its own `GasParams` from the spec and there's no hook for injecting overrides.
@@ -101,10 +100,7 @@ impl Eip8037Constants {
 /// Apply PR-11616 state-byte constants on top of revm's hardcoded
 /// `SpecId::AMSTERDAM` gas-param table.
 ///
-/// revm bakes the older spec numbers (`CPSB = 1174`,
-/// `STATE_BYTES_PER_STORAGE_SET = 32`, `STATE_BYTES_PER_NEW_ACCOUNT = 112`)
-/// into `with_spec_and_mainnet_gas_params(AMSTERDAM)`. This helper
-/// overlays the new constants so both runtime gas charges (via the cfg
+/// This helper overlays the current constants so both runtime gas charges (via the cfg
 /// env) and the intrinsic-gas computation (via a fresh `GasParams`) end
 /// up using PR-11616 values.
 fn apply_pr11616_overrides(params: &mut GasParams) {
@@ -228,8 +224,6 @@ impl GasSchedule for Eip8037Schedule {
         cfg.amsterdam_eip7708_delayed_burn_disabled = true;
 
         // Overlay PR-11616 numbers on top of revm's Amsterdam defaults.
-        // Without this, the EVM would silently charge the old CPSB=1174
-        // / 32-byte storage / 112-byte account figures at execution.
         apply_pr11616_overrides(&mut cfg.gas_params);
 
         env.cfg_env = cfg;

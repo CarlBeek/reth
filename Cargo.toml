@@ -156,11 +156,23 @@ members = [
     "crates/tracing-otlp",
 ]
 default-members = ["bin/reth"]
-exclude = ["docs/cli"]
+exclude = [
+    "docs/cli",
+    "vendor/alloy-evm",
+    "vendor/revm-context-interface",
+    "vendor/revm-handler",
+    "vendor/revm-interpreter",
+]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
 # https://doc.rust-lang.org/edition-guide/rust-2021/default-cargo-resolver.html
 resolver = "2"
+
+[patch.crates-io]
+alloy-evm = { path = "vendor/alloy-evm" }
+revm-context-interface = { path = "vendor/revm-context-interface" }
+revm-handler = { path = "vendor/revm-handler" }
+revm-interpreter = { path = "vendor/revm-interpreter" }
 
 [workspace.lints]
 rust.missing_debug_implementations = "warn"

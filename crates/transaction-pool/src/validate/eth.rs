@@ -33,14 +33,14 @@ use reth_primitives_traits::{
 };
 use reth_storage_api::{AccountInfoReader, BlockReaderIdExt, BytecodeReader, StateProviderFactory};
 use reth_tasks::Runtime;
-use revm::context_interface::Cfg;
+use revm::context_interface::{cfg::GasParams, Cfg};
 use revm_primitives::U256;
 use std::{
     fmt,
     marker::PhantomData,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize},
-        Arc,
+        Arc, RwLock,
     },
     time::{Instant, SystemTime},
 };
@@ -876,6 +876,8 @@ where
         self.fork_tracker
             .max_initcode_size
             .store(evm_env.cfg_env.max_initcode_size(), std::sync::atomic::Ordering::Relaxed);
+        *self.fork_tracker.gas_params.write().expect("gas params lock poisoned") =
+            evm_env.cfg_env.gas_params().clone();
         // EIP-8037: When state gas is enabled, `tx.gas` can exceed the per-tx gas limit cap
         // because the cap only applies to regular gas (state gas uses a reservoir).
         // Store 0 to disable the txpool-level check.
@@ -1003,6 +1005,8 @@ pub struct EthTransactionValidatorBuilder<Client, Evm> {
     max_initcode_size: usize,
     /// Cached transaction gas limit cap from EVM config (0 = no cap)
     tx_gas_limit_cap: u64,
+    /// Cached gas parameters from EVM config.
+    gas_params: GasParams,
     /// Whether EIP-7594 blob sidecars are accepted.
     /// When false, EIP-7594 (v1) sidecars are always rejected and EIP-4844 (v0) sidecars
     /// are always accepted, regardless of Osaka fork activation.
@@ -1074,6 +1078,7 @@ impl<Client, Evm> EthTransactionValidatorBuilder<Client, Evm> {
             } else {
                 evm_env.cfg_env.tx_gas_limit_cap()
             },
+            gas_params: evm_env.cfg_env.gas_params().clone(),
             max_initcode_size: evm_env.cfg_env.max_initcode_size(),
 
             // EIP-7594 sidecars are accepted by default (standard Ethereum behavior)
@@ -1285,6 +1290,7 @@ impl<Client, Evm> EthTransactionValidatorBuilder<Client, Evm> {
             other_tx_types,
             max_initcode_size,
             tx_gas_limit_cap,
+            gas_params,
             eip7594,
         } = self;
 
@@ -1297,6 +1303,7 @@ impl<Client, Evm> EthTransactionValidatorBuilder<Client, Evm> {
             max_blob_count: AtomicU64::new(max_blob_count),
             max_initcode_size: AtomicUsize::new(max_initcode_size),
             tx_gas_limit_cap: AtomicU64::new(tx_gas_limit_cap),
+            gas_params: RwLock::new(gas_params),
         };
 
         EthTransactionValidator {
@@ -1364,6 +1371,8 @@ pub struct ForkTracker {
     pub max_initcode_size: AtomicUsize,
     /// Cached transaction gas limit cap from EVM config (0 = no cap)
     pub tx_gas_limit_cap: AtomicU64,
+    /// Cached gas parameters from EVM config.
+    pub gas_params: RwLock<GasParams>,
 }
 
 impl ForkTracker {
@@ -1396,6 +1405,11 @@ impl ForkTracker {
     pub fn max_blob_count(&self) -> u64 {
         self.max_blob_count.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Returns the configured gas parameters.
+    pub fn gas_params(&self) -> GasParams {
+        self.gas_params.read().expect("gas params lock poisoned").clone()
+    }
 }
 
 /// Ensures that gas limit of the transaction exceeds the intrinsic gas of the transaction.
@@ -1405,17 +1419,10 @@ pub fn ensure_intrinsic_gas<T: EthPoolTransaction>(
     transaction: &T,
     fork_tracker: &ForkTracker,
 ) -> Result<(), InvalidPoolTransactionError> {
-    use revm_primitives::hardfork::SpecId;
-    let spec_id = if fork_tracker.is_prague_activated() {
-        SpecId::PRAGUE
-    } else if fork_tracker.is_shanghai_activated() {
-        SpecId::SHANGHAI
-    } else {
-        SpecId::MERGE
-    };
+    let gas_params = fork_tracker.gas_params();
 
-    let gas = revm_interpreter::gas::calculate_initial_tx_gas(
-        spec_id,
+    let gas = revm_interpreter::gas::calculate_initial_tx_gas_with_gas_params(
+        &gas_params,
         transaction.input(),
         transaction.is_create(),
         transaction.access_list().map(|l| l.len()).unwrap_or_default() as u64,
@@ -1448,7 +1455,7 @@ mod tests {
     use reth_evm_ethereum::EthEvmConfig;
     use reth_primitives_traits::SignedTransaction;
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
-    use revm_primitives::eip3860::MAX_INITCODE_SIZE;
+    use revm_primitives::{eip3860::MAX_INITCODE_SIZE, hardfork::SpecId};
 
     fn test_evm_config() -> EthEvmConfig {
         EthEvmConfig::mainnet()
@@ -1476,12 +1483,14 @@ mod tests {
             max_blob_count: 0.into(),
             max_initcode_size: AtomicUsize::new(MAX_INITCODE_SIZE),
             tx_gas_limit_cap: AtomicU64::new(0),
+            gas_params: RwLock::new(GasParams::new_spec(SpecId::MERGE)),
         };
 
         let res = ensure_intrinsic_gas(&transaction, &fork_tracker);
         assert!(res.is_ok());
 
         fork_tracker.shanghai = true.into();
+        *fork_tracker.gas_params.write().unwrap() = GasParams::new_spec(SpecId::SHANGHAI);
         let res = ensure_intrinsic_gas(&transaction, &fork_tracker);
         assert!(res.is_ok());
 
