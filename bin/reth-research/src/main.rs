@@ -356,6 +356,7 @@ where
         backfill: bool,
         backfill_min_block: u64,
         backfill_concurrency: usize,
+        metadata_backfill_interval_secs: u64,
     ) -> eyre::Result<Self> {
         let registry = Arc::new(registry);
         let all_schedules = registry.all();
@@ -524,6 +525,23 @@ where
             db_tx,
             divergences_found: AtomicU64::new(0),
         });
+
+        // Periodic contract-metadata backfill. Decoupled from block flow:
+        // a tokio task wakes every N seconds and runs the SQL-prefiltered
+        // incremental backfill so `contract_metadata` fills as new
+        // addresses appear. Requires a real DB; in-memory mode skips it.
+        if metadata_backfill_interval_secs > 0 {
+            if let Some(db) = divergence_db.clone() {
+                let provider = ctx.components.provider().clone();
+                let interval = std::time::Duration::from_secs(metadata_backfill_interval_secs);
+                tokio::spawn(periodic_metadata_backfill(db, provider, interval));
+                info!(
+                    target: "exex::research",
+                    interval_secs = metadata_backfill_interval_secs,
+                    "Periodic contract-metadata backfill enabled"
+                );
+            }
+        }
 
         Ok(Self {
             ctx,
@@ -2168,6 +2186,7 @@ async fn research_exex<Node: FullNodeComponents>(
     backfill: bool,
     backfill_min_block: u64,
     backfill_concurrency: usize,
+    metadata_backfill_interval_secs: u64,
 ) -> eyre::Result<()>
 where
     Node::Evm: ConfigureEvm<
@@ -2186,6 +2205,7 @@ where
         backfill,
         backfill_min_block,
         backfill_concurrency,
+        metadata_backfill_interval_secs,
     )?
     .run()
     .await
@@ -2218,6 +2238,68 @@ where
             reth_research::contract_metadata::BackfillError::Fetch { address, source: Box::new(e) }
         })?;
         Ok(code.map(|bc| bc.bytes().to_vec()))
+    }
+}
+
+/// Run the SQL-prefiltered incremental metadata backfill every `interval`,
+/// forever, on a `spawn_blocking` thread (the orchestration loop hits the
+/// DB synchronously and may call into rocksdb / state lookups).
+///
+/// Skips ticks where the prior tick is still running by configuring the
+/// ticker with `MissedTickBehavior::Skip` — relevant after a long restart
+/// where the first scan has thousands of fresh addresses to walk.
+async fn periodic_metadata_backfill<P>(
+    db: reth_research::database::DivergenceDatabase,
+    provider: P,
+    interval: std::time::Duration,
+) where
+    P: StateProviderFactory + Clone + Send + Sync + 'static,
+{
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let db = db.clone();
+        let provider = provider.clone();
+        let join = tokio::task::spawn_blocking(move || {
+            let fetcher = ProviderBytecodeFetcher { provider };
+            reth_research::contract_metadata::run_metadata_backfill_incremental(&db, &fetcher)
+        })
+        .await;
+        match join {
+            Ok(Ok(stats)) if stats.upserted > 0 || stats.fetch_errors > 0 => {
+                info!(
+                    target: "exex::research::metadata_backfill",
+                    addresses_examined = stats.addresses_examined,
+                    upserted = stats.upserted,
+                    skipped_existing = stats.skipped_existing,
+                    no_bytecode = stats.no_bytecode,
+                    fetch_errors = stats.fetch_errors,
+                    "Periodic metadata backfill tick"
+                );
+            }
+            Ok(Ok(stats)) => {
+                debug!(
+                    target: "exex::research::metadata_backfill",
+                    addresses_examined = stats.addresses_examined,
+                    "Periodic metadata backfill tick (no new addresses)"
+                );
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    target: "exex::research::metadata_backfill",
+                    error = %e,
+                    "Periodic metadata backfill failed"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    target: "exex::research::metadata_backfill",
+                    error = %e,
+                    "Periodic metadata backfill task panicked"
+                );
+            }
+        }
     }
 }
 
@@ -2293,6 +2375,8 @@ fn main() -> eyre::Result<()> {
             let backfill = research_args.backfill;
             let backfill_min_block = research_args.backfill_min_block;
             let backfill_concurrency = research_args.backfill_concurrency;
+            let metadata_backfill_interval_secs =
+                research_args.metadata_backfill_interval_secs;
 
             info!(
                 target: "reth::cli",
@@ -2304,6 +2388,7 @@ fn main() -> eyre::Result<()> {
                 backfill,
                 backfill_min_block,
                 backfill_concurrency,
+                metadata_backfill_interval_secs,
                 "Starting multi-schedule research mode"
             );
 
@@ -2324,6 +2409,7 @@ fn main() -> eyre::Result<()> {
                             backfill,
                             backfill_min_block,
                             backfill_concurrency,
+                            metadata_backfill_interval_secs,
                         ))
                     }
                 })

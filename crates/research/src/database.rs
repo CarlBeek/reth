@@ -929,6 +929,27 @@ impl DivergenceDatabase {
             stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    /// Addresses with at least one call frame whose codehash is not yet
+    /// represented in `contract_metadata`. Drives the periodic incremental
+    /// backfill so each tick only re-fetches bytecode for genuinely new
+    /// (or never-labeled) contracts. NULL `codehash` values match too —
+    /// those rows need a fresh fetch to derive a codehash from current
+    /// state.
+    pub fn distinct_unlabeled_call_frame_addresses(&self) -> Result<Vec<String>, DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT dcf.to_address
+             FROM divergence_call_frames dcf
+             LEFT JOIN contract_metadata cm ON cm.codehash = dcf.codehash
+             WHERE dcf.to_address IS NOT NULL AND dcf.to_address <> ''
+               AND cm.codehash IS NULL
+             ORDER BY dcf.to_address",
+        )?;
+        let rows =
+            stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 }
 
 /// Per-table row counts returned by
@@ -1737,5 +1758,82 @@ mod tests {
         let addrs = db.distinct_call_frame_addresses().unwrap();
         assert_eq!(addrs.len(), 1, "duplicate to_address should be de-duplicated");
         assert_eq!(addrs[0], format!("{:#x}", Address::repeat_byte(0xaa)));
+    }
+
+    #[test]
+    fn distinct_unlabeled_call_frame_addresses_filters_labeled_codehashes() {
+        use crate::contract_metadata::ContractMetadata;
+
+        let db = DivergenceDatabase::in_memory().unwrap();
+        let labeled_addr = Address::repeat_byte(0xaa);
+        let labeled_codehash = B256::repeat_byte(0xcc);
+        let unlabeled_addr = Address::repeat_byte(0xbb);
+        let unlabeled_codehash = B256::repeat_byte(0xdd);
+        let null_codehash_addr = Address::repeat_byte(0xee);
+
+        let mut tx_index = 0u32;
+        for (addr, codehash) in [
+            (labeled_addr, Some(labeled_codehash)),
+            (unlabeled_addr, Some(unlabeled_codehash)),
+            (null_codehash_addr, None),
+        ] {
+            let drill_in = DrillInRecord {
+                divergence: fixture_divergence(99, tx_index, Bucket::ContractBroken, 0),
+                call_frames: vec![CallFrameRow {
+                    call_index: 0,
+                    parent_call_index: None,
+                    depth: 0,
+                    from_address: Address::ZERO,
+                    to_address: addr,
+                    code_address: None,
+                    codehash,
+                    call_type: "CALL".to_string(),
+                    selector: None,
+                    value_wei: None,
+                    gas_provided: 0,
+                    gas_used: 0,
+                    gas_margin: None,
+                    success: false,
+                    parent_gas_at_call: None,
+                    gas_requested_on_stack: None,
+                    eip150_cap_binding: None,
+                    state_gas_running: None,
+                }],
+                opcode_counts: vec![],
+                baseline_event_logs: vec![],
+                schedule_event_logs: vec![],
+            };
+            let output = BlockOutput {
+                coverage: fixture_coverage("test", 99, 1, 0),
+                summaries: vec![],
+                drill_ins: vec![drill_in],
+            };
+            db.record_block_output(&output).unwrap();
+            tx_index += 1;
+        }
+
+        // Pre-label only `labeled_codehash`. The other two addresses should
+        // remain in the unlabeled set.
+        let meta = ContractMetadata {
+            solc_version: Some("0.8.21".to_string()),
+            solc_commit: None,
+            evm_target: None,
+            cbor_present: true,
+            has_metadata_hash: true,
+        };
+        db.upsert_contract_metadata(
+            labeled_codehash.0,
+            &format!("{labeled_addr:#x}"),
+            1234,
+            &meta,
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let unlabeled = db.distinct_unlabeled_call_frame_addresses().unwrap();
+        assert_eq!(unlabeled.len(), 2);
+        assert!(unlabeled.contains(&format!("{unlabeled_addr:#x}")));
+        assert!(unlabeled.contains(&format!("{null_codehash_addr:#x}")));
+        assert!(!unlabeled.contains(&format!("{labeled_addr:#x}")));
     }
 }

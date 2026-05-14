@@ -342,6 +342,27 @@ pub fn run_metadata_backfill(
     fetcher: &dyn BytecodeFetcher,
 ) -> Result<BackfillStats, BackfillError> {
     let addresses = db.distinct_call_frame_addresses()?;
+    run_backfill_for_addresses(db, fetcher, addresses)
+}
+
+/// Like [`run_metadata_backfill`] but pre-filters at the SQL layer to
+/// addresses whose historical codehash isn't yet in `contract_metadata`
+/// (or whose codehash is NULL). Suitable for periodic background ticks
+/// where re-scanning every address each pass would issue redundant
+/// state lookups as the DB grows.
+pub fn run_metadata_backfill_incremental(
+    db: &DivergenceDatabase,
+    fetcher: &dyn BytecodeFetcher,
+) -> Result<BackfillStats, BackfillError> {
+    let addresses = db.distinct_unlabeled_call_frame_addresses()?;
+    run_backfill_for_addresses(db, fetcher, addresses)
+}
+
+fn run_backfill_for_addresses(
+    db: &DivergenceDatabase,
+    fetcher: &dyn BytecodeFetcher,
+    addresses: Vec<String>,
+) -> Result<BackfillStats, BackfillError> {
     let extracted_at =
         SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let mut stats = BackfillStats::default();

@@ -129,6 +129,19 @@ pub struct ResearchArgs {
     /// skip codehashes already in the DB.
     #[arg(long = "research.metadata-backfill", help_heading = "Research")]
     pub metadata_backfill: bool,
+
+    /// Interval (seconds) for the periodic contract-metadata backfill that
+    /// runs alongside the live research ExEx. Each tick re-runs the
+    /// backfill against any call-frame addresses whose codehash isn't yet
+    /// in `contract_metadata`, so `contract_metadata` fills incrementally
+    /// without the operator running the one-shot mode. Set `0` to disable.
+    #[arg(
+        long = "research.metadata-backfill-interval-secs",
+        value_name = "SECS",
+        default_value_t = 60,
+        help_heading = "Research"
+    )]
+    pub metadata_backfill_interval_secs: u64,
 }
 
 impl Default for ResearchArgs {
@@ -146,6 +159,7 @@ impl Default for ResearchArgs {
             backfill_min_block: 0,
             backfill_concurrency: 0,
             metadata_backfill: false,
+            metadata_backfill_interval_secs: 60,
         }
     }
 }
