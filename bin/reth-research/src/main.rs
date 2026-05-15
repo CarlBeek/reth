@@ -1285,14 +1285,6 @@ where
                 /// chain-walk classifier to find the OOG frame in
                 /// `call_frames`.
                 oog_call_depth: Option<usize>,
-                /// Structured divergence depth (1-based), captured from
-                /// `DivergenceLocation.call_depth` before string formatting.
-                /// Used by the bucket classifier's shallow heuristic.
-                divergence_call_depth: Option<usize>,
-                /// CALL/STATICCALL/DELEGATECALL/CALLCODE opcode count in this
-                /// schedule's run. Used by the bucket classifier's shallow
-                /// heuristic (`call_count == 0` + depth ≤ 1).
-                call_count: u64,
                 /// Structured `OutOfGasInfo` captured from the inspector so
                 /// the DivergenceRow can mirror its fields without parsing
                 /// the debug-formatted string.
@@ -1504,9 +1496,26 @@ where
                                 "Schedule execution failed at tier"
                             );
                             // EVM rejected the tx outright (e.g. adjusted
-                            // gas_limit < baseline intrinsic at this tier).
-                            // Treat as a gas-class halt — a higher tier
-                            // might still let it run, so keep sweeping.
+                            // gas_limit < schedule intrinsic at this tier).
+                            // Synthesize a 1-based root-halt OOG record so
+                            // downstream classification sees this as a
+                            // wallet-fixable gas-class halt rather than a
+                            // contract-broken signal-less revert. Without
+                            // this, EIP-8037 intrinsic blow-ups (the
+                            // dominant non-OOG cohort in the dashboard's
+                            // 8037 contract_broken count) fall through to
+                            // `oog_call_depth = None` and classify as
+                            // ContractBroken even though a higher
+                            // gas_limit is the only thing needed.
+                            let synth_oog = OutOfGasInfo {
+                                opcode: 0,
+                                opcode_name: "evm_reject_intrinsic".to_string(),
+                                pc: 0,
+                                contract: Address::ZERO,
+                                call_depth: 1,
+                                gas_remaining: 0,
+                                pattern: OogPattern::Unknown,
+                            };
                             last_attempt = Some(PerScheduleResult {
                                 success: false,
                                 gas_used: gas_limit,
@@ -1520,10 +1529,8 @@ where
                                 oog_info: Some(format!("EVM transact failed: {e:?}")),
                                 divergence_location: None,
                                 replay_halt_oog: Some(true),
-                                oog_call_depth: None,
-                                divergence_call_depth: None,
-                                call_count: 0,
-                                oog_info_structured: None,
+                                oog_call_depth: Some(synth_oog.call_depth),
+                                oog_info_structured: Some(synth_oog),
                                 divergence_location_structured: None,
                                 frame_opcode_counts: Vec::new(),
                                 call_frames: Vec::new(),
@@ -1644,11 +1651,6 @@ where
                             .map(|loc| format!("{loc:?}")),
                         replay_halt_oog,
                         oog_call_depth: inspector_oog_info.as_ref().map(|oog| oog.call_depth),
-                        divergence_call_depth: insp_result
-                            .divergence_location
-                            .as_ref()
-                            .map(|loc| loc.call_depth),
-                        call_count: inspector.operation_counts().call_count,
                         oog_info_structured: inspector_oog_info.clone(),
                         divergence_location_structured: insp_result.divergence_location.clone(),
                         frame_opcode_counts: inspector.frame_opcode_counts().frames.clone(),
@@ -1870,7 +1872,15 @@ where
                 // true difference diverge from the sum of per-opcode
                 // adjustments.
                 let total_delta = schedule_gas as i64 - normal_gas_used as i64;
-                let status_changed = schedule_success != normal_success;
+                // Decompose the outcome flip into its two directions so the
+                // bucket classifier can give beneficial flips their own
+                // category (`ScheduleRescued`) instead of folding them into
+                // `ContractBroken`. The legacy bidirectional `status_changed`
+                // value is kept on the `DivergenceRow` for backwards
+                // compatibility with existing DB rows / consumers.
+                let baseline_to_schedule_break = normal_success && !schedule_success;
+                let baseline_to_schedule_rescue = !normal_success && schedule_success;
+                let status_changed = baseline_to_schedule_break || baseline_to_schedule_rescue;
 
                 // Min gas-limit multiplier required for the schedule to
                 // succeed. Only meaningful when the replay actually
@@ -1903,18 +1913,23 @@ where
                     };
 
                 // Classify the tx into one of the seven storage buckets.
-                let divergence_call_depth = exec_result.and_then(|r| r.divergence_call_depth);
-                let call_count = exec_result.map(|r| r.call_count).unwrap_or(0);
+                // `oog_call_depth` is the 1-based OOG attribution depth from
+                // the inspector (or the producer's Err-branch synthesis when
+                // revm rejected the tx outright); the shallow-OOG predicate
+                // short-circuits on `<= 1` so root-frame OOGs — including
+                // EVM-rejection at the intrinsic-gas check — classify as
+                // `WalletFixableShallow`.
+                let oog_call_depth = exec_result.and_then(|r| r.oog_call_depth);
                 let bucket = classify_bucket(&BucketInput {
-                    status_changed,
+                    baseline_to_schedule_break,
+                    baseline_to_schedule_rescue,
                     gas_delta: total_delta,
                     event_logs_changed: event_logs_diverged,
                     call_tree_changed: call_tree_diverged,
                     output_changed,
                     created_address_changed,
                     logs_bloom_changed,
-                    divergence_call_depth,
-                    call_count,
+                    oog_call_depth,
                     oog_chain_proportional,
                 });
 

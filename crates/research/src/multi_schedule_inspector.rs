@@ -438,6 +438,14 @@ impl ScheduleInspector {
     }
 
     /// Record OOG diagnostic info (first occurrence only).
+    ///
+    /// `call_depth` is emitted **1-based** (root frame = 1, first sub-call =
+    /// 2, ...) so it matches the 1-based contract expected by
+    /// `oog_chain::classify_oog_chain` and the `record_frame_*` fallback
+    /// paths (which emit `popped.depth + 1`). Without the `+ 1`, OOGs in the
+    /// root frame would surface as `call_depth: 0`, the classifier would
+    /// fail `checked_sub(1)`, and the row would fall through to
+    /// `ContractBroken` instead of `WalletFixableShallow`.
     fn record_oog(
         &mut self,
         interp: &Interpreter<revm::interpreter::interpreter::EthInterpreter>,
@@ -455,7 +463,7 @@ impl ScheduleInspector {
             opcode_name: Self::opcode_name(opcode),
             pc: interp.bytecode.pc(),
             contract,
-            call_depth: self.call_stack.len(),
+            call_depth: self.call_stack.len() + 1,
             gas_remaining: interp.gas.remaining(),
             pattern,
         });
@@ -468,6 +476,10 @@ impl ScheduleInspector {
     }
 
     /// Record divergence location (first occurrence only).
+    ///
+    /// `call_depth` is emitted **1-based** (root frame = 1, first sub-call =
+    /// 2, ...) to match the `record_frame_*` fallback paths and the
+    /// downstream `is_shallow_oog` predicate.
     fn record_divergence(
         &mut self,
         interp: &Interpreter<revm::interpreter::interpreter::EthInterpreter>,
@@ -485,7 +497,7 @@ impl ScheduleInspector {
             contract,
             function_selectors,
             pc: interp.bytecode.pc(),
-            call_depth: self.call_stack.len(),
+            call_depth: self.call_stack.len() + 1,
             opcode,
             opcode_name: Self::opcode_name(opcode),
         });

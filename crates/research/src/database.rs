@@ -54,7 +54,13 @@ use thiserror::Error;
 /// - v3: collapsed the two placeholder opcode-totals JSON columns (`opcode_count_totals_7904`,
 ///   `opcode_gas_delta_totals_7904`) into a single `opcode_totals_7904` populated with sparse
 ///   (opcode, count, `gas_baseline`, `gas_schedule`) tuples per bucket.
-pub const SCHEMA_VERSION: u32 = 4;
+/// - v4: (undocumented — refer to git history)
+/// - v5: split symmetric `status_changed` into two directions. Added `Bucket::ScheduleRescued` and
+///   `block_coverage.tx_count_schedule_rescued` to surface tx flips toward success (schedule
+///   rescued a baseline-failed tx) separately from flips toward failure. The classifier's shallow
+///   predicate now switches from `divergence_call_depth` to `oog_call_depth` and drops the
+///   `call_count == 0` guard.
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Errors raised by the storage layer.
 #[derive(Debug, Error)]
@@ -252,6 +258,7 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             tx_count_trace_only                INTEGER NOT NULL,
             tx_count_gas_only                  INTEGER NOT NULL,
             tx_count_event_logs_changed        INTEGER NOT NULL,
+            tx_count_schedule_rescued          INTEGER NOT NULL,
             tx_count_wallet_fixable_shallow    INTEGER NOT NULL,
             tx_count_wallet_fixable_deep_chain INTEGER NOT NULL,
             tx_count_contract_broken           INTEGER NOT NULL,
@@ -556,6 +563,7 @@ pub struct BlockCoverageRow {
     pub tx_count_trace_only: u32,
     pub tx_count_gas_only: u32,
     pub tx_count_event_logs_changed: u32,
+    pub tx_count_schedule_rescued: u32,
     pub tx_count_wallet_fixable_shallow: u32,
     pub tx_count_wallet_fixable_deep_chain: u32,
     pub tx_count_contract_broken: u32,
@@ -1119,9 +1127,10 @@ fn insert_block_coverage(
             schedule_name, schedule_config_hash, block_number, block_hash,
             parent_hash, timestamp, tx_count,
             tx_count_unchanged, tx_count_trace_only, tx_count_gas_only,
-            tx_count_event_logs_changed, tx_count_wallet_fixable_shallow,
+            tx_count_event_logs_changed, tx_count_schedule_rescued,
+            tx_count_wallet_fixable_shallow,
             tx_count_wallet_fixable_deep_chain, tx_count_contract_broken
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (schedule_name, block_number, block_hash) DO UPDATE SET
             schedule_config_hash               = excluded.schedule_config_hash,
             parent_hash                        = excluded.parent_hash,
@@ -1131,6 +1140,7 @@ fn insert_block_coverage(
             tx_count_trace_only                = excluded.tx_count_trace_only,
             tx_count_gas_only                  = excluded.tx_count_gas_only,
             tx_count_event_logs_changed        = excluded.tx_count_event_logs_changed,
+            tx_count_schedule_rescued          = excluded.tx_count_schedule_rescued,
             tx_count_wallet_fixable_shallow    = excluded.tx_count_wallet_fixable_shallow,
             tx_count_wallet_fixable_deep_chain = excluded.tx_count_wallet_fixable_deep_chain,
             tx_count_contract_broken           = excluded.tx_count_contract_broken",
@@ -1146,6 +1156,7 @@ fn insert_block_coverage(
             row.tx_count_trace_only as i64,
             row.tx_count_gas_only as i64,
             row.tx_count_event_logs_changed as i64,
+            row.tx_count_schedule_rescued as i64,
             row.tx_count_wallet_fixable_shallow as i64,
             row.tx_count_wallet_fixable_deep_chain as i64,
             row.tx_count_contract_broken as i64,
@@ -1545,6 +1556,7 @@ mod tests {
             tx_count_trace_only: 0,
             tx_count_gas_only: 0,
             tx_count_event_logs_changed: log_changed,
+            tx_count_schedule_rescued: 0,
             tx_count_wallet_fixable_shallow: 0,
             tx_count_wallet_fixable_deep_chain: 0,
             tx_count_contract_broken: broken,

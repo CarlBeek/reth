@@ -161,14 +161,28 @@ fn ancestor_chain(frames: &[CallFrame], oog_idx: usize) -> Vec<&CallFrame> {
     chain
 }
 
-/// Classify each parent→child hop in `chain` (root-first). Returns proportional
-/// iff every hop is proportional or specially handled (CREATE/CREATE2 always
-/// auto-forward 63/64, so we treat them as proportional).
+/// Classify each parent→child hop in `chain` (root-first). Returns
+/// proportional iff every hop is proportional or specially handled
+/// (CREATE/CREATE2 always auto-forward 63/64, so we treat them as
+/// proportional).
+///
+/// Each frame's `gas_requested_on_stack` / `parent_gas_at_call` describes
+/// the hop from *its caller* into that frame, so a chain of length N
+/// represents N parent→child hops. The previous version of this function
+/// skipped `chain[0]` on the (incorrect) assumption that `chain[0]` was
+/// the synthetic root frame. revm never fires `call_end` on the root, so
+/// in practice `chain[0]` is the topmost *captured* ancestor — its fields
+/// describe the uncaptured-root → chain[0] hop, and dropping it on the
+/// floor hides `Stipend2300` / `FixedGas` patterns at depth 1 (the
+/// `.transfer()` / `.send()` case that this classifier exists to catch).
 fn classify_chain(chain: &[&CallFrame]) -> OogChainAnalysis {
-    // chain[0] is the root frame; transitions start at chain[1].
-    // chain[i].gas_requested_on_stack and chain[i].parent_gas_at_call describe
-    // how chain[i-1] called chain[i].
-    for frame in chain.iter().skip(1) {
+    for frame in chain {
+        // Defensive: skip a captured root frame (depth == 0) if a future
+        // inspector ever surfaces one. The root has no caller in the chain,
+        // so there's nothing to classify.
+        if frame.depth == 0 {
+            continue;
+        }
         // CREATE / CREATE2 don't take a gas argument from the stack; the EVM
         // forwards floor(parent_gas_after_create_cost * 63/64) automatically.
         // Treat as proportional regardless of `gas_requested_on_stack`.
@@ -395,5 +409,50 @@ mod tests {
         assert_eq!(OogBottleneckKind::Stipend2300.as_str(), "Stipend2300");
         assert_eq!(OogBottleneckKind::FractionalGas.as_str(), "FractionalGas");
         assert_eq!(OogBottleneckKind::FixedGas.as_str(), "FixedGas");
+    }
+
+    // ── Regression tests for the "root frame is uncaptured" path ──
+    //
+    // revm doesn't fire `call_end` on the root, so in real runs the OOG
+    // frame's chain ends with the topmost captured ancestor (not the
+    // root). Prior to the §2.1 fix, `classify_chain` skipped `chain[0]`
+    // unconditionally, dropping the only hop available to inspect when
+    // the OOG was at depth 1.
+
+    #[test]
+    fn depth_1_oog_with_stipend_2300_is_throttled_without_captured_root() {
+        // Realistic shape from a `payable(addr).transfer(value)` flow: root
+        // frame isn't in `frames` (revm never fires `call_end` for it).
+        // The depth-1 frame's `gas_requested_on_stack = 2300` describes
+        // the root → depth-1 hop, and `classify_chain` must surface it as
+        // `Stipend2300` rather than swallowing the chain as proportional.
+        let frames = vec![frame(1, false, CallType::Call, Some(2300), Some(100_000))];
+        let res = classify_oog_chain(&frames, 2).unwrap();
+        assert!(!res.proportional);
+        assert_eq!(res.bottleneck_depth, Some(1));
+        assert_eq!(res.bottleneck_kind, Some(OogBottleneckKind::Stipend2300));
+    }
+
+    #[test]
+    fn depth_1_oog_with_gas_call_is_proportional_without_captured_root() {
+        // DELEGATECALL forwarding `gas()` from the (uncaptured) root frame:
+        // single-frame chain, stack-gas saturates to u64::MAX, every hop
+        // proportional → wallet-fixable deep chain.
+        let frames = vec![frame(1, false, CallType::DelegateCall, Some(u64::MAX), Some(500_000))];
+        let res = classify_oog_chain(&frames, 2).unwrap();
+        assert!(res.proportional);
+        assert_eq!(res.bottleneck_depth, None);
+        assert_eq!(res.bottleneck_kind, None);
+    }
+
+    #[test]
+    fn depth_1_oog_with_fixed_30k_gas_is_throttled_without_captured_root() {
+        // Common pattern: `target.call{gas: 30_000}(...)`. Even though the
+        // OOG is at depth 1, the hop is throttled — adding more wallet gas
+        // can't push more than 30k through to the callee.
+        let frames = vec![frame(1, false, CallType::Call, Some(30_000), Some(500_000))];
+        let res = classify_oog_chain(&frames, 2).unwrap();
+        assert!(!res.proportional);
+        assert_eq!(res.bottleneck_kind, Some(OogBottleneckKind::FixedGas));
     }
 }

@@ -501,10 +501,12 @@ impl PerFrameCapture {
 ///
 /// See `crates/research/docs/storage-redesign.md` for the bucket semantics.
 /// The classifier in [`classify_bucket`] applies a fixed priority order:
-/// `status_changed` divergences fall into one of the wallet-fixable variants
-/// or `ContractBroken`; non-status-changed divergences are classified by the
-/// next available signal (event logs, gas, other-trace), and otherwise come
-/// out as `Unchanged`.
+/// outcome flips toward failure (`baseline_to_schedule_break`) fall into
+/// one of the wallet-fixable variants or `ContractBroken`; outcome flips
+/// the other way (`baseline_to_schedule_rescue`) are surfaced as
+/// `ScheduleRescued` (an interesting finding, not a failure); non-flipped
+/// divergences are classified by the next available signal (event logs,
+/// gas, other-trace) or `Unchanged`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Bucket {
@@ -518,16 +520,24 @@ pub enum Bucket {
     /// Emitted event logs differ but the outcome (success/revert) is the
     /// same. Drill-in bucket — full per-tx record retained.
     EventLogsChanged,
-    /// Outcome flipped *and* the legacy shallow heuristic holds: divergence
-    /// happened at depth ≤ 1 with no internal calls. Wallet-fixable: raising
-    /// the wallet's gas resolves it.
+    /// Outcome flipped from baseline-failed to schedule-succeeded.
+    /// The schedule rescued a tx the baseline couldn't run. Not a failure
+    /// — surfaced separately so it doesn't pollute the contract-broken
+    /// cohort. Aggregate-only: no per-tx record retained.
+    ScheduleRescued,
+    /// Outcome flipped from baseline-succeeded to schedule-failed, and the
+    /// OOG-class halt was attributed to the root frame (1-based depth = 1).
+    /// Wallet-fixable: raising the outer gas limit (or the wallet's gas
+    /// estimate) resolves it. Aggregate-only.
     WalletFixableShallow,
-    /// Outcome flipped *and* the OOG-chain walk confirmed every parent→child
-    /// hop got proportional gas via the EIP-150 63/64 rule. Wallet-fixable
-    /// even though the tx involves subcalls.
+    /// Outcome flipped toward failure *and* the OOG-chain walk confirmed
+    /// every parent→child hop got proportional gas via the EIP-150 63/64
+    /// rule. Wallet-fixable even though the tx involves subcalls.
+    /// Aggregate-only.
     WalletFixableDeepChain,
-    /// Outcome flipped and neither wallet-fixable rule applies. Drill-in
-    /// bucket — full per-tx record retained.
+    /// Outcome flipped from baseline-succeeded to schedule-failed and
+    /// neither wallet-fixable rule applies. Drill-in bucket — full per-tx
+    /// record retained.
     ContractBroken,
 }
 
@@ -540,6 +550,7 @@ impl Bucket {
             Self::TraceOnly => "trace_only",
             Self::GasOnly => "gas_only",
             Self::EventLogsChanged => "event_logs_changed",
+            Self::ScheduleRescued => "schedule_rescued",
             Self::WalletFixableShallow => "wallet_fixable_shallow",
             Self::WalletFixableDeepChain => "wallet_fixable_deep_chain",
             Self::ContractBroken => "contract_broken",
@@ -566,8 +577,19 @@ impl std::fmt::Display for Bucket {
 /// touching every caller.
 #[derive(Debug, Clone, Copy)]
 pub struct BucketInput {
-    /// Baseline vs schedule `is_success()` differs.
-    pub status_changed: bool,
+    /// Outcome flipped from baseline-succeeded to schedule-failed.
+    /// I.e. `normal_success && !schedule_success`. This is the "schedule
+    /// broke this tx" direction — the gate for `WalletFixableShallow`,
+    /// `WalletFixableDeepChain`, and `ContractBroken`.
+    pub baseline_to_schedule_break: bool,
+    /// Outcome flipped from baseline-failed to schedule-succeeded.
+    /// I.e. `!normal_success && schedule_success`. The schedule rescued
+    /// a tx the baseline couldn't run — interesting but not a failure,
+    /// surfaced as `Bucket::ScheduleRescued`.
+    ///
+    /// Mutually exclusive with `baseline_to_schedule_break`; both can be
+    /// false (no status flip).
+    pub baseline_to_schedule_rescue: bool,
     /// `schedule_gas_used - baseline_gas_used`. Zero means no gas difference.
     pub gas_delta: i64,
     /// Schedule and baseline emitted different event logs.
@@ -582,13 +604,13 @@ pub struct BucketInput {
     /// Different log-bloom (caught even when the per-log diff didn't, e.g.
     /// when the inspector skipped detailed log capture).
     pub logs_bloom_changed: bool,
-    /// 1-based depth at which gas accounting first diverged, from
-    /// `DivergenceLocation.call_depth`. `None` when no per-opcode divergence
-    /// was recorded (native-revm OOGs, intrinsic-only schedules, etc.).
-    pub divergence_call_depth: Option<usize>,
-    /// Tx-level CALL/STATICCALL/DELEGATECALL/CALLCODE opcode count, from
-    /// `OperationCounts.call_count`. Zero means the tx had no subcalls.
-    pub call_count: u64,
+    /// 1-based depth at which the schedule's OOG-class halt was attributed,
+    /// from `OutOfGasInfo.call_depth`. `None` when the schedule didn't OOG
+    /// (e.g. plain revert) and the producer's Err-branch synthesis didn't
+    /// fire. Used by the shallow-OOG heuristic to short-circuit root-frame
+    /// failures (including EVM-rejection at the intrinsic-gas check, which
+    /// the producer synthesizes as a `call_depth = 1` halt).
+    pub oog_call_depth: Option<usize>,
     /// Result of the OOG-chain classifier (`oog_chain::classify_oog_chain`):
     /// `Some(true)` if every hop from root to OOG was proportional;
     /// `Some(false)` if some hop throttled; `None` when the divergence isn't
@@ -599,32 +621,37 @@ pub struct BucketInput {
 /// Classify a per-tx divergence into a [`Bucket`] using the priority ladder
 /// from `crates/research/docs/storage-redesign.md`:
 ///
-/// 1. `status_changed` →
-///    - `WalletFixableShallow` if the divergence was at depth ≤ 1 with no internal calls (legacy
-///      shallow heuristic);
+/// 1. `baseline_to_schedule_break` (schedule made the tx fail) →
+///    - `WalletFixableShallow` if the OOG was in the root frame (`oog_call_depth <= 1`, 1-based),
+///      which includes EVM-rejection at the intrinsic-gas check (synthesized as `call_depth = 1` by
+///      the producer);
 ///    - else `WalletFixableDeepChain` if the OOG-chain classifier confirmed every hop was
 ///      proportional;
 ///    - else `ContractBroken`.
-/// 2. `event_logs_changed` → `EventLogsChanged`.
-/// 3. `gas_delta != 0` → `GasOnly`.
-/// 4. Any other trace flag set → `TraceOnly`.
-/// 5. Otherwise → `Unchanged`.
+/// 2. `baseline_to_schedule_rescue` (schedule made the tx succeed) → `ScheduleRescued`.
+/// 3. `event_logs_changed` → `EventLogsChanged`.
+/// 4. `gas_delta != 0` → `GasOnly`.
+/// 5. Any other trace flag set → `TraceOnly`.
+/// 6. Otherwise → `Unchanged`.
 ///
-/// The ordering matters: a status-changed tx whose logs also differ is
-/// `ContractBroken` (or wallet-fixable), not `EventLogsChanged`, because the
-/// outcome flip is the actionable signal. Similarly, a non-status-changed tx
-/// with both event-log and gas differences is classified as
-/// `EventLogsChanged` — log changes are harder to dismiss than a gas delta
-/// alone.
+/// The break-direction outranks the rescue-direction: only one of those
+/// flags can be true (they're mutually exclusive), but a status-flipped tx
+/// whose logs also differ is `ContractBroken` (or wallet-fixable / rescued),
+/// not `EventLogsChanged`, because the outcome flip is the actionable
+/// signal. Similarly, a non-flipped tx with both event-log and gas
+/// differences is classified as `EventLogsChanged` — log changes are harder
+/// to dismiss than a gas delta alone.
 pub fn classify_bucket(input: &BucketInput) -> Bucket {
-    if input.status_changed {
-        if is_shallow_oog(input.divergence_call_depth, input.call_count) {
+    if input.baseline_to_schedule_break {
+        if is_shallow_oog(input.oog_call_depth) {
             Bucket::WalletFixableShallow
         } else if input.oog_chain_proportional == Some(true) {
             Bucket::WalletFixableDeepChain
         } else {
             Bucket::ContractBroken
         }
+    } else if input.baseline_to_schedule_rescue {
+        Bucket::ScheduleRescued
     } else if input.event_logs_changed {
         Bucket::EventLogsChanged
     } else if input.gas_delta != 0 {
@@ -640,16 +667,19 @@ pub fn classify_bucket(input: &BucketInput) -> Bucket {
     }
 }
 
-/// Legacy "shallow" heuristic preserved from the consumer's SQL:
-/// `divergence_call_depth IS NOT NULL AND divergence_call_depth <= 1 AND
-/// coalesce(call_count, 0) == 0`.
+/// Shallow heuristic: the OOG-class halt was attributed to the root frame
+/// (1-based depth = 1).
 ///
-/// A tx with no internal calls and whose divergence was attributed to the
-/// root frame is the canonical "wallets just need to estimate more gas" case
-/// — kept distinct from `WalletFixableDeepChain` for the dashboard's
-/// breakdown view.
-const fn is_shallow_oog(divergence_call_depth: Option<usize>, call_count: u64) -> bool {
-    matches!(divergence_call_depth, Some(d) if d <= 1) && call_count == 0
+/// Captures three real-world cases:
+/// - Simple tx (no sub-calls) whose root frame ran out of gas — the canonical "wallet just needs
+///   more gas" failure.
+/// - Tx that made some sub-calls which returned cleanly, then OOG'd back in the root frame on a
+///   later opcode (the old `call_count == 0` guard wrongly excluded this).
+/// - EVM-rejection at the intrinsic-gas check: the producer synthesizes `OutOfGasInfo { call_depth:
+///   1, .. }` so these EIP-8037 intrinsic blow-ups classify as wallet-fixable rather than
+///   contract-broken.
+const fn is_shallow_oog(oog_call_depth: Option<usize>) -> bool {
+    matches!(oog_call_depth, Some(d) if d <= 1)
 }
 
 #[cfg(test)]
@@ -706,15 +736,15 @@ mod tests {
     /// Tests override only the fields they care about.
     fn neutral_input() -> BucketInput {
         BucketInput {
-            status_changed: false,
+            baseline_to_schedule_break: false,
+            baseline_to_schedule_rescue: false,
             gas_delta: 0,
             event_logs_changed: false,
             call_tree_changed: false,
             output_changed: false,
             created_address_changed: false,
             logs_bloom_changed: false,
-            divergence_call_depth: None,
-            call_count: 0,
+            oog_call_depth: None,
             oog_chain_proportional: None,
         }
     }
@@ -768,54 +798,67 @@ mod tests {
     }
 
     #[test]
-    fn bucket_status_changed_outranks_event_logs() {
+    fn bucket_break_outranks_event_logs() {
         // A status flip with diverging logs is still a wallet-fixable /
         // contract-broken case; the outcome flip is the actionable signal.
         let input = BucketInput {
-            status_changed: true,
+            baseline_to_schedule_break: true,
             event_logs_changed: true,
-            // Make it shallow so the variant is deterministic without
+            // Root-frame OOG so the variant is deterministic without
             // depending on oog_chain_proportional.
-            divergence_call_depth: Some(1),
-            call_count: 0,
+            oog_call_depth: Some(1),
             ..neutral_input()
         };
         assert_eq!(classify_bucket(&input), Bucket::WalletFixableShallow);
     }
 
     #[test]
-    fn bucket_wallet_fixable_shallow_for_root_oog_without_subcalls() {
+    fn bucket_wallet_fixable_shallow_for_root_frame_oog() {
+        // OOG attributed to the root frame (1-based depth = 1) is the
+        // canonical wallet-fixable case.
         let input = BucketInput {
-            status_changed: true,
-            divergence_call_depth: Some(1),
-            call_count: 0,
+            baseline_to_schedule_break: true,
+            oog_call_depth: Some(1),
             ..neutral_input()
         };
         assert_eq!(classify_bucket(&input), Bucket::WalletFixableShallow);
     }
 
     #[test]
-    fn bucket_wallet_fixable_shallow_requires_zero_call_count() {
-        // Depth ≤ 1 but the tx made an internal call → not shallow even
-        // though depth is small.
+    fn bucket_wallet_fixable_shallow_even_when_tx_had_subcalls() {
+        // Tx made internal calls that returned cleanly, then OOG'd at the
+        // root frame on a later opcode. The old `call_count == 0` guard
+        // wrongly excluded this; the new predicate accepts it because the
+        // OOG itself is at depth 1.
         let input = BucketInput {
-            status_changed: true,
-            divergence_call_depth: Some(1),
-            call_count: 1,
-            oog_chain_proportional: None,
+            baseline_to_schedule_break: true,
+            oog_call_depth: Some(1),
+            oog_chain_proportional: Some(true),
             ..neutral_input()
         };
-        assert_eq!(classify_bucket(&input), Bucket::ContractBroken);
+        assert_eq!(classify_bucket(&input), Bucket::WalletFixableShallow);
+    }
+
+    #[test]
+    fn bucket_wallet_fixable_shallow_for_synthesized_evm_reject() {
+        // EVM-rejection at the intrinsic-gas check: producer synthesizes
+        // `OutOfGasInfo { call_depth: 1, .. }` so these classify the same
+        // as a natural root-frame OOG.
+        let input = BucketInput {
+            baseline_to_schedule_break: true,
+            oog_call_depth: Some(1),
+            ..neutral_input()
+        };
+        assert_eq!(classify_bucket(&input), Bucket::WalletFixableShallow);
     }
 
     #[test]
     fn bucket_wallet_fixable_deep_chain_when_proportional_with_subcalls() {
-        // Depth > 1 with subcalls, but the OOG-chain classifier said every
+        // OOG at depth > 1 with the chain-walk classifier confirming every
         // hop got proportional gas → the deep-chain wallet-fixable rescue.
         let input = BucketInput {
-            status_changed: true,
-            divergence_call_depth: Some(3),
-            call_count: 5,
+            baseline_to_schedule_break: true,
+            oog_call_depth: Some(3),
             oog_chain_proportional: Some(true),
             ..neutral_input()
         };
@@ -825,9 +868,8 @@ mod tests {
     #[test]
     fn bucket_contract_broken_when_chain_throttled() {
         let input = BucketInput {
-            status_changed: true,
-            divergence_call_depth: Some(2),
-            call_count: 3,
+            baseline_to_schedule_break: true,
+            oog_call_depth: Some(2),
             oog_chain_proportional: Some(false),
             ..neutral_input()
         };
@@ -835,14 +877,13 @@ mod tests {
     }
 
     #[test]
-    fn bucket_contract_broken_when_chain_classification_missing() {
-        // Status flipped, not shallow, and the OOG-chain classifier didn't
-        // produce a verdict (None) — be conservative and call it broken
-        // rather than wallet-fixable.
+    fn bucket_contract_broken_when_oog_depth_missing() {
+        // Status flipped without an OOG signal (plain revert, or producer
+        // didn't capture depth) and the chain-walk classifier didn't run
+        // either — be conservative and call it broken.
         let input = BucketInput {
-            status_changed: true,
-            divergence_call_depth: Some(2),
-            call_count: 3,
+            baseline_to_schedule_break: true,
+            oog_call_depth: None,
             oog_chain_proportional: None,
             ..neutral_input()
         };
@@ -851,16 +892,53 @@ mod tests {
 
     #[test]
     fn bucket_shallow_outranks_deep_chain_when_both_apply() {
-        // Depth 1, no subcalls (shallow), but also proportional chain. The
-        // shallow variant wins because it's the more specific case.
+        // Depth 1 OOG, but also proportional chain (single-hop chain that
+        // trivially passed). The shallow variant wins because it's the more
+        // specific case.
         let input = BucketInput {
-            status_changed: true,
-            divergence_call_depth: Some(1),
-            call_count: 0,
+            baseline_to_schedule_break: true,
+            oog_call_depth: Some(1),
             oog_chain_proportional: Some(true),
             ..neutral_input()
         };
         assert_eq!(classify_bucket(&input), Bucket::WalletFixableShallow);
+    }
+
+    #[test]
+    fn bucket_schedule_rescued_for_baseline_failed_schedule_succeeded() {
+        // Beneficial flip: baseline failed, schedule succeeded. The schedule
+        // *fixed* a tx the baseline couldn't run — not a failure, gets its
+        // own bucket so it doesn't pollute the contract_broken cohort.
+        let input = BucketInput { baseline_to_schedule_rescue: true, ..neutral_input() };
+        assert_eq!(classify_bucket(&input), Bucket::ScheduleRescued);
+    }
+
+    #[test]
+    fn bucket_break_outranks_rescue_at_input_level() {
+        // The two direction flags are mutually exclusive at the producer
+        // level, but classify_bucket is defensive: if both are set we take
+        // the break direction (more conservative — surface the failure).
+        let input = BucketInput {
+            baseline_to_schedule_break: true,
+            baseline_to_schedule_rescue: true,
+            oog_call_depth: Some(1),
+            ..neutral_input()
+        };
+        assert_eq!(classify_bucket(&input), Bucket::WalletFixableShallow);
+    }
+
+    #[test]
+    fn bucket_rescue_outranks_event_logs_and_gas() {
+        // A rescued tx will often have a gas delta or different logs (the
+        // baseline reverted with no logs, the schedule succeeded with full
+        // logs). The rescue label is the actionable signal — it should win.
+        let input = BucketInput {
+            baseline_to_schedule_rescue: true,
+            event_logs_changed: true,
+            gas_delta: -50_000,
+            ..neutral_input()
+        };
+        assert_eq!(classify_bucket(&input), Bucket::ScheduleRescued);
     }
 
     #[test]
@@ -871,6 +949,7 @@ mod tests {
         assert_eq!(Bucket::TraceOnly.as_str(), "trace_only");
         assert_eq!(Bucket::GasOnly.as_str(), "gas_only");
         assert_eq!(Bucket::EventLogsChanged.as_str(), "event_logs_changed");
+        assert_eq!(Bucket::ScheduleRescued.as_str(), "schedule_rescued");
         assert_eq!(Bucket::WalletFixableShallow.as_str(), "wallet_fixable_shallow");
         assert_eq!(Bucket::WalletFixableDeepChain.as_str(), "wallet_fixable_deep_chain");
         assert_eq!(Bucket::ContractBroken.as_str(), "contract_broken");
@@ -885,6 +964,7 @@ mod tests {
             Bucket::Unchanged,
             Bucket::TraceOnly,
             Bucket::GasOnly,
+            Bucket::ScheduleRescued,
             Bucket::WalletFixableShallow,
             Bucket::WalletFixableDeepChain,
         ] {
