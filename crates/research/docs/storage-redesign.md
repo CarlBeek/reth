@@ -54,26 +54,30 @@ pub enum Bucket {
     Unchanged,           // outcome + traces match
     TraceOnly,           // trace differs, outcome identical
     GasOnly,             // status_changed=false, gas_delta>0
-    EventLogsChanged,    // status_changed=false, event_logs differ
-    WalletFixableShallow,    // status flipped, depth ≤ 1, no internal calls
+    EventLogsChanged,        // status_changed=false, event_logs differ
+    WalletFixableShallow,    // status flipped, root/outer-limit gas failure
     WalletFixableDeepChain,  // status flipped, oog_chain_proportional=true, not shallow
-    ContractBroken,      // status flipped, neither wallet-fixable form
+    InconclusiveNeedsHigherSweep, // status flipped, OOG at highest sweep tier
+    ContractBroken,          // status flipped, neither wallet-fixable form
 }
 ```
 
-`WalletFixableShallow` is the legacy heuristic (kept because it's a
-useful distinction in the UI, but applies even when the chain-walk
-classifier wasn't run — root-frame OOG with no subcalls is trivially
-proportional). `WalletFixableDeepChain` is the chain-walk rescue.
+`WalletFixableShallow` covers root-frame OOG and the tier-sweep case where a
+higher outer-gas replay succeeds, matches baseline observable behavior, and only
+fails the original schedule-success check because the computed gas exceeds the
+tx's original limit. `WalletFixableDeepChain` is the chain-walk rescue.
+`InconclusiveNeedsHigherSweep` means no throttled call-chain bottleneck was proven,
+but the highest configured replay tier still halted OOG; rerun with a higher
+`--research.gas-limit-multipliers` ceiling before deciding.
 
 Storage rule per bucket:
 
 - `Unchanged` — nothing written. Counted in `block_coverage.tx_count`.
 - `TraceOnly` / `GasOnly` / `WalletFixableShallow` / `WalletFixableDeepChain`
   — increments `block_summaries.{bucket}.*`. No row in `divergences`.
-- `EventLogsChanged` / `ContractBroken` — full per-tx record in
-  `divergences`, plus `divergence_call_frames`, `divergence_opcode_counts`,
-  `divergence_event_logs`.
+- `EventLogsChanged` / `InconclusiveNeedsHigherSweep` / `ContractBroken` —
+  full per-tx record in `divergences`, plus `divergence_call_frames`,
+  `divergence_opcode_counts`, `divergence_event_logs`.
 
 Inspector keeps the per-frame opcode counter running regardless of
 bucket, since the bucket isn't known until both traces complete. When
@@ -89,7 +93,7 @@ Canonical DDL lives in `crates/research/src/database.rs` (function
   block_hash, parent_hash, timestamp, tx_count, tx_count_unchanged,
   tx_count_trace_only, tx_count_gas_only, tx_count_event_logs_changed,
   tx_count_wallet_fixable_shallow, tx_count_wallet_fixable_deep_chain,
-  tx_count_contract_broken)`
+  tx_count_inconclusive_needs_higher_sweep, tx_count_contract_broken)`
 - `block_summaries(schedule_name, block_number, bucket, tx_count,
   gas_delta_sum, gas_delta_sum_sq REAL, gas_delta_min, gas_delta_max,
   gas_delta_log2_hist TEXT/JSON, opcode_totals_7904 TEXT/JSON

@@ -502,11 +502,12 @@ impl PerFrameCapture {
 /// See `crates/research/docs/storage-redesign.md` for the bucket semantics.
 /// The classifier in [`classify_bucket`] applies a fixed priority order:
 /// outcome flips toward failure (`baseline_to_schedule_break`) fall into
-/// one of the wallet-fixable variants or `ContractBroken`; outcome flips
-/// the other way (`baseline_to_schedule_rescue`) are surfaced as
-/// `ScheduleRescued` (an interesting finding, not a failure); non-flipped
-/// divergences are classified by the next available signal (event logs,
-/// gas, other-trace) or `Unchanged`.
+/// one of the wallet-fixable variants, `InconclusiveNeedsHigherSweep`, or
+/// `ContractBroken`; outcome flips the other way
+/// (`baseline_to_schedule_rescue`) are surfaced as `ScheduleRescued` (an
+/// interesting finding, not a failure); non-flipped divergences are
+/// classified by the next available signal (event logs, gas, other-trace) or
+/// `Unchanged`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Bucket {
@@ -535,6 +536,11 @@ pub enum Bucket {
     /// rule. Wallet-fixable even though the tx involves subcalls.
     /// Aggregate-only.
     WalletFixableDeepChain,
+    /// Outcome flipped toward failure, the highest configured gas-limit
+    /// multiplier still halted OOG, and no fixed/fractional/stipend
+    /// bottleneck was proven. Drill-in bucket — rerun with a higher sweep
+    /// ceiling before deciding wallet-fixable vs contract-broken.
+    InconclusiveNeedsHigherSweep,
     /// Outcome flipped from baseline-succeeded to schedule-failed and
     /// neither wallet-fixable rule applies. Drill-in bucket — full per-tx
     /// record retained.
@@ -553,6 +559,7 @@ impl Bucket {
             Self::ScheduleRescued => "schedule_rescued",
             Self::WalletFixableShallow => "wallet_fixable_shallow",
             Self::WalletFixableDeepChain => "wallet_fixable_deep_chain",
+            Self::InconclusiveNeedsHigherSweep => "inconclusive_needs_higher_sweep",
             Self::ContractBroken => "contract_broken",
         }
     }
@@ -560,7 +567,10 @@ impl Bucket {
     /// Whether divergences in this bucket are written per-tx (drill-in) or
     /// rolled into per-block aggregates.
     pub const fn is_drill_in(&self) -> bool {
-        matches!(self, Self::EventLogsChanged | Self::ContractBroken)
+        matches!(
+            self,
+            Self::EventLogsChanged | Self::InconclusiveNeedsHigherSweep | Self::ContractBroken
+        )
     }
 }
 
@@ -580,7 +590,8 @@ pub struct BucketInput {
     /// Outcome flipped from baseline-succeeded to schedule-failed.
     /// I.e. `normal_success && !schedule_success`. This is the "schedule
     /// broke this tx" direction — the gate for `WalletFixableShallow`,
-    /// `WalletFixableDeepChain`, and `ContractBroken`.
+    /// `WalletFixableDeepChain`, `InconclusiveNeedsHigherSweep`, and
+    /// `ContractBroken`.
     pub baseline_to_schedule_break: bool,
     /// Outcome flipped from baseline-failed to schedule-succeeded.
     /// I.e. `!normal_success && schedule_success`. The schedule rescued
@@ -604,6 +615,18 @@ pub struct BucketInput {
     /// Different log-bloom (caught even when the per-log diff didn't, e.g.
     /// when the inspector skipped detailed log capture).
     pub logs_bloom_changed: bool,
+    /// The schedule replay succeeded with a larger outer gas limit, but the
+    /// resulting `schedule_gas_used` exceeded the transaction's original gas
+    /// limit while still matching baseline observable behavior. This is a
+    /// direct witness that the original-limit failure is wallet-fixable even
+    /// when the stored successful replay no longer has an OOG site to classify.
+    pub outer_limit_only_failure: bool,
+    /// Outcome of the schedule replay's final attempted gas-limit multiplier
+    /// tier. `Some(true)` means the highest configured tier still halted OOG,
+    /// so the tx needs a higher sweep before wallet-fixable can be proven.
+    /// `Some(false)` means the highest tier failed for a non-OOG reason, and
+    /// `None` means at least one tier succeeded.
+    pub replay_halt_oog: Option<bool>,
     /// 1-based depth at which the schedule's OOG-class halt was attributed,
     /// from `OutOfGasInfo.call_depth`. `None` when the schedule didn't OOG
     /// (e.g. plain revert) and the producer's Err-branch synthesis didn't
@@ -622,6 +645,11 @@ pub struct BucketInput {
 /// from `crates/research/docs/storage-redesign.md`:
 ///
 /// 1. `baseline_to_schedule_break` (schedule made the tx fail) →
+///    - `WalletFixableShallow` if a successful higher-gas replay proves the original tx failed only
+///      because the outer limit was too low;
+///    - `ContractBroken` if the OOG-chain classifier found a fixed/fractional/stipend bottleneck;
+///    - `InconclusiveNeedsHigherSweep` if the highest configured replay tier still halted OOG and
+///      no bottleneck was proven;
 ///    - `WalletFixableShallow` if the OOG was in the root frame (`oog_call_depth <= 1`, 1-based),
 ///      which includes EVM-rejection at the intrinsic-gas check (synthesized as `call_depth = 1` by
 ///      the producer);
@@ -636,14 +664,20 @@ pub struct BucketInput {
 ///
 /// The break-direction outranks the rescue-direction: only one of those
 /// flags can be true (they're mutually exclusive), but a status-flipped tx
-/// whose logs also differ is `ContractBroken` (or wallet-fixable / rescued),
-/// not `EventLogsChanged`, because the outcome flip is the actionable
-/// signal. Similarly, a non-flipped tx with both event-log and gas
-/// differences is classified as `EventLogsChanged` — log changes are harder
-/// to dismiss than a gas delta alone.
+/// whose logs also differ is one of the break buckets (wallet-fixable,
+/// inconclusive, or contract-broken), not `EventLogsChanged`, because the
+/// outcome flip is the actionable signal. Similarly, a non-flipped tx with
+/// both event-log and gas differences is classified as `EventLogsChanged`
+/// — log changes are harder to dismiss than a gas delta alone.
 pub fn classify_bucket(input: &BucketInput) -> Bucket {
     if input.baseline_to_schedule_break {
-        if is_shallow_oog(input.oog_call_depth) {
+        if input.outer_limit_only_failure {
+            Bucket::WalletFixableShallow
+        } else if input.oog_chain_proportional == Some(false) {
+            Bucket::ContractBroken
+        } else if input.replay_halt_oog == Some(true) {
+            Bucket::InconclusiveNeedsHigherSweep
+        } else if is_shallow_oog(input.oog_call_depth) {
             Bucket::WalletFixableShallow
         } else if input.oog_chain_proportional == Some(true) {
             Bucket::WalletFixableDeepChain
@@ -744,6 +778,8 @@ mod tests {
             output_changed: false,
             created_address_changed: false,
             logs_bloom_changed: false,
+            outer_limit_only_failure: false,
+            replay_halt_oog: None,
             oog_call_depth: None,
             oog_chain_proportional: None,
         }
@@ -853,6 +889,21 @@ mod tests {
     }
 
     #[test]
+    fn bucket_wallet_fixable_shallow_for_outer_limit_only_failure() {
+        // A tier-sweep replay can succeed with more gas, then still be marked
+        // `schedule_success=false` because the computed schedule gas does not
+        // fit the tx's original limit. There is no OOG site in the stored
+        // successful replay, but the successful replay itself proves a wallet
+        // gas-limit increase clears the failure.
+        let input = BucketInput {
+            baseline_to_schedule_break: true,
+            outer_limit_only_failure: true,
+            ..neutral_input()
+        };
+        assert_eq!(classify_bucket(&input), Bucket::WalletFixableShallow);
+    }
+
+    #[test]
     fn bucket_wallet_fixable_deep_chain_when_proportional_with_subcalls() {
         // OOG at depth > 1 with the chain-walk classifier confirming every
         // hop got proportional gas → the deep-chain wallet-fixable rescue.
@@ -871,9 +922,33 @@ mod tests {
             baseline_to_schedule_break: true,
             oog_call_depth: Some(2),
             oog_chain_proportional: Some(false),
+            replay_halt_oog: Some(true),
             ..neutral_input()
         };
         assert_eq!(classify_bucket(&input), Bucket::ContractBroken);
+    }
+
+    #[test]
+    fn bucket_inconclusive_when_highest_sweep_still_oog_without_bottleneck() {
+        let input = BucketInput {
+            baseline_to_schedule_break: true,
+            oog_call_depth: Some(3),
+            oog_chain_proportional: Some(true),
+            replay_halt_oog: Some(true),
+            ..neutral_input()
+        };
+        assert_eq!(classify_bucket(&input), Bucket::InconclusiveNeedsHigherSweep);
+    }
+
+    #[test]
+    fn bucket_inconclusive_for_root_oog_when_sweep_exhausted() {
+        let input = BucketInput {
+            baseline_to_schedule_break: true,
+            oog_call_depth: Some(1),
+            replay_halt_oog: Some(true),
+            ..neutral_input()
+        };
+        assert_eq!(classify_bucket(&input), Bucket::InconclusiveNeedsHigherSweep);
     }
 
     #[test]
@@ -952,12 +1027,18 @@ mod tests {
         assert_eq!(Bucket::ScheduleRescued.as_str(), "schedule_rescued");
         assert_eq!(Bucket::WalletFixableShallow.as_str(), "wallet_fixable_shallow");
         assert_eq!(Bucket::WalletFixableDeepChain.as_str(), "wallet_fixable_deep_chain");
+        assert_eq!(
+            Bucket::InconclusiveNeedsHigherSweep.as_str(),
+            "inconclusive_needs_higher_sweep"
+        );
         assert_eq!(Bucket::ContractBroken.as_str(), "contract_broken");
     }
 
     #[test]
     fn bucket_is_drill_in_only_for_full_record_buckets() {
-        for bucket in [Bucket::EventLogsChanged, Bucket::ContractBroken] {
+        for bucket in
+            [Bucket::EventLogsChanged, Bucket::InconclusiveNeedsHigherSweep, Bucket::ContractBroken]
+        {
             assert!(bucket.is_drill_in(), "{bucket:?} should be drill-in");
         }
         for bucket in [

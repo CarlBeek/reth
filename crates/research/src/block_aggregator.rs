@@ -3,9 +3,9 @@
 //! `BlockAggregator` buffers every tx's classification across a single
 //! (schedule, block) and flushes the result as a [`BlockOutput`] at
 //! `finish_block()`. Drill-in buckets (`EventLogsChanged`,
-//! `ContractBroken`) keep their full per-tx record; aggregate buckets
-//! roll up into `block_summaries` rows so we don't pay per-tx storage
-//! for them.
+//! `InconclusiveNeedsHigherSweep`, `ContractBroken`) keep their full per-tx
+//! record; aggregate buckets roll up into `block_summaries` rows so we don't
+//! pay per-tx storage for them.
 //!
 //! See `crates/research/docs/storage-redesign.md` for the bucket /
 //! storage rules and the schema.
@@ -220,8 +220,8 @@ pub struct TxObservation {
     /// allotment with no spillover.
     pub has_runtime_state: bool,
     /// Per-tx drill-in record — populated only for drill-in buckets
-    /// (`EventLogsChanged` / `ContractBroken`); ignored for aggregate
-    /// buckets.
+    /// (`EventLogsChanged` / `InconclusiveNeedsHigherSweep` /
+    /// `ContractBroken`); ignored for aggregate buckets.
     pub drill_in_record: Option<DrillInRecord>,
 }
 
@@ -323,6 +323,7 @@ impl BlockAggregator {
             tx_count_schedule_rescued: 0,
             tx_count_wallet_fixable_shallow: 0,
             tx_count_wallet_fixable_deep_chain: 0,
+            tx_count_inconclusive_needs_higher_sweep: 0,
             tx_count_contract_broken: 0,
         };
         let mut summaries = Vec::with_capacity(self.buckets.len());
@@ -339,6 +340,9 @@ impl BlockAggregator {
                 }
                 Bucket::WalletFixableDeepChain => {
                     coverage.tx_count_wallet_fixable_deep_chain = acc.tx_count
+                }
+                Bucket::InconclusiveNeedsHigherSweep => {
+                    coverage.tx_count_inconclusive_needs_higher_sweep = acc.tx_count
                 }
                 Bucket::ContractBroken => coverage.tx_count_contract_broken = acc.tx_count,
             }
@@ -436,26 +440,28 @@ mod tests {
 
     #[test]
     fn coverage_counts_split_by_bucket() {
-        let mut agg = BlockAggregator::start_block(meta(), 4);
+        let mut agg = BlockAggregator::start_block(meta(), 5);
         agg.observe_tx(obs(Bucket::Unchanged, 0), &[]);
         agg.observe_tx(obs(Bucket::GasOnly, 100), &[]);
         agg.observe_tx(obs(Bucket::WalletFixableShallow, 5_000), &[]);
+        agg.observe_tx(obs(Bucket::InconclusiveNeedsHigherSweep, 20_000), &[]);
         agg.observe_tx(obs(Bucket::ContractBroken, 50_000), &[]);
 
         let out = agg.finish_block();
-        assert_eq!(out.coverage.tx_count, 4);
+        assert_eq!(out.coverage.tx_count, 5);
         assert_eq!(out.coverage.tx_count_unchanged, 1);
         assert_eq!(out.coverage.tx_count_gas_only, 1);
         assert_eq!(out.coverage.tx_count_wallet_fixable_shallow, 1);
+        assert_eq!(out.coverage.tx_count_inconclusive_needs_higher_sweep, 1);
         assert_eq!(out.coverage.tx_count_contract_broken, 1);
         assert_eq!(out.coverage.tx_count_event_logs_changed, 0);
         // One summary per touched bucket.
-        assert_eq!(out.summaries.len(), 4);
+        assert_eq!(out.summaries.len(), 5);
     }
 
     #[test]
     fn drill_in_records_collected_only_for_drill_in_buckets() {
-        let mut agg = BlockAggregator::start_block(meta(), 2);
+        let mut agg = BlockAggregator::start_block(meta(), 3);
 
         // Aggregate bucket — drill_in_record is ignored even if passed.
         let mut o = obs(Bucket::GasOnly, 100);
@@ -465,9 +471,12 @@ mod tests {
         let mut o = obs(Bucket::ContractBroken, -50);
         o.drill_in_record = Some(dummy_drill_in());
         agg.observe_tx(o, &[]);
+        let mut o = obs(Bucket::InconclusiveNeedsHigherSweep, 500);
+        o.drill_in_record = Some(dummy_drill_in());
+        agg.observe_tx(o, &[]);
 
         let out = agg.finish_block();
-        assert_eq!(out.drill_ins.len(), 1, "only ContractBroken should retain its record");
+        assert_eq!(out.drill_ins.len(), 2, "only drill-in buckets should retain records");
     }
 
     #[test]

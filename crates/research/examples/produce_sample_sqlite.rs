@@ -132,8 +132,10 @@ fn main() {
             tx_count_trace_only: 0,
             tx_count_gas_only: 0,
             tx_count_event_logs_changed: 0,
+            tx_count_schedule_rescued: 0,
             tx_count_wallet_fixable_shallow: 0,
             tx_count_wallet_fixable_deep_chain: 0,
+            tx_count_inconclusive_needs_higher_sweep: 0,
             tx_count_contract_broken: 1,
         },
         summaries: vec![BlockSummaryRow {

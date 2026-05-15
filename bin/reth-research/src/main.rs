@@ -1142,6 +1142,7 @@ where
             })
             .collect();
         let mut drill_ins_recorded = 0usize;
+        let block_gas_limit = block.header().gas_limit();
 
         for (tx_idx, tx) in block.transactions_recovered().enumerate() {
             let tx_env = self.components.evm_config().tx_env(tx);
@@ -1881,6 +1882,16 @@ where
                 let baseline_to_schedule_break = normal_success && !schedule_success;
                 let baseline_to_schedule_rescue = !normal_success && schedule_success;
                 let status_changed = baseline_to_schedule_break || baseline_to_schedule_rescue;
+                let observable_trace_matches_baseline = !event_logs_diverged &&
+                    !call_tree_diverged &&
+                    !output_changed &&
+                    !created_address_changed &&
+                    !logs_bloom_changed;
+                let outer_limit_only_failure = baseline_to_schedule_break &&
+                    schedule_replay_success &&
+                    schedule_gas > gas_limit &&
+                    schedule_gas <= block_gas_limit &&
+                    observable_trace_matches_baseline;
 
                 // Min gas-limit multiplier required for the schedule to
                 // succeed. Only meaningful when the replay actually
@@ -1912,13 +1923,12 @@ where
                         None => (None, None, None),
                     };
 
-                // Classify the tx into one of the seven storage buckets.
+                // Classify the tx into one of the storage buckets.
                 // `oog_call_depth` is the 1-based OOG attribution depth from
                 // the inspector (or the producer's Err-branch synthesis when
-                // revm rejected the tx outright); the shallow-OOG predicate
-                // short-circuits on `<= 1` so root-frame OOGs — including
-                // EVM-rejection at the intrinsic-gas check — classify as
-                // `WalletFixableShallow`.
+                // revm rejected the tx outright). The classifier uses it only
+                // after handling successful higher-gas witnesses, throttled
+                // chains, and sweep-exhausted OOGs.
                 let oog_call_depth = exec_result.and_then(|r| r.oog_call_depth);
                 let bucket = classify_bucket(&BucketInput {
                     baseline_to_schedule_break,
@@ -1929,6 +1939,8 @@ where
                     output_changed,
                     created_address_changed,
                     logs_bloom_changed,
+                    outer_limit_only_failure,
+                    replay_halt_oog,
                     oog_call_depth,
                     oog_chain_proportional,
                 });

@@ -21,13 +21,14 @@ For each committed block at or above `--research.start-block`:
    `TrackingInspector`.
 4. Re-execute the same transaction once per configured execution schedule
    with `ScheduleInspector`.
-5. Classify each (tx, schedule) pair into one of seven buckets
+5. Classify each (tx, schedule) pair into one of eight buckets
    (`unchanged` / `trace_only` / `gas_only` / `event_logs_changed` /
    `wallet_fixable_shallow` / `wallet_fixable_deep_chain` /
-   `contract_broken`).
+   `inconclusive_needs_higher_sweep` / `contract_broken`).
 6. Aggregate-only buckets roll into per-block summaries; drill-in buckets
-   (`event_logs_changed`, `contract_broken`) get the full per-tx record
-   (call frames, per-frame opcode counts, event logs).
+   (`event_logs_changed`, `inconclusive_needs_higher_sweep`,
+   `contract_broken`) get the full per-tx record (call frames, per-frame
+   opcode counts, event logs).
 
 Each execution-modifying schedule gets its own state view for the block,
 so schedule-induced failures can affect later transactions under that
@@ -76,6 +77,7 @@ Block-level incidence and gas impact:
 SELECT schedule_name,
        sum(tx_count) AS txs,
        sum(tx_count_contract_broken) AS broken,
+       sum(tx_count_inconclusive_needs_higher_sweep) AS needs_higher_sweep,
        sum(tx_count_wallet_fixable_shallow + tx_count_wallet_fixable_deep_chain) AS wallet_fixable
 FROM block_coverage
 GROUP BY 1
@@ -108,7 +110,7 @@ SELECT d.schedule_name, d.block_number, d.tx_index,
        f.depth, f.call_type, f.to_address, f.gas_provided, f.gas_used
 FROM divergences d
 JOIN divergence_call_frames f USING (divergence_id)
-WHERE d.bucket = 'contract_broken'
+WHERE d.bucket IN ('contract_broken', 'inconclusive_needs_higher_sweep')
 ORDER BY d.block_number, d.tx_index, f.call_index
 LIMIT 100;
 ```
@@ -121,7 +123,7 @@ Per (schedule, block):
 - `block_summaries`: per-bucket aggregates (gas-delta histograms,
   sums/min/max, eventually 8037 state-gas metrics)
 
-Per drill-in transaction (event-logs-changed or contract-broken only):
+Per drill-in transaction (event-logs-changed, inconclusive, or contract-broken only):
 
 - `divergences`: outcome flags, gas figures, OOG / divergence location,
   chain-walk classification (`oog_chain_proportional`,

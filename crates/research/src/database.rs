@@ -2,8 +2,8 @@
 //!
 //! Implements the schema described in `crates/research/docs/storage-redesign.md`:
 //! per-block aggregates for the bucketed cohort (wallet-fixable / gas-only /
-//! trace-only / unchanged) and per-tx drill-in rows for the event-logs-changed
-//! and contract-broken cohorts.
+//! trace-only / unchanged) and per-tx drill-in rows for the event-logs-changed,
+//! inconclusive, and contract-broken cohorts.
 //!
 //! Why `SQLite`, not `DuckDB`: we tried `DuckDB` first for its analytical query
 //! performance, but ran into its single-process writer-lock — the dashboard
@@ -60,7 +60,11 @@ use thiserror::Error;
 ///   rescued a baseline-failed tx) separately from flips toward failure. The classifier's shallow
 ///   predicate now switches from `divergence_call_depth` to `oog_call_depth` and drops the
 ///   `call_count == 0` guard.
-pub const SCHEMA_VERSION: u32 = 5;
+/// - v6: added `Bucket::InconclusiveNeedsHigherSweep` and
+///   `block_coverage.tx_count_inconclusive_needs_higher_sweep` for break-direction txs whose
+///   highest configured replay tier still halted OOG without proving a throttled call-chain
+///   bottleneck.
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Errors raised by the storage layer.
 #[derive(Debug, Error)]
@@ -261,6 +265,7 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             tx_count_schedule_rescued          INTEGER NOT NULL,
             tx_count_wallet_fixable_shallow    INTEGER NOT NULL,
             tx_count_wallet_fixable_deep_chain INTEGER NOT NULL,
+            tx_count_inconclusive_needs_higher_sweep INTEGER NOT NULL,
             tx_count_contract_broken           INTEGER NOT NULL,
             PRIMARY KEY (schedule_name, block_number, block_hash)
         );",
@@ -542,7 +547,8 @@ pub struct BlockOutput {
     pub coverage: BlockCoverageRow,
     /// One per non-empty bucket. Go to `block_summaries`.
     pub summaries: Vec<BlockSummaryRow>,
-    /// Drill-in records — one per `EventLogsChanged` or `ContractBroken` tx.
+    /// Drill-in records — one per `EventLogsChanged`, `InconclusiveNeedsHigherSweep`, or
+    /// `ContractBroken` tx.
     pub drill_ins: Vec<DrillInRecord>,
 }
 
@@ -566,6 +572,7 @@ pub struct BlockCoverageRow {
     pub tx_count_schedule_rescued: u32,
     pub tx_count_wallet_fixable_shallow: u32,
     pub tx_count_wallet_fixable_deep_chain: u32,
+    pub tx_count_inconclusive_needs_higher_sweep: u32,
     pub tx_count_contract_broken: u32,
 }
 
@@ -621,8 +628,9 @@ pub struct BlockSummaryRow {
 /// Per-tx drill-in record: the `divergences` row plus its dependent
 /// `divergence_call_frames`, `divergence_opcode_counts`, and
 /// `divergence_event_logs` rows. Emitted only for the
-/// `EventLogsChanged` and `ContractBroken` buckets — aggregate buckets
-/// collapse into `BlockSummaryRow`.
+/// `EventLogsChanged`, `InconclusiveNeedsHigherSweep`, and
+/// `ContractBroken` buckets — aggregate buckets collapse into
+/// `BlockSummaryRow`.
 #[allow(missing_docs)]
 #[derive(Debug, Clone)]
 pub struct DrillInRecord {
@@ -1129,8 +1137,10 @@ fn insert_block_coverage(
             tx_count_unchanged, tx_count_trace_only, tx_count_gas_only,
             tx_count_event_logs_changed, tx_count_schedule_rescued,
             tx_count_wallet_fixable_shallow,
-            tx_count_wallet_fixable_deep_chain, tx_count_contract_broken
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            tx_count_wallet_fixable_deep_chain,
+            tx_count_inconclusive_needs_higher_sweep,
+            tx_count_contract_broken
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (schedule_name, block_number, block_hash) DO UPDATE SET
             schedule_config_hash               = excluded.schedule_config_hash,
             parent_hash                        = excluded.parent_hash,
@@ -1143,6 +1153,8 @@ fn insert_block_coverage(
             tx_count_schedule_rescued          = excluded.tx_count_schedule_rescued,
             tx_count_wallet_fixable_shallow    = excluded.tx_count_wallet_fixable_shallow,
             tx_count_wallet_fixable_deep_chain = excluded.tx_count_wallet_fixable_deep_chain,
+            tx_count_inconclusive_needs_higher_sweep =
+                excluded.tx_count_inconclusive_needs_higher_sweep,
             tx_count_contract_broken           = excluded.tx_count_contract_broken",
         params![
             row.schedule_name,
@@ -1159,6 +1171,7 @@ fn insert_block_coverage(
             row.tx_count_schedule_rescued as i64,
             row.tx_count_wallet_fixable_shallow as i64,
             row.tx_count_wallet_fixable_deep_chain as i64,
+            row.tx_count_inconclusive_needs_higher_sweep as i64,
             row.tx_count_contract_broken as i64,
         ],
     )?;
@@ -1559,6 +1572,7 @@ mod tests {
             tx_count_schedule_rescued: 0,
             tx_count_wallet_fixable_shallow: 0,
             tx_count_wallet_fixable_deep_chain: 0,
+            tx_count_inconclusive_needs_higher_sweep: 0,
             tx_count_contract_broken: broken,
         }
     }
