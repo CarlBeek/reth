@@ -518,16 +518,26 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
     )?;
 
     // Indexes for the per-recipient / per-codehash / per-bucket lookups
-    // the dashboard hits.
+    // the dashboard hits. The composite divergence indexes mirror the
+    // consumer's hot path: every dashboard aggregate is scoped by
+    // `(schedule_name, bucket)` before grouping by recipient, opcode, or
+    // bottleneck fields.
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_div_schedule      ON divergences(schedule_name);
          CREATE INDEX IF NOT EXISTS idx_div_block         ON divergences(schedule_name, block_number);
          CREATE INDEX IF NOT EXISTS idx_div_recipient     ON divergences(recipient);
          CREATE INDEX IF NOT EXISTS idx_div_bucket        ON divergences(bucket);
+         CREATE INDEX IF NOT EXISTS idx_div_sched_bucket_recipient
+             ON divergences(schedule_name, bucket, recipient);
+         CREATE INDEX IF NOT EXISTS idx_div_sched_bucket_oog
+             ON divergences(schedule_name, bucket, oog_call_depth, oog_bottleneck_kind);
+         CREATE INDEX IF NOT EXISTS idx_div_sched_bucket_opcode
+             ON divergences(schedule_name, bucket, divergence_opcode);
          CREATE INDEX IF NOT EXISTS idx_dcf_to_addr       ON divergence_call_frames(to_address);
          CREATE INDEX IF NOT EXISTS idx_dcf_codehash      ON divergence_call_frames(codehash);
          CREATE INDEX IF NOT EXISTS idx_doc_opcode        ON divergence_opcode_counts(opcode);
-         CREATE INDEX IF NOT EXISTS idx_bs_schedule_block ON block_summaries(schedule_name, block_number);",
+         CREATE INDEX IF NOT EXISTS idx_bs_schedule_block ON block_summaries(schedule_name, block_number);
+         CREATE INDEX IF NOT EXISTS idx_bs_schedule_bucket ON block_summaries(schedule_name, bucket);",
     )?;
 
     Ok(())
