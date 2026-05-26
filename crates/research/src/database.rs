@@ -530,6 +530,7 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
         "CREATE INDEX IF NOT EXISTS idx_div_schedule      ON divergences(schedule_name);
          CREATE INDEX IF NOT EXISTS idx_div_block         ON divergences(schedule_name, block_number);
          CREATE INDEX IF NOT EXISTS idx_div_recipient     ON divergences(recipient);
+         CREATE INDEX IF NOT EXISTS idx_div_tx_hash       ON divergences(tx_hash);
          CREATE INDEX IF NOT EXISTS idx_div_bucket        ON divergences(bucket);
          CREATE INDEX IF NOT EXISTS idx_div_sched_bucket_recipient
              ON divergences(schedule_name, bucket, recipient);
