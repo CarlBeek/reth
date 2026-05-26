@@ -536,8 +536,12 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
          CREATE INDEX IF NOT EXISTS idx_dcf_to_addr       ON divergence_call_frames(to_address);
          CREATE INDEX IF NOT EXISTS idx_dcf_codehash      ON divergence_call_frames(codehash);
          CREATE INDEX IF NOT EXISTS idx_doc_opcode        ON divergence_opcode_counts(opcode);
+         CREATE INDEX IF NOT EXISTS idx_bc_schedule_block ON block_coverage(schedule_name, block_number);
          CREATE INDEX IF NOT EXISTS idx_bs_schedule_block ON block_summaries(schedule_name, block_number);
-         CREATE INDEX IF NOT EXISTS idx_bs_schedule_bucket ON block_summaries(schedule_name, bucket);",
+         CREATE INDEX IF NOT EXISTS idx_bs_schedule_bucket ON block_summaries(schedule_name, bucket);
+         CREATE INDEX IF NOT EXISTS idx_bs_schedule_opcode_totals
+             ON block_summaries(schedule_name)
+             WHERE opcode_totals_7904 IS NOT NULL AND opcode_totals_7904 <> '[]';",
     )?;
 
     Ok(())
