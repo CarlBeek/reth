@@ -64,7 +64,10 @@ use thiserror::Error;
 ///   `block_coverage.tx_count_inconclusive_needs_higher_sweep` for break-direction txs whose
 ///   highest configured replay tier still halted OOG without proving a throttled call-chain
 ///   bottleneck.
-pub const SCHEMA_VERSION: u32 = 6;
+/// - v7: added `divergence_call_frames.deployed_bytecode_len` (NULL except on successful
+///   CREATE/CREATE2 frames) so the EIP-8037 dashboard can plot true deployed-code size for the
+///   deployment-ceiling chart instead of approximating from baseline gas.
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Errors raised by the storage layer.
 #[derive(Debug, Error)]
@@ -414,6 +417,7 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             gas_requested_on_stack INTEGER,
             eip150_cap_binding     INTEGER,
             state_gas_running      INTEGER,
+            deployed_bytecode_len  INTEGER,
             PRIMARY KEY (divergence_id, call_index)
         );",
     )?;
@@ -747,6 +751,12 @@ pub struct CallFrameRow {
     pub gas_requested_on_stack: Option<u64>,
     pub eip150_cap_binding: Option<bool>,
     pub state_gas_running: Option<u64>,
+    /// Length of the deployed bytecode in bytes. Set only on successful
+    /// CREATE / CREATE2 frames (`call_type` is `CREATE`/`CREATE2` and
+    /// `success` is true); `None` everywhere else. Used by the EIP-8037
+    /// dashboard to plot true deployment cost without approximating
+    /// bytecode size from baseline gas.
+    pub deployed_bytecode_len: Option<u32>,
 }
 
 /// One row destined for `divergence_opcode_counts`. Producer omits zero-
@@ -1361,8 +1371,8 @@ fn insert_call_frame(
             from_address, to_address, code_address, codehash, call_type,
             selector, value_wei, gas_provided, gas_used, gas_margin,
             success, parent_gas_at_call, gas_requested_on_stack,
-            eip150_cap_binding, state_gas_running
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            eip150_cap_binding, state_gas_running, deployed_bytecode_len
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             divergence_id as i64,
             row.call_index as i64,
@@ -1383,6 +1393,7 @@ fn insert_call_frame(
             row.gas_requested_on_stack.map(|v| v as i64),
             row.eip150_cap_binding,
             row.state_gas_running.map(|v| v as i64),
+            row.deployed_bytecode_len.map(|v| v as i64),
         ],
     )?;
     Ok(())
@@ -1677,6 +1688,7 @@ mod tests {
                 gas_requested_on_stack: None,
                 eip150_cap_binding: None,
                 state_gas_running: None,
+                deployed_bytecode_len: None,
             }],
             opcode_counts: vec![OpcodeCountRow {
                 call_index: 0,
@@ -1802,6 +1814,7 @@ mod tests {
                     gas_requested_on_stack: None,
                     eip150_cap_binding: None,
                     state_gas_running: None,
+                    deployed_bytecode_len: None,
                 }],
                 opcode_counts: vec![],
                 baseline_event_logs: vec![],
@@ -1927,6 +1940,7 @@ mod tests {
                     gas_requested_on_stack: None,
                     eip150_cap_binding: None,
                     state_gas_running: None,
+                    deployed_bytecode_len: None,
                 }],
                 opcode_counts: vec![],
                 baseline_event_logs: vec![],
@@ -1983,6 +1997,7 @@ mod tests {
                     gas_requested_on_stack: None,
                     eip150_cap_binding: None,
                     state_gas_running: None,
+                    deployed_bytecode_len: None,
                 }],
                 opcode_counts: vec![],
                 baseline_event_logs: vec![],
@@ -2048,6 +2063,7 @@ mod tests {
                 gas_requested_on_stack: None,
                 eip150_cap_binding: None,
                 state_gas_running: None,
+                deployed_bytecode_len: None,
             }],
             opcode_counts: vec![],
             baseline_event_logs: vec![],
@@ -2108,6 +2124,7 @@ mod tests {
                     gas_requested_on_stack: None,
                     eip150_cap_binding: None,
                     state_gas_running: None,
+                    deployed_bytecode_len: None,
                 }],
                 opcode_counts: vec![],
                 baseline_event_logs: vec![],

@@ -2112,6 +2112,18 @@ where
                                         f.parent_gas_at_call,
                                     ),
                                     state_gas_running: None,
+                                    // For successful CREATE/CREATE2 frames the inspector stashes
+                                    // the deployed runtime code in `output`; its length is the
+                                    // deployed-bytecode size EIP-8037 charges CPSB per byte for.
+                                    // All other frames leave this NULL.
+                                    deployed_bytecode_len: match f.call_type {
+                                        ResCallType::Create | ResCallType::Create2
+                                            if f.success =>
+                                        {
+                                            f.output.as_ref().map(|b| b.len() as u32)
+                                        }
+                                        _ => None,
+                                    },
                                 }
                             })
                             .collect();

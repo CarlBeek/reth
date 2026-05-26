@@ -655,6 +655,7 @@ mod tests {
                 gas_requested_on_stack: None,
                 eip150_cap_binding: None,
                 state_gas_running: None,
+                deployed_bytecode_len: None,
             }],
             opcode_counts: vec![],
             baseline_event_logs: vec![],
