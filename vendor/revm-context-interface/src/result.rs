@@ -37,7 +37,7 @@ pub type ResultVecAndState<R, S> = ExecResultAndState<Vec<R>, S>;
 
 impl<R, S> ExecResultAndState<R, S> {
     /// Creates new ResultAndState.
-    pub fn new(result: R, state: S) -> Self {
+    pub const fn new(result: R, state: S) -> Self {
         Self { result, state }
     }
 }
@@ -53,12 +53,12 @@ impl<R, S> ExecResultAndState<R, S> {
 /// | [`total_gas_spent()`]  | `Gas::spent()` = limit − remaining | Total gas consumed before refund               |
 /// | [`inner_refunded()`]   | `Gas::refunded()` as u64           | Gas refunded (capped per EIP-3529)             |
 /// | [`floor_gas()`]        | `InitialAndFloorGas::floor_gas`    | EIP-7623 floor gas (0 if not applicable)       |
-/// | [`state_gas_spent()`]  | `Gas::state_gas_spent`             | State gas consumed during execution (EIP-8037) |
+/// | [`state_gas_spent_final()`] | `Gas::state_gas_spent`        | State gas consumed during execution (EIP-8037) |
 ///
 /// [`total_gas_spent()`]: ResultGas::total_gas_spent
 /// [`inner_refunded()`]: ResultGas::inner_refunded
 /// [`floor_gas()`]: ResultGas::floor_gas
-/// [`state_gas_spent()`]: ResultGas::state_gas_spent
+/// [`state_gas_spent_final()`]: ResultGas::state_gas_spent_final
 ///
 /// ## Derived values
 ///
@@ -74,7 +74,8 @@ pub struct ResultGas {
     /// For actual gas used, use [`used()`](ResultGas::used).
     #[cfg_attr(feature = "serde", serde(rename = "gas_spent"))]
     total_gas_spent: u64,
-    /// State gas consumed during execution (EIP-8037).
+    /// State gas consumed during execution (EIP-8037), net of the EIP-7702
+    /// per-authorization state-gas refund applied at result-build time.
     /// Tracks gas for storage creation, account creation, and code deposit.
     /// Zero when state gas is not enabled.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -140,11 +141,14 @@ impl ResultGas {
         self.total_gas_spent
     }
 
-    /// Returns the state gas spent during execution (EIP-8037).
+    /// Returns the final state gas spent during execution (EIP-8037).
+    ///
+    /// The stored value is already net of the EIP-7702 per-authorization
+    /// state-gas refund (subtracted when the result is built).
     ///
     /// This is same as [`ResultGas::block_state_gas_used`] for the transaction.
     #[inline]
-    pub const fn state_gas_spent(&self) -> u64 {
+    pub const fn state_gas_spent_final(&self) -> u64 {
         self.state_gas_spent
     }
 
@@ -153,12 +157,6 @@ impl ResultGas {
     #[inline]
     pub const fn state_gas_demanded(&self) -> u64 {
         self.state_gas_demanded
-    }
-
-    /// Sets the `state_gas_demanded` field.
-    #[inline]
-    pub fn set_state_gas_demanded(&mut self, val: u64) {
-        self.state_gas_demanded = val;
     }
 
     /// Returns the EIP-7623 floor gas.
@@ -192,25 +190,25 @@ impl ResultGas {
 
     /// Sets the `total_gas_spent` field by mutable reference.
     #[inline]
-    pub fn set_total_gas_spent(&mut self, total_gas_spent: u64) {
+    pub const fn set_total_gas_spent(&mut self, total_gas_spent: u64) {
         self.total_gas_spent = total_gas_spent;
     }
 
     /// Sets the `refunded` field by mutable reference.
     #[inline]
-    pub fn set_refunded(&mut self, refunded: u64) {
+    pub const fn set_refunded(&mut self, refunded: u64) {
         self.refunded = refunded;
     }
 
     /// Sets the `floor_gas` field by mutable reference.
     #[inline]
-    pub fn set_floor_gas(&mut self, floor_gas: u64) {
+    pub const fn set_floor_gas(&mut self, floor_gas: u64) {
         self.floor_gas = floor_gas;
     }
 
     /// Sets the `state_gas_spent` field by mutable reference.
     #[inline]
-    pub fn set_state_gas_spent(&mut self, state_gas_spent: u64) {
+    pub const fn set_state_gas_spent(&mut self, state_gas_spent: u64) {
         self.state_gas_spent = state_gas_spent;
     }
 
@@ -222,7 +220,7 @@ impl ResultGas {
             regular and state gas, this method is no longer valid.
             Use [`ResultGas::set_total_gas_spent`] instead"
     )]
-    pub fn set_spent(&mut self, spent: u64) {
+    pub const fn set_spent(&mut self, spent: u64) {
         self.total_gas_spent = spent;
     }
 
@@ -256,7 +254,7 @@ impl ResultGas {
         self
     }
 
-    /// Sets the `state_gas_demanded` field.
+    /// Sets the `state_gas_demanded` field (EIP-8037 diagnostic).
     #[inline]
     pub const fn with_state_gas_demanded(mut self, state_gas_demanded: u64) -> Self {
         self.state_gas_demanded = state_gas_demanded;
@@ -295,16 +293,16 @@ impl ResultGas {
     pub const fn block_regular_gas_used(&self) -> u64 {
         let execution_gas_spent = self
             .total_gas_spent()
-            .saturating_sub(self.state_gas_spent());
+            .saturating_sub(self.state_gas_spent_final());
         max(execution_gas_spent, self.floor_gas())
     }
 
     /// Returns the state gas used by the block.
     ///
-    /// This is same as [`ResultGas::state_gas_spent`] for the block.
+    /// This is same as [`ResultGas::state_gas_spent_final`] for the block.
     #[inline]
     pub const fn block_state_gas_used(&self) -> u64 {
-        self.state_gas_spent()
+        self.state_gas_spent_final()
     }
 
     /// Returns the final gas used: `max(spent - refunded, floor_gas)`.
@@ -434,7 +432,7 @@ impl<HaltReasonTy> ExecutionResult<HaltReasonTy> {
     /// 1 indicates success, 0 indicates revert.
     ///
     /// <https://eips.ethereum.org/EIPS/eip-658>
-    pub fn is_success(&self) -> bool {
+    pub const fn is_success(&self) -> bool {
         matches!(self, Self::Success { .. })
     }
 
@@ -474,14 +472,14 @@ impl<HaltReasonTy> ExecutionResult<HaltReasonTy> {
     }
 
     /// Returns true if execution result is a Halt.
-    pub fn is_halt(&self) -> bool {
+    pub const fn is_halt(&self) -> bool {
         matches!(self, Self::Halt { .. })
     }
 
     /// Returns the output data of the execution.
     ///
     /// Returns [`None`] if the execution was halted.
-    pub fn output(&self) -> Option<&Bytes> {
+    pub const fn output(&self) -> Option<&Bytes> {
         match self {
             Self::Success { output, .. } => Some(output.data()),
             Self::Revert { output, .. } => Some(output),
@@ -501,7 +499,7 @@ impl<HaltReasonTy> ExecutionResult<HaltReasonTy> {
     }
 
     /// Returns the logs emitted during execution.
-    pub fn logs(&self) -> &[Log] {
+    pub const fn logs(&self) -> &[Log] {
         match self {
             Self::Success { logs, .. } | Self::Revert { logs, .. } | Self::Halt { logs, .. } => {
                 logs.as_slice()
@@ -519,14 +517,14 @@ impl<HaltReasonTy> ExecutionResult<HaltReasonTy> {
     }
 
     /// Returns the gas accounting information.
-    pub fn gas(&self) -> &ResultGas {
+    pub const fn gas(&self) -> &ResultGas {
         match self {
             Self::Success { gas, .. } | Self::Revert { gas, .. } | Self::Halt { gas, .. } => gas,
         }
     }
 
     /// Returns the gas used needed for the transaction receipt.
-    pub fn tx_gas_used(&self) -> u64 {
+    pub const fn tx_gas_used(&self) -> u64 {
         self.gas().tx_gas_used()
     }
 
@@ -536,7 +534,7 @@ impl<HaltReasonTy> ExecutionResult<HaltReasonTy> {
         since = "32.0.0",
         note = "Use `tx_gas_used()` instead, `gas_used` is ambiguous after EIP-8037 state gas split"
     )]
-    pub fn gas_used(&self) -> u64 {
+    pub const fn gas_used(&self) -> u64 {
         self.tx_gas_used()
     }
 }
@@ -612,7 +610,7 @@ impl Output {
     }
 
     /// Returns the output data of the execution output.
-    pub fn data(&self) -> &Bytes {
+    pub const fn data(&self) -> &Bytes {
         match self {
             Output::Call(data) => data,
             Output::Create(data, _) => data,
@@ -620,7 +618,7 @@ impl Output {
     }
 
     /// Returns the created address, if any.
-    pub fn address(&self) -> Option<&Address> {
+    pub const fn address(&self) -> Option<&Address> {
         match self {
             Output::Call(_) => None,
             Output::Create(_, address) => address.as_ref(),
@@ -1237,7 +1235,7 @@ pub struct TransactionIndexedError<Error> {
 impl<Error> TransactionIndexedError<Error> {
     /// Create a new `TransactionIndexedError` with the given error and transaction index.
     #[must_use]
-    pub fn new(error: Error, transaction_index: usize) -> Self {
+    pub const fn new(error: Error, transaction_index: usize) -> Self {
         Self {
             error,
             transaction_index,
@@ -1245,7 +1243,7 @@ impl<Error> TransactionIndexedError<Error> {
     }
 
     /// Get a reference to the underlying error.
-    pub fn error(&self) -> &Error {
+    pub const fn error(&self) -> &Error {
         &self.error
     }
 

@@ -12,7 +12,7 @@ use context_interface::{
 };
 use core::cmp::Ordering;
 use interpreter::InitialAndFloorGas;
-use primitives::{hardfork::SpecId, Address, AddressMap, HashSet, StorageKey, KECCAK_EMPTY, U256};
+use primitives::{hardfork::SpecId, AddressMap, HashSet, StorageKey, U256};
 use state::AccountInfo;
 
 /// Loads and warms accounts for execution, including precompiles and access list.
@@ -33,9 +33,10 @@ pub fn load_accounts<
 
     if precompiles_changed || empty_warmed_precompiles {
         // load new precompile addresses into journal.
-        // When precompiles addresses are changed we reset the warmed hashmap to those new
-        // addresses.
-        context.journal_mut().warm_precompiles(precompiles.warm_addresses().collect());
+        // When precompiles addresses are changed we reset the warmed hashmap to those new addresses.
+        context
+            .journal_mut()
+            .warm_precompiles(precompiles.warm_addresses());
     }
 
     // Load coinbase
@@ -105,6 +106,9 @@ pub fn validate_account_nonce_and_code(
     if !is_nonce_check_disabled {
         let tx = tx_nonce;
         let state = caller_info.nonce;
+        if tx == u64::MAX && state == u64::MAX {
+            return Err(InvalidTransaction::NonceOverflowInTransaction);
+        }
         match tx.cmp(&state) {
             Ordering::Greater => {
                 return Err(InvalidTransaction::NonceTooHigh { tx, state });
@@ -198,53 +202,55 @@ pub fn apply_eip7702_auth_list<
     init_and_floor_gas: &mut InitialAndFloorGas,
 ) -> Result<u64, ERROR> {
     let chain_id = context.cfg().chain_id();
-    let gas_params = context.cfg().gas_params();
-    let account_state_refund = gas_params.new_account_state_gas();
-    let auth_base_state_refund = gas_params.tx_eip7702_auth_base_state_gas();
-    let regular_refund_per_existing_account =
-        gas_params.tx_eip7702_auth_refund().saturating_sub(account_state_refund);
+    let is_eip8037 = context.cfg().is_amsterdam_eip8037_enabled();
     let (tx, journal) = context.tx_journal_mut();
 
     // Return if not EIP-7702 transaction.
     if tx.tx_type() != TransactionType::Eip7702 {
         return Ok(0);
     }
-    let eip7702_refund = apply_auth_list::<_, ERROR>(
-        chain_id,
-        regular_refund_per_existing_account,
-        account_state_refund,
-        auth_base_state_refund,
-        tx.authorization_list(),
-        journal,
-    )?;
+    let (number_of_refunded_accounts, number_of_refunded_bytecodes) =
+        apply_auth_list::<_, ERROR>(chain_id, tx.authorization_list(), journal)?;
 
-    if eip7702_refund.state > 0 {
-        init_and_floor_gas.eip7702_reservoir_refund = eip7702_refund.state;
+    let params = context.cfg().gas_params();
+
+    // EIP-8037: Split per-auth refund into state and regular components. The
+    // state portion is credited back to the reservoir by reducing
+    // `initial_state_gas` (which is what `initial_gas_and_reservoir` deducts
+    // from the reservoir). The regular portion is returned and routed through
+    // the standard refund counter, subject to the 1/5 cap.
+    if is_eip8037 {
+        init_and_floor_gas.state_refund += params
+            .tx_eip7702_state_refund(number_of_refunded_accounts, number_of_refunded_bytecodes);
     }
 
-    Ok(eip7702_refund.regular)
+    let regular_gas_refund = params
+        .tx_eip7702_auth_refund_regular()
+        .saturating_mul(number_of_refunded_accounts);
+
+    Ok(regular_gas_refund)
 }
 
 /// Apply EIP-7702 style auth list and return number gas refund on already created accounts.
 ///
-/// It is more granular function from [`apply_eip7702_auth_list`] function as it takes only the
-/// list, journal and chain id.
+/// It is more granular function from [`apply_eip7702_auth_list`] function as it takes only the list, journal and chain id.
 ///
-/// The refund parameters specify the regular refund and reservoir refills for successful
-/// authorizations that avoid creating new account or authorization-base state.
+/// The `refund_per_auth` parameter specifies the gas refund per existing account authorization.
+/// By default this is `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` (25000 - 12500 = 12500),
+/// but can be configured via [`GasParams::tx_eip7702_auth_refund`](context_interface::cfg::gas_params::GasParams::tx_eip7702_auth_refund).
+///
+/// Return number of refunded account and number of refunded bytecodes (Delegation length is already fixed).
 #[inline]
 pub fn apply_auth_list<
     JOURNAL: JournalTr,
     ERROR: From<InvalidTransaction> + From<<JOURNAL::Database as Database>::Error>,
 >(
     chain_id: u64,
-    regular_refund_per_existing_account: u64,
-    account_state_refund: u64,
-    auth_base_state_refund: u64,
     auth_list: impl Iterator<Item = impl AuthorizationTr>,
     journal: &mut JOURNAL,
-) -> Result<Eip7702AuthRefund, ERROR> {
-    let mut refund = Eip7702AuthRefund::default();
+) -> Result<(u64, u64), ERROR> {
+    let mut refunded_accounts = 0;
+    let mut refunded_bytecodes = 0;
     for authorization in auth_list {
         // 1. Verify the chain id is either 0 or the chain's current ID.
         let auth_chain_id = authorization.chain_id();
@@ -258,8 +264,7 @@ pub fn apply_auth_list<
         }
 
         // recover authority and authorized addresses.
-        // 3. `authority = ecrecover(keccak(MAGIC || rlp([chain_id, address, nonce])), y_parity, r,
-        //    s]`
+        // 3. `authority = ecrecover(keccak(MAGIC || rlp([chain_id, address, nonce])), y_parity, r, s]`
         let Some(authority) = authorization.authority() else {
             continue;
         };
@@ -277,43 +282,60 @@ pub fn apply_auth_list<
             }
         }
 
-        // 6. Verify the nonce of `authority` is equal to `nonce`. In case `authority` does not
-        //    exist in the trie, verify that `nonce` is equal to `0`.
+        // 6. Verify the nonce of `authority` is equal to `nonce`. In case `authority` does not exist in the trie, verify that `nonce` is equal to `0`.
         if authorization.nonce() != authority_acc_info.nonce {
             continue;
         }
 
-        let authority_exists = !(authority_acc_info.is_empty() &&
-            authority_acc.account().is_loaded_as_not_existing_not_touched());
-        let auth_base_already_present = authority_acc_info.code_hash != KECCAK_EMPTY ||
-            authorization.address() == Address::ZERO;
-
-        if authority_exists {
-            refund.regular = refund.regular.saturating_add(regular_refund_per_existing_account);
-            refund.state = refund.state.saturating_add(account_state_refund);
+        // 7. Add `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` gas to the global refund counter if `authority` exists in the trie.
+        if !(authority_acc_info.is_empty()
+            && authority_acc
+                .account()
+                .is_loaded_as_not_existing_not_touched())
+        {
+            refunded_accounts += 1;
         }
 
-        if auth_base_already_present {
-            refund.state = refund.state.saturating_add(auth_base_state_refund);
+        if !authority_acc_info.is_code_hash_empty_or_zero() || authorization.address().is_zero() {
+            refunded_bytecodes += 1;
         }
 
-        // 8. Set the code of `authority` to be `0xef0100 || address`. This is a delegation
-        //    designation.
-        //  * As a special case, if `address` is `0x0000000000000000000000000000000000000000` do not
-        //    write the designation. Clear the accounts code and reset the account's code hash to
-        //    the empty hash `0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470`.
+        // 8. Set the code of `authority` to be `0xef0100 || address`. This is a delegation designation.
+        //  * As a special case, if `address` is `0x0000000000000000000000000000000000000000` do not write the designation.
+        //    Clear the accounts code and reset the account's code hash to the empty hash `0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470`.
         // 9. Increase the nonce of `authority` by one.
         authority_acc.delegate(authorization.address());
     }
 
-    Ok(refund)
+    Ok((refunded_accounts, refunded_bytecodes))
 }
 
-/// EIP-7702 authorization refunds split by gas dimension.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Eip7702AuthRefund {
-    /// Regular refund counter contribution.
-    pub regular: u64,
-    /// State-gas reservoir refill.
-    pub state: u64,
+#[cfg(test)]
+mod tests {
+    use super::validate_account_nonce_and_code;
+    use context_interface::result::InvalidTransaction;
+    use state::AccountInfo;
+
+    #[test]
+    fn rejects_transactions_when_sender_nonce_is_max() {
+        let caller_info = AccountInfo {
+            nonce: u64::MAX,
+            ..AccountInfo::default()
+        };
+
+        let err = validate_account_nonce_and_code(&caller_info, u64::MAX, false, false)
+            .expect_err("nonce-max sender should be rejected before execution");
+
+        assert_eq!(err, InvalidTransaction::NonceOverflowInTransaction);
+    }
+
+    #[test]
+    fn allows_matching_non_max_nonce() {
+        let caller_info = AccountInfo {
+            nonce: 7,
+            ..AccountInfo::default()
+        };
+
+        assert!(validate_account_nonce_and_code(&caller_info, 7, false, false).is_ok());
+    }
 }

@@ -1421,8 +1421,7 @@ pub fn ensure_intrinsic_gas<T: EthPoolTransaction>(
 ) -> Result<(), InvalidPoolTransactionError> {
     let gas_params = fork_tracker.gas_params();
 
-    let gas = revm_interpreter::gas::calculate_initial_tx_gas_with_gas_params(
-        &gas_params,
+    let gas = gas_params.initial_tx_gas(
         transaction.input(),
         transaction.is_create(),
         transaction.access_list().map(|l| l.len()).unwrap_or_default() as u64,
@@ -1434,7 +1433,7 @@ pub fn ensure_intrinsic_gas<T: EthPoolTransaction>(
     );
 
     let gas_limit = transaction.gas_limit();
-    if gas_limit < gas.initial_total_gas || gas_limit < gas.floor_gas {
+    if gas_limit < gas.initial_total_gas() || gas_limit < gas.floor_gas {
         Err(InvalidPoolTransactionError::IntrinsicGasTooLow)
     } else {
         Ok(())

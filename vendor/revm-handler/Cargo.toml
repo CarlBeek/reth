@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.91.0"
 name = "revm-handler"
-version = "18.1.0"
+version = "20.0.3"
 authors = ["Dragan Rakita <dragan0rakita@gmail.com>"]
 build = false
 autolib = false
@@ -76,22 +76,22 @@ path = "src/lib.rs"
 version = "1.3.0"
 
 [dependencies.bytecode]
-version = "10.0.0"
+version = "11.0.1"
 default-features = false
 package = "revm-bytecode"
 
 [dependencies.context]
-version = "16.0.1"
+version = "18.0.3"
 default-features = false
 package = "revm-context"
 
 [dependencies.context-interface]
-version = "17.0.1"
+version = "19.0.3"
 default-features = false
 package = "revm-context-interface"
 
 [dependencies.database-interface]
-version = "11.0.1"
+version = "12.1.1"
 default-features = false
 package = "revm-database-interface"
 
@@ -100,17 +100,17 @@ version = "1.6"
 default-features = false
 
 [dependencies.interpreter]
-version = "35.0.1"
+version = "37.0.3"
 default-features = false
 package = "revm-interpreter"
 
 [dependencies.precompile]
-version = "34.0.0"
+version = "36.0.3"
 default-features = false
 package = "revm-precompile"
 
 [dependencies.primitives]
-version = "23.0.0"
+version = "24.0.1"
 default-features = false
 package = "revm-primitives"
 
@@ -124,22 +124,25 @@ optional = true
 default-features = false
 
 [dependencies.state]
-version = "11.0.1"
+version = "12.0.1"
 default-features = false
 package = "revm-state"
 
 [dev-dependencies.alloy-signer]
-version = "1.4.2"
+version = "2.0.0"
 default-features = false
 
 [dev-dependencies.alloy-signer-local]
-version = "1.4.2"
+version = "2.0.0"
 default-features = false
 
 [dev-dependencies.database]
-version = "13.0.1"
+version = "15.0.2"
 default-features = false
 package = "revm-database"
+
+[lints.clippy]
+missing_const_for_fn = "warn"
 
 [lints.rust]
 missing_debug_implementations = "warn"
@@ -153,7 +156,3 @@ priority = -1
 
 [lints.rustdoc]
 all = "warn"
-
-[patch.crates-io]
-revm-context-interface = { path = "../revm-context-interface" }
-revm-interpreter = { path = "../revm-interpreter" }

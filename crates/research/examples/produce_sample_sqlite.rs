@@ -75,6 +75,7 @@ fn main() {
             oog_bottleneck_depth: Some(1),
             oog_bottleneck_kind: Some("Stipend2300".into()),
             schedule_state_gas_spent: None,
+            schedule_state_gas_demanded: None,
             schedule_initial_state_gas: None,
             schedule_initial_reservoir: None,
             runtime_state_gas: None,

@@ -29,13 +29,13 @@ fn record_state_cost_counts_demand_even_on_oog() {
 
     assert!(gas.record_state_cost(200));
     assert_eq!(gas.state_gas_spent(), 200);
-    assert_eq!(gas.state_gas_demanded(), 200);
+    assert_eq!(gas.tracker().state_gas_demanded(), 200);
 
     // Unaffordable (reservoir 800, no regular gas to spill into) → OOG.
     // spent must NOT move; demanded must still record the attempt.
     assert!(!gas.record_state_cost(5000));
     assert_eq!(gas.state_gas_spent(), 200, "spent unchanged on OOG");
-    assert_eq!(gas.state_gas_demanded(), 5200, "attempt counted despite OOG");
+    assert_eq!(gas.tracker().state_gas_demanded(), 5200, "attempt counted despite OOG");
 }
 
 /// 2. The final `ResultGas` the tx exposes carries demanded.
@@ -44,7 +44,7 @@ fn build_result_gas_surfaces_demanded() {
     let mut gas = Gas::new_with_regular_gas_and_reservoir(1_000_000, 0);
     assert!(gas.record_state_cost(500));
 
-    let rg = build_result_gas(&gas, InitialAndFloorGas::new(0, 0));
+    let rg = build_result_gas(false, &gas, InitialAndFloorGas::new(0, 0));
     assert_eq!(rg.state_gas_demanded(), 500);
 }
 
@@ -134,7 +134,7 @@ mod evm {
             gas.state_gas_demanded() > 0,
             "a new-slot SSTORE in a sub-call must report state gas demanded on the \
              tx result; got spent={} demanded={}",
-            gas.state_gas_spent(),
+            gas.state_gas_spent_final(),
             gas.state_gas_demanded(),
         );
     }

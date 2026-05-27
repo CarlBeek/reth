@@ -247,7 +247,7 @@ where
                         targets
                             .rev_iter()
                             .take_while(|target| target.key_nibbles.starts_with(path))
-                            .any(|target| path.len() >= target.min_len as usize));
+                            .any(|target| path.len() >= target.min_len as usize))
             }
 
             // If the path isn't in the current range then iterate forward until it is (or until
@@ -258,7 +258,7 @@ where
                 (lower, upper) = targets.next();
                 trace!(target: TRACE_TARGET, target = ?lower, "upper target <= path, next target");
             } else {
-                return false;
+                return false
             }
         }
     }
@@ -276,7 +276,7 @@ where
     ) -> Result<RlpNode, StateProofError> {
         // If the child is already an `RlpNode` then there is nothing to do.
         if let ProofTrieBranchChild::RlpNode(rlp_node) = child {
-            return Ok(rlp_node);
+            return Ok(rlp_node)
         }
 
         // If we should retain the child then do so.
@@ -365,17 +365,14 @@ where
         &mut self,
         targets: &mut Option<TargetsCursor<'a>>,
     ) -> Result<(), StateProofError> {
+        if matches!(self.child_stack.last(), Some(ProofTrieBranchChild::RlpNode(_))) {
+            trace!(target: TRACE_TARGET, "Last child already committed, leaving stack unchanged");
+            return Ok(())
+        }
+
         let Some(child_path) = self.last_child_path() else { return Ok(()) };
         let child =
             self.child_stack.pop().expect("child_stack can't be empty if there's a child path");
-
-        // If the child is already an `RlpNode` then there is nothing to do, push it back on with no
-        // changes.
-        if let ProofTrieBranchChild::RlpNode(_rlp_node) = &child {
-            trace!(target: TRACE_TARGET, ?_rlp_node, "Already RlpNode, pushing onto stack");
-            self.child_stack.push(child);
-            return Ok(());
-        }
 
         // Only commit immediately if retained for the proof. Otherwise, defer conversion
         // to pop_branch() to give DeferredEncoder time for async work.
@@ -538,6 +535,7 @@ where
         );
 
         // Collect children into RlpNode Vec. Children are in lexicographic order.
+        rlp_nodes_buf.reserve(num_children);
         for child in self.child_stack.drain(self.child_stack.len() - num_children..) {
             let child_rlp_node = match child {
                 ProofTrieBranchChild::RlpNode(rlp_node) => rlp_node,
@@ -557,7 +555,7 @@ where
 
         debug_assert_eq!(
             rlp_nodes_buf.len(),
-            branch.state_mask.count_ones() as usize,
+            num_children,
             "children length must match number of bits set in state_mask"
         );
 
@@ -623,7 +621,7 @@ where
                     // If the child stack is empty then this is the first leaf, push it and be done
                     self.child_stack
                         .push(ProofTrieBranchChild::Leaf { short_key: key, value: val });
-                    return Ok(());
+                    return Ok(())
                 }
                 None => {
                     // If the child stack is not empty then it must only have a single other child
@@ -637,7 +635,7 @@ where
                         .is_empty());
                     let (nibble, short_key) = self.push_new_branch(key);
                     self.push_new_leaf(targets, nibble, short_key, val)?;
-                    return Ok(());
+                    return Ok(())
                 }
             };
 
@@ -650,7 +648,7 @@ where
             // children. We can pop it and loop back to the top to try again with its parent branch.
             if common_prefix_len < self.branch_path.len() {
                 self.pop_branch(targets)?;
-                continue;
+                continue
             }
 
             // If the current branch is a prefix of the new key then the leaf is a child of the
@@ -669,7 +667,7 @@ where
                 self.push_new_leaf(targets, nibble, short_key, val)?;
             }
 
-            return Ok(());
+            return Ok(())
         }
     }
 
@@ -773,7 +771,7 @@ where
             self.branch_path = cached_path;
             self.branch_stack
                 .push(Self::new_from_cached_branch(cached_branch, cached_path.len() as u8));
-            return Ok(());
+            return Ok(())
         }
 
         // Get the nibble which should be set in the parent branch's `state_mask` for this new
@@ -923,7 +921,7 @@ where
         // If [`TrieCursorState::path`] returns None it means that the cursor has been
         // exhausted, so there can be no more cached data.
         let Some(mut trie_cursor_path) = trie_cursor_state.path() else {
-            return Ok(PopCachedBranchOutcome::Exhausted);
+            return Ok(PopCachedBranchOutcome::Exhausted)
         };
 
         // If the trie cursor is seeked to a branch whose leaves have already been processed
@@ -937,13 +935,13 @@ where
             if let Some(new_trie_cursor_path) = trie_cursor_state.path() {
                 trie_cursor_path = new_trie_cursor_path
             } else {
-                return Ok(PopCachedBranchOutcome::Exhausted);
+                return Ok(PopCachedBranchOutcome::Exhausted)
             };
         }
 
         // If the trie cursor has exceeded the sub-trie then we consider it to be exhausted.
         if !trie_cursor_path.starts_with(sub_trie_prefix) {
-            return Ok(PopCachedBranchOutcome::Exhausted);
+            return Ok(PopCachedBranchOutcome::Exhausted)
         }
 
         // At this point we can be sure that the cursor is in an `Available` state. We know for
@@ -1165,7 +1163,7 @@ where
                 // be the next possible prefix, if any.
                 uncalculated_lower_bound = cached_path.next_without_prefix();
 
-                continue;
+                continue
             }
 
             // Determine the next nibble of the branch which has not yet been constructed, and
@@ -1234,7 +1232,7 @@ where
                     // Push the current cached branch back onto the stack before looping.
                     self.cached_branch_stack.push((cached_path, cached_branch));
 
-                    continue;
+                    continue
                 }
             }
 
@@ -1480,7 +1478,7 @@ where
         // If there are no targets then nothing could be returned, return early.
         if targets.is_empty() {
             trace!(target: TRACE_TARGET, "Empty targets, returning");
-            return Ok(Vec::new());
+            return Ok(Vec::new())
         }
 
         // Initialize the variables which track the state of the two cursors. Both indicate the
@@ -1641,7 +1639,7 @@ where
                 path: Nibbles::default(),
                 node: TrieNodeV2::EmptyRoot,
                 masks: None,
-            }]);
+            }])
         }
 
         // Don't call `set_hashed_address` on the trie cursor until after the previous shortcut has
@@ -1669,7 +1667,7 @@ where
                 path: Nibbles::default(),
                 node: TrieNodeV2::EmptyRoot,
                 masks: None,
-            });
+            })
         }
 
         // Don't call `set_hashed_address` on the trie cursor until after the previous shortcut has

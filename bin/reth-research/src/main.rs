@@ -325,7 +325,7 @@ where
             access_list_storage_slots,
             authorization_list_num,
         )
-        .initial_total_gas
+        .initial_total_gas()
     }
 
     fn apply_signed_gas_delta(gas: u64, delta: i128) -> u64 {
@@ -1387,13 +1387,12 @@ where
                     let (_limit, reservoir) = init_gas.initial_gas_and_reservoir(
                         gas_limit,
                         revm::primitives::eip7825::TX_GAS_LIMIT_CAP,
-                        true,
                     );
                     (
-                        init_gas.initial_total_gas,
+                        init_gas.initial_total_gas(),
                         init_gas.initial_state_gas,
                         reservoir,
-                        native_init_gas.initial_total_gas,
+                        native_init_gas.initial_total_gas(),
                         native_init_gas.initial_state_gas,
                     )
                 } else {
@@ -1576,7 +1575,7 @@ where
                     let sched_success = result.result.is_success();
                     let mut sched_gas_used = result.result.tx_gas_used();
                     let mut sched_total_gas_spent = result.result.gas().total_gas_spent();
-                    let mut sched_state_gas_spent = result.result.gas().state_gas_spent();
+                    let mut sched_state_gas_spent = result.result.gas().state_gas_spent_final();
                     // Runtime state gas the tx attempted (survives OOG); raw —
                     // not intrinsic-normalized, since it's a sum of runtime
                     // record_state_cost charges, not the tx-start intrinsic.

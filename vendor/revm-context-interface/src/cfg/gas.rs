@@ -1,6 +1,6 @@
 //! Gas constants and functions for gas calculation.
 
-use crate::{cfg::GasParams, transaction::AccessListItemTr as _, Transaction, TransactionType};
+use crate::{cfg::GasParams, Transaction};
 use primitives::hardfork::SpecId;
 
 /// Tracker for gas during execution.
@@ -13,12 +13,15 @@ pub struct GasTracker {
     gas_limit: u64,
     /// Regular gas remaining (`gas_left`). Reservoir is tracked separately.
     remaining: u64,
-    /// State gas reservoir (gas exceeding TX_MAX_GAS_LIMIT). Starts as `execution_gas -
-    /// min(execution_gas, regular_gas_budget)`. When 0, all remaining gas is regular gas with
-    /// hard cap at `TX_MAX_GAS_LIMIT`.
+    /// State gas reservoir (gas exceeding TX_MAX_GAS_LIMIT). Starts as `execution_gas - min(execution_gas, regular_gas_budget)`.
+    /// When 0, all remaining gas is regular gas with hard cap at `TX_MAX_GAS_LIMIT`.
     reservoir: u64,
-    /// Total state gas spent so far.
-    state_gas_spent: u64,
+    /// Net state gas spent so far.
+    ///
+    /// Can be negative within a call frame when 0→x→0 storage restoration refills
+    /// more state gas than the frame itself has charged (the parent previously
+    /// charged the 0→x portion). The net is reconciled on frame return.
+    state_gas_spent: i64,
     /// Total state gas *attempted*, including charges that failed for lack of
     /// gas. Unlike `state_gas_spent` (which only counts charges that landed),
     /// this increments on every `record_state_cost` call, so it survives an
@@ -58,7 +61,7 @@ impl GasTracker {
 
     /// Sets the gas limit.
     #[inline]
-    pub fn set_limit(&mut self, val: u64) {
+    pub const fn set_limit(&mut self, val: u64) {
         self.gas_limit = val;
     }
 
@@ -70,7 +73,7 @@ impl GasTracker {
 
     /// Sets the remaining gas.
     #[inline]
-    pub fn set_remaining(&mut self, val: u64) {
+    pub const fn set_remaining(&mut self, val: u64) {
         self.remaining = val;
     }
 
@@ -82,14 +85,20 @@ impl GasTracker {
 
     /// Sets the reservoir gas.
     #[inline]
-    pub fn set_reservoir(&mut self, val: u64) {
+    pub const fn set_reservoir(&mut self, val: u64) {
         self.reservoir = val;
     }
 
     /// Returns the state gas spent.
     #[inline]
-    pub const fn state_gas_spent(&self) -> u64 {
+    pub const fn state_gas_spent(&self) -> i64 {
         self.state_gas_spent
+    }
+
+    /// Sets the state gas spent.
+    #[inline]
+    pub const fn set_state_gas_spent(&mut self, val: i64) {
+        self.state_gas_spent = val;
     }
 
     /// Total state gas attempted (including charges that OOG'd). Diagnostic.
@@ -100,21 +109,8 @@ impl GasTracker {
 
     /// Sets the total state gas attempted. Used to propagate from child frames.
     #[inline]
-    pub fn set_state_gas_demanded(&mut self, val: u64) {
+    pub const fn set_state_gas_demanded(&mut self, val: u64) {
         self.state_gas_demanded = val;
-    }
-
-    /// Sets the state gas spent.
-    #[inline]
-    pub fn set_state_gas_spent(&mut self, val: u64) {
-        self.state_gas_spent = val;
-    }
-
-    /// Refills state gas to the reservoir and reduces tracked state gas spent.
-    #[inline]
-    pub fn refill_state_gas(&mut self, amount: u64) {
-        self.reservoir = self.reservoir.saturating_add(amount);
-        self.state_gas_spent = self.state_gas_spent.saturating_sub(amount);
     }
 
     /// Returns the refunded gas.
@@ -125,7 +121,7 @@ impl GasTracker {
 
     /// Sets the refunded gas.
     #[inline]
-    pub fn set_refunded(&mut self, val: i64) {
+    pub const fn set_refunded(&mut self, val: i64) {
         self.refunded = val;
     }
 
@@ -134,7 +130,7 @@ impl GasTracker {
     /// Deducts from `remaining`. Returns `false` if insufficient gas.
     #[inline]
     #[must_use = "In case of not enough gas, the interpreter should halt with an out-of-gas error"]
-    pub fn record_regular_cost(&mut self, cost: u64) -> bool {
+    pub const fn record_regular_cost(&mut self, cost: u64) -> bool {
         if let Some(new_remaining) = self.remaining.checked_sub(cost) {
             self.remaining = new_remaining;
             return true;
@@ -151,13 +147,13 @@ impl GasTracker {
     /// Returns `false` if total remaining gas is insufficient.
     #[inline]
     #[must_use = "In case of not enough gas, the interpreter should halt with an out-of-gas error"]
-    pub fn record_state_cost(&mut self, cost: u64) -> bool {
+    pub const fn record_state_cost(&mut self, cost: u64) -> bool {
         // Count the attempt regardless of whether it can be afforded, so an
         // OOG at a state op still reports the gas it needed. Diagnostic only —
         // does not affect the affordability decision below.
         self.state_gas_demanded = self.state_gas_demanded.saturating_add(cost);
         if self.reservoir >= cost {
-            self.state_gas_spent = self.state_gas_spent.saturating_add(cost);
+            self.state_gas_spent = self.state_gas_spent.saturating_add(cost as i64);
             self.reservoir -= cost;
             return true;
         }
@@ -166,27 +162,44 @@ impl GasTracker {
 
         let success = self.record_regular_cost(spill);
         if success {
-            self.state_gas_spent = self.state_gas_spent.saturating_add(cost);
+            self.state_gas_spent = self.state_gas_spent.saturating_add(cost as i64);
             self.reservoir = 0;
         }
         success
     }
 
+    /// Refills the reservoir with state gas that is returned by 0→x→0 storage
+    /// restoration (EIP-8037 issue #2).
+    ///
+    /// Per the spec, when a storage slot is restored to its original zero value
+    /// within the same transaction, the state gas charged for the initial 0→x
+    /// transition is directly restored to the reservoir rather than routed
+    /// through the capped refund counter.
+    ///
+    /// `state_gas_spent` is decremented by the same amount and may become
+    /// negative if the matching 0→x charge was made by a parent frame. The
+    /// parent's total is reconciled on frame return.
+    #[inline]
+    pub const fn refill_reservoir(&mut self, amount: u64) {
+        self.reservoir = self.reservoir.saturating_add(amount);
+        self.state_gas_spent = self.state_gas_spent.saturating_sub(amount as i64);
+    }
+
     /// Records a refund value.
     #[inline]
-    pub fn record_refund(&mut self, refund: i64) {
+    pub const fn record_refund(&mut self, refund: i64) {
         self.refunded += refund;
     }
 
     /// Erases a gas cost from remaining (returns gas from child frame).
     #[inline]
-    pub fn erase_cost(&mut self, returned: u64) {
+    pub const fn erase_cost(&mut self, returned: u64) {
         self.remaining += returned;
     }
 
     /// Spends all remaining gas excluding the reservoir.
     #[inline]
-    pub fn spend_all(&mut self) {
+    pub const fn spend_all(&mut self) {
         self.remaining = 0;
     }
 }
@@ -265,7 +278,7 @@ pub const NON_ZERO_BYTE_DATA_COST_ISTANBUL: u64 = 16;
 /// The multiplier for a non zero byte in calldata adjusted by [EIP-2028](https://eips.ethereum.org/EIPS/eip-2028).
 pub const NON_ZERO_BYTE_MULTIPLIER_ISTANBUL: u64 =
     NON_ZERO_BYTE_DATA_COST_ISTANBUL / STANDARD_TOKEN_COST;
-/// The cost floor per token as defined by EIP-2028.
+/// The cost floor per token as defined by [EIP-7623](https://eips.ethereum.org/EIPS/eip-7623).
 pub const TOTAL_COST_FLOOR_PER_TOKEN: u64 = 10;
 
 /// Gas cost for EOF CREATE instruction.
@@ -299,41 +312,55 @@ pub const CALL_STIPEND: u64 = 2300;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct InitialAndFloorGas {
-    /// Initial gas for transaction.
-    pub initial_total_gas: u64,
-    /// State gas component of initial_gas (subset of initial_total_gas).
+    /// Regular (non-state) portion of the initial intrinsic gas.
+    ///
+    /// Under EIP-8037, this is the part constrained by `TX_MAX_GAS_LIMIT`;
+    /// state gas uses its own reservoir and is not subject to that cap.
+    pub initial_regular_gas: u64,
+    /// State gas component of the initial intrinsic gas.
     /// Under EIP-8037, this includes:
     /// - EIP-7702 auth list state gas (per-auth account creation + metadata costs)
     /// - For CREATE transactions: `create_state_gas` (account creation + contract metadata)
     /// - For CALL transactions: 0 (state gas is unpredictable at validation time)
     pub initial_state_gas: u64,
+    /// EIP-7702 refund for existing authorities.
+    /// This is the refund given when an authorization is applied to an already existing account.
+    pub state_refund: u64,
     /// If transaction is a Call and Prague is enabled
     /// floor_gas is at least amount of gas that is going to be spent.
     pub floor_gas: u64,
-    /// EIP-7702 state gas refund for existing authorities.
-    /// Added to the reservoir after initial_state_gas is deducted.
-    /// In the Python spec, set_delegation adds this back to state_gas_reservoir
-    /// rather than reducing initial_state_gas, so the refunded gas stays as
-    /// reservoir gas (not regular gas).
-    pub eip7702_reservoir_refund: u64,
 }
 
 impl InitialAndFloorGas {
+    /***** Constructors *****/
+
     /// Create a new InitialAndFloorGas instance.
     #[inline]
-    pub const fn new(initial_total_gas: u64, floor_gas: u64) -> Self {
-        Self { initial_total_gas, initial_state_gas: 0, floor_gas, eip7702_reservoir_refund: 0 }
+    pub const fn new(initial_regular_gas: u64, floor_gas: u64) -> Self {
+        Self {
+            initial_regular_gas,
+            initial_state_gas: 0,
+            state_refund: 0,
+            floor_gas,
+        }
     }
 
     /// Create a new InitialAndFloorGas instance with state gas tracking.
     #[inline]
     pub const fn new_with_state_gas(
-        initial_total_gas: u64,
+        initial_regular_gas: u64,
         initial_state_gas: u64,
         floor_gas: u64,
     ) -> Self {
-        Self { initial_total_gas, initial_state_gas, floor_gas, eip7702_reservoir_refund: 0 }
+        Self {
+            initial_regular_gas,
+            initial_state_gas,
+            state_refund: 0,
+            floor_gas,
+        }
     }
+
+    /***** Simple getters *****/
 
     /// Regular (non-state) portion of the initial intrinsic gas.
     ///
@@ -341,7 +368,69 @@ impl InitialAndFloorGas {
     /// state gas uses its own reservoir and is not subject to that cap.
     #[inline]
     pub const fn initial_regular_gas(&self) -> u64 {
-        self.initial_total_gas - self.initial_state_gas
+        self.initial_regular_gas
+    }
+
+    /// State gas component of the initial intrinsic gas.
+    /// This is the state gas component of the initial intrinsic gas minus the EIP-7702 refund.
+    #[inline]
+    pub const fn initial_state_gas_final(&self) -> u64 {
+        self.initial_state_gas - self.state_refund
+    }
+
+    /// EIP-7623 floor gas.
+    #[inline]
+    pub const fn floor_gas(&self) -> u64 {
+        self.floor_gas
+    }
+
+    /// Total initial intrinsic gas: `initial_regular_gas + initial_state_gas`.
+    #[inline]
+    pub const fn initial_total_gas(&self) -> u64 {
+        self.initial_regular_gas + self.initial_state_gas_final()
+    }
+
+    /***** Simple setters *****/
+
+    /// Sets the `initial_regular_gas` field by mutable reference.
+    #[inline]
+    pub const fn set_initial_regular_gas(&mut self, initial_regular_gas: u64) {
+        self.initial_regular_gas = initial_regular_gas;
+    }
+
+    /// Sets the `initial_state_gas` field by mutable reference.
+    #[inline]
+    pub const fn set_initial_state_gas(&mut self, initial_state_gas: u64) {
+        self.initial_state_gas = initial_state_gas;
+    }
+
+    /// Sets the `floor_gas` field by mutable reference.
+    #[inline]
+    pub const fn set_floor_gas(&mut self, floor_gas: u64) {
+        self.floor_gas = floor_gas;
+    }
+
+    /***** Builder with_* methods *****/
+
+    /// Sets the `initial_regular_gas` field.
+    #[inline]
+    pub const fn with_initial_regular_gas(mut self, initial_regular_gas: u64) -> Self {
+        self.initial_regular_gas = initial_regular_gas;
+        self
+    }
+
+    /// Sets the `initial_state_gas` field.
+    #[inline]
+    pub const fn with_initial_state_gas(mut self, initial_state_gas: u64) -> Self {
+        self.initial_state_gas = initial_state_gas;
+        self
+    }
+
+    /// Sets the `floor_gas` field.
+    #[inline]
+    pub const fn with_floor_gas(mut self, floor_gas: u64) -> Self {
+        self.floor_gas = floor_gas;
+        self
     }
 
     /// Computes the regular gas budget and reservoir for the initial call frame.
@@ -362,42 +451,36 @@ impl InitialAndFloorGas {
         &self,
         tx_gas_limit: u64,
         tx_gas_limit_cap: u64,
-        is_eip8037: bool,
     ) -> (u64, u64) {
         let execution_gas = tx_gas_limit - self.initial_regular_gas();
 
         // System calls pass InitialAndFloorGas with all zeros and should not be
         // subject to the TX_MAX_GAS_LIMIT cap.
-        let regular_gas_cap = if self.initial_total_gas == 0 {
+        let tx_gas_limit_cap = if self.initial_total_gas() == 0 {
             u64::MAX
-        } else if is_eip8037 {
-            tx_gas_limit_cap.saturating_sub(self.initial_regular_gas())
         } else {
             tx_gas_limit_cap
         };
 
-        let mut gas_limit = core::cmp::min(execution_gas, regular_gas_cap);
-        let mut reservoir = execution_gas - gas_limit;
+        let mut regular_gas_limit = core::cmp::min(tx_gas_limit, tx_gas_limit_cap)
+            .saturating_sub(self.initial_regular_gas());
+        let mut reservoir = execution_gas - regular_gas_limit;
 
         // Deduct initial state gas from the reservoir. When the reservoir is
         // insufficient, the deficit is charged from the regular gas budget.
-        if self.initial_state_gas > 0 {
-            if reservoir >= self.initial_state_gas {
-                reservoir -= self.initial_state_gas;
-            } else {
-                gas_limit -= self.initial_state_gas - reservoir;
-                reservoir = 0;
-            }
+        if reservoir >= self.initial_state_gas {
+            reservoir -= self.initial_state_gas;
+        } else {
+            regular_gas_limit -= self.initial_state_gas - reservoir;
+            reservoir = 0;
         }
 
         // EIP-7702 state gas refund for existing authorities goes directly to
         // the reservoir. In the Python spec, set_delegation adds this refund to
         // state_gas_reservoir so it stays as state gas (not regular gas).
-        if self.eip7702_reservoir_refund > 0 {
-            reservoir += self.eip7702_reservoir_refund;
-        }
+        reservoir += self.state_refund;
 
-        (gas_limit, reservoir)
+        (regular_gas_limit, reservoir)
     }
 }
 
@@ -416,28 +499,7 @@ pub fn calculate_initial_tx_gas(
     access_list_storages: u64,
     authorization_list_num: u64,
 ) -> InitialAndFloorGas {
-    calculate_initial_tx_gas_with_gas_params(
-        &GasParams::new_spec(spec_id),
-        input,
-        is_create,
-        access_list_accounts,
-        access_list_storages,
-        authorization_list_num,
-    )
-}
-
-/// Initial gas that is deducted for transaction to be included, using the provided gas params.
-///
-/// This is required by forks that override the spec gas table through [`crate::Cfg::gas_params`].
-pub fn calculate_initial_tx_gas_with_gas_params(
-    gas_params: &GasParams,
-    input: &[u8],
-    is_create: bool,
-    access_list_accounts: u64,
-    access_list_storages: u64,
-    authorization_list_num: u64,
-) -> InitialAndFloorGas {
-    gas_params.initial_tx_gas(
+    GasParams::new_spec(spec_id).initial_tx_gas(
         input,
         is_create,
         access_list_accounts,
@@ -454,39 +516,7 @@ pub fn calculate_initial_tx_gas_with_gas_params(
 /// - Intrinsic gas
 /// - Number of tokens in calldata
 pub fn calculate_initial_tx_gas_for_tx(tx: impl Transaction, spec: SpecId) -> InitialAndFloorGas {
-    calculate_initial_tx_gas_for_tx_with_gas_params(&tx, &GasParams::new_spec(spec))
-}
-
-/// Initial gas that is deducted for transaction to be included, using the provided gas params.
-pub fn calculate_initial_tx_gas_for_tx_with_gas_params(
-    tx: impl Transaction,
-    gas_params: &GasParams,
-) -> InitialAndFloorGas {
-    let mut accounts = 0;
-    let mut storages = 0;
-    // legacy is only tx type that does not have access list.
-    if tx.tx_type() != TransactionType::Legacy {
-        (accounts, storages) = tx
-            .access_list()
-            .map(|al| {
-                al.fold((0, 0), |(mut num_accounts, mut num_storage_slots), item| {
-                    num_accounts += 1;
-                    num_storage_slots += item.storage_slots().count();
-
-                    (num_accounts, num_storage_slots)
-                })
-            })
-            .unwrap_or_default();
-    }
-
-    calculate_initial_tx_gas_with_gas_params(
-        gas_params,
-        tx.input(),
-        tx.kind().is_create(),
-        accounts as u64,
-        storages as u64,
-        tx.authorization_list_len() as u64,
-    )
+    GasParams::new_spec(spec).initial_tx_gas_for_tx(tx)
 }
 
 /// Retrieve the total number of tokens in calldata.

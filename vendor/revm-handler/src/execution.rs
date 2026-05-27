@@ -25,9 +25,15 @@ pub fn create_init_frame<CTX: ContextTr>(
                 account.code.as_ref().and_then(Bytecode::eip7702_address)
             {
                 let account = &journal.load_account_with_code(delegated_address)?.info;
-                (account.code_hash(), account.code.clone().unwrap_or_default())
+                (
+                    account.code_hash(),
+                    account.code.clone().unwrap_or_default(),
+                )
             } else {
-                (account.code_hash(), account.code.clone().unwrap_or_default())
+                (
+                    account.code_hash(),
+                    account.code.clone().unwrap_or_default(),
+                )
             };
             Ok(FrameInput::Call(Box::new(CallInputs {
                 input: CallInput::Bytes(input),
@@ -41,7 +47,7 @@ pub fn create_init_frame<CTX: ContextTr>(
                 is_static: false,
                 return_memory_offset: 0..0,
                 reservoir,
-                refundable_state_gas: 0,
+                charged_new_account_state_gas: false,
             })))
         }
         TxKind::Create => Ok(FrameInput::Create(Box::new(CreateInputs::new(

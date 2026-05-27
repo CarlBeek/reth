@@ -109,35 +109,25 @@ fn apply_pr11616_overrides(params: &mut GasParams) {
     let bytes_account = Eip8037Constants::STATE_BYTES_PER_NEW_ACCOUNT;
     let bytes_auth = Eip8037Constants::STATE_BYTES_PER_AUTH_BASE;
 
-    // Per-opcode state-gas figures. revm reads these via
-    // `GasParams::{sstore_set_state_gas,new_account_state_gas,
-    // create_state_gas,code_deposit_state_gas}` during execution.
+    // Per-opcode state-gas figures, overlaid on revm's Amsterdam table. revm 40
+    // splits the EIP-7702 authorization state gas into a per-account portion
+    // (`new_account_state_gas`) and a per-bytecode portion
+    // (`tx_eip7702_state_gas_bytecode` = the 23-byte delegation designator);
+    // `GasParams::initial_tx_gas` recombines them. The regular-gas slots
+    // (`tx_eip7702_per_empty_account_cost` = 7500, `sstore_set_refund`,
+    // `tx_eip7702_auth_refund` = 0) are left at revm's native Amsterdam values,
+    // which already equal the PR-11616 numbers, so only the state-gas entries
+    // need overriding.
     let storage_set_state = bytes_storage * cpsb;
     let new_account_state = bytes_account * cpsb;
-
-    // SSTORE 0 -> nonzero refund. revm models this as
-    //   sstore_set_state_gas + 2800
-    // (the 2800 here is the regular-gas portion that drops when the
-    //  slot is reset; not a number the PR changes).
-    let sstore_set_refund = storage_set_state + 2_800;
-
-    // EIP-7702 authorization bundles regular + state into one entry on
-    // revm's table. We reconstruct it the same way revm does so the
-    // intrinsic-gas split (regular vs state) stays correct.
-    let auth_total_cost =
-        Eip8037Constants::REGULAR_PER_AUTH_BASE_COST + (bytes_account + bytes_auth) * cpsb;
-    let auth_state_gas = (bytes_account + bytes_auth) * cpsb;
-    let auth_refund = bytes_account * cpsb;
+    let auth_bytecode_state = bytes_auth * cpsb;
 
     params.override_gas([
         (GasId::sstore_set_state_gas(), storage_set_state),
         (GasId::new_account_state_gas(), new_account_state),
         (GasId::create_state_gas(), new_account_state),
         (GasId::code_deposit_state_gas(), cpsb),
-        (GasId::sstore_set_refund(), sstore_set_refund),
-        (GasId::tx_eip7702_per_empty_account_cost(), auth_total_cost),
-        (GasId::tx_eip7702_per_auth_state_gas(), auth_state_gas),
-        (GasId::tx_eip7702_auth_refund(), auth_refund),
+        (GasId::tx_eip7702_state_gas_bytecode(), auth_bytecode_state),
     ]);
 }
 
@@ -206,7 +196,7 @@ impl GasSchedule for Eip8037Schedule {
         // top-level helper `calculate_initial_tx_gas` allocates its own
         // GasParams from the spec — no hook for overrides — so we walk
         // the per-instance path instead.
-        Some(pr11616_initial_and_floor_gas(ctx).initial_total_gas)
+        Some(pr11616_initial_and_floor_gas(ctx).initial_total_gas())
     }
 
     fn initial_and_floor_gas(&self, ctx: &TxContext) -> Option<InitialAndFloorGas> {
