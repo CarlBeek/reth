@@ -374,9 +374,14 @@ pub trait Handler {
         let refunded = gas.refunded();
         let reservoir = gas.reservoir();
         let state_gas_spent = gas.state_gas_spent();
+        // Diagnostic (EIP-8037): preserve the demanded tally across the rebuild
+        // below. Unlike state_gas_spent it's restored unconditionally — it
+        // records what state ops *attempted*, regardless of success/revert.
+        let state_gas_demanded = gas.state_gas_demanded();
 
         // Spend the gas limit. Gas is reimbursed when the tx returns successfully.
         *gas = Gas::new_spent(evm.ctx().tx().gas_limit());
+        gas.set_state_gas_demanded(state_gas_demanded);
 
         if instruction_result.is_ok_or_revert() {
             // Return unused regular gas. Reservoir is handled separately via state_gas_spent.
