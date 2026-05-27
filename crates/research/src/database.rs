@@ -67,7 +67,10 @@ use thiserror::Error;
 /// - v7: added `divergence_call_frames.deployed_bytecode_len` (NULL except on successful
 ///   CREATE/CREATE2 frames) so the EIP-8037 dashboard can plot true deployed-code size for the
 ///   deployment-ceiling chart instead of approximating from baseline gas.
-pub const SCHEMA_VERSION: u32 = 7;
+/// - v8: added `divergences.schedule_state_gas_demanded` — state gas the tx attempted, including a
+///   charge that OOG'd (so it's nonzero even when `schedule_state_gas_spent` is 0 because the state
+///   op ran out of gas). Lets the dashboard show "this op needed N state gas" instead of 0.
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Errors raised by the storage layer.
 #[derive(Debug, Error)]
@@ -365,6 +368,7 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             oog_bottleneck_kind    TEXT,
 
             schedule_state_gas_spent    INTEGER,
+            schedule_state_gas_demanded INTEGER,
             schedule_initial_state_gas  INTEGER,
             schedule_initial_reservoir  INTEGER,
             runtime_state_gas           INTEGER,
@@ -715,6 +719,9 @@ pub struct DivergenceRow {
     pub oog_bottleneck_kind: Option<String>,
 
     pub schedule_state_gas_spent: Option<u64>,
+    /// State gas the tx *attempted* (incl. a charge that OOG'd). Nonzero even
+    /// when `schedule_state_gas_spent` is 0 because the state op ran out of gas.
+    pub schedule_state_gas_demanded: Option<u64>,
     pub schedule_initial_state_gas: Option<u64>,
     pub schedule_initial_reservoir: Option<u64>,
     pub runtime_state_gas: Option<u64>,
@@ -1289,7 +1296,8 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             divergence_contract, divergence_pc, divergence_call_depth, divergence_opcode,
             oog_contract, oog_pc, oog_call_depth, oog_opcode, oog_pattern, oog_gas_remaining,
             oog_chain_proportional, oog_bottleneck_depth, oog_bottleneck_kind,
-            schedule_state_gas_spent, schedule_initial_state_gas, schedule_initial_reservoir,
+            schedule_state_gas_spent, schedule_state_gas_demanded,
+            schedule_initial_state_gas, schedule_initial_reservoir,
             runtime_state_gas, runtime_state_gas_spillover,
             state_gas_category, reservoir_exhausted,
             replay_halt_oog
@@ -1303,7 +1311,7 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
                   ?, ?,
                   ?, ?, ?, ?,
                   ?, ?, ?, ?, ?, ?,
-                  ?, ?, ?,
+                  ?, ?, ?, ?,
                   ?, ?, ?, ?, ?, ?, ?,
                   ?)",
         params![
@@ -1349,6 +1357,7 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             row.oog_bottleneck_depth,
             row.oog_bottleneck_kind,
             row.schedule_state_gas_spent.map(|v| v as i64),
+            row.schedule_state_gas_demanded.map(|v| v as i64),
             row.schedule_initial_state_gas.map(|v| v as i64),
             row.schedule_initial_reservoir.map(|v| v as i64),
             row.runtime_state_gas.map(|v| v as i64),
@@ -1654,6 +1663,7 @@ mod tests {
             oog_bottleneck_depth: None,
             oog_bottleneck_kind: None,
             schedule_state_gas_spent: None,
+            schedule_state_gas_demanded: None,
             schedule_initial_state_gas: None,
             schedule_initial_reservoir: None,
             runtime_state_gas: None,

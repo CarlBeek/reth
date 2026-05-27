@@ -1266,6 +1266,10 @@ where
                 gas_used: u64,
                 total_gas_spent: u64,
                 state_gas_spent: u64,
+                /// State gas the tx *attempted* across all frames, including a
+                /// charge that OOG'd (so it's nonzero even when state_gas_spent
+                /// is 0 because the state op ran out of gas). Diagnostic.
+                state_gas_demanded: u64,
                 initial_state_gas: u64,
                 initial_reservoir: u64,
                 floor_gas: u64,
@@ -1542,6 +1546,7 @@ where
                                 gas_used: gas_limit,
                                 total_gas_spent: 0,
                                 state_gas_spent: 0,
+                                state_gas_demanded: 0,
                                 initial_state_gas: schedule_initial_state_gas,
                                 initial_reservoir: schedule_initial_reservoir,
                                 floor_gas: 0,
@@ -1572,6 +1577,10 @@ where
                     let mut sched_gas_used = result.result.tx_gas_used();
                     let mut sched_total_gas_spent = result.result.gas().total_gas_spent();
                     let mut sched_state_gas_spent = result.result.gas().state_gas_spent();
+                    // Runtime state gas the tx attempted (survives OOG); raw —
+                    // not intrinsic-normalized, since it's a sum of runtime
+                    // record_state_cost charges, not the tx-start intrinsic.
+                    let sched_state_gas_demanded = result.result.gas().state_gas_demanded();
                     if uses_schedule_eip8037 {
                         // revm reports totals with its built-in Amsterdam
                         // intrinsic state-gas component. Normalize the
@@ -1655,6 +1664,7 @@ where
                         gas_used: sched_gas_used,
                         total_gas_spent: sched_total_gas_spent,
                         state_gas_spent: sched_state_gas_spent,
+                        state_gas_demanded: sched_state_gas_demanded,
                         initial_state_gas: schedule_initial_state_gas,
                         initial_reservoir: schedule_initial_reservoir,
                         floor_gas: sched_floor_gas,
@@ -1812,6 +1822,7 @@ where
                     schedule_replay_success,
                     schedule_total_gas_spent,
                     schedule_state_gas_spent,
+                    schedule_state_gas_demanded,
                     schedule_initial_state_gas,
                     schedule_initial_reservoir,
                     schedule_floor_gas,
@@ -1871,6 +1882,7 @@ where
                             r.success,
                             r.total_gas_spent,
                             r.state_gas_spent,
+                            r.state_gas_demanded,
                             r.initial_state_gas,
                             r.initial_reservoir,
                             r.floor_gas,
@@ -1919,6 +1931,7 @@ where
                             normal_success,
                             0,
                             0,
+                            0, // schedule_state_gas_demanded (no schedule run)
                             0,
                             0,
                             0,
@@ -2106,6 +2119,7 @@ where
                             oog_bottleneck_depth: oog_bottleneck_depth.map(|d| d as i32),
                             oog_bottleneck_kind: oog_bottleneck_kind.clone(),
                             schedule_state_gas_spent: Some(schedule_state_gas_spent),
+                            schedule_state_gas_demanded: Some(schedule_state_gas_demanded),
                             schedule_initial_state_gas: Some(schedule_initial_state_gas),
                             schedule_initial_reservoir: Some(schedule_initial_reservoir),
                             // Derived 8037 figures, mirroring what

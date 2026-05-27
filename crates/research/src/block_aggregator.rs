@@ -662,6 +662,7 @@ mod tests {
                 oog_bottleneck_depth: None,
                 oog_bottleneck_kind: None,
                 schedule_state_gas_spent: None,
+                schedule_state_gas_demanded: None,
                 schedule_initial_state_gas: None,
                 schedule_initial_reservoir: None,
                 runtime_state_gas: None,

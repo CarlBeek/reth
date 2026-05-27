@@ -79,6 +79,11 @@ pub struct ResultGas {
     /// Zero when state gas is not enabled.
     #[cfg_attr(feature = "serde", serde(default))]
     state_gas_spent: u64,
+    /// State gas the tx *attempted*, including a charge that ran out of gas
+    /// (EIP-8037, diagnostic only). Unlike `state_gas_spent`, this is nonzero
+    /// even when a state-creating op OOG'd before its charge could land.
+    #[cfg_attr(feature = "serde", serde(default))]
+    state_gas_demanded: u64,
     /// Gas refund amount (capped per EIP-3529).
     ///
     /// Note: This is the raw refund before EIP-7623 floor gas adjustment.
@@ -104,6 +109,7 @@ impl ResultGas {
             refunded,
             floor_gas,
             state_gas_spent: 0,
+            state_gas_demanded: 0,
         }
     }
 
@@ -120,6 +126,7 @@ impl ResultGas {
             refunded,
             floor_gas,
             state_gas_spent,
+            state_gas_demanded: 0,
         }
     }
 
@@ -139,6 +146,19 @@ impl ResultGas {
     #[inline]
     pub const fn state_gas_spent(&self) -> u64 {
         self.state_gas_spent
+    }
+
+    /// Returns the state gas the tx *attempted* (incl. a charge that OOG'd).
+    /// Diagnostic only; see the field docs.
+    #[inline]
+    pub const fn state_gas_demanded(&self) -> u64 {
+        self.state_gas_demanded
+    }
+
+    /// Sets the `state_gas_demanded` field.
+    #[inline]
+    pub fn set_state_gas_demanded(&mut self, val: u64) {
+        self.state_gas_demanded = val;
     }
 
     /// Returns the EIP-7623 floor gas.
@@ -233,6 +253,13 @@ impl ResultGas {
     #[inline]
     pub const fn with_state_gas_spent(mut self, state_gas_spent: u64) -> Self {
         self.state_gas_spent = state_gas_spent;
+        self
+    }
+
+    /// Sets the `state_gas_demanded` field.
+    #[inline]
+    pub const fn with_state_gas_demanded(mut self, state_gas_demanded: u64) -> Self {
+        self.state_gas_demanded = state_gas_demanded;
         self
     }
 

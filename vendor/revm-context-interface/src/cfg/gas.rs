@@ -19,6 +19,13 @@ pub struct GasTracker {
     reservoir: u64,
     /// Total state gas spent so far.
     state_gas_spent: u64,
+    /// Total state gas *attempted*, including charges that failed for lack of
+    /// gas. Unlike `state_gas_spent` (which only counts charges that landed),
+    /// this increments on every `record_state_cost` call, so it survives an
+    /// out-of-gas at a state-creating op. Lets downstream tooling report "this
+    /// op needed N state gas" instead of a misleading 0 when the op OOG'd.
+    /// Not a consensus value — diagnostic only.
+    state_gas_demanded: u64,
     /// Refunded gas. Used to refund the gas to the caller at the end of execution.
     refunded: i64,
 }
@@ -27,7 +34,14 @@ impl GasTracker {
     /// Creates a new `GasTracker` with the given remaining gas and reservoir.
     #[inline]
     pub const fn new(gas_limit: u64, remaining: u64, reservoir: u64) -> Self {
-        Self { gas_limit, remaining, reservoir, state_gas_spent: 0, refunded: 0 }
+        Self {
+            gas_limit,
+            remaining,
+            reservoir,
+            state_gas_spent: 0,
+            state_gas_demanded: 0,
+            refunded: 0,
+        }
     }
 
     /// Creates a new `GasTracker` with the given used gas and reservoir.
@@ -78,6 +92,18 @@ impl GasTracker {
         self.state_gas_spent
     }
 
+    /// Total state gas attempted (including charges that OOG'd). Diagnostic.
+    #[inline]
+    pub const fn state_gas_demanded(&self) -> u64 {
+        self.state_gas_demanded
+    }
+
+    /// Sets the total state gas attempted. Used to propagate from child frames.
+    #[inline]
+    pub fn set_state_gas_demanded(&mut self, val: u64) {
+        self.state_gas_demanded = val;
+    }
+
     /// Sets the state gas spent.
     #[inline]
     pub fn set_state_gas_spent(&mut self, val: u64) {
@@ -126,6 +152,10 @@ impl GasTracker {
     #[inline]
     #[must_use = "In case of not enough gas, the interpreter should halt with an out-of-gas error"]
     pub fn record_state_cost(&mut self, cost: u64) -> bool {
+        // Count the attempt regardless of whether it can be afforded, so an
+        // OOG at a state op still reports the gas it needed. Diagnostic only —
+        // does not affect the affordability decision below.
+        self.state_gas_demanded = self.state_gas_demanded.saturating_add(cost);
         if self.reservoir >= cost {
             self.state_gas_spent = self.state_gas_spent.saturating_add(cost);
             self.reservoir -= cost;

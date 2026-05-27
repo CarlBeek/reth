@@ -547,6 +547,14 @@ pub fn handle_reservoir_remaining_gas(
     result: InstructionResult,
     refundable_state_gas: u64,
 ) {
+    // Diagnostic (not consensus): demanded state gas always bubbles up,
+    // regardless of success/revert, so the top-level gas reflects what every
+    // frame *attempted* — including a frame that OOG'd at a state op and whose
+    // state_gas_spent therefore stayed 0. Child frames start demanded at 0, so
+    // adding (not overwriting) preserves the parent's own prior attempts.
+    parent_gas
+        .set_state_gas_demanded(parent_gas.state_gas_demanded() + child_gas.state_gas_demanded());
+
     if result.is_ok() {
         // On success: parent takes the child's final reservoir.
         parent_gas.set_reservoir(child_gas.reservoir());

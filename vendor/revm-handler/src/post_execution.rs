@@ -24,6 +24,7 @@ pub fn build_result_gas(gas: &Gas, init_and_floor_gas: InitialAndFloorGas) -> Re
         .with_refunded(gas.refunded() as u64)
         .with_floor_gas(init_and_floor_gas.floor_gas)
         .with_state_gas_spent(state_gas)
+        .with_state_gas_demanded(gas.state_gas_demanded())
 }
 
 /// Ensures minimum gas floor is spent according to EIP-7623.

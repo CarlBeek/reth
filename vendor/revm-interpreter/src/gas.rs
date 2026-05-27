@@ -150,6 +150,19 @@ impl Gas {
         self.tracker.set_state_gas_spent(val);
     }
 
+    /// Returns total state gas *attempted* (including charges that OOG'd).
+    /// Diagnostic only; see [`GasTracker::state_gas_demanded`].
+    #[inline]
+    pub const fn state_gas_demanded(&self) -> u64 {
+        self.tracker.state_gas_demanded()
+    }
+
+    /// Sets the total state gas attempted (used when propagating from child frame).
+    #[inline]
+    pub fn set_state_gas_demanded(&mut self, val: u64) {
+        self.tracker.set_state_gas_demanded(val);
+    }
+
     /// Refills state gas back to the reservoir.
     #[inline]
     pub fn refill_state_gas(&mut self, amount: u64) {
