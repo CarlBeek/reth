@@ -200,6 +200,7 @@ pub mod external_labels;
 pub mod multi_schedule_inspector;
 pub mod oog_chain;
 pub mod schedule;
+pub mod step_trace;
 pub mod tracking_inspector;
 
 pub use cli::{CliError, NamedCsvSchedule, NamedMultiplierSchedule, ResearchArgs};

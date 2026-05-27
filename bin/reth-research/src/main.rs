@@ -45,6 +45,7 @@ use reth_research::{
     },
     oog_chain::classify_oog_chain,
     schedule::{GasSchedule, RecipientInfo, ScheduleKind, ScheduleRegistry, TxContext},
+    step_trace::{first_divergence, StepTraceInspector},
     ScheduleInspector, TrackingInspector,
 };
 use reth_revm::{database::StateProviderDatabase, db::State, Database, DatabaseCommit};
@@ -1312,6 +1313,14 @@ where
             let mut schedule_results: Vec<PerScheduleResult> =
                 Vec::with_capacity(self.execution_schedules.len());
 
+            // Baseline step trace for the trace-diff divergence fallback,
+            // computed lazily at most once per tx and reused across schedules.
+            // Outer Option = "have we tried"; inner = "usable trace or not"
+            // (None when the baseline replay errored or the trace truncated).
+            let mut baseline_step_trace: Option<
+                Option<Vec<reth_research::step_trace::StepRecord>>,
+            > = None;
+
             // Each schedule executes against the pre-tx state (normal_db before
             // baseline commit) so that re-execution sees exactly the same state
             // the baseline saw. We do NOT commit schedule results — each
@@ -1403,6 +1412,11 @@ where
                 // behavior.
                 let mut accepted: Option<PerScheduleResult> = None;
                 let mut last_attempt: Option<PerScheduleResult> = None;
+                // Tier-1 (mainnet-equivalent) env + tx, stashed for the
+                // trace-diff divergence fallback so it can reproduce the
+                // failure at the original gas limit without rebuilding the
+                // schedule env setup.
+                let mut tier1_envs: Option<(_, _)> = None;
                 for &tier in &self.gas_limit_multipliers {
                     let schedule_execution_gas_limit = gas_limit.saturating_mul(tier);
 
@@ -1473,6 +1487,12 @@ where
                                 sched_tx_env.set_gas_limit(adjusted);
                             }
                         }
+                    }
+
+                    // Stash the first tier's env (the mainnet-equivalent run)
+                    // for the trace-diff fallback before the EVM consumes it.
+                    if tier1_envs.is_none() {
+                        tier1_envs = Some((tier_evm_env.clone(), sched_tx_env.clone()));
                     }
 
                     let mut inspector = ScheduleInspector::new(schedule.clone());
@@ -1682,8 +1702,70 @@ where
                 // At least one tier always runs (constructor enforces non-empty),
                 // so unwrapping is safe. Successful sweep wins; otherwise we
                 // keep the highest-tier failure to carry the OOG / halt signal.
-                schedule_results
-                    .push(accepted.or(last_attempt).expect("tier loop ran at least once"));
+                let mut chosen =
+                    accepted.or(last_attempt).expect("tier loop ran at least once");
+
+                // Trace-diff divergence for the "non-OOG schedule revert"
+                // cohort: a status flip to failure that the inspector left
+                // undiagnosed (no per-opcode divergence fired, no OOG). Only
+                // native-revm schedules qualify — their gas changes live in the
+                // EVM env, so re-running under that env with a plain step-tracer
+                // reproduces the schedule's execution exactly, and diffing
+                // against the baseline trace pinpoints the first step whose
+                // control flow changed. Non-native schedules (e.g. 7904) apply
+                // gas via the inspector, so they already record a divergence and
+                // never reach here.
+                if chosen.divergence_location_structured.is_none() &&
+                    chosen.replay_halt_oog != Some(true) &&
+                    native_env_configured &&
+                    normal_result.result.is_success() &&
+                    !chosen.success
+                {
+                    if let Some((diff_evm_env, diff_tx_env)) = tier1_envs.take() {
+                        let root_contract = recipient.unwrap_or(Address::ZERO);
+
+                        // Baseline trace (once per tx; pre-tx state is unchanged
+                        // across schedules since baseline commit is deferred).
+                        if baseline_step_trace.is_none() {
+                            let mut insp = StepTraceInspector::new(root_contract);
+                            let mut evm =
+                                self.components.evm_config().evm_with_env_and_inspector(
+                                    &mut normal_db,
+                                    evm_env.clone(),
+                                    &mut insp,
+                                );
+                            let ok = evm.transact(tx_env.clone()).is_ok();
+                            drop(evm);
+                            baseline_step_trace = Some(
+                                (ok && !insp.truncated()).then(|| insp.steps().to_vec()),
+                            );
+                        }
+
+                        // Schedule trace under the tier-1 (mainnet-equivalent) env.
+                        let mut sched_insp = StepTraceInspector::new(root_contract);
+                        let mut sched_evm =
+                            self.components.evm_config().evm_with_env_and_inspector(
+                                &mut normal_db,
+                                diff_evm_env,
+                                &mut sched_insp,
+                            );
+                        let sched_ok = sched_evm.transact(diff_tx_env).is_ok();
+                        drop(sched_evm);
+
+                        if let Some(Some(base_steps)) = baseline_step_trace.as_ref() {
+                            if sched_ok && !sched_insp.truncated() {
+                                if let Some(loc) =
+                                    first_divergence(base_steps, sched_insp.steps())
+                                {
+                                    chosen.divergence_location = Some(format!("{loc:?}"));
+                                    chosen.divergence_location_structured = Some(loc);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                schedule_results.push(chosen);
             }
 
             // Commit baseline state AFTER all schedule re-executions so that
