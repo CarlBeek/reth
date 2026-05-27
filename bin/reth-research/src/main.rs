@@ -40,8 +40,8 @@ use reth_research::{
         BlockOutput, CallFrameRow, DivergenceDatabase, DivergenceRow, DrillInRecord, OpcodeCountRow,
     },
     divergence::{
-        classify_bucket, BucketInput, CallFrame, CallType as ResCallType, DivergenceLocation,
-        EventLog, OogPattern, OutOfGasInfo,
+        classify_bucket, is_erc4337_entrypoint, BucketInput, CallFrame, CallType as ResCallType,
+        DivergenceLocation, EventLog, OogPattern, OutOfGasInfo,
     },
     oog_chain::classify_oog_chain,
     schedule::{GasSchedule, RecipientInfo, ScheduleKind, ScheduleRegistry, TxContext},
@@ -2022,6 +2022,7 @@ where
                 // chains, and sweep-exhausted OOGs.
                 let oog_call_depth = exec_result.and_then(|r| r.oog_call_depth);
                 let bucket = classify_bucket(&BucketInput {
+                    recipient_is_entrypoint: recipient.map(is_erc4337_entrypoint).unwrap_or(false),
                     baseline_to_schedule_break,
                     baseline_to_schedule_rescue,
                     gas_delta: total_delta,

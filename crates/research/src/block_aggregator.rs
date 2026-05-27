@@ -325,6 +325,7 @@ impl BlockAggregator {
             tx_count_wallet_fixable_deep_chain: 0,
             tx_count_inconclusive_needs_higher_sweep: 0,
             tx_count_contract_broken: 0,
+            tx_count_aa_gas_reestimation: 0,
         };
         let mut summaries = Vec::with_capacity(self.buckets.len());
 
@@ -345,6 +346,7 @@ impl BlockAggregator {
                     coverage.tx_count_inconclusive_needs_higher_sweep = acc.tx_count
                 }
                 Bucket::ContractBroken => coverage.tx_count_contract_broken = acc.tx_count,
+                Bucket::AaGasReestimation => coverage.tx_count_aa_gas_reestimation = acc.tx_count,
             }
 
             // Only emit the 8037 / multiplier columns when the bucket

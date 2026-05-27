@@ -545,6 +545,16 @@ pub enum Bucket {
     /// neither wallet-fixable rule applies. Drill-in bucket — full per-tx
     /// record retained.
     ContractBroken,
+    /// Outcome flipped toward failure on a transaction sent to an ERC-4337
+    /// `EntryPoint`, via an OOG-class halt. The chain-walk sees the
+    /// `EntryPoint` forward a *fixed* `callGasLimit`/`verificationGasLimit` to
+    /// the account and would otherwise call it a `FixedGas` contract bottleneck
+    /// — but those limits are signed `UserOp` fields the bundler computes
+    /// off-chain, so the real fix is re-estimating them and re-signing, not a
+    /// contract change. Distinct from `WalletFixable*` because raising the
+    /// *outer* tx gas doesn't help (the `EntryPoint` still forwards the fixed
+    /// inner budget). Drill-in bucket — full per-tx record retained.
+    AaGasReestimation,
 }
 
 impl Bucket {
@@ -561,6 +571,7 @@ impl Bucket {
             Self::WalletFixableDeepChain => "wallet_fixable_deep_chain",
             Self::InconclusiveNeedsHigherSweep => "inconclusive_needs_higher_sweep",
             Self::ContractBroken => "contract_broken",
+            Self::AaGasReestimation => "aa_gas_reestimation",
         }
     }
 
@@ -569,7 +580,10 @@ impl Bucket {
     pub const fn is_drill_in(&self) -> bool {
         matches!(
             self,
-            Self::EventLogsChanged | Self::InconclusiveNeedsHigherSweep | Self::ContractBroken
+            Self::EventLogsChanged |
+                Self::InconclusiveNeedsHigherSweep |
+                Self::ContractBroken |
+                Self::AaGasReestimation
         )
     }
 }
@@ -580,6 +594,22 @@ impl std::fmt::Display for Bucket {
     }
 }
 
+/// Canonical ERC-4337 `EntryPoint` addresses (v0.6 / v0.7 / v0.8). A tx whose
+/// top-level recipient is one of these is an account-abstraction bundle: its
+/// per-`UserOp` gas budgets (`callGasLimit`, `verificationGasLimit`, …) are
+/// signed off-chain fields, so a gas-class failure is a re-estimation problem,
+/// not a contract bug. See [`Bucket::AaGasReestimation`].
+pub const ERC4337_ENTRYPOINTS: [Address; 3] = [
+    alloy_primitives::address!("5ff137d4b0fdcd49dca30c7cf57e578a026d2789"), // v0.6
+    alloy_primitives::address!("0000000071727de22e5e9d8baf0edac6f37da032"), // v0.7
+    alloy_primitives::address!("4337084d9e255ff0702461cf8895ce9e3b5ff108"), // v0.8
+];
+
+/// Whether `addr` is a known ERC-4337 `EntryPoint`.
+pub fn is_erc4337_entrypoint(addr: Address) -> bool {
+    ERC4337_ENTRYPOINTS.contains(&addr)
+}
+
 /// Inputs to [`classify_bucket`].
 ///
 /// Bundled so the classifier signature stays readable at call sites and so
@@ -587,6 +617,11 @@ impl std::fmt::Display for Bucket {
 /// touching every caller.
 #[derive(Debug, Clone, Copy)]
 pub struct BucketInput {
+    /// The transaction's top-level recipient is a known ERC-4337 `EntryPoint`.
+    /// Gates [`Bucket::AaGasReestimation`]: an OOG-class break on such a tx is
+    /// a `UserOp` gas-limit shortfall (re-estimate + re-sign), not a contract
+    /// bug, even though the chain-walk sees a `FixedGas` forward.
+    pub recipient_is_entrypoint: bool,
     /// Outcome flipped from baseline-succeeded to schedule-failed.
     /// I.e. `normal_success && !schedule_success`. This is the "schedule
     /// broke this tx" direction — the gate for `WalletFixableShallow`,
@@ -673,6 +708,14 @@ pub fn classify_bucket(input: &BucketInput) -> Bucket {
     if input.baseline_to_schedule_break {
         if input.outer_limit_only_failure {
             Bucket::WalletFixableShallow
+        } else if input.recipient_is_entrypoint && is_oog_class(input) {
+            // ERC-4337 EntryPoint bundle that OOG'd: the EntryPoint meters
+            // each UserOp via signed gas limits, so the chain-walk's
+            // `FixedGas` verdict is misleading — the fix is off-chain
+            // re-estimation, not a contract change. Takes priority over the
+            // ContractBroken / InconclusiveNeedsHigherSweep branches below,
+            // which is where these otherwise (mis)landed.
+            Bucket::AaGasReestimation
         } else if input.oog_chain_proportional == Some(false) {
             Bucket::ContractBroken
         } else if input.replay_halt_oog == Some(true) {
@@ -699,6 +742,14 @@ pub fn classify_bucket(input: &BucketInput) -> Bucket {
     } else {
         Bucket::Unchanged
     }
+}
+
+/// Whether the schedule break was gas-class (an OOG site was recorded, or the
+/// highest replay tier still halted OOG). Distinguishes `EntryPoint` OOGs —
+/// which are AA gas re-estimation — from `EntryPoint` reverts for non-gas
+/// reasons (e.g. a paymaster rejecting), which are not.
+const fn is_oog_class(input: &BucketInput) -> bool {
+    input.oog_call_depth.is_some() || matches!(input.replay_halt_oog, Some(true))
 }
 
 /// Shallow heuristic: the OOG-class halt was attributed to the root frame
@@ -770,6 +821,7 @@ mod tests {
     /// Tests override only the fields they care about.
     fn neutral_input() -> BucketInput {
         BucketInput {
+            recipient_is_entrypoint: false,
             baseline_to_schedule_break: false,
             baseline_to_schedule_rescue: false,
             gas_delta: 0,
@@ -783,6 +835,44 @@ mod tests {
             oog_call_depth: None,
             oog_chain_proportional: None,
         }
+    }
+
+    #[test]
+    fn entrypoint_oog_break_is_aa_gas_reestimation() {
+        // Same shape that lands a non-EntryPoint tx in ContractBroken
+        // (FixedGas bottleneck), but to an EntryPoint → AA re-estimation.
+        let base = BucketInput {
+            baseline_to_schedule_break: true,
+            oog_call_depth: Some(3),
+            oog_chain_proportional: Some(false),
+            ..neutral_input()
+        };
+        assert_eq!(classify_bucket(&base), Bucket::ContractBroken);
+        let aa = BucketInput { recipient_is_entrypoint: true, ..base };
+        assert_eq!(classify_bucket(&aa), Bucket::AaGasReestimation);
+    }
+
+    #[test]
+    fn entrypoint_non_oog_revert_is_not_aa_gas_reestimation() {
+        // EntryPoint break with no OOG signal (e.g. paymaster revert) must
+        // not be swept into AA re-estimation — it's not a gas-limit fix.
+        let input = BucketInput {
+            recipient_is_entrypoint: true,
+            baseline_to_schedule_break: true,
+            oog_call_depth: None,
+            replay_halt_oog: Some(false),
+            oog_chain_proportional: None,
+            ..neutral_input()
+        };
+        assert_ne!(classify_bucket(&input), Bucket::AaGasReestimation);
+    }
+
+    #[test]
+    fn erc4337_entrypoint_recognized() {
+        assert!(is_erc4337_entrypoint(alloy_primitives::address!(
+            "0000000071727de22e5e9d8baf0edac6f37da032"
+        )));
+        assert!(!is_erc4337_entrypoint(Address::ZERO));
     }
 
     #[test]
@@ -1036,9 +1126,12 @@ mod tests {
 
     #[test]
     fn bucket_is_drill_in_only_for_full_record_buckets() {
-        for bucket in
-            [Bucket::EventLogsChanged, Bucket::InconclusiveNeedsHigherSweep, Bucket::ContractBroken]
-        {
+        for bucket in [
+            Bucket::EventLogsChanged,
+            Bucket::InconclusiveNeedsHigherSweep,
+            Bucket::ContractBroken,
+            Bucket::AaGasReestimation,
+        ] {
             assert!(bucket.is_drill_in(), "{bucket:?} should be drill-in");
         }
         for bucket in [

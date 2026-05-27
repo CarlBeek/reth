@@ -138,6 +138,7 @@ fn main() {
             tx_count_wallet_fixable_deep_chain: 0,
             tx_count_inconclusive_needs_higher_sweep: 0,
             tx_count_contract_broken: 1,
+            tx_count_aa_gas_reestimation: 0,
         },
         summaries: vec![BlockSummaryRow {
             schedule_name: "eip-8037".into(),

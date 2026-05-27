@@ -70,7 +70,10 @@ use thiserror::Error;
 /// - v8: added `divergences.schedule_state_gas_demanded` — state gas the tx attempted, including a
 ///   charge that OOG'd (so it's nonzero even when `schedule_state_gas_spent` is 0 because the state
 ///   op ran out of gas). Lets the dashboard show "this op needed N state gas" instead of 0.
-pub const SCHEMA_VERSION: u32 = 8;
+/// - v9: added `Bucket::AaGasReestimation` + `block_coverage.tx_count_aa_gas_reestimation` for
+///   ERC-4337 `EntryPoint` OOG breaks — an off-chain `UserOp` gas re-estimation fix, split out of
+///   `contract_broken` where they were misclassified as `FixedGas` contract bottlenecks.
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Errors raised by the storage layer.
 #[derive(Debug, Error)]
@@ -273,6 +276,7 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             tx_count_wallet_fixable_deep_chain INTEGER NOT NULL,
             tx_count_inconclusive_needs_higher_sweep INTEGER NOT NULL,
             tx_count_contract_broken           INTEGER NOT NULL,
+            tx_count_aa_gas_reestimation       INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (schedule_name, block_number, block_hash)
         );",
     )?;
@@ -597,6 +601,7 @@ pub struct BlockCoverageRow {
     pub tx_count_wallet_fixable_deep_chain: u32,
     pub tx_count_inconclusive_needs_higher_sweep: u32,
     pub tx_count_contract_broken: u32,
+    pub tx_count_aa_gas_reestimation: u32,
 }
 
 /// Per-opcode totals for one (block, bucket) row in `block_summaries`,
@@ -1171,8 +1176,9 @@ fn insert_block_coverage(
             tx_count_wallet_fixable_shallow,
             tx_count_wallet_fixable_deep_chain,
             tx_count_inconclusive_needs_higher_sweep,
-            tx_count_contract_broken
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            tx_count_contract_broken,
+            tx_count_aa_gas_reestimation
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (schedule_name, block_number, block_hash) DO UPDATE SET
             schedule_config_hash               = excluded.schedule_config_hash,
             parent_hash                        = excluded.parent_hash,
@@ -1187,7 +1193,8 @@ fn insert_block_coverage(
             tx_count_wallet_fixable_deep_chain = excluded.tx_count_wallet_fixable_deep_chain,
             tx_count_inconclusive_needs_higher_sweep =
                 excluded.tx_count_inconclusive_needs_higher_sweep,
-            tx_count_contract_broken           = excluded.tx_count_contract_broken",
+            tx_count_contract_broken           = excluded.tx_count_contract_broken,
+            tx_count_aa_gas_reestimation       = excluded.tx_count_aa_gas_reestimation",
         params![
             row.schedule_name,
             row.schedule_config_hash,
@@ -1205,6 +1212,7 @@ fn insert_block_coverage(
             row.tx_count_wallet_fixable_deep_chain as i64,
             row.tx_count_inconclusive_needs_higher_sweep as i64,
             row.tx_count_contract_broken as i64,
+            row.tx_count_aa_gas_reestimation as i64,
         ],
     )?;
     Ok(())
@@ -1609,6 +1617,7 @@ mod tests {
             tx_count_wallet_fixable_deep_chain: 0,
             tx_count_inconclusive_needs_higher_sweep: 0,
             tx_count_contract_broken: broken,
+            tx_count_aa_gas_reestimation: 0,
         }
     }
 
