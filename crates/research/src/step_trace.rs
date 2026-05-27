@@ -56,7 +56,7 @@ pub struct StepRecord {
 impl StepRecord {
     /// Path-identity key: two executions agree at a step iff these match.
     /// Deliberately excludes `contract` (it's derived from the same path).
-    fn key(&self) -> (u32, u32, u8) {
+    const fn key(&self) -> (u32, u32, u8) {
         (self.depth, self.pc, self.opcode)
     }
 }
@@ -89,7 +89,7 @@ impl StepTraceInspector {
     }
 
     /// Whether the trace hit [`MAX_TRACE_STEPS`] and stopped recording.
-    pub fn truncated(&self) -> bool {
+    pub const fn truncated(&self) -> bool {
         self.truncated
     }
 

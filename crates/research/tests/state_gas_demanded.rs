@@ -6,22 +6,22 @@
 //! before its charge landed — otherwise the tx misleadingly reads "0 state
 //! gas needed". These tests pin the chain:
 //!
-//!   1. `Gas::record_state_cost` — the function every state charge funnels
-//!      through (SSTORE / account-create via the `state_gas!` macro; code
-//!      deposit directly). It must count the attempt even when it OOGs.
-//!   2. `build_result_gas` — the sole builder of the final tx `ResultGas`,
-//!      must copy demanded onto it.
-//!   3. End-to-end: a real SSTORE-to-a-new-slot, executed in a *sub-call*
-//!      under the Amsterdam (EIP-8037) spec, must surface demanded on the
-//!      top-level transaction result — which also exercises the
-//!      child→parent propagation in `handle_reservoir_remaining_gas`.
+//!   1. `Gas::record_state_cost` — the function every state charge funnels through (SSTORE /
+//!      account-create via the `state_gas!` macro; code deposit directly). It must count the
+//!      attempt even when it OOGs.
+//!   2. `build_result_gas` — the sole builder of the final tx `ResultGas`, must copy demanded onto
+//!      it.
+//!   3. End-to-end: a real SSTORE-to-a-new-slot, executed in a *sub-call* under the Amsterdam
+//!      (EIP-8037) spec, must surface demanded on the top-level transaction result — which also
+//!      exercises the child→parent propagation in `handle_reservoir_remaining_gas`.
 
-use revm::context_interface::cfg::gas::InitialAndFloorGas;
-use revm::handler::post_execution::build_result_gas;
-use revm::interpreter::Gas;
+use revm::{
+    context_interface::cfg::gas::InitialAndFloorGas, handler::post_execution::build_result_gas,
+    interpreter::Gas,
+};
 
-/// 1. A charge that can't be afforded still counts toward demanded, while
-///    state_gas_spent only moves when the charge actually lands.
+/// 1. A charge that can't be afforded still counts toward demanded, while `state_gas_spent` only
+///    moves when the charge actually lands.
 #[test]
 fn record_state_cost_counts_demand_even_on_oog() {
     // regular gas = 0, reservoir = 1000: state charges draw from the reservoir.
@@ -38,7 +38,7 @@ fn record_state_cost_counts_demand_even_on_oog() {
     assert_eq!(gas.state_gas_demanded(), 5200, "attempt counted despite OOG");
 }
 
-/// 2. The final ResultGas the tx exposes carries demanded.
+/// 2. The final `ResultGas` the tx exposes carries demanded.
 #[test]
 fn build_result_gas_surfaces_demanded() {
     let mut gas = Gas::new_with_regular_gas_and_reservoir(1_000_000, 0);
@@ -51,13 +51,15 @@ fn build_result_gas_surfaces_demanded() {
 // ── 3. End-to-end: SSTORE-to-new-slot in a sub-call, Amsterdam spec ──
 
 mod evm {
-    use revm::bytecode::Bytecode;
-    use revm::context::{Context, TxEnv};
-    use revm::database::CacheDB;
-    use revm::database_interface::EmptyDB;
-    use revm::primitives::{hardfork::SpecId, Address, Bytes, TxKind, U256};
-    use revm::state::AccountInfo;
-    use revm::{ExecuteEvm, MainBuilder, MainContext};
+    use revm::{
+        bytecode::Bytecode,
+        context::{Context, TxEnv},
+        database::CacheDB,
+        database_interface::EmptyDB,
+        primitives::{hardfork::SpecId, Address, Bytes, TxKind, U256},
+        state::AccountInfo,
+        ExecuteEvm, MainBuilder, MainContext,
+    };
 
     /// PUSH1 0x01, PUSH1 0x00, SSTORE, STOP — writes a fresh slot (0 → 1).
     const SSTORE_NEW_SLOT: [u8; 6] = [0x60, 0x01, 0x60, 0x00, 0x55, 0x00];
@@ -70,7 +72,8 @@ mod evm {
         // CALL pops gas, addr, value, argsOffset, argsSize, retOffset, retSize
         // → push them in reverse so `gas` ends up on top.
         for _ in 0..5 {
-            code.extend_from_slice(&[0x60, 0x00]); // PUSH1 0 (retSize,retOffset,argsSize,argsOffset,value)
+            code.extend_from_slice(&[0x60, 0x00]); // PUSH1 0 (retSize,retOffset,argsSize,
+                                                   // argsOffset,value)
         }
         code.push(0x73); // PUSH20 callee
         code.extend_from_slice(callee.as_slice());

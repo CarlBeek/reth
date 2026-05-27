@@ -1712,8 +1712,7 @@ where
                 // At least one tier always runs (constructor enforces non-empty),
                 // so unwrapping is safe. Successful sweep wins; otherwise we
                 // keep the highest-tier failure to carry the OOG / halt signal.
-                let mut chosen =
-                    accepted.or(last_attempt).expect("tier loop ran at least once");
+                let mut chosen = accepted.or(last_attempt).expect("tier loop ran at least once");
 
                 // Trace-diff divergence for the "non-OOG schedule revert"
                 // cohort: a status flip to failure that the inspector left
@@ -1738,17 +1737,15 @@ where
                         // across schedules since baseline commit is deferred).
                         if baseline_step_trace.is_none() {
                             let mut insp = StepTraceInspector::new(root_contract);
-                            let mut evm =
-                                self.components.evm_config().evm_with_env_and_inspector(
-                                    &mut normal_db,
-                                    evm_env.clone(),
-                                    &mut insp,
-                                );
+                            let mut evm = self.components.evm_config().evm_with_env_and_inspector(
+                                &mut normal_db,
+                                evm_env.clone(),
+                                &mut insp,
+                            );
                             let ok = evm.transact(tx_env.clone()).is_ok();
                             drop(evm);
-                            baseline_step_trace = Some(
-                                (ok && !insp.truncated()).then(|| insp.steps().to_vec()),
-                            );
+                            baseline_step_trace =
+                                Some((ok && !insp.truncated()).then(|| insp.steps().to_vec()));
                         }
 
                         // Schedule trace under the tier-1 (mainnet-equivalent) env.
@@ -1764,8 +1761,7 @@ where
 
                         if let Some(Some(base_steps)) = baseline_step_trace.as_ref() {
                             if sched_ok && !sched_insp.truncated() {
-                                if let Some(loc) =
-                                    first_divergence(base_steps, sched_insp.steps())
+                                if let Some(loc) = first_divergence(base_steps, sched_insp.steps())
                                 {
                                     chosen.divergence_location = Some(format!("{loc:?}"));
                                     chosen.divergence_location_structured = Some(loc);
@@ -2213,9 +2209,7 @@ where
                                     // deployed-bytecode size EIP-8037 charges CPSB per byte for.
                                     // All other frames leave this NULL.
                                     deployed_bytecode_len: match f.call_type {
-                                        ResCallType::Create | ResCallType::Create2
-                                            if f.success =>
-                                        {
+                                        ResCallType::Create | ResCallType::Create2 if f.success => {
                                             f.output.as_ref().map(|b| b.len() as u32)
                                         }
                                         _ => None,
