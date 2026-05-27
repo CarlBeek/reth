@@ -13,7 +13,7 @@ The current system is centered on the `reth-research` ExEx in
 3. It re-executes the same transaction once per configured execution schedule.
 4. It classifies each (tx, schedule) into a storage bucket (see
    [`docs/storage-redesign.md`](docs/storage-redesign.md)) and writes the
-   block's coverage + per-bucket summaries + drill-in rows to DuckDB.
+   block's coverage + per-bucket summaries + drill-in rows to SQLite.
 
 Execution schedules are isolated from one another: each configured schedule gets its own per-block
 state so schedule-induced failures can cascade across later transactions in the same block.

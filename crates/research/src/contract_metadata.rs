@@ -290,8 +290,8 @@ pub trait BytecodeFetcher {
 /// a DB write error or address-parse error short-circuits.
 #[derive(Debug, Error)]
 pub enum BackfillError {
-    /// `DuckDB` read/write failed.
-    #[error("DuckDB error: {0}")]
+    /// `SQLite` read/write failed.
+    #[error("database error: {0}")]
     Db(#[from] DatabaseError),
     /// `to_address` column held a value that didn't parse as 0x-prefixed
     /// hex. Indicates a producer-side bug since the producer always

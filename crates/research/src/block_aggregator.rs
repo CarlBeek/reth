@@ -1,4 +1,4 @@
-//! Per-block bucket aggregator for the `DuckDB` write path.
+//! Per-block bucket aggregator for the `SQLite` write path.
 //!
 //! `BlockAggregator` buffers every tx's classification across a single
 //! (schedule, block) and flushes the result as a [`BlockOutput`] at
@@ -39,7 +39,7 @@ pub struct BlockMeta {
 ///
 /// Construct with [`BlockAggregator::start_block`], feed each tx via
 /// [`BlockAggregator::observe_tx`], and call [`BlockAggregator::finish_block`]
-/// to materialise the [`BlockOutput`] for the `DuckDB` writer.
+/// to materialise the [`BlockOutput`] for the `SQLite` writer.
 #[derive(Debug)]
 pub struct BlockAggregator {
     meta: BlockMeta,
