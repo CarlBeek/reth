@@ -71,6 +71,22 @@ enum DbCommand {
     DeleteRange { from_block: u64, to_block: u64 },
 }
 
+/// Upper bound on the per-replay gas limit during the tier-multiplier sweep.
+///
+/// At tiers > 1 the sweep lifts `tx_gas_limit_cap` so it can measure how much
+/// extra gas a tx would need. Without a ceiling, a tx that loops until it runs
+/// out of gas executes up to `tx_gas_limit × max_tier` gas (e.g. 8 × a 36M-gas
+/// tx ≈ 288M) — tens of millions of traced opcodes per replay, taking minutes
+/// to hours while holding a long-lived MDBX read transaction that stalls the
+/// whole node (the memory/MDBX runaway observed in production).
+///
+/// Capping here bounds per-tx replay time and read-txn lifetime. Beyond the
+/// ceiling a tx is simply recorded as failing the tier (it needs more gas than
+/// the cap); for repricing analysis "needs > 150M gas" is as actionable as the
+/// exact figure. ~150M ≈ 4× a mainnet block, comfortably above any legitimate
+/// single-tx demand (EIP-7825 caps real txs at ~16.7M).
+const TIER_REPLAY_GAS_CEILING: u64 = 150_000_000;
+
 /// Per-schedule metadata cached once at startup.
 ///
 /// Previously also held kind / description / affected_opcodes /
@@ -1421,7 +1437,11 @@ where
                 // schedule env setup.
                 let mut tier1_envs: Option<(_, _)> = None;
                 for &tier in &self.gas_limit_multipliers {
-                    let schedule_execution_gas_limit = gas_limit.saturating_mul(tier);
+                    // Cap the per-replay gas so a single unbounded-gas tx can't
+                    // execute for minutes/hours (and pin a long-lived MDBX read
+                    // txn); see `TIER_REPLAY_GAS_CEILING`.
+                    let schedule_execution_gas_limit =
+                        gas_limit.saturating_mul(tier).min(TIER_REPLAY_GAS_CEILING);
 
                     let mut tier_evm_env = schedule_evm_env.clone();
                     if tier > 1 {
