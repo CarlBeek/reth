@@ -4,8 +4,8 @@
 //! to configure multi-schedule research experiments.
 
 use crate::schedule::{
-    CsvPricingError, CsvPricingSchedule, Eip2780Schedule, Eip8037Schedule, MultiplierSchedule,
-    ScheduleRegistry,
+    CsvPricingError, CsvPricingSchedule, Eip2780Schedule, Eip8037Schedule, Eip8038Schedule,
+    MultiplierSchedule, ScheduleRegistry,
 };
 use std::path::PathBuf;
 use thiserror::Error;
@@ -39,7 +39,7 @@ pub enum CliError {
     },
 
     /// No schedules configured
-    #[error("No schedules configured. Enable at least one schedule with --research.eip2780, --research.eip8037, --research.csv, or --research.multiplier")]
+    #[error("No schedules configured. Enable at least one schedule with --research.eip2780, --research.eip8037, --research.eip8038, --research.csv, or --research.multiplier")]
     NoSchedules,
 
     /// Schedule registry error
@@ -141,6 +141,9 @@ pub struct ResearchArgs {
     /// Enable EIP-8037 state creation gas experiment
     pub eip8037_enabled: bool,
 
+    /// Enable EIP-8038 state access/write gas experiment
+    pub eip8038_enabled: bool,
+
     /// CSV pricing schedules (name=path pairs)
     pub csv_schedules: Vec<NamedCsvSchedule>,
 
@@ -192,6 +195,12 @@ impl ResearchArgs {
     /// Enable EIP-8037 schedule.
     pub const fn with_eip8037(mut self) -> Self {
         self.eip8037_enabled = true;
+        self
+    }
+
+    /// Enable EIP-8038 schedule.
+    pub const fn with_eip8038(mut self) -> Self {
+        self.eip8038_enabled = true;
         self
     }
 
@@ -264,6 +273,7 @@ impl ResearchArgs {
     pub const fn has_schedules(&self) -> bool {
         self.eip2780_enabled ||
             self.eip8037_enabled ||
+            self.eip8038_enabled ||
             !self.csv_schedules.is_empty() ||
             !self.multiplier_schedules.is_empty()
     }
@@ -275,6 +285,9 @@ impl ResearchArgs {
             count += 1;
         }
         if self.eip8037_enabled {
+            count += 1;
+        }
+        if self.eip8038_enabled {
             count += 1;
         }
         count += self.csv_schedules.len();
@@ -298,6 +311,11 @@ impl ResearchArgs {
         // Add EIP-8037 if enabled
         if self.eip8037_enabled {
             registry.register(Eip8037Schedule::new())?;
+        }
+
+        // Add EIP-8038 if enabled
+        if self.eip8038_enabled {
+            registry.register(Eip8038Schedule::new())?;
         }
 
         // Add CSV schedules
@@ -324,6 +342,10 @@ impl ResearchArgs {
 
         if self.eip8037_enabled {
             parts.push("eip-8037".to_string());
+        }
+
+        if self.eip8038_enabled {
+            parts.push("eip-8038".to_string());
         }
 
         for csv in &self.csv_schedules {
@@ -457,6 +479,26 @@ mod tests {
 
         assert_eq!(registry.len(), 1);
         assert!(registry.get("eip-8037").is_some());
+    }
+
+    #[test]
+    fn test_research_args_build_registry_with_eip8038() {
+        let args = ResearchArgs::new().with_eip8038();
+        let registry = args.build_registry().unwrap();
+
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get("eip-8038").is_some());
+    }
+
+    #[test]
+    fn test_research_args_eip8037_and_eip8038_independent() {
+        // Both schedules register side by side; 8038 must not collide with 8037.
+        let args = ResearchArgs::new().with_eip8037().with_eip8038();
+        let registry = args.build_registry().unwrap();
+
+        assert_eq!(registry.len(), 2);
+        assert!(registry.get("eip-8037").is_some());
+        assert!(registry.get("eip-8038").is_some());
     }
 
     #[test]

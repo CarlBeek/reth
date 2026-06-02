@@ -1600,6 +1600,26 @@ where
                             sched_state_gas_spent,
                             state_intrinsic_delta,
                         );
+                    } else if schedule.modifies_intrinsic() &&
+                        !schedule.uses_native_intrinsic_gas() &&
+                        let Some(ctx) = tx_context.as_ref() &&
+                        let Some(schedule_intrinsic) = schedule.intrinsic_gas(ctx)
+                    {
+                        // Non-native "Both" schedule (e.g. EIP-8038): revm
+                        // deducted the block's *native* intrinsic during
+                        // execution (its initial-tx-gas helper ignores
+                        // `cfg.gas_params` overrides), so the reported regular
+                        // gas reflects baseline intrinsic, not the schedule's.
+                        // Normalize by the intrinsic delta — mirroring the
+                        // native EIP-8037 path above — so `gas_delta` includes
+                        // the schedule's intrinsic repricing (access-list /
+                        // create-tx). State gas is unaffected (zero here).
+                        let intrinsic_delta =
+                            i128::from(schedule_intrinsic) - i128::from(baseline_intrinsic_gas);
+                        sched_gas_used =
+                            Self::apply_signed_gas_delta(sched_gas_used, intrinsic_delta);
+                        sched_total_gas_spent =
+                            Self::apply_signed_gas_delta(sched_total_gas_spent, intrinsic_delta);
                     }
                     let sched_floor_gas = result.result.gas().floor_gas();
                     let sched_gas_refunded = result.result.gas().inner_refunded();

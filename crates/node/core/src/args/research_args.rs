@@ -23,6 +23,13 @@ pub struct ResearchArgs {
     #[arg(long = "research.eip8037", help_heading = "Research")]
     pub eip8037: bool,
 
+    /// Enable EIP-8038 state access/write gas experiment.
+    ///
+    /// This reprices state access/write/create costs (3x) on the block's native
+    /// spec, independent of EIP-8037's state-gas reservoir.
+    #[arg(long = "research.eip8038", help_heading = "Research")]
+    pub eip8038: bool,
+
     /// Add a CSV-based gas pricing schedule.
     ///
     /// Format: name=path (e.g., --research.csv 7904-v1=./pricing.csv)
@@ -181,6 +188,7 @@ impl Default for ResearchArgs {
         Self {
             eip2780: false,
             eip8037: false,
+            eip8038: false,
             csv_schedules: Vec::new(),
             multiplier_schedules: Vec::new(),
             db_path: PathBuf::from("./divergence.db"),
@@ -204,6 +212,7 @@ impl ResearchArgs {
     pub const fn has_schedules(&self) -> bool {
         self.eip2780 ||
             self.eip8037 ||
+            self.eip8038 ||
             !self.csv_schedules.is_empty() ||
             !self.multiplier_schedules.is_empty()
     }
@@ -215,6 +224,9 @@ impl ResearchArgs {
             count += 1;
         }
         if self.eip8037 {
+            count += 1;
+        }
+        if self.eip8038 {
             count += 1;
         }
         count += self.csv_schedules.len();
@@ -245,6 +257,10 @@ impl ResearchArgs {
 
         if self.eip8037 {
             args = args.with_eip8037();
+        }
+
+        if self.eip8038 {
+            args = args.with_eip8038();
         }
 
         args = args.with_gas_limit_multipliers(self.gas_limit_multipliers.clone());
@@ -287,6 +303,10 @@ impl ResearchArgs {
 
         if self.eip8037 {
             args = args.with_eip8037();
+        }
+
+        if self.eip8038 {
+            args = args.with_eip8038();
         }
 
         args = args.with_gas_limit_multipliers(self.gas_limit_multipliers.clone());
@@ -338,6 +358,27 @@ mod tests {
         assert!(args.eip8037);
         assert!(args.has_schedules());
         assert_eq!(args.schedule_count(), 1);
+    }
+
+    #[test]
+    fn test_parse_research_args_eip8038() {
+        let args = CommandParser::<ResearchArgs>::parse_from(["reth", "--research.eip8038"]).args;
+        assert!(args.eip8038);
+        assert!(args.has_schedules());
+        assert_eq!(args.schedule_count(), 1);
+    }
+
+    #[test]
+    fn test_parse_research_args_eip8037_and_eip8038() {
+        let args = CommandParser::<ResearchArgs>::parse_from([
+            "reth",
+            "--research.eip8037",
+            "--research.eip8038",
+        ])
+        .args;
+        assert!(args.eip8037);
+        assert!(args.eip8038);
+        assert_eq!(args.schedule_count(), 2);
     }
 
     #[test]

@@ -38,6 +38,7 @@ same schedule.
 
 - `--research.eip2780`
 - `--research.eip8037`
+- `--research.eip8038` (state access/write repricing, 3x, native-spec; independent of `--research.eip8037`)
 - `--research.csv NAME=PATH`
 - `--research.multiplier NAME=MULT`
 - `--research.db-path PATH` (DuckDB file)
@@ -56,12 +57,17 @@ At least one schedule flag is required.
 
 ```bash
 cargo run --release -p reth-research-bin -- node \
-  --research.eip2780 \
+  --research.eip8037 \
+  --research.eip8038 \
   --research.csv 7904-prelim=./schedules/7904_prelim.csv \
   --research.multiplier 4x=4 \
   --research.db-path ./divergences.sqlite \
   --research.start-block 18000000
 ```
+
+`--research.eip8037` and `--research.eip8038` can run together: each is a separate schedule with its
+own `eip-8037` / `eip-8038` rows, and 8038 stays on the block's native spec so it neither alters
+8037's replay nor its persisted data.
 
 ## Analyze With DuckDB
 
