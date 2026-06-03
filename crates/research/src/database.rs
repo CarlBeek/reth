@@ -72,8 +72,13 @@ use thiserror::Error;
 ///   op ran out of gas). Lets the dashboard show "this op needed N state gas" instead of 0.
 /// - v9: added `Bucket::AaGasReestimation` + `block_coverage.tx_count_aa_gas_reestimation` for
 ///   ERC-4337 `EntryPoint` OOG breaks — an off-chain `UserOp` gas re-estimation fix, split out of
-///   `contract_broken` where they were misclassified as `FixedGas` contract bottlenecks.
-pub const SCHEMA_VERSION: u32 = 9;
+///   `contract_broken` where they were misclassified as `FixedGas` contract bottlenecks. This
+///   column was added in-place without bumping `SCHEMA_VERSION`, so a v9 database created before it
+///   lacked the column and every write failed with `no column named …`.
+/// - v10: bump so the `tx_count_aa_gas_reestimation` column is properly version-gated. A database
+///   written under an older version is detected by [`verify_schema_version`] as a mismatch and
+///   re-replayed, rather than silently failing every write.
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Errors raised by the storage layer.
 #[derive(Debug, Error)]
