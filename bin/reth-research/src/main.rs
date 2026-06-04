@@ -466,6 +466,7 @@ where
                                             to_block,
                                             coverage = counts.coverage,
                                             summaries = counts.summaries,
+                                            bucket_recipients = counts.bucket_recipients,
                                             divergences = counts.divergences,
                                             call_frames = counts.call_frames,
                                             opcode_counts = counts.opcode_counts,
@@ -1151,6 +1152,8 @@ where
                     block_hash,
                     parent_hash,
                     timestamp: block_timestamp,
+                    gas_used: block.header().gas_used(),
+                    gas_limit: block.header().gas_limit(),
                 };
                 (
                     schedule.name().to_string(),
@@ -2302,6 +2305,20 @@ where
                             has_authorization: authorization_count > 0,
                             has_runtime_state,
                             drill_in_record: drill_in,
+                            recipient,
+                            // 4-byte selector for calls with >=4 calldata bytes;
+                            // None for creations (init code, no selector).
+                            selector: (!is_create && input.len() >= 4).then(|| {
+                                let mut s = [0u8; 4];
+                                s.copy_from_slice(&input[..4]);
+                                s
+                            }),
+                            // gas_delta is only clean when the schedule replay
+                            // fit the original limit; OOG-at-higher-tier txs
+                            // carry halt-gas deltas and are excluded from the
+                            // recipient gas sum.
+                            succeeded_within_limit: schedule_replay_success &&
+                                schedule_gas <= gas_limit,
                         },
                         opcode_frames_for_agg,
                     );

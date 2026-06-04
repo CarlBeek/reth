@@ -78,7 +78,15 @@ use thiserror::Error;
 /// - v10: bump so the `tx_count_aa_gas_reestimation` column is properly version-gated. A database
 ///   written under an older version is detected by [`verify_schema_version`] as a mismatch and
 ///   re-replayed, rather than silently failing every write.
-pub const SCHEMA_VERSION: u32 = 10;
+/// - v11: added block-capacity columns `block_coverage.block_gas_used` / `block_gas_limit` (the
+///   native header values — utilization, fullness and gas-limit-exceedance analysis) and the
+///   `block_bucket_recipients` rollup table (per-(block,bucket) top recipients + 4-byte selector,
+///   ranked/truncated by `tx_count` with the tail folded into an `__other__` row) so the two
+///   aggregate-only cohorts (`gas_only`, `wallet_fixable_shallow`) gain protocol/selector
+///   attribution they previously lacked. All additions are nullable / new-table, so a pre-v11
+///   database is forward-compatible after an additive `ALTER TABLE … ADD COLUMN`; rows for blocks
+///   not re-touched simply read NULL.
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Errors raised by the storage layer.
 #[derive(Debug, Error)]
@@ -282,6 +290,14 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             tx_count_inconclusive_needs_higher_sweep INTEGER NOT NULL,
             tx_count_contract_broken           INTEGER NOT NULL,
             tx_count_aa_gas_reestimation       INTEGER NOT NULL DEFAULT 0,
+            -- Native block header values (NULL on rows written before v11 / not
+            -- re-touched). gas_used is the actual mainnet baseline the block
+            -- consumed; gas_limit is the protocol cap. Together they anchor
+            -- utilization, block-fullness shift, and gas-limit-exceedance under
+            -- a repricing schedule. Nullable so an additive ADD COLUMN on an
+            -- existing DB leaves historical rows readable as 'n/a'.
+            block_gas_used                     INTEGER,
+            block_gas_limit                    INTEGER,
             PRIMARY KEY (schedule_name, block_number, block_hash)
         );",
     )?;
@@ -321,6 +337,37 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             tx_count_runtime_state  INTEGER,
             tx_count_no_state       INTEGER,
             PRIMARY KEY (schedule_name, block_number, bucket)
+        );",
+    )?;
+
+    // Per-(schedule, block, bucket) recipient attribution for the
+    // aggregate-only cohorts that have no per-tx rows (`gas_only`,
+    // `wallet_fixable_shallow`, …). One row per distinct destination, ranked
+    // and truncated to the top `BUCKET_RECIPIENT_TOP_K` by `tx_count`; the
+    // truncated tail is folded into a single synthetic `recipient='__other__'`
+    // row so the unattributed mass stays quantified (no silent long-tail
+    // blind spot). `recipient` is the tx's to-address as lowercase `{:#x}`
+    // hex (joins `contract_labels.address`), `'__create__'` for contract
+    // creations, or `'__other__'` for the tail. `top_selector` is the 4-byte
+    // function selector (`x'00000000'` when absent / create / tail).
+    //
+    // `gas_delta_sum_succeeding` sums `gas_delta` ONLY over txs that succeeded
+    // under the schedule within their original gas limit. Txs that OOG under
+    // the schedule are deliberately excluded: their `schedule_gas_used` is
+    // revm's all-gas-consumed halt value (≈ the inflated tier limit), so
+    // including them would pollute the sum with halt-gas artefacts. Their
+    // `tx_count` is still counted, so the failed cohort is attributed by
+    // *who/how many*, while gas magnitude reflects only the clean cohort.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS block_bucket_recipients (
+            schedule_name TEXT    NOT NULL,
+            block_number  INTEGER NOT NULL,
+            bucket        TEXT    NOT NULL,
+            recipient     TEXT    NOT NULL,
+            top_selector  BLOB    NOT NULL,
+            tx_count      INTEGER NOT NULL,
+            gas_delta_sum_succeeding INTEGER NOT NULL,
+            PRIMARY KEY (schedule_name, block_number, bucket, recipient, top_selector)
         );",
     )?;
 
@@ -559,7 +606,9 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
          CREATE INDEX IF NOT EXISTS idx_bs_schedule_bucket ON block_summaries(schedule_name, bucket);
          CREATE INDEX IF NOT EXISTS idx_bs_schedule_opcode_totals
              ON block_summaries(schedule_name)
-             WHERE opcode_totals_7904 IS NOT NULL AND opcode_totals_7904 <> '[]';",
+             WHERE opcode_totals_7904 IS NOT NULL AND opcode_totals_7904 <> '[]';
+         CREATE INDEX IF NOT EXISTS idx_bbr_sched_bucket_recipient
+             ON block_bucket_recipients(schedule_name, bucket, recipient);",
     )?;
 
     Ok(())
@@ -582,6 +631,26 @@ pub struct BlockOutput {
     /// Drill-in records — one per `EventLogsChanged`, `InconclusiveNeedsHigherSweep`, or
     /// `ContractBroken` tx.
     pub drill_ins: Vec<DrillInRecord>,
+    /// Per-(bucket) top-recipient rollup rows. Go to `block_bucket_recipients`.
+    pub bucket_recipients: Vec<BucketRecipientRow>,
+}
+
+/// One row of the `block_bucket_recipients` rollup: a single destination's
+/// share of a (schedule, block, bucket). See the table DDL for the ranking /
+/// truncation rules and the `gas_delta_sum_succeeding` semantics.
+#[allow(missing_docs)]
+#[derive(Debug, Clone)]
+pub struct BucketRecipientRow {
+    pub schedule_name: String,
+    pub block_number: u64,
+    pub bucket: Bucket,
+    /// Lowercase `{:#x}` to-address, or the `__create__` / `__other__` sentinel.
+    pub recipient: String,
+    /// 4-byte function selector; all-zero when absent / create / tail row.
+    pub top_selector: [u8; 4],
+    pub tx_count: u32,
+    /// Sum of `gas_delta` over the succeeding-within-original-limit cohort only.
+    pub gas_delta_sum_succeeding: i64,
 }
 
 /// Counts per bucket for one (schedule, block, `block_hash`). Always emitted
@@ -607,6 +676,12 @@ pub struct BlockCoverageRow {
     pub tx_count_inconclusive_needs_higher_sweep: u32,
     pub tx_count_contract_broken: u32,
     pub tx_count_aa_gas_reestimation: u32,
+    /// Native block header `gas_used` — the actual gas the block consumed on
+    /// mainnet (the baseline for utilization and the repricing-tax fraction).
+    pub block_gas_used: u64,
+    /// Native block header `gas_limit` — the protocol cap, for block-fullness
+    /// and gas-limit-exceedance analysis under a repricing schedule.
+    pub block_gas_limit: u64,
 }
 
 /// Per-opcode totals for one (block, bucket) row in `block_summaries`,
@@ -835,6 +910,9 @@ impl DivergenceDatabase {
         for summary in &output.summaries {
             insert_block_summary(&tx, summary)?;
         }
+        for recipient in &output.bucket_recipients {
+            insert_bucket_recipient(&tx, recipient)?;
+        }
         for drill_in in &output.drill_ins {
             let divergence_id = insert_divergence(&tx, &drill_in.divergence)?;
             for frame in &drill_in.call_frames {
@@ -914,6 +992,10 @@ impl DivergenceDatabase {
             "DELETE FROM block_summaries WHERE block_number >= ? AND block_number <= ?",
             params![from_block as i64, to_block as i64],
         )?;
+        let bucket_recipients_deleted = tx.execute(
+            "DELETE FROM block_bucket_recipients WHERE block_number >= ? AND block_number <= ?",
+            params![from_block as i64, to_block as i64],
+        )?;
         let coverage_deleted = tx.execute(
             "DELETE FROM block_coverage WHERE block_number >= ? AND block_number <= ?",
             params![from_block as i64, to_block as i64],
@@ -923,6 +1005,7 @@ impl DivergenceDatabase {
         Ok(BlockRangeDeleteCounts {
             coverage: coverage_deleted,
             summaries: summaries_deleted,
+            bucket_recipients: bucket_recipients_deleted,
             divergences: divergences_deleted,
             call_frames: call_frames_deleted,
             opcode_counts: opcode_counts_deleted,
@@ -1162,6 +1245,7 @@ impl DivergenceDatabase {
 pub struct BlockRangeDeleteCounts {
     pub coverage: usize,
     pub summaries: usize,
+    pub bucket_recipients: usize,
     pub divergences: usize,
     pub call_frames: usize,
     pub opcode_counts: usize,
@@ -1182,8 +1266,9 @@ fn insert_block_coverage(
             tx_count_wallet_fixable_deep_chain,
             tx_count_inconclusive_needs_higher_sweep,
             tx_count_contract_broken,
-            tx_count_aa_gas_reestimation
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            tx_count_aa_gas_reestimation,
+            block_gas_used, block_gas_limit
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (schedule_name, block_number, block_hash) DO UPDATE SET
             schedule_config_hash               = excluded.schedule_config_hash,
             parent_hash                        = excluded.parent_hash,
@@ -1199,7 +1284,9 @@ fn insert_block_coverage(
             tx_count_inconclusive_needs_higher_sweep =
                 excluded.tx_count_inconclusive_needs_higher_sweep,
             tx_count_contract_broken           = excluded.tx_count_contract_broken,
-            tx_count_aa_gas_reestimation       = excluded.tx_count_aa_gas_reestimation",
+            tx_count_aa_gas_reestimation       = excluded.tx_count_aa_gas_reestimation,
+            block_gas_used                     = excluded.block_gas_used,
+            block_gas_limit                    = excluded.block_gas_limit",
         params![
             row.schedule_name,
             row.schedule_config_hash,
@@ -1218,6 +1305,36 @@ fn insert_block_coverage(
             row.tx_count_inconclusive_needs_higher_sweep as i64,
             row.tx_count_contract_broken as i64,
             row.tx_count_aa_gas_reestimation as i64,
+            row.block_gas_used as i64,
+            row.block_gas_limit as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Insert one `block_bucket_recipients` rollup row. Upsert on the natural key
+/// so re-touching a block (idempotent re-replay) refreshes counts in place.
+fn insert_bucket_recipient(
+    tx: &Transaction<'_>,
+    row: &BucketRecipientRow,
+) -> Result<(), DatabaseError> {
+    tx.execute(
+        "INSERT INTO block_bucket_recipients (
+            schedule_name, block_number, bucket, recipient, top_selector,
+            tx_count, gas_delta_sum_succeeding
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (schedule_name, block_number, bucket, recipient, top_selector)
+        DO UPDATE SET
+            tx_count                 = excluded.tx_count,
+            gas_delta_sum_succeeding = excluded.gas_delta_sum_succeeding",
+        params![
+            row.schedule_name,
+            row.block_number as i64,
+            row.bucket.as_str(),
+            row.recipient,
+            row.top_selector.as_slice(),
+            row.tx_count as i64,
+            row.gas_delta_sum_succeeding,
         ],
     )?;
     Ok(())
@@ -1623,6 +1740,8 @@ mod tests {
             tx_count_inconclusive_needs_higher_sweep: 0,
             tx_count_contract_broken: broken,
             tx_count_aa_gas_reestimation: 0,
+            block_gas_used: 15_000_000,
+            block_gas_limit: 30_000_000,
         }
     }
 
@@ -1758,6 +1877,7 @@ mod tests {
                 tx_count_no_state: None,
             }],
             drill_ins: vec![drill_in],
+            bucket_recipients: vec![],
         };
 
         db.record_block_output(&output).unwrap();
@@ -1849,6 +1969,7 @@ mod tests {
                 coverage: fixture_coverage("test", block, 1, 0),
                 summaries: vec![],
                 drill_ins: vec![drill_in],
+                bucket_recipients: vec![],
             };
             db.record_block_output(&output).unwrap();
         }
@@ -1883,6 +2004,7 @@ mod tests {
             coverage: fixture_coverage("test", 42, 0, 0),
             summaries: vec![],
             drill_ins: vec![],
+            bucket_recipients: vec![],
         };
         db.record_block_output(&output).unwrap();
 
@@ -1975,6 +2097,7 @@ mod tests {
                 coverage: fixture_coverage("test", 99, 1, 0),
                 summaries: vec![],
                 drill_ins: vec![drill_in],
+                bucket_recipients: vec![],
             };
             db.record_block_output(&output).unwrap();
         }
@@ -2032,6 +2155,7 @@ mod tests {
                 coverage: fixture_coverage("test", 99, 1, 0),
                 summaries: vec![],
                 drill_ins: vec![drill_in],
+                bucket_recipients: vec![],
             };
             db.record_block_output(&output).unwrap();
             tx_index += 1;
@@ -2098,6 +2222,7 @@ mod tests {
             coverage: fixture_coverage("test", 99, 1, 0),
             summaries: vec![],
             drill_ins: vec![drill_in],
+            bucket_recipients: vec![],
         })
         .unwrap();
 
@@ -2159,6 +2284,7 @@ mod tests {
                 coverage: fixture_coverage("test", 99, 1, 0),
                 summaries: vec![],
                 drill_ins: vec![drill_in],
+                bucket_recipients: vec![],
             })
             .unwrap();
         }

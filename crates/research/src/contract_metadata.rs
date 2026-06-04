@@ -680,6 +680,8 @@ mod tests {
             tx_count_inconclusive_needs_higher_sweep: 0,
             tx_count_contract_broken: 1,
             tx_count_aa_gas_reestimation: 0,
+            block_gas_used: 15_000_000,
+            block_gas_limit: 30_000_000,
         };
         // block_hash needs to differ per call to satisfy the PK if we
         // seed multiple times.
@@ -688,7 +690,12 @@ mod tests {
         coverage.block_number = 1 + tx_index as u64;
         let mut div = drill_in;
         div.divergence.block_number = coverage.block_number;
-        let output = BlockOutput { coverage, summaries: vec![], drill_ins: vec![div] };
+        let output = BlockOutput {
+            coverage,
+            summaries: vec![],
+            drill_ins: vec![div],
+            bucket_recipients: vec![],
+        };
         db.record_block_output(&output).unwrap();
     }
 

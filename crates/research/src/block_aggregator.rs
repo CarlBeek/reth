@@ -11,11 +11,21 @@
 //! storage rules and the schema.
 
 use crate::{
-    database::{BlockCoverageRow, BlockOutput, BlockSummaryRow, DrillInRecord, OpcodeBucketTotal},
+    database::{
+        BlockCoverageRow, BlockOutput, BlockSummaryRow, BucketRecipientRow, DrillInRecord,
+        OpcodeBucketTotal,
+    },
     divergence::{Bucket, FrameOpcodeCounts},
 };
-use alloy_primitives::B256;
-use std::collections::BTreeMap;
+use alloy_primitives::{Address, B256};
+use std::collections::{BTreeMap, HashMap};
+
+/// Max distinct recipients kept per (block, bucket) in the
+/// `block_bucket_recipients` rollup. The truncated tail folds into one
+/// `__other__` row so the unattributed mass stays quantified. Generous enough
+/// that most blocks (a few hundred distinct destinations) aren't truncated at
+/// all; bounds the worst case so a pathological block can't balloon the table.
+const BUCKET_RECIPIENT_TOP_K: usize = 128;
 
 /// Inputs the aggregator needs the moment the block starts.
 #[derive(Debug, Clone)]
@@ -33,6 +43,10 @@ pub struct BlockMeta {
     pub parent_hash: B256,
     /// Block timestamp (Unix seconds).
     pub timestamp: u64,
+    /// Native block header `gas_used` — actual gas the block consumed.
+    pub gas_used: u64,
+    /// Native block header `gas_limit` — the protocol cap.
+    pub gas_limit: u64,
 }
 
 /// Accumulates per-tx classifications and metrics for a single block.
@@ -103,6 +117,22 @@ struct BucketAccumulator {
     opcode_counts: [u64; 256],
     opcode_gas_baseline: [u64; 256],
     opcode_gas_schedule: [u64; 256],
+
+    // Per-recipient attribution for this bucket, keyed by (to-address as
+    // lowercase `{:#x}` hex or the `__create__` sentinel, 4-byte selector).
+    // Folded into top-K `block_bucket_recipients` rows at `finish_block`.
+    // Skipped for `Bucket::Unchanged` (nothing diverged → nothing to attribute).
+    recipients: HashMap<(String, [u8; 4]), RecipientAcc>,
+}
+
+/// One recipient's running totals within a bucket. `tx_count` is meaningful for
+/// every cohort; `gas_delta_sum_succeeding` accumulates `gas_delta` only over
+/// txs that succeeded within their original gas limit, so OOG halt-gas never
+/// pollutes it (see [`BucketRecipientRow`]).
+#[derive(Debug, Default, Clone, Copy)]
+struct RecipientAcc {
+    tx_count: u32,
+    gas_delta_sum_succeeding: i64,
 }
 
 impl Default for BucketAccumulator {
@@ -125,6 +155,7 @@ impl Default for BucketAccumulator {
             opcode_counts: [0; 256],
             opcode_gas_baseline: [0; 256],
             opcode_gas_schedule: [0; 256],
+            recipients: HashMap::new(),
         }
     }
 }
@@ -223,6 +254,16 @@ pub struct TxObservation {
     /// (`EventLogsChanged` / `InconclusiveNeedsHigherSweep` /
     /// `ContractBroken`); ignored for aggregate buckets.
     pub drill_in_record: Option<DrillInRecord>,
+    /// Tx destination (to-address). `None` for contract creations — recorded
+    /// under the `__create__` sentinel in the recipient rollup.
+    pub recipient: Option<Address>,
+    /// 4-byte function selector (first 4 calldata bytes). `None` for creations
+    /// and for calls with fewer than 4 calldata bytes.
+    pub selector: Option<[u8; 4]>,
+    /// Whether the schedule replay succeeded within the tx's *original* gas
+    /// limit. Gates whether `gas_delta` feeds `gas_delta_sum_succeeding` —
+    /// OOG-at-higher-tier txs carry halt-gas `gas_delta` and are excluded.
+    pub succeeded_within_limit: bool,
 }
 
 impl BlockAggregator {
@@ -296,6 +337,25 @@ impl BlockAggregator {
             }
         }
 
+        // Per-recipient attribution. Skip `Unchanged` — those txs diverged in
+        // neither gas nor outcome, so there's nothing to attribute and it
+        // would bloat the rollup with every passing tx's destination.
+        if obs.bucket != Bucket::Unchanged {
+            let recipient_key = match obs.recipient {
+                Some(addr) => format!("{addr:#x}"),
+                None => "__create__".to_string(),
+            };
+            let selector_key = obs.selector.unwrap_or([0u8; 4]);
+            let r = acc.recipients.entry((recipient_key, selector_key)).or_default();
+            r.tx_count = r.tx_count.saturating_add(1);
+            // Only the succeeding-within-original-limit cohort contributes gas;
+            // OOG-at-higher-tier txs carry halt-gas deltas (see RecipientAcc).
+            if obs.succeeded_within_limit {
+                r.gas_delta_sum_succeeding =
+                    r.gas_delta_sum_succeeding.saturating_add(obs.gas_delta);
+            }
+        }
+
         if obs.bucket.is_drill_in() &&
             let Some(record) = obs.drill_in_record
         {
@@ -326,8 +386,11 @@ impl BlockAggregator {
             tx_count_inconclusive_needs_higher_sweep: 0,
             tx_count_contract_broken: 0,
             tx_count_aa_gas_reestimation: 0,
+            block_gas_used: self.meta.gas_used,
+            block_gas_limit: self.meta.gas_limit,
         };
         let mut summaries = Vec::with_capacity(self.buckets.len());
+        let mut bucket_recipients = Vec::new();
 
         for (bucket, acc) in self.buckets {
             match bucket {
@@ -395,9 +458,53 @@ impl BlockAggregator {
                 tx_count_runtime_state: Some(acc.tx_count_runtime_state),
                 tx_count_no_state: Some(acc.tx_count_no_state),
             });
+
+            // Fold this bucket's per-recipient map into top-K rollup rows.
+            // Rank by `tx_count` (gas_delta is a halt-gas artefact for the
+            // failed cohort, so it can't drive the ranking); the truncated
+            // tail collapses into one `__other__` row that keeps the
+            // unattributed count/gas visible rather than silently dropping it.
+            if !acc.recipients.is_empty() {
+                let mut entries: Vec<((String, [u8; 4]), RecipientAcc)> =
+                    acc.recipients.into_iter().collect();
+                // Deterministic order so re-touching a block upserts identical
+                // rows: tx_count desc, then (recipient, selector) ascending.
+                entries.sort_by(|a, b| b.1.tx_count.cmp(&a.1.tx_count).then_with(|| a.0.cmp(&b.0)));
+
+                let mut tail = RecipientAcc::default();
+                for (rank, ((recipient, top_selector), racc)) in entries.into_iter().enumerate() {
+                    if rank < BUCKET_RECIPIENT_TOP_K {
+                        bucket_recipients.push(BucketRecipientRow {
+                            schedule_name: self.meta.schedule_name.clone(),
+                            block_number: self.meta.block_number,
+                            bucket,
+                            recipient,
+                            top_selector,
+                            tx_count: racc.tx_count,
+                            gas_delta_sum_succeeding: racc.gas_delta_sum_succeeding,
+                        });
+                    } else {
+                        tail.tx_count = tail.tx_count.saturating_add(racc.tx_count);
+                        tail.gas_delta_sum_succeeding = tail
+                            .gas_delta_sum_succeeding
+                            .saturating_add(racc.gas_delta_sum_succeeding);
+                    }
+                }
+                if tail.tx_count > 0 {
+                    bucket_recipients.push(BucketRecipientRow {
+                        schedule_name: self.meta.schedule_name.clone(),
+                        block_number: self.meta.block_number,
+                        bucket,
+                        recipient: "__other__".to_string(),
+                        top_selector: [0u8; 4],
+                        tx_count: tail.tx_count,
+                        gas_delta_sum_succeeding: tail.gas_delta_sum_succeeding,
+                    });
+                }
+            }
         }
 
-        BlockOutput { coverage, summaries, drill_ins: self.drill_ins }
+        BlockOutput { coverage, summaries, drill_ins: self.drill_ins, bucket_recipients }
     }
 }
 
@@ -413,6 +520,8 @@ mod tests {
             block_hash: B256::repeat_byte(0x42),
             parent_hash: B256::repeat_byte(0x41),
             timestamp: 1_700_000_000,
+            gas_used: 15_000_000,
+            gas_limit: 30_000_000,
         }
     }
 
@@ -428,6 +537,9 @@ mod tests {
             has_authorization: false,
             has_runtime_state: false,
             drill_in_record: None,
+            recipient: Some(Address::repeat_byte(0xab)),
+            selector: Some([0x12, 0x34, 0x56, 0x78]),
+            succeeded_within_limit: true,
         }
     }
 
@@ -497,6 +609,110 @@ mod tests {
         assert_eq!(summary.gas_delta_max, Some(200));
     }
 
+    /// Observation with an explicit recipient / success flag for the
+    /// recipient-rollup tests. A `None` recipient models a contract creation.
+    fn obs_recipient(
+        bucket: Bucket,
+        gas_delta: i64,
+        recipient: Option<Address>,
+        succeeded_within_limit: bool,
+    ) -> TxObservation {
+        TxObservation {
+            bucket,
+            gas_delta,
+            state_gas_spent: 0,
+            state_gas_spillover: 0,
+            min_multiplier_to_succeed: None,
+            is_creation: recipient.is_none(),
+            has_authorization: false,
+            has_runtime_state: false,
+            drill_in_record: None,
+            recipient,
+            selector: Some([0xaa, 0xbb, 0xcc, 0xdd]),
+            succeeded_within_limit,
+        }
+    }
+
+    #[test]
+    fn coverage_carries_block_gas_fields() {
+        let out = BlockAggregator::start_block(meta(), 0).finish_block();
+        assert_eq!(out.coverage.block_gas_used, 15_000_000);
+        assert_eq!(out.coverage.block_gas_limit, 30_000_000);
+    }
+
+    #[test]
+    fn bucket_recipients_skip_unchanged_and_attribute_others() {
+        let mut agg = BlockAggregator::start_block(meta(), 3);
+        let a = Address::repeat_byte(0x10);
+        // Unchanged tx — diverged in neither gas nor outcome, so it must NOT
+        // appear in the attribution rollup.
+        agg.observe_tx(obs_recipient(Bucket::Unchanged, 0, Some(a), true), &[]);
+        agg.observe_tx(obs_recipient(Bucket::GasOnly, 100, Some(a), true), &[]);
+        agg.observe_tx(obs_recipient(Bucket::GasOnly, 200, Some(a), true), &[]);
+
+        let out = agg.finish_block();
+        assert!(
+            out.bucket_recipients.iter().all(|r| r.bucket != Bucket::Unchanged),
+            "Unchanged bucket must not be attributed"
+        );
+        let row = out
+            .bucket_recipients
+            .iter()
+            .find(|r| r.bucket == Bucket::GasOnly)
+            .expect("gas_only recipient row");
+        assert_eq!(row.recipient, format!("{a:#x}"));
+        assert_eq!(row.tx_count, 2);
+        assert_eq!(row.gas_delta_sum_succeeding, 300);
+    }
+
+    #[test]
+    fn bucket_recipients_gas_sum_excludes_non_succeeding() {
+        let mut agg = BlockAggregator::start_block(meta(), 2);
+        let a = Address::repeat_byte(0x20);
+        // Succeeding tx: gas counted. OOG-at-tier tx: counted in tx_count only —
+        // its halt-gas gas_delta must NOT pollute the sum.
+        agg.observe_tx(obs_recipient(Bucket::WalletFixableShallow, 1_000, Some(a), true), &[]);
+        agg.observe_tx(obs_recipient(Bucket::WalletFixableShallow, 9_999_999, Some(a), false), &[]);
+
+        let out = agg.finish_block();
+        let row = out
+            .bucket_recipients
+            .iter()
+            .find(|r| r.bucket == Bucket::WalletFixableShallow)
+            .unwrap();
+        assert_eq!(row.tx_count, 2, "both txs counted");
+        assert_eq!(row.gas_delta_sum_succeeding, 1_000, "halt-gas delta excluded");
+    }
+
+    #[test]
+    fn bucket_recipients_create_uses_sentinel() {
+        let mut agg = BlockAggregator::start_block(meta(), 1);
+        agg.observe_tx(obs_recipient(Bucket::ContractBroken, 5, None, true), &[]);
+        let out = agg.finish_block();
+        let row =
+            out.bucket_recipients.iter().find(|r| r.bucket == Bucket::ContractBroken).unwrap();
+        assert_eq!(row.recipient, "__create__");
+    }
+
+    #[test]
+    fn bucket_recipients_top_k_folds_tail_into_other() {
+        let mut agg = BlockAggregator::start_block(meta(), 0);
+        // K+3 distinct recipients, one tx each, so 3 fall outside the top-K.
+        let n = BUCKET_RECIPIENT_TOP_K + 3;
+        for i in 0..n {
+            agg.observe_tx(
+                obs_recipient(Bucket::GasOnly, 1, Some(Address::repeat_byte(i as u8)), true),
+                &[],
+            );
+        }
+        let out = agg.finish_block();
+        let rows: Vec<_> =
+            out.bucket_recipients.iter().filter(|r| r.bucket == Bucket::GasOnly).collect();
+        assert_eq!(rows.len(), BUCKET_RECIPIENT_TOP_K + 1, "top-K rows plus one __other__");
+        let other = rows.iter().find(|r| r.recipient == "__other__").expect("__other__ row");
+        assert_eq!(other.tx_count, 3, "the 3 truncated recipients fold into __other__");
+    }
+
     #[test]
     fn state_gas_aggregates_only_emit_when_non_zero() {
         let mut agg = BlockAggregator::start_block(meta(), 2);
@@ -533,6 +749,9 @@ mod tests {
                 has_authorization: true,
                 has_runtime_state: true,
                 drill_in_record: None,
+                recipient: None,
+                selector: None,
+                succeeded_within_limit: false,
             },
             &[],
         );

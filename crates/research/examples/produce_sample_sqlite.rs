@@ -140,6 +140,8 @@ fn main() {
             tx_count_inconclusive_needs_higher_sweep: 0,
             tx_count_contract_broken: 1,
             tx_count_aa_gas_reestimation: 0,
+            block_gas_used: 15_000_000,
+            block_gas_limit: 30_000_000,
         },
         summaries: vec![BlockSummaryRow {
             schedule_name: "eip-8037".into(),
@@ -166,6 +168,7 @@ fn main() {
             tx_count_no_state: None,
         }],
         drill_ins: vec![drill_in],
+        bucket_recipients: vec![],
     })
     .unwrap();
 
