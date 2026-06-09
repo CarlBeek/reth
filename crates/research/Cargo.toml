@@ -69,5 +69,5 @@ tempfile = "3.0"
 [features]
 default = []
 test-utils = [
-	"reth-evm/test-utils"
+    "reth-evm/test-utils",
 ]

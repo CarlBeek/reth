@@ -1,0 +1,49 @@
+# Example ClickHouse export config for reth-research.
+#
+# Pass with `--research.export-config-path`. Parsed strictly: unknown keys are
+# rejected, so a typo fails fast at startup. All keys except endpoint/database/
+# username/password_env have defaults (shown).
+
+# Required. Must be https:// — plaintext endpoints are rejected.
+endpoint = "https://clickhouse.example.org:8443"
+
+# Required. Validated as a SQL identifier ([A-Za-z0-9_]) before use.
+database = "default"
+
+# Required. The ingest account; needs INSERT on the four destination tables
+# plus the metadata read used by the startup DESCRIBE TABLE schema check.
+username = "reth_research_ingest"
+
+# Required. NAME OF THE ENV VAR holding the password — never the password
+# itself, and never a CLI argument (process command lines are observable).
+password_env = "RETH_RESEARCH_CLICKHOUSE_PASSWORD"
+
+# --- Optional tunables (defaults shown) ---
+
+# Per-request HTTP timeout.
+request_timeout_secs = 30
+
+# How often the worker polls the outbox when nothing is due.
+poll_interval_ms = 1000
+
+# Exponential backoff bounds for transient failures.
+retry_initial_ms = 500
+retry_max_secs = 60
+
+# Batch sizing for JSONEachRow inserts.
+max_batch_rows = 1000
+max_batch_bytes = 8388608 # 8 MiB
+
+# A single row larger than this is permanently blocked (not retried).
+max_single_row_bytes = 16777216 # 16 MiB
+
+# How long exported audit rows are kept in export_outbox before pruning.
+exported_retention_secs = 604800 # 7 days
+
+# Backlog ceiling. When pending outbox bytes exceed this, the worker stops
+# loudly rather than grow the outbox without bound. Remediate ClickHouse/disk
+# and restart; pending rows are durable and resume.
+max_pending_bytes = 53687091200 # 50 GiB
+
+# Optional PEM certificate for a private CA. Omit for a public CA.
+# ca_cert_path = "/etc/reth-research/clickhouse-ca.pem"
