@@ -12,14 +12,14 @@ use crate::export::config::ExportConfig;
 use std::collections::HashSet;
 use thiserror::Error;
 
-/// Destination table for `reth_research_run`.
-pub const RUN_TABLE: &str = "reth_research_run";
-/// Destination table for `reth_research_block_coverage`.
-pub const COVERAGE_TABLE: &str = "reth_research_block_coverage";
-/// Destination table for `reth_research_block_summary`.
-pub const SUMMARY_TABLE: &str = "reth_research_block_summary";
-/// Destination table for `reth_research_divergence`.
-pub const DIVERGENCE_TABLE: &str = "reth_research_divergence";
+/// Destination table for `gas_analysis_run`.
+pub const RUN_TABLE: &str = "gas_analysis_run";
+/// Destination table for `gas_analysis_block_coverage`.
+pub const COVERAGE_TABLE: &str = "gas_analysis_block_coverage";
+/// Destination table for `gas_analysis_block_summary`.
+pub const SUMMARY_TABLE: &str = "gas_analysis_block_summary";
+/// Destination table for `gas_analysis_divergence`.
+pub const DIVERGENCE_TABLE: &str = "gas_analysis_divergence";
 
 /// Maximum bytes of a remote error response body included in an error message.
 const ERROR_BODY_SNIPPET_BYTES: usize = 500;
@@ -28,13 +28,13 @@ const ERROR_BODY_SNIPPET_BYTES: usize = 500;
 /// malformed config can't redirect inserts to an attacker-chosen table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DestinationTable {
-    /// `reth_research_run`
+    /// `gas_analysis_run`
     Run,
-    /// `reth_research_block_coverage`
+    /// `gas_analysis_block_coverage`
     Coverage,
-    /// `reth_research_block_summary`
+    /// `gas_analysis_block_summary`
     Summary,
-    /// `reth_research_divergence`
+    /// `gas_analysis_divergence`
     Divergence,
 }
 
@@ -56,7 +56,7 @@ impl DestinationTable {
     /// Columns this producer writes. The startup schema check requires every
     /// one to be present in the live table (extra columns in the table are
     /// allowed). This is the producer's half of the column contract; the
-    /// canonical DDL lives in `bin/reth-research/clickhouse/schema.sql`.
+    /// canonical DDL lives in `bin/reth-research/clickhouse/migrations`.
     pub const fn required_columns(self) -> &'static [&'static str] {
         match self {
             Self::Run => &[
@@ -369,10 +369,10 @@ mod tests {
 
     #[test]
     fn table_names_are_constants() {
-        assert_eq!(DestinationTable::Run.name(), "reth_research_run");
-        assert_eq!(DestinationTable::Coverage.name(), "reth_research_block_coverage");
-        assert_eq!(DestinationTable::Summary.name(), "reth_research_block_summary");
-        assert_eq!(DestinationTable::Divergence.name(), "reth_research_divergence");
+        assert_eq!(DestinationTable::Run.name(), "gas_analysis_run");
+        assert_eq!(DestinationTable::Coverage.name(), "gas_analysis_block_coverage");
+        assert_eq!(DestinationTable::Summary.name(), "gas_analysis_block_summary");
+        assert_eq!(DestinationTable::Divergence.name(), "gas_analysis_divergence");
     }
 
     #[test]
@@ -445,7 +445,7 @@ mod tests {
 
         let req = String::from_utf8_lossy(&handle.await.unwrap()).to_string();
         assert!(req.starts_with("POST "), "expected POST, got: {}", &req[..req.len().min(40)]);
-        assert!(req.contains("query=INSERT+INTO+default.reth_research_block_coverage"));
+        assert!(req.contains("query=INSERT+INTO+default.gas_analysis_block_coverage"));
         assert!(req.contains("insert_deduplication_token=tok-1"));
         assert!(req.to_lowercase().contains("authorization: basic "));
         assert!(req.contains("{\"a\":1}"));

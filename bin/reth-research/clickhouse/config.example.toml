@@ -1,22 +1,23 @@
 # Example ClickHouse export config for reth-research.
 #
 # Pass with `--research.export-config-path`. Parsed strictly: unknown keys are
-# rejected, so a typo fails fast at startup. All keys except endpoint/database/
-# username/password_env have defaults (shown).
+# rejected, so a typo fails fast at startup. Only endpoint/username/password_env
+# are required; everything else (including database) has a default (shown).
 
 # Required. Must be https:// — plaintext endpoints are rejected.
 endpoint = "https://clickhouse.example.org:8443"
 
-# Required. Validated as a SQL identifier ([A-Za-z0-9_]) before use.
-database = "default"
+# Destination database. Validated as a SQL identifier ([A-Za-z0-9_]) before use.
+# Defaults to "gas_analysis"; the tables live here (see clickhouse/migrations).
+database = "gas_analysis"
 
 # Required. The ingest account; needs INSERT on the four destination tables
 # plus the metadata read used by the startup DESCRIBE TABLE schema check.
-username = "reth_research_ingest"
+username = "gas_analysis"
 
 # Required. NAME OF THE ENV VAR holding the password — never the password
 # itself, and never a CLI argument (process command lines are observable).
-password_env = "RETH_RESEARCH_CLICKHOUSE_PASSWORD"
+password_env = "CLICKHOUSE_PASSWORD"
 
 # --- Optional tunables (defaults shown) ---
 

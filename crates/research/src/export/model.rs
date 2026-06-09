@@ -13,7 +13,7 @@
 //!    worker.
 //! 3. The `ClickHouse` row model ([`RunRow`], [`CoverageRow`], [`SummaryRow`],
 //!    [`DivergenceExportRow`]) and the conversion from a `BlockOutput`. Column names and types here
-//!    are the producer contract; the canonical DDL in `bin/reth-research/clickhouse/schema.sql`
+//!    are the producer contract; the canonical DDL in `bin/reth-research/clickhouse/migrations`
 //!    must match.
 //!
 //! Delivery to `ClickHouse` is at least once. Correctness comes from the
@@ -218,17 +218,17 @@ pub fn export_id(analysis_config_hash: &str, schedule_name: &str, block_hash: B2
     ])
 }
 
-/// Deterministic `reth_research_block_coverage.row_id`.
+/// Deterministic `gas_analysis_block_coverage.row_id`.
 pub fn coverage_row_id(export_id: &str) -> String {
     framed_keccak(&[export_id.as_bytes(), b"coverage"])
 }
 
-/// Deterministic `reth_research_block_summary.row_id`.
+/// Deterministic `gas_analysis_block_summary.row_id`.
 pub fn summary_row_id(export_id: &str, bucket: Bucket) -> String {
     framed_keccak(&[export_id.as_bytes(), bucket.as_str().as_bytes(), b"summary"])
 }
 
-/// Deterministic `reth_research_divergence.row_id`.
+/// Deterministic `gas_analysis_divergence.row_id`.
 pub fn divergence_row_id(export_id: &str, tx_index: u32, tx_hash: B256) -> String {
     framed_keccak(&[
         export_id.as_bytes(),
@@ -351,7 +351,7 @@ impl ExportEnvelopeV1 {
 // ClickHouse row model
 //
 // Column names and types here are the producer contract. The canonical DDL in
-// `bin/reth-research/clickhouse/schema.sql` must match. Hashes are emitted as
+// `bin/reth-research/clickhouse/migrations` must match. Hashes are emitted as
 // `0x`-prefixed lowercase hex (FixedString(66)); addresses as FixedString(42).
 // `DateTime` columns are emitted as Unix-second integers, which ClickHouse
 // accepts in JSONEachRow.
@@ -369,7 +369,7 @@ fn opt_addr42(value: Option<Address>) -> Option<String> {
     value.map(addr42)
 }
 
-/// One row for `reth_research_run` — one per deterministic analysis config.
+/// One row for `gas_analysis_run` — one per deterministic analysis config.
 #[allow(missing_docs)]
 #[derive(Debug, Clone, Serialize)]
 pub struct RunRow {
@@ -403,7 +403,7 @@ impl RunRow {
     }
 }
 
-/// One row for `reth_research_block_coverage`.
+/// One row for `gas_analysis_block_coverage`.
 #[allow(missing_docs)]
 #[derive(Debug, Clone, Serialize)]
 pub struct CoverageRow {
@@ -436,7 +436,7 @@ pub struct CoverageRow {
     pub drill_ins_truncated: bool,
 }
 
-/// One row for `reth_research_block_summary`.
+/// One row for `gas_analysis_block_summary`.
 #[allow(missing_docs)]
 #[derive(Debug, Clone, Serialize)]
 pub struct SummaryRow {
@@ -472,7 +472,7 @@ pub struct SummaryRow {
     pub tx_count_no_state: Option<u32>,
 }
 
-/// One row for `reth_research_divergence`. Copies every scalar from
+/// One row for `gas_analysis_divergence`. Copies every scalar from
 /// [`DivergenceRow`], inherits the block hash and identity columns, and carries
 /// the forensic child components as a `trace_payload` JSON blob plus its
 /// content hash and component counts.

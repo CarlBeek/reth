@@ -423,15 +423,17 @@ mod tests {
     use alloy_primitives::{Address, B256};
     use std::sync::{Arc, Mutex};
 
+    /// Callback run *during* the fake sink's insert await (used to prove the
+    /// `SQLite` lock is not held while the worker is contacting the sink).
+    type InsertHook = Arc<Mutex<Option<Box<dyn FnMut() + Send>>>>;
+
     /// A scriptable in-memory sink that records insert order and bodies.
     #[derive(Clone)]
     struct FakeSink {
         log: Arc<Mutex<Vec<DestinationTable>>>,
         // Per-table failure to inject, consulted on each insert.
         fail: Arc<Mutex<Option<(DestinationTable, ClickHouseError)>>>,
-        // Optional callback run *during* the insert await (used to prove the
-        // SQLite lock is not held while the worker is contacting the sink).
-        on_insert: Arc<Mutex<Option<Box<dyn FnMut() + Send>>>>,
+        on_insert: InsertHook,
     }
 
     impl FakeSink {

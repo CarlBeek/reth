@@ -211,7 +211,7 @@ set + normalized gas tiers + drill-in cap + commit + chain id). `ReplacingMergeT
 plus deterministic row IDs make at-least-once delivery idempotent. The immutable
 `analysis_manifests` row lets a restarted process export a pending item under the
 manifest it was produced with, independent of the current CLI configuration. See
-`bin/reth-research/README.md` and `bin/reth-research/clickhouse/schema.sql` for
+`bin/reth-research/README.md` and `bin/reth-research/clickhouse/migrations` for
 the operator-facing contract.
 
 ## Per-frame opcode capture

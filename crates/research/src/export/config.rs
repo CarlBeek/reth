@@ -18,6 +18,9 @@ use std::{
 };
 use thiserror::Error;
 
+fn default_database() -> String {
+    "gas_analysis".to_string()
+}
 const fn default_request_timeout_secs() -> u64 {
     30
 }
@@ -116,6 +119,7 @@ impl fmt::Debug for Secret {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     endpoint: String,
+    #[serde(default = "default_database")]
     database: String,
     username: String,
     password_env: String,
@@ -311,6 +315,17 @@ mod tests {
             bogus_key = 1
         "#;
         assert!(toml::from_str::<RawConfig>(toml).is_err());
+    }
+
+    #[test]
+    fn database_defaults_to_gas_analysis_when_omitted() {
+        let toml = r#"
+            endpoint = "https://x:8443"
+            username = "gas_analysis"
+            password_env = "PW"
+        "#;
+        let raw: RawConfig = toml::from_str(toml).unwrap();
+        assert_eq!(raw.database, "gas_analysis");
     }
 
     #[test]
