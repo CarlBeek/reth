@@ -2015,6 +2015,20 @@ impl DivergenceDatabase {
         )?;
         Ok(deleted)
     }
+
+    /// Read the `state` of an outbox row by `export_id`. Test-only accessor for
+    /// worker tests in a sibling module that cannot reach the private connection.
+    #[cfg(test)]
+    pub(crate) fn export_state_for_test(&self, export_id: &str) -> Option<String> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
+        conn.query_row(
+            "SELECT state FROM export_outbox WHERE export_id = ?",
+            params![export_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap_or(None)
+    }
 }
 
 /// Truncate an error message to a bounded length before storing it in the

@@ -51,7 +51,7 @@ thiserror.workspace = true
 # `default-features = false` mirrors the workspace declaration (rustls
 # + stream features only — no native-tls baggage).
 reqwest = { workspace = true, features = ["json", "query"] }
-tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros", "net", "io-util"] }
 
 # Config-file parsing for the optional label-backfill credentials
 # (Etherscan API key, URL overrides).

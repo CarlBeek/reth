@@ -9,9 +9,17 @@
 //!
 //! - [`model`]: dataset identity (manifest + hash), the outbox envelope, and the `ClickHouse` row
 //!   contract with conversion from a `BlockOutput`.
+//! - [`config`]: strict TOML configuration; export is opt-in.
+//! - [`clickhouse`]: the HTTPS `JSONEachRow` client and failure classification.
+//! - [`worker`]: the background drain loop.
 
+pub mod clickhouse;
+pub mod config;
 pub mod model;
+pub mod worker;
 
+pub use clickhouse::{ClickHouseClient, ClickHouseError, DestinationTable};
+pub use config::{ConfigError, ExportConfig};
 pub use model::{
     block_output_to_rows, coverage_row_id, divergence_row_id, export_id, normalize_gas_tiers,
     summary_row_id, AnalysisManifestV1, BlockClickHouseRows, CaptureMetadataV1, CoverageRow,
@@ -19,3 +27,4 @@ pub use model::{
     ScheduleManifestV1, SummaryRow, ENVELOPE_FORMAT_VERSION, MANIFEST_FORMAT_VERSION,
     REPLAY_SEMANTICS,
 };
+pub use worker::{run_export_worker, ClickHouseSink, ExportError};
