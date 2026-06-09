@@ -50,6 +50,8 @@ same schedule.
 - `--research.max-divergences-per-block N`
 - `--research.metadata-backfill` (run the contract-metadata backfill in
   one-shot mode instead of starting live analysis; see below)
+- `--research.export-config-path PATH` (enable durable ClickHouse export; see
+  [ClickHouse Export](#clickhouse-export))
 
 At least one schedule flag is required.
 
@@ -182,6 +184,89 @@ After the backfill completes the process exits; the node launch is just
 to get a provider handle on reth state. At least one schedule flag is
 still required because reth-research's CLI parser shares args with the
 live mode.
+
+## ClickHouse Export
+
+Optional. When `--research.export-config-path` points at a TOML config, every
+analyzed block output is also shipped to ClickHouse. SQLite remains the local
+source of truth; ClickHouse is a downstream copy.
+
+### Architecture
+
+```text
+block replay -> BlockOutput
+  -> SQLite analytical rows + export_outbox row (one transaction)
+  -> embedded async export worker
+  -> ClickHouse HTTPS JSONEachRow inserts
+```
+
+The outbox row is written in the **same SQLite transaction** as the analytical
+rows, so there is no crash window where a block is durable locally but its
+export request is lost. An embedded worker drains the outbox and inserts the run
+manifest, divergences, summaries, then **coverage last** (the remote completion
+marker). Delivery is at-least-once; deterministic row IDs plus ClickHouse
+`ReplacingMergeTree` make re-sends idempotent, so a crash mid-flight is recovered
+by simply retrying.
+
+Remote outages never block replay or the SQLite writer. They grow the outbox on
+disk instead; that is observable (logged pending count/bytes/age) and bounded by
+`max_pending_bytes` — once exceeded the process stops loudly rather than grow
+without bound.
+
+### Config
+
+The canonical table DDL is in [`clickhouse/schema.sql`](./clickhouse/schema.sql)
+and an example config is in
+[`clickhouse/config.example.toml`](./clickhouse/config.example.toml):
+
+```toml
+endpoint = "https://clickhouse.example.org:8443"   # must be https://
+database = "default"
+username = "reth_research_ingest"
+password_env = "RETH_RESEARCH_CLICKHOUSE_PASSWORD"  # password read from env, never a flag
+# ... batching/retry/backlog tunables, optional ca_cert_path ...
+```
+
+The password is **never** a CLI argument or a value in the file — it is resolved
+once at startup from the environment variable named by `password_env`. Grant the
+ingest account only `INSERT` on the four destination tables plus the metadata
+read needed for the startup `DESCRIBE TABLE` schema check.
+
+Run the schema in `clickhouse/schema.sql` against your cluster first (adapt the
+engine to `ReplicatedReplacingMergeTree` + `Distributed` for a clustered
+deployment; column names and types are fixed). Then:
+
+```bash
+export RETH_RESEARCH_CLICKHOUSE_PASSWORD=...
+cargo run --release -p reth-research-bin -- node \
+  --research.eip2780 \
+  --research.db-path ./divergences.sqlite \
+  --research.export-config-path ./clickhouse/config.example.toml
+```
+
+### Operating notes
+
+- **Fresh DB for history.** The outbox only captures blocks committed *after*
+  deployment. Adding the exporter does **not** ship pre-existing SQLite history.
+  To export history, replay into a fresh database, or wait for the separate
+  backfill pass. Export requires a real on-disk `--research.db-path` (not
+  `:memory:`).
+- **Finalized/historical only (v1).** Live-head reorg cleanup is not supported:
+  if an exported block is later reorged, its ClickHouse rows remain. Every row
+  carries `block_hash`, so consumers can join canonicality data. Do not point v1
+  export at the live head expecting tombstones.
+- **`trace_payload` is not a full EVM trace.** It holds only the retained
+  drill-in child components (call frames, opcode counts, event logs) plus an
+  identity header, with a content hash and component counts for verification.
+- **`ReplacingMergeTree` is eventual.** Consumers needing immediate exactness
+  should query an `argMax` view or use `FINAL` selectively.
+- **Backlog/disk alerts.** Watch the worker's `export backlog` logs
+  (pending count, pending bytes, oldest age). A growing backlog means ClickHouse
+  is unreachable; remediate before `max_pending_bytes` is hit.
+- **Blocked rows.** A permanently failing item (e.g. an oversized row, or a 4xx
+  schema error) is marked `blocked` in `export_outbox` and logged at high
+  severity. Inspect with
+  `SELECT export_id, last_error FROM export_outbox WHERE state = 'blocked'`.
 
 ## Important Limits
 

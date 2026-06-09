@@ -190,6 +190,30 @@ doesn't match its compiled-in version. The consumer warns and reads
 anyway (so older replays remain inspectable in the dashboard during a
 migration window).
 
+Schema `v10` adds the ClickHouse export outbox (`analysis_manifests` +
+`export_outbox`); the version check fails closed across **both**
+`analysis_runs` and `analysis_manifests`, so an export-enabled v10 binary
+rejects a v9 DB (and vice versa). There is no in-place migration — an
+export-enabled deployment replays into a fresh database.
+
+## ClickHouse export outbox (optional)
+
+When `--research.export-config-path` is set, each `record_block_output` also
+writes one `export_outbox` row **in the same transaction** as the analytical
+rows, so there is no crash window between local persistence and the export
+request. An embedded worker drains the outbox and ships rows to ClickHouse over
+HTTPS; remote failures never touch replay or the SQLite writer (they grow the
+outbox, bounded by `max_pending_bytes`).
+
+The export path lives entirely in `crates/research/src/export/` and is keyed by
+a deterministic `analysis_config_hash` (a manifest hash over the full schedule
+set + normalized gas tiers + drill-in cap + commit + chain id). `ReplacingMergeTree`
+plus deterministic row IDs make at-least-once delivery idempotent. The immutable
+`analysis_manifests` row lets a restarted process export a pending item under the
+manifest it was produced with, independent of the current CLI configuration. See
+`bin/reth-research/README.md` and `bin/reth-research/clickhouse/schema.sql` for
+the operator-facing contract.
+
 ## Per-frame opcode capture
 
 The current `tracking_inspector.rs` records a single tx-level
