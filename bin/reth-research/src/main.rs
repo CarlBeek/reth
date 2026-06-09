@@ -3154,7 +3154,11 @@ fn main() -> eyre::Result<()> {
                         ))
                     }
                 })
-                .launch()
+                // Use the debug-capable launcher (same as the standard `reth`
+                // binary) so node debug features work — notably `--dev`, whose
+                // `LocalMiner` is only installed by this launcher. Plain
+                // `.launch()` would never produce blocks in dev mode.
+                .launch_with_debug_capabilities()
                 .await?;
 
             handle.wait_for_node_exit().await
