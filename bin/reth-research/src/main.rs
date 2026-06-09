@@ -28,22 +28,28 @@ use alloy_primitives::{keccak256, logs_bloom, Address, Bloom, Bytes, B256, U256}
 use clap::Parser;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt, TryStreamExt};
 use reth_ethereum::{
+    chainspec::EthChainSpec,
     exex::{ExExContext, ExExEvent, ExExNotification},
     node::EthereumNode,
 };
 use reth_evm::{block::BlockExecutorFactory, ConfigureEvm, Evm, EvmFactory, TransactionEnvMut};
 use reth_node_api::{BlockTy, FullNodeComponents};
-use reth_node_core::args::ResearchArgs;
+use reth_node_core::{args::ResearchArgs, version::version_metadata};
 use reth_primitives_traits::BlockBody;
 use reth_provider::{BlockNumReader, BlockReader, StateProviderFactory, TransactionVariant};
 use reth_research::{
     block_aggregator::{BlockAggregator, BlockMeta},
     database::{
-        BlockOutput, CallFrameRow, DivergenceDatabase, DivergenceRow, DrillInRecord, OpcodeCountRow,
+        AnalysisManifestRecord, BlockOutput, CallFrameRow, DivergenceDatabase, DivergenceRow,
+        DrillInRecord, EncodedExportEnvelope, OpcodeCountRow, SCHEMA_VERSION,
     },
     divergence::{
         AccountDrivers, CallFrame, CallType as ResCallType, DivergenceFacts, DivergenceLocation,
         EventLog, OutOfGasInfo, StorageDrivers, Tier1Diagnostics,
+    },
+    export::{
+        export_id, normalize_gas_tiers, run_export_worker, AnalysisManifestV1, ExportConfig,
+        ExportEnvelopeV1, ExportError, REPLAY_SEMANTICS,
     },
     oog_chain::classify_oog_chain,
     schedule::{GasSchedule, RecipientInfo, ScheduleKind, ScheduleRegistry, TxContext},
@@ -62,7 +68,10 @@ use std::{
     },
     thread::JoinHandle,
 };
-use tokio::{sync::mpsc, task::JoinHandle as TokioJoinHandle};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle as TokioJoinHandle,
+};
 
 /// One unit of work for the DB writer thread. Each `BlockProcessed`
 /// command is a fully-built per-(schedule, block) output and gets written
@@ -274,6 +283,30 @@ fn build_call_frame_rows<D: Database>(
         .collect()
 }
 
+/// Encode a block output into a durable export envelope. Runs on the DB writer
+/// thread before the SQLite connection lock is taken: the payload is
+/// JSON-serialized, hashed, and ZSTD-compressed here so the lock is held only
+/// for the insert.
+fn encode_export_envelope(
+    analysis_config_hash: &str,
+    output: &BlockOutput,
+) -> Result<EncodedExportEnvelope, reth_research::export::ExportModelError> {
+    let export_id =
+        export_id(analysis_config_hash, &output.coverage.schedule_name, output.coverage.block_hash);
+    let schedule_config_hash = output.coverage.schedule_config_hash.clone();
+    let envelope = ExportEnvelopeV1::new(analysis_config_hash.to_string(), output.clone());
+    let encoded = envelope.encode()?;
+    Ok(EncodedExportEnvelope {
+        export_id,
+        analysis_config_hash: analysis_config_hash.to_string(),
+        schedule_config_hash,
+        payload_version: encoded.payload_version,
+        payload_zstd: encoded.payload_zstd,
+        payload_hash: encoded.payload_hash,
+        payload_bytes: encoded.payload_bytes,
+    })
+}
+
 /// Analyzer state shared between the live arm and concurrent backfill workers.
 ///
 /// This struct holds everything needed to analyze a single block: the node
@@ -341,6 +374,15 @@ struct ResearchExEx<Node: FullNodeComponents> {
     in_flight_backfill: FuturesUnordered<TokioJoinHandle<eyre::Result<bool>>>,
     /// Total blocks processed (live + backfill).
     blocks_processed: u64,
+    /// Shutdown signal for the embedded ClickHouse export worker. `None` when
+    /// export is disabled.
+    export_shutdown: Option<watch::Sender<bool>>,
+    /// Join handle for the export worker task. `None` when export is disabled.
+    export_task: Option<TokioJoinHandle<Result<(), ExportError>>>,
+    /// Fatal-error channel from the export worker. A message here (invariant or
+    /// backlog-limit breach) stops the ExEx visibly; transient ClickHouse
+    /// failures stay in the outbox retry loop and never use this channel.
+    export_fatal_rx: Option<mpsc::Receiver<ExportError>>,
 }
 
 impl<Node> Analyzer<Node>
@@ -459,6 +501,7 @@ where
         contract_labels_interval_secs: u64,
         function_signatures_interval_secs: u64,
         label_config_path: Option<std::path::PathBuf>,
+        export_config: Option<ExportConfig>,
     ) -> eyre::Result<Self> {
         let registry = Arc::new(registry);
         let all_schedules = registry.all();
@@ -479,8 +522,18 @@ where
             })
             .collect();
 
-        // Initialize database and async writer
-        let (divergence_db, db_tx, db_writer_task) = if db_path.to_str() != Some(":memory:") {
+        // Normalize the gas-limit-multiplier sweep exactly once and reuse it for
+        // both the deterministic export manifest and the analyzer, so the
+        // dataset identity matches the data actually produced.
+        let normalized_gas_tiers = normalize_gas_tiers(&gas_limit_multipliers);
+        let chain_id = ctx.config.chain.chain_id();
+
+        // Initialize database and async writer. `export_ach` is the deterministic
+        // analysis-config hash to stamp on outbox rows, present only when export
+        // is enabled against a real on-disk database.
+        let (divergence_db, db_tx, db_writer_task, export_ach) = if db_path.to_str() !=
+            Some(":memory:")
+        {
             let divergence_db = DivergenceDatabase::open(&db_path)?;
 
             info!(
@@ -504,11 +557,56 @@ where
                 }
             }
 
+            // Construct the deterministic export manifest and persist it as the
+            // immutable dataset descriptor before any analysis runs. A durable
+            // outbox row can outlive the current configuration, so the manifest
+            // it was produced under must be retrievable independently.
+            let export_ach = if let Some(_cfg) = export_config.as_ref() {
+                let producer_git_commit = version_metadata().vergen_git_sha_long.to_string();
+                let manifest = AnalysisManifestV1::build(
+                    &registry,
+                    normalized_gas_tiers.clone(),
+                    max_divergences_per_block,
+                    chain_id,
+                    SCHEMA_VERSION,
+                    producer_git_commit,
+                );
+                let ach = manifest
+                    .analysis_config_hash()
+                    .map_err(|e| eyre::eyre!("failed to derive analysis_config_hash: {e}"))?;
+                let manifest_json = manifest
+                    .to_json()
+                    .map_err(|e| eyre::eyre!("failed to serialize export manifest: {e}"))?;
+                divergence_db
+                    .upsert_analysis_manifest(&AnalysisManifestRecord {
+                        analysis_config_hash: ach.clone(),
+                        schema_version: SCHEMA_VERSION,
+                        chain_id,
+                        producer_git_commit: manifest.producer_git_commit.clone(),
+                        replay_semantics: REPLAY_SEMANTICS.to_string(),
+                        manifest_json,
+                    })
+                    .map_err(|e| eyre::eyre!("failed to upsert export manifest: {e}"))?;
+                info!(
+                    target: "exex::research::export",
+                    analysis_config_hash = %ach,
+                    chain_id,
+                    "ClickHouse export enabled"
+                );
+                Some(ach)
+            } else {
+                None
+            };
+
             // Spawn database writer task. Each `BlockProcessed` command
             // lands in a single DuckDB transaction (per-block commit) so
-            // a crash mid-block doesn't leave half-written aggregates.
+            // a crash mid-block doesn't leave half-written aggregates. When
+            // export is enabled, the block-output envelope is JSON-encoded and
+            // ZSTD-compressed on this thread before the connection lock is
+            // taken, then enqueued in the outbox in the same transaction.
             let (tx, mut rx) = mpsc::unbounded_channel::<DbCommand>();
             let writer_db = divergence_db.clone();
+            let writer_ach = export_ach.clone();
             let writer_task = std::thread::Builder::new()
                 .name("reth-research-db-writer".to_string())
                 .spawn(move || {
@@ -519,7 +617,28 @@ where
                             DbCommand::BlockProcessed(output) => {
                                 let block_number = output.coverage.block_number;
                                 let schedule_name = output.coverage.schedule_name.clone();
-                                if let Err(error) = divergence_db.record_block_output(&output) {
+                                let result = match writer_ach.as_deref() {
+                                    Some(ach) => match encode_export_envelope(ach, &output) {
+                                        Ok(export) => divergence_db
+                                            .record_block_output_with_export(&output, &export),
+                                        Err(error) => {
+                                            // Encoding a block should never fail; if it
+                                            // does, persist analytics anyway so the local
+                                            // source of truth is never lost, and skip the
+                                            // export for this block.
+                                            warn!(
+                                                target: "exex::research::db_writer",
+                                                block = block_number,
+                                                schedule = schedule_name,
+                                                %error,
+                                                "Failed to encode export envelope; recording without export"
+                                            );
+                                            divergence_db.record_block_output(&output)
+                                        }
+                                    },
+                                    None => divergence_db.record_block_output(&output),
+                                };
+                                if let Err(error) = result {
                                     warn!(
                                         target: "exex::research::db_writer",
                                         block = block_number,
@@ -552,6 +671,7 @@ where
                                             call_frames = counts.call_frames,
                                             opcode_counts = counts.opcode_counts,
                                             event_logs = counts.event_logs,
+                                            outbox_pending = counts.outbox_pending,
                                             "Deleted rows for non-canonical block range"
                                         );
                                     }
@@ -576,9 +696,15 @@ where
                 })
                 .map_err(|err| eyre::eyre!("failed to spawn db writer thread: {err}"))?;
 
-            (Some(divergence_db), Some(tx), Some(writer_task))
+            (Some(divergence_db), Some(tx), Some(writer_task), export_ach)
         } else {
-            (None, None, None)
+            if export_config.is_some() {
+                warn!(
+                    target: "exex::research",
+                    "ClickHouse export requested but disabled: db-path is in-memory"
+                );
+            }
+            (None, None, None, None)
         };
 
         // Backfill requires a real DB — there's nowhere to record dedupe
@@ -611,20 +737,10 @@ where
             has_intrinsic_schedules,
             schedule_metadata,
             max_divergences_per_block,
-            // Guarantee at least one tier and that every tier is ≥ 1, so
-            // the replay loop never multiplies by zero and always
-            // executes at least the original-limit attempt.
-            gas_limit_multipliers: {
-                let mut tiers: Vec<u64> =
-                    gas_limit_multipliers.into_iter().map(|m| m.max(1)).collect();
-                if tiers.is_empty() {
-                    tiers.push(1);
-                }
-                // Ascending so we accept the smallest successful tier.
-                tiers.sort_unstable();
-                tiers.dedup();
-                tiers
-            },
+            // Normalized once above (clamp ≥1, sort, dedup, never empty) and
+            // shared with the export manifest so the dataset identity matches
+            // the tiers actually replayed.
+            gas_limit_multipliers: normalized_gas_tiers,
             db_tx,
             divergences_found: AtomicU64::new(0),
         });
@@ -691,6 +807,21 @@ where
             }
         }
 
+        // Start the embedded ClickHouse export worker when export is configured
+        // against a real database. The worker drains the outbox and ships rows;
+        // it shares the `DivergenceDatabase` handle (SQLite WAL) with the writer.
+        let (export_shutdown, export_task, export_fatal_rx) =
+            match (divergence_db.as_ref(), export_config, export_ach.as_ref()) {
+                (Some(db), Some(cfg), Some(_ach)) => {
+                    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                    let (fatal_tx, fatal_rx) = mpsc::channel(4);
+                    let task =
+                        tokio::spawn(run_export_worker(db.clone(), cfg, shutdown_rx, fatal_tx));
+                    (Some(shutdown_tx), Some(task), Some(fatal_rx))
+                }
+                _ => (None, None, None),
+            };
+
         Ok(Self {
             ctx,
             analyzer,
@@ -704,6 +835,9 @@ where
             backfill_exhausted: false,
             in_flight_backfill: FuturesUnordered::new(),
             blocks_processed: 0,
+            export_shutdown,
+            export_task,
+            export_fatal_rx,
         })
     }
 
@@ -766,14 +900,34 @@ where
             // 4. If nothing is in flight and backfill is exhausted/disabled, just block on the next
             //    notification. Otherwise race notifications against worker completions.
             if self.in_flight_backfill.is_empty() {
-                match self.ctx.notifications.try_next().await? {
-                    Some(notification) => self.handle_notification(notification).await?,
-                    None => break,
+                // Borrow disjoint fields out before select! to keep the macro happy.
+                let notifications = &mut self.ctx.notifications;
+                let export_fatal_rx = &mut self.export_fatal_rx;
+                let outcome: SelectOutcome<<Node::Evm as ConfigureEvm>::Primitives> = tokio::select! {
+                    biased;
+                    notif = notifications.try_next() => {
+                        match notif? {
+                            Some(n) => SelectOutcome::Notification(n),
+                            None => SelectOutcome::StreamClosed,
+                        }
+                    }
+                    fatal = next_export_fatal(export_fatal_rx) => {
+                        SelectOutcome::ExportFatal(fatal)
+                    }
+                };
+                match outcome {
+                    SelectOutcome::Notification(n) => self.handle_notification(n).await?,
+                    SelectOutcome::StreamClosed => break,
+                    SelectOutcome::ExportFatal(err) => {
+                        return Err(eyre::eyre!("export worker fatal error: {err}"));
+                    }
+                    SelectOutcome::WorkerCompleted(_) => {}
                 }
             } else {
                 // Borrow disjoint fields out before select! to keep the macro happy.
                 let notifications = &mut self.ctx.notifications;
                 let in_flight = &mut self.in_flight_backfill;
+                let export_fatal_rx = &mut self.export_fatal_rx;
                 let outcome: SelectOutcome<<Node::Evm as ConfigureEvm>::Primitives> = tokio::select! {
                     biased;
                     notif = notifications.try_next() => {
@@ -785,10 +939,16 @@ where
                     completed = in_flight.next() => {
                         SelectOutcome::WorkerCompleted(completed)
                     }
+                    fatal = next_export_fatal(export_fatal_rx) => {
+                        SelectOutcome::ExportFatal(fatal)
+                    }
                 };
                 match outcome {
                     SelectOutcome::Notification(n) => self.handle_notification(n).await?,
                     SelectOutcome::StreamClosed => break,
+                    SelectOutcome::ExportFatal(err) => {
+                        return Err(eyre::eyre!("export worker fatal error: {err}"));
+                    }
                     SelectOutcome::WorkerCompleted(Some(result)) => {
                         self.handle_backfill_completion(result);
                     }
@@ -811,6 +971,32 @@ where
         if let Some(task) = self.db_writer_task.take() {
             if let Err(err) = task.join() {
                 warn!(target: "exex::research", error = ?err, "Database writer task join failed during shutdown");
+            }
+        }
+
+        // Stop the export worker only after the DB writer has joined, so every
+        // produced outbox row is committed. Let it finish its current request
+        // but don't wait for the whole backlog; pending rows stay durable.
+        if let Some(shutdown) = self.export_shutdown.take() {
+            let _ = shutdown.send(true);
+        }
+        if let Some(task) = self.export_task.take() {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), task).await {
+                Ok(Ok(Ok(()))) => {
+                    info!(target: "exex::research::export", "Export worker stopped cleanly");
+                }
+                Ok(Ok(Err(err))) => {
+                    warn!(target: "exex::research::export", %err, "Export worker exited with error");
+                }
+                Ok(Err(join_err)) => {
+                    warn!(target: "exex::research::export", error = %join_err, "Export worker join failed");
+                }
+                Err(_) => {
+                    warn!(
+                        target: "exex::research::export",
+                        "Export worker did not stop within timeout; aborting. Pending outbox rows remain durable."
+                    );
+                }
             }
         }
 
@@ -1094,6 +1280,21 @@ enum SelectOutcome<P: reth_node_api::NodePrimitives> {
     Notification(ExExNotification<P>),
     StreamClosed,
     WorkerCompleted(Option<Result<eyre::Result<bool>, tokio::task::JoinError>>),
+    /// The export worker reported a fatal error (invariant or backlog breach).
+    ExportFatal(ExportError),
+}
+
+/// Await the next fatal export error, or never resolve when export is disabled
+/// or the worker's sender has been dropped. Used as a `tokio::select!` arm so a
+/// fatal export failure wakes the run loop even with no backfill workers.
+async fn next_export_fatal(rx: &mut Option<mpsc::Receiver<ExportError>>) -> ExportError {
+    match rx.as_mut() {
+        Some(receiver) => match receiver.recv().await {
+            Some(err) => err,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
 }
 
 impl<Node> Analyzer<Node>
@@ -2610,6 +2811,7 @@ async fn research_exex<Node: FullNodeComponents>(
     contract_labels_interval_secs: u64,
     function_signatures_interval_secs: u64,
     label_config_path: Option<std::path::PathBuf>,
+    export_config: Option<ExportConfig>,
 ) -> eyre::Result<()>
 where
     Node::Evm: ConfigureEvm<
@@ -2632,6 +2834,7 @@ where
         contract_labels_interval_secs,
         function_signatures_interval_secs,
         label_config_path,
+        export_config,
     )?
     .run()
     .await
@@ -2897,6 +3100,16 @@ fn main() -> eyre::Result<()> {
                 research_args.function_signatures_interval_secs;
             let label_config_path = research_args.label_config_path.clone();
 
+            // Parse the export config before launching the node so malformed
+            // configuration fails fast. Export stays disabled when absent.
+            let export_config = match research_args.export_config_path.as_ref() {
+                Some(path) => Some(
+                    ExportConfig::load(path)
+                        .map_err(|e| eyre::eyre!("failed to load ClickHouse export config: {e}"))?,
+                ),
+                None => None,
+            };
+
             info!(
                 target: "reth::cli",
                 schedules = registry.len(),
@@ -2921,6 +3134,7 @@ fn main() -> eyre::Result<()> {
                     let db_path = db_path.clone();
                     let gas_limit_multipliers = gas_limit_multipliers.clone();
                     let label_config_path = label_config_path.clone();
+                    let export_config = export_config.clone();
                     async move {
                         Ok(research_exex(
                             ctx,
@@ -2936,6 +3150,7 @@ fn main() -> eyre::Result<()> {
                             contract_labels_interval_secs,
                             function_signatures_interval_secs,
                             label_config_path,
+                            export_config,
                         ))
                     }
                 })
