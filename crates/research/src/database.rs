@@ -119,7 +119,12 @@ use thiserror::Error;
 ///   call tree diverged also stores the baseline call tree (F15) and baseline opcode counts (F11).
 ///   There is no in-place migration: opening a pre-v10 database is rejected by
 ///   [`enforce_schema_version`] (via `PRAGMA user_version`) — wipe the divergences `SQLite` and
-///   re-gather. The archive datadir is never touched.
+///   re-gather. The archive datadir is never touched. This branch additionally adds two optional,
+///   additive `ClickHouse`-export tables within v10 — `analysis_manifests` (immutable
+///   per-`analysis_config_hash` dataset descriptor) and `export_outbox` (one durable row per
+///   export-enabled block output, drained by the embedded export worker) — created via
+///   `CREATE TABLE IF NOT EXISTS`; they are inert unless `--research.export-config-path` is set, so
+///   v10 is unchanged for non-export deployments.
 pub const SCHEMA_VERSION: u32 = 10;
 
 /// Errors raised by the storage layer.
@@ -146,6 +151,19 @@ pub enum DatabaseError {
         expected: u32,
         /// Version found in the existing database.
         found: u32,
+    },
+    /// An `analysis_manifests` row already exists for this
+    /// `analysis_config_hash` but carries different `manifest_json`. Because the
+    /// hash is derived from the JSON this is impossible without a hash
+    /// collision or a bug, so we refuse the upsert rather than silently
+    /// overwrite an immutable dataset descriptor.
+    #[error(
+        "analysis manifest conflict: hash {analysis_config_hash} already stored \
+         with different manifest JSON"
+    )]
+    ManifestConflict {
+        /// The conflicting dataset identity.
+        analysis_config_hash: String,
     },
 }
 
@@ -320,7 +338,7 @@ fn enforce_schema_version(conn: &Connection) -> Result<(), DatabaseError> {
 }
 
 fn verify_schema_version(conn: &Connection) -> Result<(), DatabaseError> {
-    let latest: Option<u32> = conn
+    let run_version: Option<u32> = conn
         .query_row(
             "SELECT schema_version FROM analysis_runs
              ORDER BY run_id DESC LIMIT 1",
@@ -331,12 +349,23 @@ fn verify_schema_version(conn: &Connection) -> Result<(), DatabaseError> {
             },
         )
         .optional()?;
-    match latest {
-        Some(found) if found != SCHEMA_VERSION => {
-            Err(DatabaseError::SchemaVersionMismatch { expected: SCHEMA_VERSION, found })
+    let manifest_version: Option<u32> = conn
+        .query_row(
+            "SELECT schema_version FROM analysis_manifests
+             ORDER BY created_at DESC LIMIT 1",
+            [],
+            |row| {
+                let v: i64 = row.get(0)?;
+                Ok(v as u32)
+            },
+        )
+        .optional()?;
+    for found in [run_version, manifest_version].into_iter().flatten() {
+        if found != SCHEMA_VERSION {
+            return Err(DatabaseError::SchemaVersionMismatch { expected: SCHEMA_VERSION, found });
         }
-        _ => Ok(()),
     }
+    Ok(())
 }
 
 /// Apply the full DDL. Idempotent via `CREATE TABLE IF NOT EXISTS` and
@@ -825,6 +854,61 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
              ON block_recipients(schedule_name, recipient);",
     )?;
 
+    // Immutable per-dataset manifest. A durable outbox row can outlive the
+    // process/configuration that created it, so a restarted process must be
+    // able to export an old pending item using the manifest the data was
+    // produced under — not the current CLI configuration. Keyed by the
+    // deterministic `analysis_config_hash` from `export/model.rs`.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS analysis_manifests (
+            analysis_config_hash   TEXT PRIMARY KEY,
+            schema_version         INTEGER NOT NULL,
+            chain_id               INTEGER NOT NULL,
+            producer_git_commit    TEXT NOT NULL,
+            replay_semantics       TEXT NOT NULL,
+            manifest_json          TEXT NOT NULL,
+            created_at             INTEGER NOT NULL
+        );",
+    )?;
+
+    // Transactional export outbox. One row per export-enabled block output,
+    // written in the SAME transaction as the analytical rows so there is no
+    // crash window between local persistence and the export request. The
+    // worker drains rows whose `state` is `pending`/`retry` and whose
+    // `next_attempt_at` is due. `state` transitions: pending → retry (transient
+    // failure, backoff in `next_attempt_at`) → exported (coverage insert
+    // confirmed) or blocked (permanent, e.g. oversized row). The deterministic
+    // `export_id` is the primary key, so re-recording a block is idempotent.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS export_outbox (
+            export_id             TEXT PRIMARY KEY,
+            analysis_config_hash  TEXT NOT NULL,
+            schedule_name         TEXT NOT NULL,
+            schedule_config_hash  TEXT NOT NULL,
+            block_number          INTEGER NOT NULL,
+            block_hash            BLOB NOT NULL,
+            payload_version       INTEGER NOT NULL,
+            payload_zstd          BLOB NOT NULL,
+            payload_hash          BLOB NOT NULL,
+            payload_bytes         INTEGER NOT NULL,
+            state                 TEXT NOT NULL DEFAULT 'pending',
+            attempts              INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at       INTEGER NOT NULL DEFAULT 0,
+            last_error            TEXT,
+            created_at            INTEGER NOT NULL,
+            updated_at            INTEGER NOT NULL,
+            exported_at           INTEGER,
+            CHECK (state IN ('pending', 'retry', 'exported', 'blocked'))
+        );",
+    )?;
+
+    // Drives the worker's "next due item" query: filter by state, order by
+    // due time then insertion order.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_export_outbox_due
+            ON export_outbox(state, next_attempt_at, created_at);",
+    )?;
+
     Ok(())
 }
 
@@ -1268,6 +1352,34 @@ impl DivergenceDatabase {
     /// until the reader released. We don't error on a failed
     /// checkpoint — it's best-effort and the next call will retry.
     pub fn record_block_output(&self, output: &BlockOutput) -> Result<(), DatabaseError> {
+        self.record_block_output_inner(output, None)
+    }
+
+    /// Persist per-block state AND enqueue a durable export-outbox row in the
+    /// same transaction, so a crash can never leave the analytical rows durable
+    /// while losing the export request. The `export` envelope is pre-encoded
+    /// (JSON → ZSTD) by the caller before the connection lock is taken.
+    ///
+    /// Idempotent on the deterministic `export_id`: re-recording an identical
+    /// payload is a no-op that preserves an already-`exported` state; a changed
+    /// payload for the same ID is an invariant violation that resets the row to
+    /// `pending` and logs a warning.
+    pub fn record_block_output_with_export(
+        &self,
+        output: &BlockOutput,
+        export: &EncodedExportEnvelope,
+    ) -> Result<(), DatabaseError> {
+        self.record_block_output_inner(output, Some(export))
+    }
+
+    /// Shared transaction body for both public record methods. The outbox row,
+    /// when present, lands in the same transaction as coverage/summaries/
+    /// divergences.
+    fn record_block_output_inner(
+        &self,
+        output: &BlockOutput,
+        export: Option<&EncodedExportEnvelope>,
+    ) -> Result<(), DatabaseError> {
         let mut conn = self.conn.lock().expect("SQLite connection mutex poisoned");
         let tx = conn.transaction()?;
 
@@ -1298,6 +1410,9 @@ impl DivergenceDatabase {
             for log in &drill_in.schedule_event_logs {
                 insert_event_log(&tx, divergence_id, "schedule", log)?;
             }
+        }
+        if let Some(export) = export {
+            insert_export_outbox(&tx, &output.coverage, export)?;
         }
         tx.commit()?;
 
@@ -1371,6 +1486,16 @@ impl DivergenceDatabase {
             "DELETE FROM block_coverage WHERE block_number >= ? AND block_number <= ?",
             params![from_block as i64, to_block as i64],
         )?;
+        // Drop not-yet-exported outbox rows for the reverted range in the same
+        // transaction. Already-`exported` rows are preserved as an audit trail;
+        // their ClickHouse rows are not retracted in v1 (live-head reorg
+        // tombstones are out of scope — see the export design doc).
+        let outbox_deleted = tx.execute(
+            "DELETE FROM export_outbox
+             WHERE block_number >= ? AND block_number <= ?
+               AND state IN ('pending', 'retry')",
+            params![from_block as i64, to_block as i64],
+        )?;
         tx.commit()?;
 
         Ok(BlockRangeDeleteCounts {
@@ -1381,6 +1506,7 @@ impl DivergenceDatabase {
             call_frames: call_frames_deleted,
             opcode_counts: opcode_counts_deleted,
             event_logs: event_logs_deleted,
+            outbox_pending: outbox_deleted,
         })
     }
 
@@ -1615,6 +1741,297 @@ impl DivergenceDatabase {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Export outbox: types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A pre-encoded export payload ready to be enqueued in the same transaction as
+/// a block's analytical rows. Produced by `export/model.rs` on the writer
+/// thread before the `SQLite` lock is taken. The block coordinates
+/// (`schedule_name`, `block_number`, `block_hash`) come from the accompanying
+/// [`BlockCoverageRow`]; this struct carries only the deterministic identity and
+/// the compressed payload.
+#[allow(missing_docs)]
+#[derive(Debug, Clone)]
+pub struct EncodedExportEnvelope {
+    pub export_id: String,
+    pub analysis_config_hash: String,
+    pub schedule_config_hash: String,
+    pub payload_version: u16,
+    pub payload_zstd: Vec<u8>,
+    pub payload_hash: B256,
+    pub payload_bytes: usize,
+}
+
+/// Immutable per-dataset descriptor stored in `analysis_manifests`. Persisted
+/// once per `analysis_config_hash` so a pending outbox row can be exported under
+/// the manifest it was produced with, even after a restart with a different CLI
+/// configuration.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalysisManifestRecord {
+    pub analysis_config_hash: String,
+    pub schema_version: u32,
+    pub chain_id: u64,
+    pub producer_git_commit: String,
+    pub replay_semantics: String,
+    pub manifest_json: String,
+}
+
+/// A due outbox row returned by [`DivergenceDatabase::next_due_export`].
+#[allow(missing_docs)]
+#[derive(Debug, Clone)]
+pub struct OutboxItem {
+    pub export_id: String,
+    pub analysis_config_hash: String,
+    pub schedule_name: String,
+    pub schedule_config_hash: String,
+    pub block_number: u64,
+    pub block_hash: B256,
+    pub payload_version: u16,
+    pub payload_zstd: Vec<u8>,
+    pub payload_hash: B256,
+    pub payload_bytes: usize,
+    pub attempts: u32,
+    pub created_at: u64,
+}
+
+/// Backlog health snapshot returned by
+/// [`DivergenceDatabase::export_backlog_stats`], used for periodic logging and
+/// the `max_pending_bytes` backpressure check.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExportBacklogStats {
+    /// Rows in `pending`/`retry` state (awaiting or retrying export).
+    pub pending_count: u64,
+    /// Sum of `payload_bytes` across pending/retry rows.
+    pub pending_bytes: u64,
+    /// Age in seconds of the oldest pending/retry row (`0` if none).
+    pub oldest_pending_age_secs: u64,
+    /// Rows permanently `blocked` (e.g. oversized payload).
+    pub blocked_count: u64,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Export outbox: API
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl DivergenceDatabase {
+    /// Insert or confirm the immutable manifest row for a dataset. Idempotent
+    /// when the stored `manifest_json` matches; returns
+    /// [`DatabaseError::ManifestConflict`] if a row with the same hash but
+    /// different JSON already exists.
+    pub fn upsert_analysis_manifest(
+        &self,
+        manifest: &AnalysisManifestRecord,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT manifest_json FROM analysis_manifests WHERE analysis_config_hash = ?",
+                params![manifest.analysis_config_hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(json) if json == manifest.manifest_json => Ok(()),
+            Some(_) => Err(DatabaseError::ManifestConflict {
+                analysis_config_hash: manifest.analysis_config_hash.clone(),
+            }),
+            None => {
+                conn.execute(
+                    "INSERT INTO analysis_manifests (
+                        analysis_config_hash, schema_version, chain_id,
+                        producer_git_commit, replay_semantics, manifest_json, created_at
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        manifest.analysis_config_hash,
+                        manifest.schema_version as i64,
+                        manifest.chain_id as i64,
+                        manifest.producer_git_commit,
+                        manifest.replay_semantics,
+                        manifest.manifest_json,
+                        current_unix_seconds() as i64,
+                    ],
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Load the immutable manifest for a dataset identity, if present.
+    pub fn analysis_manifest(
+        &self,
+        analysis_config_hash: &str,
+    ) -> Result<Option<AnalysisManifestRecord>, DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
+        let record = conn
+            .query_row(
+                "SELECT analysis_config_hash, schema_version, chain_id,
+                        producer_git_commit, replay_semantics, manifest_json
+                 FROM analysis_manifests WHERE analysis_config_hash = ?",
+                params![analysis_config_hash],
+                |row| {
+                    Ok(AnalysisManifestRecord {
+                        analysis_config_hash: row.get(0)?,
+                        schema_version: row.get::<_, i64>(1)? as u32,
+                        chain_id: row.get::<_, i64>(2)? as u64,
+                        producer_git_commit: row.get(3)?,
+                        replay_semantics: row.get(4)?,
+                        manifest_json: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(record)
+    }
+
+    /// Fetch the single most-due export item: the oldest `pending`/`retry` row
+    /// whose `next_attempt_at` is at or before `now`. Returns `None` when the
+    /// queue is empty or nothing is due yet. Never holds the lock across HTTP —
+    /// the caller releases it before contacting `ClickHouse`.
+    pub fn next_due_export(&self, now: u64) -> Result<Option<OutboxItem>, DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
+        let item = conn
+            .query_row(
+                "SELECT export_id, analysis_config_hash, schedule_name, schedule_config_hash,
+                        block_number, block_hash, payload_version, payload_zstd,
+                        payload_hash, payload_bytes, attempts, created_at
+                 FROM export_outbox
+                 WHERE state IN ('pending', 'retry') AND next_attempt_at <= ?
+                 ORDER BY next_attempt_at ASC, created_at ASC
+                 LIMIT 1",
+                params![now as i64],
+                |row| {
+                    let block_hash: Vec<u8> = row.get(5)?;
+                    let payload_hash: Vec<u8> = row.get(8)?;
+                    Ok(OutboxItem {
+                        export_id: row.get(0)?,
+                        analysis_config_hash: row.get(1)?,
+                        schedule_name: row.get(2)?,
+                        schedule_config_hash: row.get(3)?,
+                        block_number: row.get::<_, i64>(4)? as u64,
+                        block_hash: B256::from_slice(&block_hash),
+                        payload_version: row.get::<_, i64>(6)? as u16,
+                        payload_zstd: row.get(7)?,
+                        payload_hash: B256::from_slice(&payload_hash),
+                        payload_bytes: row.get::<_, i64>(9)? as usize,
+                        attempts: row.get::<_, i64>(10)? as u32,
+                        created_at: row.get::<_, i64>(11)? as u64,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(item)
+    }
+
+    /// Record a transient export failure: bump `attempts`, schedule the next
+    /// attempt, store a shortened error, and move the row to `retry`.
+    pub fn mark_export_retry(
+        &self,
+        export_id: &str,
+        attempts: u32,
+        next_attempt_at: u64,
+        error: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
+        conn.execute(
+            "UPDATE export_outbox
+             SET state = 'retry', attempts = ?, next_attempt_at = ?,
+                 last_error = ?, updated_at = ?
+             WHERE export_id = ?",
+            params![
+                attempts as i64,
+                next_attempt_at as i64,
+                truncate_error(error),
+                current_unix_seconds() as i64,
+                export_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Mark an outbox row as successfully exported (coverage insert confirmed).
+    pub fn mark_exported(&self, export_id: &str, exported_at: u64) -> Result<(), DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
+        conn.execute(
+            "UPDATE export_outbox
+             SET state = 'exported', exported_at = ?, last_error = NULL, updated_at = ?
+             WHERE export_id = ?",
+            params![exported_at as i64, current_unix_seconds() as i64, export_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark an outbox row as permanently `blocked` (e.g. a single row exceeds
+    /// the configured hard size limit). Blocked rows are not retried and are
+    /// surfaced by [`Self::export_backlog_stats`].
+    pub fn mark_export_blocked(&self, export_id: &str, error: &str) -> Result<(), DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
+        conn.execute(
+            "UPDATE export_outbox
+             SET state = 'blocked', last_error = ?, updated_at = ?
+             WHERE export_id = ?",
+            params![truncate_error(error), current_unix_seconds() as i64, export_id],
+        )?;
+        Ok(())
+    }
+
+    /// Snapshot of outbox backlog health for logging and backpressure.
+    pub fn export_backlog_stats(&self, now: u64) -> Result<ExportBacklogStats, DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
+        let (pending_count, pending_bytes, oldest_created, blocked_count): (
+            i64,
+            i64,
+            Option<i64>,
+            i64,
+        ) = conn.query_row(
+            "SELECT
+                    COUNT(*) FILTER (WHERE state IN ('pending', 'retry')),
+                    COALESCE(SUM(payload_bytes) FILTER (WHERE state IN ('pending', 'retry')), 0),
+                    MIN(created_at) FILTER (WHERE state IN ('pending', 'retry')),
+                    COUNT(*) FILTER (WHERE state = 'blocked')
+                 FROM export_outbox",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let oldest_pending_age_secs =
+            oldest_created.map(|c| now.saturating_sub(c as u64)).unwrap_or(0);
+        Ok(ExportBacklogStats {
+            pending_count: pending_count as u64,
+            pending_bytes: pending_bytes as u64,
+            oldest_pending_age_secs,
+            blocked_count: blocked_count as u64,
+        })
+    }
+
+    /// Delete `exported` rows whose `exported_at` is older than `cutoff`,
+    /// bounding the audit-trail growth of the outbox. Returns the number pruned.
+    pub fn prune_exported_before(&self, cutoff: u64) -> Result<usize, DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
+        let deleted = conn.execute(
+            "DELETE FROM export_outbox WHERE state = 'exported' AND exported_at < ?",
+            params![cutoff as i64],
+        )?;
+        Ok(deleted)
+    }
+}
+
+/// Truncate an error message to a bounded length before storing it in the
+/// outbox, so a pathological remote response body can't bloat the row.
+fn truncate_error(error: &str) -> String {
+    const MAX: usize = 500;
+    if error.len() <= MAX {
+        error.to_string()
+    } else {
+        let mut end = MAX;
+        while !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &error[..end])
+    }
+}
+
 /// Per-table row counts returned by
 /// [`DivergenceDatabase::delete_block_range`]. Used for logging.
 #[allow(missing_docs)]
@@ -1627,6 +2044,8 @@ pub struct BlockRangeDeleteCounts {
     pub call_frames: usize,
     pub opcode_counts: usize,
     pub event_logs: usize,
+    /// Non-exported (`pending`/`retry`) export-outbox rows removed for the range.
+    pub outbox_pending: usize,
 }
 
 fn insert_block_coverage(
@@ -2069,6 +2488,95 @@ fn insert_event_log(
     Ok(())
 }
 
+/// Insert (or idempotently reconcile) one export-outbox row inside the
+/// caller's transaction. The block coordinates are read from `coverage`; the
+/// identity and payload come from `export`.
+///
+/// Conflict handling on the deterministic `export_id`:
+/// - identical `payload_hash` → no-op, preserving any `exported` state;
+/// - different `payload_hash` → replace the payload and reset to `pending`, logging an invariant
+///   warning (the same logical block produced two different payloads, which should not happen).
+fn insert_export_outbox(
+    tx: &Transaction<'_>,
+    coverage: &BlockCoverageRow,
+    export: &EncodedExportEnvelope,
+) -> Result<(), DatabaseError> {
+    let existing: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT payload_hash FROM export_outbox WHERE export_id = ?",
+            params![export.export_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    let now = current_unix_seconds() as i64;
+    match existing {
+        Some(hash) if hash == export.payload_hash.as_slice() => {
+            // Identical payload already enqueued (or already exported). Nothing
+            // to do — re-recording the same block must not resurrect or
+            // duplicate an export.
+            Ok(())
+        }
+        Some(_) => {
+            tracing::warn!(
+                target: "exex::research::outbox",
+                export_id = %export.export_id,
+                block = coverage.block_number,
+                schedule = %coverage.schedule_name,
+                "export payload changed for an existing export_id; resetting outbox row to pending"
+            );
+            tx.execute(
+                "UPDATE export_outbox SET
+                    analysis_config_hash = ?, schedule_name = ?, schedule_config_hash = ?,
+                    block_number = ?, block_hash = ?, payload_version = ?,
+                    payload_zstd = ?, payload_hash = ?, payload_bytes = ?,
+                    state = 'pending', attempts = 0, next_attempt_at = 0,
+                    last_error = NULL, updated_at = ?, exported_at = NULL
+                 WHERE export_id = ?",
+                params![
+                    export.analysis_config_hash,
+                    coverage.schedule_name,
+                    export.schedule_config_hash,
+                    coverage.block_number as i64,
+                    coverage.block_hash.as_slice(),
+                    export.payload_version as i64,
+                    export.payload_zstd,
+                    export.payload_hash.as_slice(),
+                    export.payload_bytes as i64,
+                    now,
+                    export.export_id,
+                ],
+            )?;
+            Ok(())
+        }
+        None => {
+            tx.execute(
+                "INSERT INTO export_outbox (
+                    export_id, analysis_config_hash, schedule_name, schedule_config_hash,
+                    block_number, block_hash, payload_version, payload_zstd,
+                    payload_hash, payload_bytes, state, attempts, next_attempt_at,
+                    last_error, created_at, updated_at, exported_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, NULL, ?, ?, NULL)",
+                params![
+                    export.export_id,
+                    export.analysis_config_hash,
+                    coverage.schedule_name,
+                    export.schedule_config_hash,
+                    coverage.block_number as i64,
+                    coverage.block_hash.as_slice(),
+                    export.payload_version as i64,
+                    export.payload_zstd,
+                    export.payload_hash.as_slice(),
+                    export.payload_bytes as i64,
+                    now,
+                    now,
+                ],
+            )?;
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2095,6 +2603,7 @@ mod tests {
         }
 
         for expected in [
+            "analysis_manifests",
             "analysis_runs",
             "block_coverage",
             "block_summaries",
@@ -2103,6 +2612,7 @@ mod tests {
             "divergence_event_logs",
             "divergence_opcode_counts",
             "divergences",
+            "export_outbox",
         ] {
             assert!(
                 tables.iter().any(|t| t == expected),
@@ -3031,5 +3541,318 @@ mod tests {
         let unresolved = db.distinct_unresolved_selectors().unwrap();
         assert_eq!(unresolved.len(), 1);
         assert_eq!(unresolved[0], approve.to_vec());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Export outbox (schema v10)
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn make_export(export_id: &str, payload: &[u8]) -> EncodedExportEnvelope {
+        EncodedExportEnvelope {
+            export_id: export_id.to_string(),
+            analysis_config_hash: "0xach".to_string(),
+            schedule_config_hash: "config".to_string(),
+            payload_version: 1,
+            payload_zstd: payload.to_vec(),
+            payload_hash: keccak256(payload),
+            payload_bytes: payload.len(),
+        }
+    }
+
+    fn count(db: &DivergenceDatabase, sql: &str) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    fn outbox_state(db: &DivergenceDatabase, export_id: &str) -> Option<String> {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT state FROM export_outbox WHERE export_id = ?",
+            params![export_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    fn sample_manifest(hash: &str, json: &str) -> AnalysisManifestRecord {
+        AnalysisManifestRecord {
+            analysis_config_hash: hash.to_string(),
+            schema_version: SCHEMA_VERSION,
+            chain_id: 1,
+            producer_git_commit: "deadbeef".to_string(),
+            replay_semantics: "canonical_pre_tx_state".to_string(),
+            manifest_json: json.to_string(),
+        }
+    }
+
+    #[test]
+    fn fresh_db_creates_outbox_tables_and_index() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        let conn = db.conn.lock().unwrap();
+        for table in ["analysis_manifests", "export_outbox"] {
+            let found: Option<String> = conn
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
+                    params![table],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap();
+            assert_eq!(found.as_deref(), Some(table));
+        }
+        let index: Option<String> = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_export_outbox_due'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(index.is_some());
+    }
+
+    #[test]
+    fn manifest_upsert_is_idempotent_and_rejects_changed_json() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        let m = sample_manifest("0xhash1", "{\"a\":1}");
+        db.upsert_analysis_manifest(&m).unwrap();
+        // Same JSON → idempotent.
+        db.upsert_analysis_manifest(&m).unwrap();
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM analysis_manifests"), 1);
+
+        // Same hash, different JSON → invariant conflict.
+        let conflicting = sample_manifest("0xhash1", "{\"a\":2}");
+        let err = db.upsert_analysis_manifest(&conflicting).unwrap_err();
+        assert!(matches!(err, DatabaseError::ManifestConflict { .. }));
+
+        let loaded = db.analysis_manifest("0xhash1").unwrap().unwrap();
+        assert_eq!(loaded.manifest_json, "{\"a\":1}");
+        assert_eq!(loaded.schema_version, SCHEMA_VERSION);
+        assert!(db.analysis_manifest("0xmissing").unwrap().is_none());
+    }
+
+    #[test]
+    fn pending_row_loads_its_original_manifest_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_db_path(&dir);
+        {
+            let db = DivergenceDatabase::open(&path).unwrap();
+            // make_export stamps analysis_config_hash = "0xach"; store the
+            // matching manifest so the pending row can resolve it later.
+            db.upsert_analysis_manifest(&sample_manifest("0xach", "{\"old\":true}")).unwrap();
+            db.record_block_output_with_export(
+                &BlockOutput {
+                    coverage: fixture_coverage("test", 10, 0, 0),
+                    summaries: vec![],
+                    drill_ins: vec![],
+                },
+                &make_export("e-old", b"payload"),
+            )
+            .unwrap();
+        }
+        // Reopen the same on-disk DB (simulating a restart with no live config).
+        let db = DivergenceDatabase::open(&path).unwrap();
+        let item = db.next_due_export(current_unix_seconds()).unwrap().unwrap();
+        assert_eq!(item.export_id, "e-old");
+        // The pending row's stored identity resolves to its original manifest,
+        // independent of the current configuration.
+        let manifest = db.analysis_manifest(&item.analysis_config_hash).unwrap().unwrap();
+        assert_eq!(manifest.manifest_json, "{\"old\":true}");
+    }
+
+    #[test]
+    fn analytical_rows_and_outbox_row_commit_together() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        db.record_block_output_with_export(
+            &BlockOutput {
+                coverage: fixture_coverage("test", 5, 0, 0),
+                summaries: vec![],
+                drill_ins: vec![],
+            },
+            &make_export("e-5", b"payload-5"),
+        )
+        .unwrap();
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM block_coverage"), 1);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM export_outbox"), 1);
+        assert_eq!(outbox_state(&db, "e-5").as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn failed_analytical_insert_rolls_back_outbox_row() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        // First write a drill-in at (test, block 7, tx_index 0, config).
+        let drill_in = DrillInRecord {
+            divergence: fixture_divergence(7, 0, Bucket::ContractBroken, 1),
+            call_frames: vec![],
+            opcode_counts: vec![],
+            baseline_event_logs: vec![],
+            schedule_event_logs: vec![],
+        };
+        db.record_block_output(&BlockOutput {
+            coverage: fixture_coverage("test", 7, 1, 0),
+            summaries: vec![],
+            drill_ins: vec![drill_in.clone()],
+        })
+        .unwrap();
+
+        // Re-recording the same divergence violates the UNIQUE constraint and
+        // must fail; the accompanying outbox row must not survive.
+        let err = db.record_block_output_with_export(
+            &BlockOutput {
+                coverage: fixture_coverage("test", 7, 1, 0),
+                summaries: vec![],
+                drill_ins: vec![drill_in],
+            },
+            &make_export("e-7", b"payload-7"),
+        );
+        assert!(err.is_err());
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM export_outbox"), 0);
+    }
+
+    #[test]
+    fn same_export_id_and_hash_is_idempotent_and_preserves_exported_state() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        let output = BlockOutput {
+            coverage: fixture_coverage("test", 8, 0, 0),
+            summaries: vec![],
+            drill_ins: vec![],
+        };
+        let export = make_export("e-8", b"same-payload");
+        db.record_block_output_with_export(&output, &export).unwrap();
+        db.mark_exported("e-8", current_unix_seconds()).unwrap();
+        assert_eq!(outbox_state(&db, "e-8").as_deref(), Some("exported"));
+
+        // Re-recording the identical payload must not resurrect the row.
+        db.record_block_output_with_export(&output, &export).unwrap();
+        assert_eq!(outbox_state(&db, "e-8").as_deref(), Some("exported"));
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM export_outbox"), 1);
+    }
+
+    #[test]
+    fn changed_payload_for_same_export_id_resets_to_pending() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        let output = BlockOutput {
+            coverage: fixture_coverage("test", 9, 0, 0),
+            summaries: vec![],
+            drill_ins: vec![],
+        };
+        db.record_block_output_with_export(&output, &make_export("e-9", b"v1")).unwrap();
+        db.mark_exported("e-9", current_unix_seconds()).unwrap();
+        // A different payload under the same deterministic id is an invariant
+        // violation: reset to pending so the new payload gets re-exported.
+        db.record_block_output_with_export(&output, &make_export("e-9", b"v2-different")).unwrap();
+        assert_eq!(outbox_state(&db, "e-9").as_deref(), Some("pending"));
+        let conn = db.conn.lock().unwrap();
+        let bytes: i64 = conn
+            .query_row("SELECT payload_bytes FROM export_outbox WHERE export_id = 'e-9'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(bytes as usize, b"v2-different".len());
+    }
+
+    #[test]
+    fn due_ordering_respects_next_attempt_then_created() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        for (i, id) in ["e-a", "e-b", "e-c"].iter().enumerate() {
+            db.record_block_output_with_export(
+                &BlockOutput {
+                    coverage: fixture_coverage("test", 20 + i as u64, 0, 0),
+                    summaries: vec![],
+                    drill_ins: vec![],
+                },
+                &make_export(id, format!("p{i}").as_bytes()),
+            )
+            .unwrap();
+        }
+        // Push e-a into the future; e-b stays due now. e-b should come first.
+        db.mark_export_retry("e-a", 1, current_unix_seconds() + 10_000, "later").unwrap();
+        let item = db.next_due_export(current_unix_seconds()).unwrap().unwrap();
+        assert_eq!(item.export_id, "e-b");
+    }
+
+    #[test]
+    fn retry_blocked_exported_and_backlog_transitions() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        db.record_block_output_with_export(
+            &BlockOutput {
+                coverage: fixture_coverage("test", 30, 0, 0),
+                summaries: vec![],
+                drill_ins: vec![],
+            },
+            &make_export("e-30", b"0123456789"),
+        )
+        .unwrap();
+
+        let now = current_unix_seconds();
+        let stats = db.export_backlog_stats(now).unwrap();
+        assert_eq!(stats.pending_count, 1);
+        assert_eq!(stats.pending_bytes, 10);
+        assert_eq!(stats.blocked_count, 0);
+
+        // Retry: still counts as pending backlog.
+        db.mark_export_retry("e-30", 2, now + 5, "boom").unwrap();
+        assert_eq!(db.export_backlog_stats(now).unwrap().pending_count, 1);
+        // Not due yet (next_attempt_at in the future).
+        assert!(db.next_due_export(now).unwrap().is_none());
+
+        // Blocked: leaves the pending backlog, counted as blocked.
+        db.mark_export_blocked("e-30", "too big").unwrap();
+        let stats = db.export_backlog_stats(now).unwrap();
+        assert_eq!(stats.pending_count, 0);
+        assert_eq!(stats.blocked_count, 1);
+
+        // Exported + prune.
+        db.mark_exported("e-30", now - 100).unwrap();
+        assert_eq!(db.prune_exported_before(now).unwrap(), 1);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM export_outbox"), 0);
+    }
+
+    #[test]
+    fn delete_block_range_drops_pending_but_keeps_exported() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        for (id, block, exported) in [("e-keep", 40u64, true), ("e-drop", 41u64, false)] {
+            db.record_block_output_with_export(
+                &BlockOutput {
+                    coverage: fixture_coverage("test", block, 0, 0),
+                    summaries: vec![],
+                    drill_ins: vec![],
+                },
+                &make_export(id, id.as_bytes()),
+            )
+            .unwrap();
+            if exported {
+                db.mark_exported(id, current_unix_seconds()).unwrap();
+            }
+        }
+        let counts = db.delete_block_range(40, 41).unwrap();
+        assert_eq!(counts.outbox_pending, 1);
+        // Exported audit row survives; pending row is gone.
+        assert_eq!(outbox_state(&db, "e-keep").as_deref(), Some("exported"));
+        assert!(outbox_state(&db, "e-drop").is_none());
+    }
+
+    #[test]
+    fn schema_mismatch_detected_via_analysis_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_db_path(&dir);
+        {
+            let db = DivergenceDatabase::open(&path).unwrap();
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO analysis_manifests (
+                    analysis_config_hash, schema_version, chain_id,
+                    producer_git_commit, replay_semantics, manifest_json, created_at
+                 ) VALUES ('0xfuture', ?, 1, 'c', 'r', '{}', ?)",
+                params![SCHEMA_VERSION + 1, current_unix_seconds() as i64],
+            )
+            .unwrap();
+        }
+        let err = DivergenceDatabase::open(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            DatabaseError::SchemaVersionMismatch { found, .. } if found == SCHEMA_VERSION + 1
+        ));
     }
 }
