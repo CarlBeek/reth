@@ -836,7 +836,7 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
 /// more bucket-summary rows + zero or more drill-in records. Built by the
 /// `BlockAggregator` and consumed by [`DivergenceDatabase::record_block_output`]
 /// in a single transaction so the per-block state lands atomically.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlockOutput {
     /// Always present. Counts go to `block_coverage`.
     pub coverage: BlockCoverageRow,
@@ -871,7 +871,7 @@ pub struct RecipientRow {
 /// regardless of divergence count so coverage joins work even for fully-
 /// matching blocks.
 #[allow(missing_docs)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlockCoverageRow {
     pub schedule_name: String,
     pub schedule_config_hash: String,
@@ -897,7 +897,7 @@ pub struct BlockCoverageRow {
 /// emitted as JSON array. Sparse — only opcodes that actually executed
 /// in this bucket on this block appear.
 #[allow(missing_docs)]
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OpcodeBucketTotal {
     pub opcode: u8,
     /// Total executions of this opcode across every tx in the bucket
@@ -913,7 +913,7 @@ pub struct OpcodeBucketTotal {
 
 /// Aggregate summary for one (schedule, block, bucket).
 #[allow(missing_docs)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlockSummaryRow {
     pub schedule_name: String,
     pub block_number: u64,
@@ -962,7 +962,7 @@ pub struct BlockSummaryRow {
 /// populated only when the call tree diverged (where the baseline path differs
 /// and is worth keeping); otherwise they're empty and only schedule rows land.
 #[allow(missing_docs)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DrillInRecord {
     pub divergence: DivergenceRow,
     pub call_frames: Vec<CallFrameRow>,
@@ -987,7 +987,7 @@ pub struct DrillInRecord {
 /// and set only the fields they care about — new nullable forensic columns then
 /// need no fixture edits.
 #[allow(missing_docs)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DivergenceRow {
     pub schedule_name: String,
     pub schedule_config_hash: String,
@@ -1169,7 +1169,7 @@ pub struct DivergenceRow {
 /// `Default` is derived for the same fixture-spread convenience as
 /// [`DivergenceRow`].
 #[allow(missing_docs)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CallFrameRow {
     pub call_index: u32,
     pub parent_call_index: Option<u32>,
@@ -1220,7 +1220,7 @@ pub struct CallFrameRow {
 /// One row destined for `divergence_opcode_counts`. Producer omits zero-
 /// count rows.
 #[allow(missing_docs)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OpcodeCountRow {
     pub call_index: u32,
     pub opcode: u8,
