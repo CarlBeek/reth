@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS gas_analysis.gas_analysis_divergence ON CLUSTER '{cluster}';
+DROP TABLE IF EXISTS gas_analysis.gas_analysis_divergence_local ON CLUSTER '{cluster}';
+DROP TABLE IF EXISTS gas_analysis.gas_analysis_block_summary ON CLUSTER '{cluster}';
+DROP TABLE IF EXISTS gas_analysis.gas_analysis_block_summary_local ON CLUSTER '{cluster}';
+DROP TABLE IF EXISTS gas_analysis.gas_analysis_block_coverage ON CLUSTER '{cluster}';
+DROP TABLE IF EXISTS gas_analysis.gas_analysis_block_coverage_local ON CLUSTER '{cluster}';
+DROP TABLE IF EXISTS gas_analysis.gas_analysis_run ON CLUSTER '{cluster}';
+DROP TABLE IF EXISTS gas_analysis.gas_analysis_run_local ON CLUSTER '{cluster}';
+DROP DATABASE IF EXISTS gas_analysis ON CLUSTER '{cluster}';

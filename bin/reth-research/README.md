@@ -215,15 +215,18 @@ without bound.
 
 ### Config
 
-The canonical table DDL is in [`clickhouse/schema.sql`](./clickhouse/schema.sql)
-and an example config is in
+The destination schema lives in
+[`clickhouse/migrations`](./clickhouse/migrations) — golang-migrate up/down
+pairs that create a dedicated `gas_analysis` database with
+`ReplicatedReplacingMergeTree` local tables + `Distributed` wrappers,
+`ON CLUSTER '{cluster}'`. An example config is in
 [`clickhouse/config.example.toml`](./clickhouse/config.example.toml):
 
 ```toml
 endpoint = "https://clickhouse.example.org:8443"   # must be https://
-database = "default"
-username = "reth_research_ingest"
-password_env = "RETH_RESEARCH_CLICKHOUSE_PASSWORD"  # password read from env, never a flag
+database = "gas_analysis"                            # defaults to gas_analysis
+username = "gas_analysis"
+password_env = "CLICKHOUSE_PASSWORD"                 # password read from env, never a flag
 # ... batching/retry/backlog tunables, optional ca_cert_path ...
 ```
 
@@ -232,41 +235,16 @@ once at startup from the environment variable named by `password_env`. Grant the
 ingest account only `INSERT` on the four destination tables plus the metadata
 read needed for the startup `DESCRIBE TABLE` schema check.
 
-Run the schema in `clickhouse/schema.sql` against your cluster first (adapt the
-engine to `ReplicatedReplacingMergeTree` + `Distributed` for a clustered
-deployment; column names and types are fixed). Then:
+Apply the migrations in `clickhouse/migrations` to your cluster first (column
+names and types are the fixed producer contract). Then:
 
 ```bash
-export RETH_RESEARCH_CLICKHOUSE_PASSWORD=...
+export CLICKHOUSE_PASSWORD=...
 cargo run --release -p reth-research-bin -- node \
   --research.eip2780 \
   --research.db-path ./divergences.sqlite \
   --research.export-config-path ./clickhouse/config.example.toml
 ```
-
-### Operating notes
-
-- **Fresh DB for history.** The outbox only captures blocks committed *after*
-  deployment. Adding the exporter does **not** ship pre-existing SQLite history.
-  To export history, replay into a fresh database, or wait for the separate
-  backfill pass. Export requires a real on-disk `--research.db-path` (not
-  `:memory:`).
-- **Finalized/historical only (v1).** Live-head reorg cleanup is not supported:
-  if an exported block is later reorged, its ClickHouse rows remain. Every row
-  carries `block_hash`, so consumers can join canonicality data. Do not point v1
-  export at the live head expecting tombstones.
-- **`trace_payload` is not a full EVM trace.** It holds only the retained
-  drill-in child components (call frames, opcode counts, event logs) plus an
-  identity header, with a content hash and component counts for verification.
-- **`ReplacingMergeTree` is eventual.** Consumers needing immediate exactness
-  should query an `argMax` view or use `FINAL` selectively.
-- **Backlog/disk alerts.** Watch the worker's `export backlog` logs
-  (pending count, pending bytes, oldest age). A growing backlog means ClickHouse
-  is unreachable; remediate before `max_pending_bytes` is hit.
-- **Blocked rows.** A permanently failing item (e.g. an oversized row, or a 4xx
-  schema error) is marked `blocked` in `export_outbox` and logged at high
-  severity. Inspect with
-  `SELECT export_id, last_error FROM export_outbox WHERE state = 'blocked'`.
 
 ## Important Limits
 
