@@ -46,7 +46,9 @@ pub use context::{OpcodeContext, RecipientInfo, TxContext};
 pub use csv_pricing::{CsvPricingError, CsvPricingSchedule, GasPricingTable, OperationPricing};
 pub use eip2780::{Eip2780Category, Eip2780Constants, Eip2780Schedule};
 pub use eip8037::{Eip8037Constants, Eip8037Schedule};
-pub use eip8038::{Eip8038Constants, Eip8038Schedule};
+pub use eip8038::{
+    apply_gas_overrides as apply_eip8038_gas_overrides, Eip8038Constants, Eip8038Schedule,
+};
 pub use multiplier::MultiplierSchedule;
 pub use registry::{ScheduleError, ScheduleRegistry};
 pub use traits::{GasSchedule, ScheduleKind};

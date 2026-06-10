@@ -161,6 +161,13 @@ pub struct ScheduleInspector {
     cached_keccak_msg_size: Option<usize>,
     cached_exp_byte_size: Option<usize>,
 
+    /// EIP-8038 cold-account split: for account-access opcodes, whether the
+    /// target is touched cold and whether it has code (`code_hash !=
+    /// KECCAK_EMPTY`). Classified read-only from the journal in `step()` before
+    /// execution and consumed via `build_opcode_context`. Reset each step.
+    cached_target_is_cold: bool,
+    cached_target_is_code: bool,
+
     /// Captured at `step()` for the upcoming CALL/CALLCODE/DELEGATECALL/
     /// STATICCALL opcode: the raw gas argument the caller pushed onto the
     /// stack (top of stack at CALL invocation). Consumed in `call()` to
@@ -344,6 +351,8 @@ impl ScheduleInspector {
             current_pc: 0,
             cached_keccak_msg_size: None,
             cached_exp_byte_size: None,
+            cached_target_is_cold: false,
+            cached_target_is_code: false,
             pending_call_stack_gas: None,
             frame_capture: PerFrameCapture::new(),
             active_frame_stack: Vec::new(),
@@ -599,6 +608,10 @@ impl ScheduleInspector {
             exp_byte_size: self.cached_exp_byte_size,
             memory_offset: None,
             memory_access_size: None,
+            // Populated for account-access opcodes by the cold/code classification
+            // cached in `step()` (added with the EIP-8038 cold-account split).
+            target_is_cold: self.cached_target_is_cold,
+            target_is_code: self.cached_target_is_code,
         }
     }
 
@@ -757,6 +770,36 @@ impl ScheduleInspector {
     }
 }
 
+/// Classify a cold-account-access target for the EIP-8038 code/no-code split,
+/// **read-only**. Returns `(is_cold, is_code)`.
+///
+/// `load_account_info_skip_cold_load(skip_cold_load = true)` never warms the
+/// target: it returns `Ok` for an already-warm account and `ColdLoadSkipped`
+/// for a cold one. For a cold target we read `code_hash` straight from the DB
+/// (which does not touch the journal's EIP-2929 warm set), so the replay's own
+/// cold/warm accounting is preserved. Warm targets get no surcharge — so we
+/// short-circuit without the DB read. `is_code` follows the misilva73 rule:
+/// `code_hash != KECCAK_EMPTY` (contracts + EIP-7702 delegated; pure EOA /
+/// empty / non-existent are `NO_CODE`).
+fn classify_account_target<CTX>(context: &mut CTX, addr: Address) -> (bool, bool)
+where
+    CTX: ContextTr,
+{
+    use revm::context_interface::{journaled_state::JournalLoadError, Database, JournalTr};
+
+    let is_cold = match context.journal_mut().load_account_info_skip_cold_load(addr, false, true) {
+        Ok(_) => false,
+        Err(JournalLoadError::ColdLoadSkipped) => true,
+        Err(JournalLoadError::DBError(_)) => return (false, false),
+    };
+    if !is_cold {
+        return (false, false);
+    }
+    let is_code =
+        context.db_mut().basic(addr).ok().flatten().is_some_and(|info| !info.is_empty_code_hash());
+    (true, is_code)
+}
+
 impl<CTX> Inspector<CTX, revm::interpreter::interpreter::EthInterpreter> for ScheduleInspector
 where
     CTX: ContextTr,
@@ -764,7 +807,7 @@ where
     fn step(
         &mut self,
         interp: &mut Interpreter<revm::interpreter::interpreter::EthInterpreter>,
-        _context: &mut CTX,
+        context: &mut CTX,
     ) {
         // Once OOG has been triggered, stop applying further deltas. The
         // interpreter should be halted, but guard against revm calling step()
@@ -793,6 +836,31 @@ where
         // flag set by step() of the *same* opcode, which holds because revm
         // calls step → execute → step_end within a single loop iteration.
         self.call_delta_pre_applied = false;
+
+        // Reset the EIP-8038 cold-account classification; it is populated below
+        // only for account-access opcodes (default = not an account access).
+        self.cached_target_is_cold = false;
+        self.cached_target_is_code = false;
+
+        // EIP-8038 cold-account split: classify the account-access target
+        // (cold? has code?) read-only *before* execution, so opcode_gas_delta can
+        // apply the CODE surcharge — and, for the CALL family, before the gas is
+        // forwarded. The target's stack position differs by opcode: top-of-stack
+        // for BALANCE / EXTCODE* / SELFDESTRUCT, index 1 for the CALL family.
+        let target_pos = match self.current_opcode {
+            0x31 | 0x3B | 0x3C | 0x3F | 0xFF => Some(0),
+            0xF1 | 0xF2 | 0xF4 | 0xFA => Some(1),
+            _ => None,
+        };
+        if let Some(pos) = target_pos &&
+            let Ok(word) = interp.stack.peek(pos)
+        {
+            let bytes = word.to_be_bytes::<32>();
+            let addr = Address::from_slice(&bytes[12..]);
+            let (is_cold, is_code) = classify_account_target(context, addr);
+            self.cached_target_is_cold = is_cold;
+            self.cached_target_is_code = is_code;
+        }
 
         // Cache variable-cost opcode parameters from the stack before execution
         // consumes them. These are used in build_opcode_context() during step_end().
