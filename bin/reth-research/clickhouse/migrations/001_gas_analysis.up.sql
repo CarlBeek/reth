@@ -182,7 +182,7 @@ CREATE TABLE IF NOT EXISTS gas_analysis.gas_analysis_divergence_local ON CLUSTER
     `state_gas_category` Nullable(String) COMMENT 'State gas category' CODEC(ZSTD(1)),
     `reservoir_exhausted` Nullable(Bool) COMMENT 'Whether the reservoir was exhausted',
     `replay_halt_oog` Nullable(Bool) COMMENT 'Final tier halted OOG (Some(true)) vs non-gas halt (Some(false))',
-    `trace_payload` String COMMENT 'Forensic child components (call frames, opcode counts, event logs) as versioned JSON; NOT a full EVM trace' CODEC(ZSTD(3)),
+    `trace_payload` String COMMENT 'Forensic child components (call frames, opcode counts, event logs) as versioned JSON, NOT a full EVM trace' CODEC(ZSTD(3)),
     `trace_content_hash` FixedString(66) COMMENT 'Keccak of trace_payload' CODEC(ZSTD(1)),
     `trace_uncompressed_size_bytes` UInt64 COMMENT 'Byte length of trace_payload' CODEC(ZSTD(1)),
     `trace_format` LowCardinality(String) COMMENT 'trace_payload format tag',
