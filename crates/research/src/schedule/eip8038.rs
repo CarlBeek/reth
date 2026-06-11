@@ -1,9 +1,9 @@
 //! EIP-8038: state access / write gas repricing schedule (misilva73 parameters).
 //!
 //! EIP-8038 reprices state-access and state-write gas from client runtime
-//! benchmarks. Unlike the earlier uniform-3× placeholder, the proposed values
-//! are **non-uniform** (one is a decrease), and 8038 changes *how* charging is
-//! done for SSTORE and account writes — not just magnitudes. This schedule
+//! benchmarks. The proposed values are **non-uniform** (one — `WARM_ACCESS` — is a
+//! decrease), and 8038 changes *how* charging is done for SSTORE and account
+//! writes — not just magnitudes. This schedule
 //! applies it on the block's native OSAKA spec, as an **independent** experiment
 //! (its own `config_fingerprint` → its own dataset; never benchmarked against
 //! EIP-8037, and it does NOT pull in 8037's state-gas reservoir or 7976 floor).
@@ -25,17 +25,23 @@
 //! # Charging is applied in three layers
 //!
 //! 1. [`configure_evm_env`](Eip8038Schedule::configure_evm_env) overrides the native gas-param
-//!    slots to back-solved **absolute** values (the warm base is charged as the static leg; cold
-//!    add-ons and write surcharges are added on top, so the effective totals match the proposed
-//!    column). revm's own cold/warm/transition branch logic is unchanged — only magnitudes move.
-//!    `cold_account_additional_cost` is set to the **`NO_CODE`** baseline.
+//!    slots to back-solved **absolute** values: the cold add-ons and write surcharges revm reads
+//!    from `cfg.gas_params` and adds on top of the warm base, back-solved against `WARM_ACCESS`
+//!    (62). revm's own cold/warm/transition branch logic is unchanged — only magnitudes move.
+//!    `cold_account_additional_cost` holds the cold *add-on* (`NO_CODE − warm`), so `warm + add-on`
+//!    is the `NO_CODE` total. **Caveat:** revm sources the *warm static* leg of SLOAD/BALANCE/
+//!    EXTCODE*/CALL from a hardcoded const gas table (100), not `gas_params`, so the override only
+//!    reaches SSTORE's warm base + the EIP-7702 second read — the warm reduction for the other
+//!    opcodes is applied in Layer 3.
 //! 2. [`intrinsic_gas`](Eip8038Schedule::intrinsic_gas) applies the per-item access-list /
 //!    create-tx deltas (revm ignores `cfg.gas_params` for intrinsic gas).
-//! 3. [`opcode_gas_delta`](Eip8038Schedule::opcode_gas_delta) (inspector-applied) adds the two
-//!    state-dependent charges that have no gas-param slot: the **cold-account CODE surcharge**
-//!    (lift a cold access whose target has code from `NO_CODE` 3140 up to CODE 9131) and the
-//!    EXTCODESIZE/EXTCODECOPY **second-DB-read** flat `+WARM_ACCESS`. The inspector classifies the
-//!    target (cold? has code?) read-only from the journal and supplies it on [`OpcodeContext`].
+//! 3. [`opcode_gas_delta`](Eip8038Schedule::opcode_gas_delta) (inspector-applied) adds the
+//!    state-/opcode-dependent charges that no gas-param slot covers: the **warm-base correction**
+//!    (62 − 100 = −38 for the native-warm-100 opcodes, since their warm static leg is hardcoded —
+//!    see [`has_native_warm_static`]), the **cold-account CODE surcharge** (lift a cold access
+//!    whose target has code from `NO_CODE` 3140 to CODE 9131), and the EXTCODESIZE/EXTCODECOPY
+//!    **second-DB-read** flat `+WARM_ACCESS`. The inspector classifies the target (cold? has code?)
+//!    read-only from the journal and supplies it on [`OpcodeContext`].
 //!
 //! # Cold-account CODE / `NO_CODE` rule (misilva73-confirmed)
 //!
@@ -104,13 +110,36 @@ const fn is_account_access_opcode(opcode: u8) -> bool {
     matches!(opcode, 0x31 | 0x3B | 0x3C | 0x3F | 0xF1 | 0xF2 | 0xF4 | 0xFA | 0xFF)
 }
 
+/// revm's hardcoded warm static gas (`WARM_STORAGE_READ_COST`) for the
+/// state-access opcodes. **Coupled to a revm invariant:** revm charges this warm
+/// leg from a const per-spec gas table (`gas_table_spec`), NOT from
+/// `cfg.gas_params` — so overriding the `warm_storage_read_cost` slot is *inert*
+/// for these opcodes (only SSTORE's warm base, sourced from `sstore_static`, is
+/// overridable). 8038's warm reduction (→ [`Eip8038Constants::WARM_ACCESS`]) is
+/// therefore applied here in Layer 3, not Layer 1. A revm bump must re-validate
+/// this constant; the `warm_sload`/`cold_sload` execution tests are the guard.
+const NATIVE_WARM_STORAGE_READ_GAS: u64 = 100;
+
+/// Opcodes whose warm static gas is the hardcoded [`NATIVE_WARM_STORAGE_READ_GAS`]
+/// (so 8038's warm reduction must ride `opcode_gas_delta`, not the inert slot):
+/// SLOAD plus the eight account-access reads. **Excludes** SELFDESTRUCT (0xFF),
+/// whose cost is an account-write, not a warm read.
+const fn has_native_warm_static(opcode: u8) -> bool {
+    matches!(opcode, 0x31 | 0x3B | 0x3C | 0x3F | 0x54 | 0xF1 | 0xF2 | 0xF4 | 0xFA)
+}
+
 /// Apply EIP-8038's absolute gas-param slot overrides to `gas_params`. Shared by
 /// [`Eip8038Schedule::configure_evm_env`] and the execution tests so they never
-/// drift. revm charges the warm base separately as static gas and adds cold
-/// add-ons / write surcharges on top, so each slot is back-solved against the
-/// warm base (the SSTORE execution tests validate the resulting totals).
-/// `cold_account_additional_cost` is the `NO_CODE` baseline; the CODE surcharge
-/// is applied per-access by [`Eip8038Schedule::opcode_gas_delta`].
+/// drift. revm adds the cold add-ons / write surcharges from these slots on top of
+/// a warm base, so each is back-solved against `WARM_ACCESS` (62).
+///
+/// Note: the `warm_storage_read_cost` slot only governs SSTORE's warm base (via
+/// `sstore_static`) and the EIP-7702 second read — revm sources the warm static
+/// leg of SLOAD/BALANCE/EXTCODE*/CALL from a hardcoded table
+/// ([`NATIVE_WARM_STORAGE_READ_GAS`]), so 8038's warm reduction for those reaches
+/// them via [`Eip8038Schedule::opcode_gas_delta`], not this override.
+/// `cold_account_additional_cost` is the cold *add-on* (`warm + add-on = NO_CODE`);
+/// the CODE surcharge is applied per-access by `opcode_gas_delta`.
 pub fn apply_gas_overrides(gas_params: &mut GasParams) {
     let warm = Eip8038Constants::WARM_ACCESS.1;
     let cold_storage = Eip8038Constants::COLD_STORAGE_ACCESS.1;
@@ -167,10 +196,10 @@ impl GasSchedule for Eip8038Schedule {
         // model change invalidates only the eip-8038 rows. `model` should carry
         // misilva73's pinned commit/run id before a long backfill.
         format!(
-            "name=eip-8038|model=misilva73-absolute-v1|warm={:?}|cold_storage={:?}|\
+            "name=eip-8038|model=misilva73-absolute-v2-warm-static-L3|warm={:?}|cold_storage={:?}|\
              cold_account_nocode={:?}|cold_account_code={:?}|storage_write={:?}|account_write={:?}|\
              refund_storage_clear={:?}|access_list_key={:?}|access_list_address={:?}|create={}|\
-             ext_second_read={}|baseline=native-osaka-absolute|ref_spec={:?}",
+             ext_second_read={}|native_warm_static={}|baseline=native-osaka-absolute|ref_spec={:?}",
             Eip8038Constants::WARM_ACCESS,
             Eip8038Constants::COLD_STORAGE_ACCESS,
             Eip8038Constants::COLD_ACCOUNT_NOCODE_ACCESS,
@@ -182,6 +211,7 @@ impl GasSchedule for Eip8038Schedule {
             Eip8038Constants::TX_ACCESS_LIST_ADDRESS,
             Eip8038Constants::CREATE,
             Eip8038Constants::WARM_ACCESS.1,
+            NATIVE_WARM_STORAGE_READ_GAS,
             REF_SPEC,
         )
     }
@@ -225,6 +255,17 @@ impl GasSchedule for Eip8038Schedule {
 
     fn opcode_gas_delta(&self, opcode: u8, ctx: &OpcodeContext) -> i64 {
         let mut delta: i64 = 0;
+
+        // Warm-base correction (the misilva73 WARM_ACCESS 100 → 62 decrease).
+        // revm charges these opcodes' warm static leg from a hardcoded const gas
+        // table (NATIVE_WARM_STORAGE_READ_GAS), ignoring the `warm_storage_read_cost`
+        // override, so the reduction can only be applied here as an additive delta
+        // (= 62 - 100 = -38). The cold add-ons in `configure_evm_env` are
+        // back-solved against the 62 warm base, so warm and cold totals both land
+        // on the proposed values once this delta is applied.
+        if has_native_warm_static(opcode) {
+            delta += Eip8038Constants::WARM_ACCESS.1 as i64 - NATIVE_WARM_STORAGE_READ_GAS as i64;
+        }
 
         // EXTCODESIZE / EXTCODECOPY model a second DB read: a flat extra warm
         // access on top of the normal account-access charge.
@@ -349,33 +390,42 @@ mod tests {
         assert_eq!(g(GasId::create()), 25_601);
     }
 
+    /// The Layer-3 delta of every native-warm-100 opcode carries the warm-base
+    /// correction (62 − 100 = −38); EXTCODESIZE/EXTCODECOPY add the +62 second read
+    /// on top. (Slot-level arithmetic; the execution tests in
+    /// `tests/eip8038_execution.rs` validate the totals revm actually charges.)
     #[test]
-    fn opcode_gas_delta_ext_second_read() {
+    fn opcode_gas_delta_warm_base_and_second_read() {
         let s = Eip8038Schedule::new();
         let ctx = OpcodeContext::default();
-        assert_eq!(s.opcode_gas_delta(0x3B, &ctx), 62); // EXTCODESIZE
-        assert_eq!(s.opcode_gas_delta(0x3C, &ctx), 62); // EXTCODECOPY
-        assert_eq!(s.opcode_gas_delta(0x3F, &ctx), 0); // EXTCODEHASH: no 2nd read
-        assert_eq!(s.opcode_gas_delta(0x31, &ctx), 0); // BALANCE (warm/no code)
+        let warm_fix = Eip8038Constants::WARM_ACCESS.1 as i64 - NATIVE_WARM_STORAGE_READ_GAS as i64;
+        assert_eq!(warm_fix, -38);
+        assert_eq!(s.opcode_gas_delta(0x3B, &ctx), warm_fix + 62); // EXTCODESIZE + 2nd read
+        assert_eq!(s.opcode_gas_delta(0x3C, &ctx), warm_fix + 62); // EXTCODECOPY + 2nd read
+        assert_eq!(s.opcode_gas_delta(0x3F, &ctx), warm_fix); // EXTCODEHASH: no 2nd read
+        assert_eq!(s.opcode_gas_delta(0x31, &ctx), warm_fix); // BALANCE
+        assert_eq!(s.opcode_gas_delta(0x54, &ctx), warm_fix); // SLOAD
+        assert_eq!(s.opcode_gas_delta(0x00, &ctx), 0); // STOP: not a state access
     }
 
     #[test]
     fn opcode_gas_delta_cold_account_code_surcharge() {
         let s = Eip8038Schedule::new();
+        let warm_fix = Eip8038Constants::WARM_ACCESS.1 as i64 - NATIVE_WARM_STORAGE_READ_GAS as i64;
         let cold_code = OpcodeContext::default().with_target_classification(true, true);
         let cold_nocode = OpcodeContext::default().with_target_classification(true, false);
         let warm_code = OpcodeContext::default().with_target_classification(false, true);
 
-        // Cold CALL to a contract: `NO_CODE` baseline + 5991 surcharge.
-        assert_eq!(s.opcode_gas_delta(0xF1, &cold_code), 5_991);
-        // Cold CALL to an EOA: no surcharge.
-        assert_eq!(s.opcode_gas_delta(0xF1, &cold_nocode), 0);
-        // Warm CALL: no surcharge.
-        assert_eq!(s.opcode_gas_delta(0xF1, &warm_code), 0);
-        // Cold EXTCODECOPY to a contract: second-read (+62) AND code surcharge.
-        assert_eq!(s.opcode_gas_delta(0x3C, &cold_code), 62 + 5_991);
-        // A non-account opcode never gets the surcharge even if flags are set.
-        assert_eq!(s.opcode_gas_delta(0x54, &cold_code), 0); // SLOAD
+        // Cold CALL to a contract: warm-base correction + 5991 code surcharge.
+        assert_eq!(s.opcode_gas_delta(0xF1, &cold_code), warm_fix + 5_991);
+        // Cold CALL to an EOA: warm-base correction only (no code surcharge).
+        assert_eq!(s.opcode_gas_delta(0xF1, &cold_nocode), warm_fix);
+        // Warm CALL: warm-base correction only.
+        assert_eq!(s.opcode_gas_delta(0xF1, &warm_code), warm_fix);
+        // Cold EXTCODECOPY to a contract: warm-base + second-read (+62) + code surcharge.
+        assert_eq!(s.opcode_gas_delta(0x3C, &cold_code), warm_fix + 62 + 5_991);
+        // SLOAD is storage, not an account access: warm-base correction, no surcharge.
+        assert_eq!(s.opcode_gas_delta(0x54, &cold_code), warm_fix);
     }
 
     fn ctx(is_create: bool, accounts: u64, slots: u64) -> TxContext {
@@ -421,7 +471,10 @@ mod tests {
     #[test]
     fn config_fingerprint_reflects_new_model() {
         let fp = Eip8038Schedule::new().config_fingerprint();
-        assert!(fp.contains("model=misilva73-absolute-v1"));
+        // v2 carries the warm-base-correction model (the −38 Layer-3 fix), so
+        // pre-fix +38 rows get a distinct config_hash.
+        assert!(fp.contains("model=misilva73-absolute-v2-warm-static-L3"));
+        assert!(fp.contains("native_warm_static=100"));
         assert!(fp.contains("cold_account_code=(2600, 9131)"));
         assert!(fp.contains("create=25601"));
         assert!(!fp.contains("multiplier"));

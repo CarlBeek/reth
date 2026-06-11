@@ -106,6 +106,14 @@ struct BucketAccumulator {
     tx_count_runtime_state: u32,
     tx_count_no_state: u32,
 
+    // Cold-account code/no-code split (EIP-8038). Sum over the bucket's txs
+    // of cold account accesses whose target carried code
+    // (`code_hash != KECCAK_EMPTY`, incl. EIP-7702 delegated) vs not (EOA /
+    // empty / non-existent). Zero for schedules that don't price the split;
+    // emitted as None when the bucket saw no cold account accesses.
+    cold_account_code_sum: u64,
+    cold_account_nocode_sum: u64,
+
     // Per-opcode totals — counts + baseline / schedule gas — summed
     // across every frame of every tx in this bucket for this block.
     // Stored dense (256 wide) for cache-friendly accumulation; emitted
@@ -152,6 +160,8 @@ impl Default for BucketAccumulator {
             tx_count_authorization: 0,
             tx_count_runtime_state: 0,
             tx_count_no_state: 0,
+            cold_account_code_sum: 0,
+            cold_account_nocode_sum: 0,
             opcode_counts: [0; 256],
             opcode_gas_baseline: [0; 256],
             opcode_gas_schedule: [0; 256],
@@ -250,6 +260,14 @@ pub struct TxObservation {
     /// post-intrinsic). False when the tx only paid the initial state-gas
     /// allotment with no spillover.
     pub has_runtime_state: bool,
+    /// Cold account accesses this tx made whose target carried code
+    /// (`code_hash != KECCAK_EMPTY`, incl. EIP-7702 delegated). `None` when the
+    /// replay was rejected before classification completed (vs `Some(0)` = ran,
+    /// no cold-code access), so unmeasured txs don't dilute the bucket sum.
+    pub cold_account_code_count: Option<u64>,
+    /// Cold account accesses this tx made whose target had no code
+    /// (EOA / empty / non-existent). `None` when unmeasured (see above).
+    pub cold_account_nocode_count: Option<u64>,
     /// Per-tx drill-in record — populated only for drill-in buckets
     /// (`EventLogsChanged` / `InconclusiveNeedsHigherSweep` /
     /// `ContractBroken`); ignored for aggregate buckets.
@@ -300,6 +318,16 @@ impl BlockAggregator {
         acc.state_gas_sum = acc.state_gas_sum.saturating_add(obs.state_gas_spent);
         acc.state_gas_spillover_sum =
             acc.state_gas_spillover_sum.saturating_add(obs.state_gas_spillover);
+
+        // 8038 cold-account code/no-code split aggregates. Fold only *measured*
+        // counts (`Some`); a reject-path tx (`None`) contributes nothing rather
+        // than a phantom zero that would bias the bucket sum low.
+        if let Some(c) = obs.cold_account_code_count {
+            acc.cold_account_code_sum = acc.cold_account_code_sum.saturating_add(c);
+        }
+        if let Some(c) = obs.cold_account_nocode_count {
+            acc.cold_account_nocode_sum = acc.cold_account_nocode_sum.saturating_add(c);
+        }
 
         // Multiplier histogram. We bin every tx (including those without
         // a meaningful multiplier — they land in bin 0) so the histogram's
@@ -421,6 +449,17 @@ impl BlockAggregator {
             let multiplier_log2_hist =
                 (acc.multiplier_observations > 0).then_some(acc.multiplier_log2_hist);
 
+            // Emit the cold-account split as a pair: if the bucket saw any
+            // cold account access at all, both columns carry a real count
+            // (so a genuine zero on one side reads as Some(0), not "n/a").
+            // Schedules that don't price the split leave both sums at 0 and
+            // both columns read None.
+            let cold_split_tracked =
+                acc.cold_account_code_sum > 0 || acc.cold_account_nocode_sum > 0;
+            let cold_account_code_count = cold_split_tracked.then_some(acc.cold_account_code_sum);
+            let cold_account_nocode_count =
+                cold_split_tracked.then_some(acc.cold_account_nocode_sum);
+
             // Collapse the dense 256-wide opcode arrays into a sparse
             // list of `OpcodeBucketTotal`. Skip entries where every
             // counter is zero so the JSON column stays compact.
@@ -457,6 +496,8 @@ impl BlockAggregator {
                 tx_count_authorization: Some(acc.tx_count_authorization),
                 tx_count_runtime_state: Some(acc.tx_count_runtime_state),
                 tx_count_no_state: Some(acc.tx_count_no_state),
+                cold_account_code_count,
+                cold_account_nocode_count,
             });
 
             // Fold this bucket's per-recipient map into top-K rollup rows.
@@ -536,6 +577,8 @@ mod tests {
             is_creation: false,
             has_authorization: false,
             has_runtime_state: false,
+            cold_account_code_count: None,
+            cold_account_nocode_count: None,
             drill_in_record: None,
             recipient: Some(Address::repeat_byte(0xab)),
             selector: Some([0x12, 0x34, 0x56, 0x78]),
@@ -626,6 +669,8 @@ mod tests {
             is_creation: recipient.is_none(),
             has_authorization: false,
             has_runtime_state: false,
+            cold_account_code_count: None,
+            cold_account_nocode_count: None,
             drill_in_record: None,
             recipient,
             selector: Some([0xaa, 0xbb, 0xcc, 0xdd]),
@@ -748,6 +793,8 @@ mod tests {
                 is_creation: true,
                 has_authorization: true,
                 has_runtime_state: true,
+                cold_account_code_count: None,
+                cold_account_nocode_count: None,
                 drill_in_record: None,
                 recipient: None,
                 selector: None,
@@ -772,6 +819,59 @@ mod tests {
         let summary = &out.summaries[0];
         assert_eq!(summary.tx_count_no_state, Some(1));
         assert_eq!(summary.tx_count_runtime_state, Some(0));
+    }
+
+    #[test]
+    fn cold_account_split_sums_per_bucket_and_gates_as_a_pair() {
+        let mut agg = BlockAggregator::start_block(meta(), 4);
+
+        // Two GasOnly txs accumulate into one bucket aggregate.
+        let mut a = obs(Bucket::GasOnly, 0);
+        a.cold_account_code_count = Some(3);
+        a.cold_account_nocode_count = Some(2);
+        agg.observe_tx(a, &[]);
+        let mut b = obs(Bucket::GasOnly, 0);
+        b.cold_account_code_count = Some(1);
+        b.cold_account_nocode_count = Some(4);
+        agg.observe_tx(b, &[]);
+        // A reject-path tx (unmeasured) in the same bucket must NOT dilute the
+        // sums — `None` is skipped, not folded as a phantom zero.
+        let mut unmeasured = obs(Bucket::GasOnly, 0);
+        unmeasured.cold_account_code_count = None;
+        unmeasured.cold_account_nocode_count = None;
+        agg.observe_tx(unmeasured, &[]);
+
+        // A bucket whose cold accesses all hit code: the no-code side is a
+        // genuine zero, emitted as Some(0) because the pair is gated together.
+        let mut c = obs(Bucket::WalletFixableShallow, 0);
+        c.cold_account_code_count = Some(5);
+        c.cold_account_nocode_count = Some(0);
+        agg.observe_tx(c, &[]);
+
+        // A bucket that made no cold account accesses at all.
+        agg.observe_tx(obs(Bucket::Unchanged, 0), &[]);
+
+        let out = agg.finish_block();
+        let by = |bucket: Bucket| out.summaries.iter().find(|s| s.bucket == bucket).unwrap();
+
+        let gas_only = by(Bucket::GasOnly);
+        assert_eq!(gas_only.cold_account_code_count, Some(4));
+        assert_eq!(gas_only.cold_account_nocode_count, Some(6));
+        // code + nocode == total cold account accesses in the bucket.
+        assert_eq!(
+            gas_only.cold_account_code_count.unwrap() + gas_only.cold_account_nocode_count.unwrap(),
+            10
+        );
+
+        // Partial signal still emits the pair, so the zero side is Some(0).
+        let wfs = by(Bucket::WalletFixableShallow);
+        assert_eq!(wfs.cold_account_code_count, Some(5));
+        assert_eq!(wfs.cold_account_nocode_count, Some(0));
+
+        // No cold accesses → both columns read None (n/a), not Some(0).
+        let unchanged = by(Bucket::Unchanged);
+        assert_eq!(unchanged.cold_account_code_count, None);
+        assert_eq!(unchanged.cold_account_nocode_count, None);
     }
 
     #[test]
@@ -891,6 +991,8 @@ mod tests {
                 state_gas_category: None,
                 reservoir_exhausted: None,
                 replay_halt_oog: None,
+                cold_account_code_count: None,
+                cold_account_nocode_count: None,
             },
             call_frames: vec![],
             opcode_counts: vec![],

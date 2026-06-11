@@ -636,6 +636,8 @@ mod tests {
                 state_gas_category: None,
                 reservoir_exhausted: None,
                 replay_halt_oog: None,
+                cold_account_code_count: None,
+                cold_account_nocode_count: None,
             },
             call_frames: vec![CallFrameRow {
                 call_index: 0,

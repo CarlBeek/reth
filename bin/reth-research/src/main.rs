@@ -1320,6 +1320,15 @@ where
                 /// to populate `divergence_opcode_counts` rows for drill-in
                 /// buckets.
                 frame_opcode_counts: Vec<reth_research::divergence::FrameOpcodeCounts>,
+                /// Cold account accesses this tx made whose target carried
+                /// code (`code_hash != KECCAK_EMPTY`, incl. EIP-7702
+                /// delegated), captured from the inspector's operation counts.
+                /// `None` when the replay was rejected before execution (so the
+                /// counts are unknown, not a real zero).
+                cold_account_code_count: Option<u64>,
+                /// Cold account accesses whose target had no code
+                /// (EOA / empty / non-existent). `None` when unmeasured.
+                cold_account_nocode_count: Option<u64>,
                 call_frames: Vec<CallFrame>,
                 event_logs: Vec<EventLog>,
                 output_hash: Option<String>,
@@ -1581,6 +1590,9 @@ where
                                 oog_info_structured: Some(synth_oog),
                                 divergence_location_structured: None,
                                 frame_opcode_counts: Vec::new(),
+                                // Rejected replay: counts unknown (not zero).
+                                cold_account_code_count: None,
+                                cold_account_nocode_count: None,
                                 call_frames: Vec::new(),
                                 event_logs: Vec::new(),
                                 output_hash: None,
@@ -1727,6 +1739,12 @@ where
                         oog_info_structured: inspector_oog_info.clone(),
                         divergence_location_structured: insp_result.divergence_location.clone(),
                         frame_opcode_counts: inspector.frame_opcode_counts().frames.clone(),
+                        cold_account_code_count: Some(
+                            inspector.operation_counts().cold_account_code_count,
+                        ),
+                        cold_account_nocode_count: Some(
+                            inspector.operation_counts().cold_account_nocode_count,
+                        ),
                         call_frames_hash: Self::hash_serialized(&call_frames),
                         event_logs_hash: Self::hash_serialized(&event_logs),
                         call_frames,
@@ -2115,6 +2133,16 @@ where
                         let sched_logs_ref: &[EventLog] =
                             exec_result.map(|r| r.event_logs.as_slice()).unwrap_or(&[]);
 
+                        // Cold-account code/no-code split for this tx under this
+                        // schedule (`None` = unmeasured/reject). Emit the pair only
+                        // when the tx made at least one cold account access, so a
+                        // genuine zero on one side reads as Some(0); unmeasured or
+                        // measured-zero both read as NULL.
+                        let cold_code = exec_result.and_then(|r| r.cold_account_code_count);
+                        let cold_nocode = exec_result.and_then(|r| r.cold_account_nocode_count);
+                        let cold_split_seen =
+                            cold_code.unwrap_or(0) > 0 || cold_nocode.unwrap_or(0) > 0;
+
                         let divergence_row = DivergenceRow {
                             schedule_name: schedule_name.to_string(),
                             schedule_config_hash: metadata.config_hash.clone(),
@@ -2185,6 +2213,10 @@ where
                             // Set from the tier-sweep loop above: Some(true/false)
                             // when no tier succeeded, None when at least one did.
                             replay_halt_oog,
+                            cold_account_code_count: cold_split_seen
+                                .then_some(cold_code.unwrap_or(0)),
+                            cold_account_nocode_count: cold_split_seen
+                                .then_some(cold_nocode.unwrap_or(0)),
                         };
 
                         // Inspector emits frames in post-order DFS — children
@@ -2304,6 +2336,10 @@ where
                             is_creation: is_create,
                             has_authorization: authorization_count > 0,
                             has_runtime_state,
+                            cold_account_code_count: exec_result
+                                .and_then(|r| r.cold_account_code_count),
+                            cold_account_nocode_count: exec_result
+                                .and_then(|r| r.cold_account_nocode_count),
                             drill_in_record: drill_in,
                             recipient,
                             // 4-byte selector for calls with >=4 calldata bytes;

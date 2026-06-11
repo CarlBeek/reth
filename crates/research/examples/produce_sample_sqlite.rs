@@ -83,6 +83,8 @@ fn main() {
             state_gas_category: None,
             reservoir_exhausted: None,
             replay_halt_oog: None,
+            cold_account_code_count: None,
+            cold_account_nocode_count: None,
         },
         call_frames: vec![CallFrameRow {
             call_index: 0,
@@ -166,6 +168,8 @@ fn main() {
             tx_count_authorization: None,
             tx_count_runtime_state: None,
             tx_count_no_state: None,
+            cold_account_code_count: None,
+            cold_account_nocode_count: None,
         }],
         drill_ins: vec![drill_in],
         bucket_recipients: vec![],

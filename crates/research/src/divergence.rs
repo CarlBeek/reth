@@ -191,6 +191,19 @@ pub struct OperationCounts {
     /// Cumulative additional gas charged for KECCAK256
     #[serde(default)]
     pub keccak256_gas_delta: i64,
+
+    /// Number of COLD account accesses whose target has code (`code_hash !=
+    /// KECCAK_EMPTY`, incl. EIP-7702 delegated) — the EIP-8038 CODE cohort.
+    ///
+    /// Collected for **every** schedule (not just EIP-8038): the classification
+    /// is a near-free native baseline, so 7904/8037 rows carry it too. Only
+    /// EIP-8038 *prices* the code/no-code split.
+    #[serde(default)]
+    pub cold_account_code_count: u64,
+    /// Number of COLD account accesses whose target has no code (pure EOA /
+    /// empty / non-existent) — the EIP-8038 `NO_CODE` cohort.
+    #[serde(default)]
+    pub cold_account_nocode_count: u64,
 }
 
 /// Location where divergence first occurred.

@@ -76,17 +76,25 @@ use thiserror::Error;
 ///   column was added in-place without bumping `SCHEMA_VERSION`, so a v9 database created before it
 ///   lacked the column and every write failed with `no column named …`.
 /// - v10: bump so the `tx_count_aa_gas_reestimation` column is properly version-gated. A database
-///   written under an older version is detected by [`verify_schema_version`] as a mismatch and
-///   re-replayed, rather than silently failing every write.
+///   written under an older version is detected as a mismatch (see [`enforce_schema_version`]) and
+///   rejected, rather than silently failing every write.
 /// - v11: added block-capacity columns `block_coverage.block_gas_used` / `block_gas_limit` (the
 ///   native header values — utilization, fullness and gas-limit-exceedance analysis) and the
 ///   `block_bucket_recipients` rollup table (per-(block,bucket) top recipients + 4-byte selector,
-///   ranked/truncated by `tx_count` with the tail folded into an `__other__` row) so the two
-///   aggregate-only cohorts (`gas_only`, `wallet_fixable_shallow`) gain protocol/selector
-///   attribution they previously lacked. All additions are nullable / new-table, so a pre-v11
-///   database is forward-compatible after an additive `ALTER TABLE … ADD COLUMN`; rows for blocks
-///   not re-touched simply read NULL.
-pub const SCHEMA_VERSION: u32 = 11;
+///   ranked/truncated by `tx_count` with the tail folded into an `__other__` row) for every bucket
+///   except `Unchanged`, giving the aggregate-only cohorts (`gas_only`, `wallet_fixable_shallow`,
+///   …) the protocol/selector attribution they previously lacked and supplementing the drill-in
+///   buckets. All additions are nullable / new-table; there is no in-place migration — a
+///   `SCHEMA_VERSION` bump means wipe & re-gather (see [`SCHEMA_VERSION`]).
+/// - v12: added cold-account code/no-code split counters `cold_account_code_count` /
+///   `cold_account_nocode_count` to both `block_summaries` (per-(block,bucket) aggregate) and
+///   `divergences` (per-tx drill-in). EIP-8038 prices a cold account access at 9131 when the target
+///   carries code (`code_hash != KECCAK_EMPTY`, incl. EIP-7702 delegated) vs 3140 otherwise, so the
+///   split is what drives a schedule's account-access delta; no native revm slot distinguishes
+///   them. There is no in-place migration: opening a pre-v12 database is rejected by
+///   [`enforce_schema_version`] (via `PRAGMA user_version`) — wipe the divergences `SQLite` and
+///   re-gather. The archive datadir is never touched.
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// Errors raised by the storage layer.
 #[derive(Debug, Error)]
@@ -101,10 +109,11 @@ pub enum DatabaseError {
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     /// The on-disk schema version doesn't match the compiled-in
-    /// `SCHEMA_VERSION`. Replay is required.
+    /// `SCHEMA_VERSION`. There is no in-place migration — wipe & re-gather.
     #[error(
-        "schema version mismatch: producer compiled for v{expected}, \
-         database last written under v{found}. Re-replay required."
+        "research DB schema mismatch: binary expects v{expected}, database is v{found}. \
+         No migration — wipe the divergences SQLite and re-gather (the archive datadir is \
+         unaffected)."
     )]
     SchemaVersionMismatch {
         /// Version the running binary expects.
@@ -178,6 +187,7 @@ impl DivergenceDatabase {
         // consumer dashboard) can keep WAL_pages "in use" indefinitely
         // and the WAL grows past the database size, slowing every read.
         conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
+        enforce_schema_version(&conn)?;
         initialize_schema(&conn)?;
         verify_schema_version(&conn)?;
         Ok(Self {
@@ -246,6 +256,43 @@ fn current_unix_seconds() -> u64 {
 /// A freshly initialised DB has zero rows in `analysis_runs` and passes
 /// trivially; the version is stamped the first time
 /// [`DivergenceDatabase::record_analysis_run_start`] is called.
+/// Enforce the research-DB schema version via `SQLite`'s `PRAGMA user_version`.
+///
+/// There is **no in-place migration**: a [`SCHEMA_VERSION`] bump means wipe the
+/// divergences `SQLite` and re-gather (the archive datadir is unaffected). A
+/// brand-new DB is stamped with the current version; an existing DB whose version
+/// differs — including a legacy/un-stamped DB (`user_version == 0` with tables
+/// already present) — is rejected so the producer fails loudly instead of silently
+/// writing into a stale schema.
+///
+/// Must run BEFORE [`initialize_schema`]: `CREATE TABLE IF NOT EXISTS` would
+/// otherwise no-op against a stale DB's tables, and the missing columns would only
+/// surface as a runtime "no column named …" on the first write. This is the
+/// actually-enforced gate; [`verify_schema_version`] (below) is the older,
+/// inert `analysis_runs`-based check kept for backward compatibility.
+fn enforce_schema_version(conn: &Connection) -> Result<(), DatabaseError> {
+    let user_version: u32 =
+        conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? as u32;
+    let has_schema = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='block_coverage'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+
+    if !has_schema && user_version == 0 {
+        // Brand-new DB: stamp the current version; the DDL then creates current tables.
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        return Ok(());
+    }
+    if user_version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    Err(DatabaseError::SchemaVersionMismatch { expected: SCHEMA_VERSION, found: user_version })
+}
+
 fn verify_schema_version(conn: &Connection) -> Result<(), DatabaseError> {
     let latest: Option<u32> = conn
         .query_row(
@@ -336,13 +383,16 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             tx_count_authorization  INTEGER,
             tx_count_runtime_state  INTEGER,
             tx_count_no_state       INTEGER,
+            cold_account_code_count   INTEGER,
+            cold_account_nocode_count INTEGER,
             PRIMARY KEY (schedule_name, block_number, bucket)
         );",
     )?;
 
-    // Per-(schedule, block, bucket) recipient attribution for the
-    // aggregate-only cohorts that have no per-tx rows (`gas_only`,
-    // `wallet_fixable_shallow`, …). One row per distinct destination, ranked
+    // Per-(schedule, block, bucket) recipient attribution for every bucket
+    // except `Unchanged` — it gives the aggregate-only cohorts (`gas_only`,
+    // `wallet_fixable_shallow`, …) attribution they otherwise lack and
+    // supplements the drill-in buckets. One row per distinct destination, ranked
     // and truncated to the top `BUCKET_RECIPIENT_TOP_K` by `tx_count`; the
     // truncated tail is folded into a single synthetic `recipient='__other__'`
     // row so the unattributed mass stays quantified (no silent long-tail
@@ -443,6 +493,14 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             -- Lets the consumer split unresolved replay failures into
             -- needs-more-gas vs permanently-broken-under-this-schedule.
             replay_halt_oog             INTEGER,
+
+            -- Per-tx count of cold account accesses split by whether the
+            -- target carried code (`code_hash != KECCAK_EMPTY`, incl. EIP-7702
+            -- delegated) vs not (EOA / empty / non-existent). Under EIP-8038
+            -- the two are priced differently (9131 vs 3140), so the split is
+            -- what drives this tx's account-access delta.
+            cold_account_code_count     INTEGER,
+            cold_account_nocode_count   INTEGER,
 
             UNIQUE (schedule_name, block_number, tx_index, schedule_config_hash)
         );",
@@ -731,6 +789,13 @@ pub struct BlockSummaryRow {
     pub tx_count_authorization: Option<u32>,
     pub tx_count_runtime_state: Option<u32>,
     pub tx_count_no_state: Option<u32>,
+    /// Cold account accesses in this bucket whose target carried code
+    /// (`code_hash != KECCAK_EMPTY`, incl. EIP-7702 delegated). Populated for
+    /// every schedule; `None` when the bucket made no cold account access.
+    pub cold_account_code_count: Option<u64>,
+    /// Cold account accesses in this bucket whose target had no code
+    /// (EOA / empty / non-existent). `None` when the bucket made no cold access.
+    pub cold_account_nocode_count: Option<u64>,
 }
 
 /// Per-tx drill-in record: the `divergences` row plus its dependent
@@ -819,6 +884,15 @@ pub struct DivergenceRow {
     /// multiplier exceeds the ceiling); `Some(false)` for non-gas
     /// halts/reverts; `None` when at least one tier succeeded.
     pub replay_halt_oog: Option<bool>,
+
+    /// Cold account accesses in this tx whose target carried code
+    /// (`code_hash != KECCAK_EMPTY`, incl. EIP-7702 delegated). Populated for
+    /// every schedule; `None` when the tx made no cold account access, or when
+    /// the schedule replay was rejected before classification completed.
+    pub cold_account_code_count: Option<u64>,
+    /// Cold account accesses in this tx whose target had no code
+    /// (EOA / empty / non-existent). `None` as above.
+    pub cold_account_nocode_count: Option<u64>,
 }
 
 /// One frame row destined for `divergence_call_frames`. `call_index` and
@@ -1364,14 +1438,16 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             state_gas_sum, state_gas_spillover_sum,
             multiplier_log2_hist,
             tx_count_creation, tx_count_authorization,
-            tx_count_runtime_state, tx_count_no_state
+            tx_count_runtime_state, tx_count_no_state,
+            cold_account_code_count, cold_account_nocode_count
         ) VALUES (?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?,
                   ?,
                   ?, ?,
                   ?,
-                  ?, ?, ?, ?)
+                  ?, ?, ?, ?,
+                  ?, ?)
         ON CONFLICT (schedule_name, block_number, bucket) DO UPDATE SET
             tx_count                = excluded.tx_count,
             gas_delta_sum           = excluded.gas_delta_sum,
@@ -1386,7 +1462,9 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             tx_count_creation       = excluded.tx_count_creation,
             tx_count_authorization  = excluded.tx_count_authorization,
             tx_count_runtime_state  = excluded.tx_count_runtime_state,
-            tx_count_no_state       = excluded.tx_count_no_state",
+            tx_count_no_state       = excluded.tx_count_no_state,
+            cold_account_code_count   = excluded.cold_account_code_count,
+            cold_account_nocode_count = excluded.cold_account_nocode_count",
         params![
             row.schedule_name,
             row.block_number as i64,
@@ -1405,6 +1483,8 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             row.tx_count_authorization.map(|v| v as i64),
             row.tx_count_runtime_state.map(|v| v as i64),
             row.tx_count_no_state.map(|v| v as i64),
+            row.cold_account_code_count.map(|v| v as i64),
+            row.cold_account_nocode_count.map(|v| v as i64),
         ],
     )?;
     Ok(())
@@ -1430,7 +1510,8 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             schedule_initial_state_gas, schedule_initial_reservoir,
             runtime_state_gas, runtime_state_gas_spillover,
             state_gas_category, reservoir_exhausted,
-            replay_halt_oog
+            replay_halt_oog,
+            cold_account_code_count, cold_account_nocode_count
         ) VALUES (?, ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?,
@@ -1443,7 +1524,8 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
                   ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?, ?, ?, ?, ?, ?,
-                  ?)",
+                  ?,
+                  ?, ?)",
         params![
             row.schedule_name,
             row.schedule_config_hash,
@@ -1495,6 +1577,8 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             row.state_gas_category,
             row.reservoir_exhausted,
             row.replay_halt_oog,
+            row.cold_account_code_count.map(|v| v as i64),
+            row.cold_account_nocode_count.map(|v| v as i64),
         ],
     )?;
     Ok(tx.last_insert_rowid() as u64)
@@ -1715,6 +1799,45 @@ mod tests {
         let _db = DivergenceDatabase::open(fresh_db_path(&dir)).unwrap();
     }
 
+    #[test]
+    fn pragma_user_version_mismatch_is_rejected() {
+        // A DB created under a different schema version (tables present, wrong
+        // `PRAGMA user_version`) is rejected at open — no migration, wipe & re-gather.
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_db_path(&dir);
+        {
+            // Fresh open stamps user_version = SCHEMA_VERSION and creates tables.
+            let db = DivergenceDatabase::open(&path).unwrap();
+            db.conn
+                .lock()
+                .unwrap()
+                .pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+                .unwrap();
+        }
+        match DivergenceDatabase::open(&path).unwrap_err() {
+            DatabaseError::SchemaVersionMismatch { expected, found } => {
+                assert_eq!(expected, SCHEMA_VERSION);
+                assert_eq!(found, SCHEMA_VERSION - 1);
+            }
+            other => panic!("expected SchemaVersionMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_unstamped_db_is_rejected() {
+        // A pre-versioning DB has our tables but user_version == 0 → rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_db_path(&dir);
+        {
+            let db = DivergenceDatabase::open(&path).unwrap();
+            db.conn.lock().unwrap().pragma_update(None, "user_version", 0i64).unwrap();
+        }
+        assert!(matches!(
+            DivergenceDatabase::open(&path).unwrap_err(),
+            DatabaseError::SchemaVersionMismatch { found: 0, .. }
+        ));
+    }
+
     /// Minimal `BlockCoverageRow` fixture for write-path tests.
     fn fixture_coverage(
         schedule: &str,
@@ -1804,6 +1927,8 @@ mod tests {
             state_gas_category: None,
             reservoir_exhausted: None,
             replay_halt_oog: None,
+            cold_account_code_count: None,
+            cold_account_nocode_count: None,
         }
     }
 
@@ -1875,6 +2000,8 @@ mod tests {
                 tx_count_authorization: None,
                 tx_count_runtime_state: None,
                 tx_count_no_state: None,
+                cold_account_code_count: None,
+                cold_account_nocode_count: None,
             }],
             drill_ins: vec![drill_in],
             bucket_recipients: vec![],

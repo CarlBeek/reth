@@ -781,6 +781,10 @@ impl ScheduleInspector {
 /// short-circuit without the DB read. `is_code` follows the misilva73 rule:
 /// `code_hash != KECCAK_EMPTY` (contracts + EIP-7702 delegated; pure EOA /
 /// empty / non-existent are `NO_CODE`).
+///
+/// Invoked for **every** schedule (not just EIP-8038): the cold-account split is
+/// a near-free native baseline, and schedules that don't price it simply ignore
+/// the classification. See [`OperationCounts::cold_account_code_count`].
 fn classify_account_target<CTX>(context: &mut CTX, addr: Address) -> (bool, bool)
 where
     CTX: ContextTr,
@@ -790,13 +794,28 @@ where
     let is_cold = match context.journal_mut().load_account_info_skip_cold_load(addr, false, true) {
         Ok(_) => false,
         Err(JournalLoadError::ColdLoadSkipped) => true,
-        Err(JournalLoadError::DBError(_)) => return (false, false),
+        Err(JournalLoadError::DBError(err)) => {
+            // A real DB error here would also fail revm's own account load and
+            // abort the tx; surface it rather than silently classifying as warm.
+            tracing::warn!(target: "exex::research", %addr, ?err, "cold-account classification: journal load failed; treating as warm");
+            return (false, false);
+        }
     };
     if !is_cold {
         return (false, false);
     }
-    let is_code =
-        context.db_mut().basic(addr).ok().flatten().is_some_and(|info| !info.is_empty_code_hash());
+    // Read `code_hash` for the cold target without warming it. Distinguish a
+    // genuinely non-existent account (`Ok(None)` → `NO_CODE`) from a DB read error
+    // — collapsing the latter to `NO_CODE` would silently drop the 5991 CODE
+    // surcharge on a real contract.
+    let is_code = match context.db_mut().basic(addr) {
+        Ok(Some(info)) => !info.is_empty_code_hash(),
+        Ok(None) => false,
+        Err(err) => {
+            tracing::warn!(target: "exex::research", %addr, ?err, "cold-account classification: code-hash read failed; treating as no-code");
+            false
+        }
+    };
     (true, is_code)
 }
 
@@ -860,6 +879,14 @@ where
             let (is_cold, is_code) = classify_account_target(context, addr);
             self.cached_target_is_cold = is_cold;
             self.cached_target_is_code = is_code;
+            // Count the cold-account access by code/no-code for data collection.
+            if is_cold {
+                if is_code {
+                    self.op_counts.cold_account_code_count += 1;
+                } else {
+                    self.op_counts.cold_account_nocode_count += 1;
+                }
+            }
         }
 
         // Cache variable-cost opcode parameters from the stack before execution
