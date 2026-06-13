@@ -20,7 +20,9 @@
 //!   --research.db-path ./divergences.db
 //! ```
 
-use alloy_consensus::{constants::KECCAK_EMPTY, transaction::TxHashRef, BlockHeader, Transaction};
+use alloy_consensus::{
+    constants::KECCAK_EMPTY, transaction::TxHashRef, BlockHeader, Transaction, Typed2718,
+};
 use alloy_eips::BlockHashOrNumber;
 use alloy_primitives::{keccak256, logs_bloom, Address, Bloom, Bytes, B256, U256};
 use clap::Parser;
@@ -319,6 +321,47 @@ where
 
     fn logs_bloom_hex<HR>(result: &revm::context_interface::result::ExecutionResult<HR>) -> String {
         Self::hex_bloom(logs_bloom(result.logs().iter()))
+    }
+
+    /// Truncate returndata to a bounded prefix for storage. 132 bytes holds a
+    /// 4-byte error selector plus one 32-byte head word and the start of the
+    /// payload — enough to identify the error and read short revert strings,
+    /// while bounding a pathological multi-KB return.
+    const REVERT_DATA_CAP: usize = 132;
+
+    fn cap_bytes(data: &[u8]) -> Vec<u8> {
+        data[..data.len().min(Self::REVERT_DATA_CAP)].to_vec()
+    }
+
+    /// Best-effort decode of Solidity revert returndata (F2). Recognises the two
+    /// canonical errors plus custom 4-byte selectors; the raw (capped) bytes are
+    /// stored alongside so downstream can re-decode fully.
+    fn decode_revert(data: &[u8]) -> String {
+        if data.is_empty() {
+            return "empty".to_string();
+        }
+        if data.len() < 4 {
+            return format!("short:0x{}", alloy_primitives::hex::encode(data));
+        }
+        match [data[0], data[1], data[2], data[3]] {
+            // Error(string): selector + offset(32) + len(32) + utf8 bytes.
+            [0x08, 0xc3, 0x79, 0xa0] => {
+                if data.len() >= 68 {
+                    let len = u32::from_be_bytes([data[64], data[65], data[66], data[67]]) as usize;
+                    let end = 68usize.saturating_add(len).min(data.len());
+                    let s = String::from_utf8_lossy(&data[68..end]);
+                    format!("Error(string): {s}")
+                } else {
+                    "Error(string)".to_string()
+                }
+            }
+            // Panic(uint256): selector + 32-byte code (low byte holds the code).
+            [0x4e, 0x48, 0x7b, 0x71] => {
+                let code = data.get(35).copied().unwrap_or(0);
+                format!("Panic(0x{code:02x})")
+            }
+            sel => format!("custom:0x{}", alloy_primitives::hex::encode(sel)),
+        }
     }
 
     fn count_input_bytes(input: &Bytes) -> (u64, u64) {
@@ -1333,6 +1376,17 @@ where
                 /// F4: cumulative repricing surcharge the inspector charged
                 /// this tx (`ScheduleResult::additional_gas`). Signed.
                 additional_gas: i64,
+                /// F1: structured failure reason — the `HaltReason` discriminant
+                /// (`OutOfGas`, `StackOverflow`, …), `"Revert"`, or `None` on
+                /// success.
+                failure_reason: Option<String>,
+                /// F2: raw revert returndata (capped), best-effort decode of it
+                /// (`Error(string)` / `Panic(0xNN)` / `custom:0x…` / `empty`),
+                /// and the top-level tx output bytes (capped) — today only a
+                /// hash is kept.
+                revert_data: Option<Vec<u8>>,
+                revert_decoded: Option<String>,
+                tx_output: Option<Vec<u8>>,
                 call_frames: Vec<CallFrame>,
                 event_logs: Vec<EventLog>,
                 output_hash: Option<String>,
@@ -1608,6 +1662,12 @@ where
                                 // Rejected replay never executed an opcode → no
                                 // surcharge applied.
                                 additional_gas: 0,
+                                // Rejected before execution: revm refused the tx
+                                // outright (the `{e:?}` is in `oog_info`).
+                                failure_reason: Some("Rejected".to_string()),
+                                revert_data: None,
+                                revert_decoded: None,
+                                tx_output: None,
                                 call_frames: Vec::new(),
                                 event_logs: Vec::new(),
                                 output_hash: None,
@@ -1684,6 +1744,27 @@ where
                     let halt_info = halt_reason_debug
                         .as_ref()
                         .map(|reason| format!("Execution halted: {reason}"));
+                    // F1: structured failure reason — halt discriminant, Revert,
+                    // or None on success.
+                    let failure_reason = match &result.result {
+                        revm::context_interface::result::ExecutionResult::Halt {
+                            reason, ..
+                        } => Some(format!("{reason:?}")),
+                        revm::context_interface::result::ExecutionResult::Revert { .. } => {
+                            Some("Revert".to_string())
+                        }
+                        revm::context_interface::result::ExecutionResult::Success { .. } => None,
+                    };
+                    // F2: revert returndata (capped) + best-effort decode, and
+                    // the top-level tx output bytes (capped — today hash-only).
+                    let revert_data = match &result.result {
+                        revm::context_interface::result::ExecutionResult::Revert {
+                            output, ..
+                        } => Some(Self::cap_bytes(output)),
+                        _ => None,
+                    };
+                    let revert_decoded = revert_data.as_deref().map(Self::decode_revert);
+                    let tx_output = result.result.output().map(|o| Self::cap_bytes(o));
                     // Halt classification at this tier:
                     //   Halt { OutOfGas* } → Some(true)  (more gas might help)
                     //   Halt { other }     → Some(false) (no amount of gas helps)
@@ -1761,6 +1842,10 @@ where
                             inspector.operation_counts().cold_account_nocode_count,
                         ),
                         additional_gas: insp_result.additional_gas,
+                        failure_reason,
+                        revert_data,
+                        revert_decoded,
+                        tx_output,
                         call_frames_hash: Self::hash_serialized(&call_frames),
                         event_logs_hash: Self::hash_serialized(&event_logs),
                         call_frames,
@@ -2246,6 +2331,22 @@ where
                                     .collect();
                                 serde_json::to_string(&path).ok()
                             }),
+                            // F5: top-level tx identity.
+                            tx_type: Some(tx.ty()),
+                            tx_nonce: Some(tx.nonce()),
+                            entry_selector: (!is_create && input.len() >= 4).then(|| {
+                                let mut s = [0u8; 4];
+                                s.copy_from_slice(&input[..4]);
+                                s
+                            }),
+                            input_zero_bytes: Some(input_zero_bytes),
+                            input_nonzero_bytes: Some(input_nonzero_bytes),
+                            has_authorization: Some(authorization_count > 0),
+                            // F1/F2: structured failure reason + revert/return data.
+                            failure_reason: exec_result.and_then(|r| r.failure_reason.clone()),
+                            revert_data: exec_result.and_then(|r| r.revert_data.clone()),
+                            revert_decoded: exec_result.and_then(|r| r.revert_decoded.clone()),
+                            tx_output: exec_result.and_then(|r| r.tx_output.clone()),
                         };
 
                         // Inspector emits frames in post-order DFS — children

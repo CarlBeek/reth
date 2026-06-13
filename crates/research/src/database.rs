@@ -515,6 +515,25 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             -- nullable hex strings (null = a frame with no selector).
             failure_selector_path       TEXT,
 
+            -- F5: top-level tx identity. tx_type is the EIP-2718 type byte;
+            -- entry_selector is the first 4 calldata bytes; input_zero/nonzero
+            -- are the calldata byte split; has_authorization flags EIP-7702.
+            tx_type                     INTEGER,
+            tx_nonce                    INTEGER,
+            entry_selector              BLOB,
+            input_zero_bytes            INTEGER,
+            input_nonzero_bytes         INTEGER,
+            has_authorization           INTEGER,
+
+            -- F1: structured failure reason (HaltReason discriminant / Revert /
+            -- Rejected / NULL on success).
+            failure_reason              TEXT,
+            -- F2: raw revert returndata (capped), its best-effort decode, and
+            -- the top-level tx output bytes (capped).
+            revert_data                 BLOB,
+            revert_decoded              TEXT,
+            tx_output                   BLOB,
+
             UNIQUE (schedule_name, block_number, tx_index, schedule_config_hash)
         );",
     )?;
@@ -825,8 +844,12 @@ pub struct DrillInRecord {
 /// One row destined for `divergences`. Most fields mirror the column
 /// names; the `schema_version` / `divergence_id` / timestamp are filled in by
 /// the writer.
+///
+/// `Default` is derived so test/example fixtures can spread `..Default::default()`
+/// and set only the fields they care about — new nullable forensic columns then
+/// need no fixture edits.
 #[allow(missing_docs)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DivergenceRow {
     pub schedule_name: String,
     pub schedule_config_hash: String,
@@ -915,12 +938,44 @@ pub struct DivergenceRow {
     /// transfer or create). `None` when no divergence location was resolved.
     /// (F6)
     pub failure_selector_path: Option<String>,
+
+    /// EIP-2718 transaction type byte (0 legacy, 1 EIP-2930, 2 EIP-1559,
+    /// 3 EIP-4844 blob, 4 EIP-7702). (F5)
+    pub tx_type: Option<u8>,
+    /// Sender account nonce of this tx. (F5)
+    pub tx_nonce: Option<u64>,
+    /// Top-level 4-byte entry selector (first 4 calldata bytes). `None` for
+    /// creations and calls with fewer than 4 calldata bytes. (F5)
+    pub entry_selector: Option<[u8; 4]>,
+    /// Calldata zero / nonzero byte split — the intrinsic-gas drivers and a
+    /// cheap calldata-shape fingerprint. (F5)
+    pub input_zero_bytes: Option<u64>,
+    pub input_nonzero_bytes: Option<u64>,
+    /// Whether the tx carries an EIP-7702 authorization list. (F5)
+    pub has_authorization: Option<bool>,
+
+    /// Structured failure reason: the `HaltReason` discriminant (`OutOfGas`,
+    /// `StackOverflow`, …), `"Revert"`, `"Rejected"`, or `None` on success.
+    /// (F1)
+    pub failure_reason: Option<String>,
+    /// Raw revert returndata, truncated to a bounded prefix. `None` unless the
+    /// schedule result was a revert. (F2)
+    pub revert_data: Option<Vec<u8>>,
+    /// Best-effort decode of `revert_data` (`Error(string): …` / `Panic(0xNN)` /
+    /// `custom:0x…` / `empty`). (F2)
+    pub revert_decoded: Option<String>,
+    /// Top-level tx output bytes, truncated to a bounded prefix (today only a
+    /// hash is otherwise kept). (F2)
+    pub tx_output: Option<Vec<u8>>,
 }
 
 /// One frame row destined for `divergence_call_frames`. `call_index` and
 /// `parent_call_index` match the inspector's frame-open order (root = 0).
+///
+/// `Default` is derived for the same fixture-spread convenience as
+/// [`DivergenceRow`].
 #[allow(missing_docs)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CallFrameRow {
     pub call_index: u32,
     pub parent_call_index: Option<u32>,
@@ -1515,7 +1570,10 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             state_gas_category, reservoir_exhausted,
             replay_halt_oog,
             cold_account_code_count, cold_account_nocode_count,
-            additional_gas_charged, failure_selector_path
+            additional_gas_charged, failure_selector_path,
+            tx_type, tx_nonce, entry_selector,
+            input_zero_bytes, input_nonzero_bytes, has_authorization,
+            failure_reason, revert_data, revert_decoded, tx_output
         ) VALUES (?, ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?,
@@ -1530,7 +1588,10 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
                   ?, ?, ?, ?, ?, ?, ?,
                   ?,
                   ?, ?,
-                  ?, ?)",
+                  ?, ?,
+                  ?, ?, ?,
+                  ?, ?, ?,
+                  ?, ?, ?, ?)",
         params![
             row.schedule_name,
             row.schedule_config_hash,
@@ -1586,6 +1647,16 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             row.cold_account_nocode_count.map(|v| v as i64),
             row.additional_gas_charged,
             row.failure_selector_path,
+            row.tx_type.map(|v| v as i64),
+            row.tx_nonce.map(|v| v as i64),
+            row.entry_selector.map(|s| s.to_vec()),
+            row.input_zero_bytes.map(|v| v as i64),
+            row.input_nonzero_bytes.map(|v| v as i64),
+            row.has_authorization,
+            row.failure_reason,
+            row.revert_data,
+            row.revert_decoded,
+            row.tx_output,
         ],
     )?;
     Ok(tx.last_insert_rowid() as u64)
@@ -1887,54 +1958,16 @@ mod tests {
             tx_index,
             tx_hash: B256::repeat_byte(0xdd),
             timestamp: 1_700_000_000,
-            outer_limit_only_failure: None,
             sender: Address::repeat_byte(0x11),
             recipient: Some(Address::repeat_byte(0x22)),
-            is_create: false,
             tx_gas_limit: 500_000,
             baseline_success: true,
             schedule_success,
             status_changed: !schedule_success,
-            event_logs_changed: false,
-            output_changed: false,
-            logs_bloom_changed: false,
             baseline_gas_used: 100_000,
             schedule_gas_used: (100_000i64 + gas_delta).max(0) as u64,
             gas_delta,
-            baseline_total_gas_spent: None,
-            baseline_gas_refunded: None,
-            schedule_total_gas_spent: None,
-            schedule_gas_refunded: None,
-            schedule_intrinsic_gas: None,
-            schedule_floor_gas: None,
-            would_fit_in_original_limit: None,
-            min_multiplier_to_succeed: None,
-            divergence_contract: None,
-            divergence_pc: None,
-            divergence_call_depth: None,
-            divergence_opcode: None,
-            oog_contract: None,
-            oog_pc: None,
-            oog_call_depth: None,
-            oog_opcode: None,
-            oog_pattern: None,
-            oog_gas_remaining: None,
-            oog_chain_proportional: None,
-            oog_bottleneck_depth: None,
-            oog_bottleneck_kind: None,
-            schedule_state_gas_spent: None,
-            schedule_state_gas_demanded: None,
-            schedule_initial_state_gas: None,
-            schedule_initial_reservoir: None,
-            runtime_state_gas: None,
-            runtime_state_gas_spillover: None,
-            state_gas_category: None,
-            reservoir_exhausted: None,
-            replay_halt_oog: None,
-            cold_account_code_count: None,
-            cold_account_nocode_count: None,
-            additional_gas_charged: None,
-            failure_selector_path: None,
+            ..Default::default()
         }
     }
 
