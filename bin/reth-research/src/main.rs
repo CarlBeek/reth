@@ -133,6 +133,47 @@ fn eip150_cap_binding(stack_gas: Option<u64>, parent_gas: Option<u64>) -> Option
     Some(s >= cap.saturating_sub(100))
 }
 
+/// Truncate returndata to a bounded prefix for storage (F2). 132 bytes holds a
+/// 4-byte error selector plus one 32-byte head word and the start of the
+/// payload — enough to identify the error and read short revert strings — while
+/// bounding a pathological multi-KB return.
+const REVERT_DATA_CAP: usize = 132;
+
+fn cap_bytes(data: &[u8]) -> Vec<u8> {
+    data[..data.len().min(REVERT_DATA_CAP)].to_vec()
+}
+
+/// Best-effort decode of Solidity revert returndata (F2). Recognises the two
+/// canonical errors plus custom 4-byte selectors; the raw (capped) bytes are
+/// stored alongside so downstream can re-decode fully.
+fn decode_revert(data: &[u8]) -> String {
+    if data.is_empty() {
+        return "empty".to_string();
+    }
+    if data.len() < 4 {
+        return format!("short:0x{}", alloy_primitives::hex::encode(data));
+    }
+    match [data[0], data[1], data[2], data[3]] {
+        // Error(string): selector + offset(32) + len(32) + utf8 bytes.
+        [0x08, 0xc3, 0x79, 0xa0] => {
+            if data.len() >= 68 {
+                let len = u32::from_be_bytes([data[64], data[65], data[66], data[67]]) as usize;
+                let end = 68usize.saturating_add(len).min(data.len());
+                let s = String::from_utf8_lossy(&data[68..end]);
+                format!("Error(string): {s}")
+            } else {
+                "Error(string)".to_string()
+            }
+        }
+        // Panic(uint256): selector + 32-byte code (low byte holds the code).
+        [0x4e, 0x48, 0x7b, 0x71] => {
+            let code = data.get(35).copied().unwrap_or(0);
+            format!("Panic(0x{code:02x})")
+        }
+        sel => format!("custom:0x{}", alloy_primitives::hex::encode(sel)),
+    }
+}
+
 /// Reconstruct each frame's parent index from the post-order DFS sequence
 /// the inspector emits.
 ///
@@ -321,47 +362,6 @@ where
 
     fn logs_bloom_hex<HR>(result: &revm::context_interface::result::ExecutionResult<HR>) -> String {
         Self::hex_bloom(logs_bloom(result.logs().iter()))
-    }
-
-    /// Truncate returndata to a bounded prefix for storage. 132 bytes holds a
-    /// 4-byte error selector plus one 32-byte head word and the start of the
-    /// payload — enough to identify the error and read short revert strings,
-    /// while bounding a pathological multi-KB return.
-    const REVERT_DATA_CAP: usize = 132;
-
-    fn cap_bytes(data: &[u8]) -> Vec<u8> {
-        data[..data.len().min(Self::REVERT_DATA_CAP)].to_vec()
-    }
-
-    /// Best-effort decode of Solidity revert returndata (F2). Recognises the two
-    /// canonical errors plus custom 4-byte selectors; the raw (capped) bytes are
-    /// stored alongside so downstream can re-decode fully.
-    fn decode_revert(data: &[u8]) -> String {
-        if data.is_empty() {
-            return "empty".to_string();
-        }
-        if data.len() < 4 {
-            return format!("short:0x{}", alloy_primitives::hex::encode(data));
-        }
-        match [data[0], data[1], data[2], data[3]] {
-            // Error(string): selector + offset(32) + len(32) + utf8 bytes.
-            [0x08, 0xc3, 0x79, 0xa0] => {
-                if data.len() >= 68 {
-                    let len = u32::from_be_bytes([data[64], data[65], data[66], data[67]]) as usize;
-                    let end = 68usize.saturating_add(len).min(data.len());
-                    let s = String::from_utf8_lossy(&data[68..end]);
-                    format!("Error(string): {s}")
-                } else {
-                    "Error(string)".to_string()
-                }
-            }
-            // Panic(uint256): selector + 32-byte code (low byte holds the code).
-            [0x4e, 0x48, 0x7b, 0x71] => {
-                let code = data.get(35).copied().unwrap_or(0);
-                format!("Panic(0x{code:02x})")
-            }
-            sel => format!("custom:0x{}", alloy_primitives::hex::encode(sel)),
-        }
     }
 
     fn count_input_bytes(input: &Bytes) -> (u64, u64) {
@@ -1760,11 +1760,11 @@ where
                     let revert_data = match &result.result {
                         revm::context_interface::result::ExecutionResult::Revert {
                             output, ..
-                        } => Some(Self::cap_bytes(output)),
+                        } => Some(cap_bytes(output)),
                         _ => None,
                     };
-                    let revert_decoded = revert_data.as_deref().map(Self::decode_revert);
-                    let tx_output = result.result.output().map(|o| Self::cap_bytes(o));
+                    let revert_decoded = revert_data.as_deref().map(decode_revert);
+                    let tx_output = result.result.output().map(|o| cap_bytes(o));
                     // Halt classification at this tier:
                     //   Halt { OutOfGas* } → Some(true)  (more gas might help)
                     //   Halt { other }     → Some(false) (no amount of gas helps)
@@ -2979,6 +2979,41 @@ mod tests {
             parent_gas_at_call: None,
             value_wei: None,
         }
+    }
+
+    /// F2 revert decode: the two canonical Solidity errors, custom selectors,
+    /// and the empty/short edge cases.
+    #[test]
+    fn decode_revert_recognises_canonical_errors() {
+        // Error(string) "boom": selector + offset(32) + len(4) + utf8 + pad.
+        let mut err = vec![0x08, 0xc3, 0x79, 0xa0];
+        err.extend_from_slice(&[0u8; 31]);
+        err.push(0x20); // offset word = 32
+        err.extend_from_slice(&[0u8; 31]);
+        err.push(0x04); // length word = 4
+        err.extend_from_slice(b"boom");
+        err.extend_from_slice(&[0u8; 28]); // pad to a full 32-byte word
+        assert_eq!(decode_revert(&err), "Error(string): boom");
+
+        // Panic(uint256) 0x11 (arithmetic overflow): selector + 32-byte code.
+        let mut panic = vec![0x4e, 0x48, 0x7b, 0x71];
+        panic.extend_from_slice(&[0u8; 31]);
+        panic.push(0x11);
+        assert_eq!(decode_revert(&panic), "Panic(0x11)");
+
+        // Unknown custom-error selector is surfaced as 4 bytes.
+        assert_eq!(decode_revert(&[0xde, 0xad, 0xbe, 0xef]), "custom:0xdeadbeef");
+
+        // Empty / short returndata.
+        assert_eq!(decode_revert(&[]), "empty");
+        assert_eq!(decode_revert(&[0x01, 0x02]), "short:0x0102");
+    }
+
+    /// F2 cap: returndata is truncated to the bounded prefix.
+    #[test]
+    fn cap_bytes_truncates_to_cap() {
+        assert_eq!(cap_bytes(&[0u8; 500]).len(), REVERT_DATA_CAP);
+        assert_eq!(cap_bytes(&[1u8, 2, 3]), vec![1, 2, 3]);
     }
 
     /// Single-frame tx: root only. No parent.
