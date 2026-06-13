@@ -40,8 +40,8 @@ use reth_research::{
         BlockOutput, CallFrameRow, DivergenceDatabase, DivergenceRow, DrillInRecord, OpcodeCountRow,
     },
     divergence::{
-        classify_bucket, is_erc4337_entrypoint, BucketInput, CallFrame, CallType as ResCallType,
-        DivergenceLocation, EventLog, OogPattern, OutOfGasInfo,
+        CallFrame, CallType as ResCallType, DivergenceFacts, DivergenceLocation, EventLog,
+        OogPattern, OutOfGasInfo,
     },
     oog_chain::classify_oog_chain,
     schedule::{GasSchedule, RecipientInfo, ScheduleKind, ScheduleRegistry, TxContext},
@@ -82,10 +82,11 @@ enum DbCommand {
 ///
 /// Capping here bounds per-tx replay time and read-txn lifetime. Beyond the
 /// ceiling a tx is simply recorded as failing the tier (it needs more gas than
-/// the cap); for repricing analysis "needs > 150M gas" is as actionable as the
-/// exact figure. ~150M ≈ 4× a mainnet block, comfortably above any legitimate
-/// single-tx demand (EIP-7825 caps real txs at ~16.7M).
-const TIER_REPLAY_GAS_CEILING: u64 = 150_000_000;
+/// the cap); for repricing analysis "needs > 200M gas" is as actionable as the
+/// exact figure. 200M comfortably fits a true 10× bump of the largest legitimate
+/// tx (EIP-7825 caps real txs at ~16.7M → 10×16.7M = 167M < 200M) so the 8037
+/// conditional-bump tier is honored exactly, while still bounding runaway loops.
+const TIER_REPLAY_GAS_CEILING: u64 = 200_000_000;
 
 /// Per-schedule metadata cached once at startup.
 ///
@@ -466,7 +467,7 @@ where
                                             to_block,
                                             coverage = counts.coverage,
                                             summaries = counts.summaries,
-                                            bucket_recipients = counts.bucket_recipients,
+                                            recipients = counts.recipients,
                                             divergences = counts.divergences,
                                             call_frames = counts.call_frames,
                                             opcode_counts = counts.opcode_counts,
@@ -1329,6 +1330,9 @@ where
                 /// Cold account accesses whose target had no code
                 /// (EOA / empty / non-existent). `None` when unmeasured.
                 cold_account_nocode_count: Option<u64>,
+                /// F4: cumulative repricing surcharge the inspector charged
+                /// this tx (`ScheduleResult::additional_gas`). Signed.
+                additional_gas: i64,
                 call_frames: Vec<CallFrame>,
                 event_logs: Vec<EventLog>,
                 output_hash: Option<String>,
@@ -1448,7 +1452,15 @@ where
                 // failure at the original gas limit without rebuilding the
                 // schedule env setup.
                 let mut tier1_envs: Option<(_, _)> = None;
-                for &tier in &self.gas_limit_multipliers {
+                // Per-schedule conditional bump: a schedule may opt into a single
+                // `[1, n]` sweep (replay at 1×; only on failure, retry once at n×)
+                // instead of the global multiplier sweep — EIP-8037 uses 10,
+                // EIP-8038 uses 4. See `GasSchedule::replay_bump_multiplier`.
+                let tiers: Vec<u64> = match schedule.replay_bump_multiplier() {
+                    Some(bump) => vec![1, bump],
+                    None => self.gas_limit_multipliers.clone(),
+                };
+                for &tier in &tiers {
                     // Cap the per-replay gas so a single unbounded-gas tx can't
                     // execute for minutes/hours (and pin a long-lived MDBX read
                     // txn); see `TIER_REPLAY_GAS_CEILING`.
@@ -1593,6 +1605,9 @@ where
                                 // Rejected replay: counts unknown (not zero).
                                 cold_account_code_count: None,
                                 cold_account_nocode_count: None,
+                                // Rejected replay never executed an opcode → no
+                                // surcharge applied.
+                                additional_gas: 0,
                                 call_frames: Vec::new(),
                                 event_logs: Vec::new(),
                                 output_hash: None,
@@ -1745,6 +1760,7 @@ where
                         cold_account_nocode_count: Some(
                             inspector.operation_counts().cold_account_nocode_count,
                         ),
+                        additional_gas: insp_result.additional_gas,
                         call_frames_hash: Self::hash_serialized(&call_frames),
                         event_logs_hash: Self::hash_serialized(&event_logs),
                         call_frames,
@@ -2024,12 +2040,10 @@ where
                 // true difference diverge from the sum of per-opcode
                 // adjustments.
                 let total_delta = schedule_gas as i64 - normal_gas_used as i64;
-                // Decompose the outcome flip into its two directions so the
-                // bucket classifier can give beneficial flips their own
-                // category (`ScheduleRescued`) instead of folding them into
-                // `ContractBroken`. The legacy bidirectional `status_changed`
-                // value is kept on the `DivergenceRow` for backwards
-                // compatibility with existing DB rows / consumers.
+                // Decompose the outcome flip into its two directions: a break
+                // (baseline succeeded, schedule failed) drives the
+                // `outer_limit_only_failure` witness, while `status_changed`
+                // records the bidirectional flip on the `DivergenceRow`.
                 let baseline_to_schedule_break = normal_success && !schedule_success;
                 let baseline_to_schedule_rescue = !normal_success && schedule_success;
                 let status_changed = baseline_to_schedule_break || baseline_to_schedule_rescue;
@@ -2074,31 +2088,29 @@ where
                         None => (None, None, None),
                     };
 
-                // Classify the tx into one of the storage buckets.
-                // `oog_call_depth` is the 1-based OOG attribution depth from
-                // the inspector (or the producer's Err-branch synthesis when
-                // revm rejected the tx outright). The classifier uses it only
-                // after handling successful higher-gas witnesses, throttled
-                // chains, and sweep-exhausted OOGs.
-                let oog_call_depth = exec_result.and_then(|r| r.oog_call_depth);
-                let bucket = classify_bucket(&BucketInput {
-                    recipient_is_entrypoint: recipient.map(is_erc4337_entrypoint).unwrap_or(false),
-                    baseline_to_schedule_break,
-                    baseline_to_schedule_rescue,
+                // Reduce the comparison to raw execution facts. The producer no
+                // longer applies an editorial taxonomy (wallet-fixable /
+                // contract-broken / aa-reestimation / …); it stores a full
+                // per-tx forensic row for every failure and trace divergence and
+                // rolls the byte-identical / gas-only remainder into a 2-value
+                // aggregate class. Downstream re-derives the old cohorts from the
+                // stored facts.
+                let facts = DivergenceFacts {
+                    baseline_success: normal_success,
+                    schedule_success,
                     gas_delta: total_delta,
                     event_logs_changed: event_logs_diverged,
                     call_tree_changed: call_tree_diverged,
                     output_changed,
                     created_address_changed,
                     logs_bloom_changed,
-                    outer_limit_only_failure,
-                    replay_halt_oog,
-                    oog_call_depth,
-                    oog_chain_proportional,
-                });
+                };
+                let store_full_forensics = facts.store_full_forensics();
+                let aggregate_class = facts.aggregate_class();
 
-                // For drill-in buckets, build the full per-tx record.
-                let drill_in = if bucket.is_drill_in() {
+                // For stored txs (failures + trace divergences), build the full
+                // per-tx record.
+                let drill_in = if store_full_forensics {
                     let cap_reached = self
                         .max_divergences_per_block
                         .map(|max| drill_ins_recorded >= max)
@@ -2150,7 +2162,12 @@ where
                             tx_index: tx_idx as u32,
                             tx_hash,
                             timestamp: block_timestamp,
-                            bucket,
+                            // Witness so a tx that only failed because the
+                            // schedule pushed gas_used past the *original* limit
+                            // (succeeded at the bumped tier, trace matched
+                            // baseline) is distinguishable downstream from a
+                            // genuine OOG break.
+                            outer_limit_only_failure: Some(outer_limit_only_failure),
                             sender,
                             recipient,
                             is_create,
@@ -2217,6 +2234,18 @@ where
                                 .then_some(cold_code.unwrap_or(0)),
                             cold_account_nocode_count: cold_split_seen
                                 .then_some(cold_nocode.unwrap_or(0)),
+                            // F4: total repricing surcharge across all frames.
+                            additional_gas_charged: exec_result.map(|r| r.additional_gas),
+                            // F6: root→divergence 4-byte selector path as a JSON
+                            // array of nullable hex strings.
+                            failure_selector_path: div_loc.as_ref().and_then(|l| {
+                                let path: Vec<Option<String>> = l
+                                    .function_selectors
+                                    .iter()
+                                    .map(|s| s.map(|b| format!("0x{:08x}", u32::from_be_bytes(b))))
+                                    .collect();
+                                serde_json::to_string(&path).ok()
+                            }),
                         };
 
                         // Inspector emits frames in post-order DFS — children
@@ -2289,6 +2318,9 @@ where
                                         }
                                         _ => None,
                                     },
+                                    // F4: per-frame repricing surcharge the
+                                    // inspector accumulated for this frame.
+                                    repricing_gas_delta: f.repricing_gas_delta,
                                 }
                             })
                             .collect();
@@ -2318,9 +2350,9 @@ where
                 let has_runtime_state = runtime_state_gas > 0;
 
                 // `opcode_frames_ref` is built inside the drill-in branch but
-                // the aggregator wants it on every tx so per-bucket
-                // `opcode_totals_7904` covers every cohort, not just drill-ins.
-                // Recompute the slice here from the same source.
+                // the aggregator wants it on every tx so per-class
+                // `opcode_totals` covers the aggregate cohorts, not just
+                // drill-ins. Recompute the slice here from the same source.
                 let opcode_frames_for_agg =
                     exec_result.map(|r| r.frame_opcode_counts.as_slice()).unwrap_or(&[]);
                 aggregators
@@ -2328,7 +2360,8 @@ where
                     .expect("aggregator exists for every schedule")
                     .observe_tx(
                         reth_research::block_aggregator::TxObservation {
-                            bucket,
+                            class: aggregate_class,
+                            store_full_forensics,
                             gas_delta: total_delta,
                             state_gas_spent: schedule_state_gas_spent,
                             state_gas_spillover,

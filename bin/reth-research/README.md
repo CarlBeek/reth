@@ -81,42 +81,52 @@ Block-level incidence and gas impact:
 
 ```sql
 SELECT schedule_name,
-       sum(tx_count) AS txs,
-       sum(tx_count_contract_broken) AS broken,
-       sum(tx_count_inconclusive_needs_higher_sweep) AS needs_higher_sweep,
-       sum(tx_count_wallet_fixable_shallow + tx_count_wallet_fixable_deep_chain) AS wallet_fixable
+       sum(tx_count)           AS txs,
+       sum(tx_count_stored)    AS stored,    -- failures + trace divergences (per-tx rows)
+       sum(tx_count_gas_only)  AS gas_only,  -- gas changed, trace identical
+       sum(tx_count_unchanged) AS unchanged  -- byte-identical to baseline
 FROM block_coverage
 GROUP BY 1
 ORDER BY 1;
 ```
 
-Highest-impact divergences for one schedule:
+The producer no longer applies an editorial taxonomy (wallet-fixable /
+contract-broken / …). Every failure and trace divergence gets a full per-tx
+`divergences` row; those cohorts are re-derived downstream from the raw stored
+facts (`baseline_success`, `schedule_success`, OOG chain-walk, `code_address`,
+selector path, etc.).
+
+Highest-impact stored divergences for one schedule:
 
 ```sql
-SELECT block_number, tx_index, bucket, gas_delta, tx_hash
+SELECT block_number, tx_index, gas_delta, schedule_success, tx_hash
 FROM divergences
 WHERE schedule_name = '4x'
 ORDER BY abs(gas_delta) DESC
 LIMIT 100;
 ```
 
-Bucket mix by schedule:
+Re-derive the failure cohorts from raw facts:
 
 ```sql
-SELECT schedule_name, bucket, count(*) AS rows
+SELECT schedule_name,
+       sum(baseline_success AND NOT schedule_success) AS breaks,
+       sum(NOT baseline_success AND schedule_success)  AS rescues,
+       sum(outer_limit_only_failure)                   AS outer_limit_only
 FROM divergences
-GROUP BY 1, 2
-ORDER BY 1, 3 DESC;
+GROUP BY 1
+ORDER BY 1;
 ```
 
-Drill into call-frame data for forensics:
+Drill into call-frame data for forensics (all stored divergences are failures or
+trace divergences):
 
 ```sql
 SELECT d.schedule_name, d.block_number, d.tx_index,
        f.depth, f.call_type, f.to_address, f.gas_provided, f.gas_used
 FROM divergences d
 JOIN divergence_call_frames f USING (divergence_id)
-WHERE d.bucket IN ('contract_broken', 'inconclusive_needs_higher_sweep')
+WHERE NOT d.schedule_success
 ORDER BY d.block_number, d.tx_index, f.call_index
 LIMIT 100;
 ```
@@ -125,11 +135,14 @@ LIMIT 100;
 
 Per (schedule, block):
 
-- `block_coverage`: tx counts split by bucket
-- `block_summaries`: per-bucket aggregates (gas-delta histograms,
-  sums/min/max, eventually 8037 state-gas metrics)
+- `block_coverage`: tx counts split by execution-fact class
+  (`unchanged` / `gas_only` / `stored`)
+- `block_summaries`: per-class aggregates (gas-delta histograms,
+  sums/min/max, opcode totals, 8037 state-gas + 8038 cold-account metrics),
+  keyed by `class ∈ {unchanged, gas_only}`
+- `block_recipients`: top-K recipient/selector attribution per `class`
 
-Per drill-in transaction (event-logs-changed, inconclusive, or contract-broken only):
+Per stored transaction (every failure + every trace divergence):
 
 - `divergences`: outcome flags, gas figures, OOG / divergence location,
   chain-walk classification (`oog_chain_proportional`,

@@ -144,6 +144,18 @@ pub trait GasSchedule: Send + Sync + Debug {
         None
     }
 
+    /// Gas-limit multiplier for the schedule's *conditional bump* replay tier.
+    ///
+    /// `Some(n)` makes the tier sweep run exactly `[1, n]`: replay at the original
+    /// limit, and only if that fails, replay once at `n×`. `None` (default) keeps
+    /// the global `--research.gas-limit-multipliers` sweep. EIP-8037 uses `10`,
+    /// EIP-8038 uses `4` (a tx the reprice breaks at 1× is re-tried once at the
+    /// bump; success there means "wallet-fixable with n× gas", failure means the
+    /// reprice broke it outright).
+    fn replay_bump_multiplier(&self) -> Option<u64> {
+        None
+    }
+
     /// Configure the EVM environment used for this schedule's replay pass.
     ///
     /// Most schedules are implemented as explicit inspector deltas and leave the

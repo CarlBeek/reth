@@ -220,6 +220,10 @@ impl GasSchedule for Eip8038Schedule {
         ScheduleKind::Both
     }
 
+    fn replay_bump_multiplier(&self) -> Option<u64> {
+        Some(4)
+    }
+
     fn intrinsic_gas(&self, ctx: &TxContext) -> Option<u64> {
         // Per-item ABSOLUTE deltas (proposed − native), non-uniform. revm's
         // initial-tx-gas helper ignores `cfg.gas_params`, so we model the
@@ -351,6 +355,7 @@ mod tests {
         assert!(s.modifies_execution());
         assert!(!s.uses_native_intrinsic_gas());
         assert!(s.affected_opcodes().contains(&0x55)); // SSTORE
+        assert_eq!(s.replay_bump_multiplier(), Some(4)); // single [1,4] conditional bump
     }
 
     #[test]

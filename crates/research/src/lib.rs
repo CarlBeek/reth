@@ -206,7 +206,7 @@ pub mod tracking_inspector;
 
 pub use cli::{CliError, NamedCsvSchedule, NamedMultiplierSchedule, ResearchArgs};
 pub use divergence::{
-    Bucket, BucketInput, CallTrees, Divergence, DivergenceType, EventLog, EventLogs,
+    AggregateClass, CallTrees, Divergence, DivergenceFacts, DivergenceType, EventLog, EventLogs,
     OperationCounts,
 };
 pub use multi_schedule_inspector::{ScheduleInspector, ScheduleResult};

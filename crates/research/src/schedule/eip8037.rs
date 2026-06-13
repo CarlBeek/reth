@@ -170,6 +170,10 @@ impl GasSchedule for Eip8037Schedule {
         ScheduleKind::Both
     }
 
+    fn replay_bump_multiplier(&self) -> Option<u64> {
+        Some(10)
+    }
+
     fn intrinsic_gas(&self, ctx: &TxContext) -> Option<u64> {
         // Build a fresh GasParams for Amsterdam, overlay PR-11616
         // numbers, then drive intrinsic-gas through it directly. The
@@ -244,6 +248,12 @@ mod tests {
         assert_eq!(Eip8037Constants::NEW_ACCOUNT_STATE_GAS, 120 * 1_530);
         assert_eq!(Eip8037Constants::STORAGE_SET_STATE_GAS, 64 * 1_530);
         assert_eq!(Eip8037Constants::AUTH_STATE_GAS, (120 + 23) * 1_530);
+    }
+
+    #[test]
+    fn replay_bump_is_single_10x() {
+        // 8037 retries a failed 1× replay exactly once at 10×.
+        assert_eq!(Eip8037Schedule::new().replay_bump_multiplier(), Some(10));
     }
 
     #[test]

@@ -545,9 +545,8 @@ mod tests {
         assert!(matches!(res, Err(MetadataParseError::BytecodeTooShort(1))));
     }
 
-    use crate::{
-        database::{BlockCoverageRow, BlockOutput, CallFrameRow, DivergenceRow, DrillInRecord},
-        divergence::Bucket,
+    use crate::database::{
+        BlockCoverageRow, BlockOutput, CallFrameRow, DivergenceRow, DrillInRecord,
     };
     use alloy_primitives::B256;
     use std::{cell::RefCell, collections::HashMap};
@@ -592,7 +591,7 @@ mod tests {
                 tx_index,
                 tx_hash: B256::ZERO,
                 timestamp: 0,
-                bucket: Bucket::ContractBroken,
+                outer_limit_only_failure: None,
                 sender: Address::ZERO,
                 recipient: Some(addr),
                 is_create: false,
@@ -638,6 +637,8 @@ mod tests {
                 replay_halt_oog: None,
                 cold_account_code_count: None,
                 cold_account_nocode_count: None,
+                additional_gas_charged: None,
+                failure_selector_path: None,
             },
             call_frames: vec![CallFrameRow {
                 call_index: 0,
@@ -659,6 +660,7 @@ mod tests {
                 eip150_cap_binding: None,
                 state_gas_running: None,
                 deployed_bytecode_len: None,
+                repricing_gas_delta: 0,
             }],
             opcode_counts: vec![],
             baseline_event_logs: vec![],
@@ -673,15 +675,8 @@ mod tests {
             timestamp: 0,
             tx_count: 1,
             tx_count_unchanged: 0,
-            tx_count_trace_only: 0,
             tx_count_gas_only: 0,
-            tx_count_event_logs_changed: 0,
-            tx_count_schedule_rescued: 0,
-            tx_count_wallet_fixable_shallow: 0,
-            tx_count_wallet_fixable_deep_chain: 0,
-            tx_count_inconclusive_needs_higher_sweep: 0,
-            tx_count_contract_broken: 1,
-            tx_count_aa_gas_reestimation: 0,
+            tx_count_stored: 1,
             block_gas_used: 15_000_000,
             block_gas_limit: 30_000_000,
         };
@@ -692,12 +687,8 @@ mod tests {
         coverage.block_number = 1 + tx_index as u64;
         let mut div = drill_in;
         div.divergence.block_number = coverage.block_number;
-        let output = BlockOutput {
-            coverage,
-            summaries: vec![],
-            drill_ins: vec![div],
-            bucket_recipients: vec![],
-        };
+        let output =
+            BlockOutput { coverage, summaries: vec![], drill_ins: vec![div], recipients: vec![] };
         db.record_block_output(&output).unwrap();
     }
 
