@@ -543,7 +543,7 @@ impl std::fmt::Display for AggregateClass {
 }
 
 /// Canonical ERC-4337 `EntryPoint` addresses (v0.6 / v0.7 / v0.8). Preserved as
-/// institutional knowledge for the downstream ClickHouse classifier: a gas-class
+/// institutional knowledge for the downstream `ClickHouse` classifier: a gas-class
 /// failure on a tx whose recipient is one of these is a `UserOp` gas
 /// re-estimation problem (the signed off-chain `callGasLimit` /
 /// `verificationGasLimit`), not a contract bug. The producer no longer

@@ -2240,6 +2240,26 @@ where
                         let cold_split_seen =
                             cold_code.unwrap_or(0) > 0 || cold_nocode.unwrap_or(0) > 0;
 
+                        // F7: baseline counterpart of the frame that failed under
+                        // the schedule. The innermost failing frame (deepest
+                        // `!success`) is the bottleneck; its baseline twin —
+                        // matched by call_index when the pre-divergence structure
+                        // lines up (always true for pure-OOG failures) — shows
+                        // whether baseline ran that frame and with how much gas.
+                        // The cleanest wallet-fixable (baseline succeeded, more
+                        // gas would too) vs contract-broken discriminator.
+                        let baseline_twin = frames_ref
+                            .iter()
+                            .filter(|f| !f.success)
+                            .max_by_key(|f| f.depth)
+                            .and_then(|ff| {
+                                baseline_call_frames.iter().find(|bf| {
+                                    bf.call_index == ff.call_index &&
+                                        bf.depth == ff.depth &&
+                                        bf.to == ff.to
+                                })
+                            });
+
                         let divergence_row = DivergenceRow {
                             schedule_name: schedule_name.to_string(),
                             schedule_config_hash: metadata.config_hash.clone(),
@@ -2347,6 +2367,10 @@ where
                             revert_data: exec_result.and_then(|r| r.revert_data.clone()),
                             revert_decoded: exec_result.and_then(|r| r.revert_decoded.clone()),
                             tx_output: exec_result.and_then(|r| r.tx_output.clone()),
+                            // F7: baseline counterpart of the failing frame.
+                            baseline_frame_success: baseline_twin.map(|bf| bf.success),
+                            baseline_frame_gas_used: baseline_twin.map(|bf| bf.gas_used),
+                            baseline_frame_gas_provided: baseline_twin.map(|bf| bf.gas_provided),
                         };
 
                         // Inspector emits frames in post-order DFS — children

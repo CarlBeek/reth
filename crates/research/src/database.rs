@@ -78,23 +78,26 @@ use thiserror::Error;
 /// - v10: this PR's schema, a single bump over the v9 merge base. The editorial bucket/analysis-tag
 ///   taxonomy (`wallet_fixable_*`, `contract_broken`, `schedule_rescued`, `aa_gas_reestimation`,
 ///   `inconclusive_needs_higher_sweep`, `event_logs_changed`, `trace_only`) is removed entirely.
-///   Aggregates are re-keyed by a 2-value execution-fact `class ∈ {unchanged, gas_only}` — the only
-///   txs without a per-tx forensic row; every failure and trace-divergence now gets a per-tx
-///   `divergences` row (strictly more per-tx coverage than the old drill-in buckets). Schema delta:
-///     * `block_coverage`: dropped the 10 `tx_count_<bucket>` editorial counts; added fact counts
-///       `tx_count_unchanged` / `tx_count_gas_only` / `tx_count_stored`. Kept the v11
-///       block-capacity columns `block_gas_used` / `block_gas_limit`.
-///     * `block_summaries`: re-keyed PK `(schedule_name, block_number, class)`; renamed
-///       `opcode_totals_7904` → `opcode_totals`. Kept the v12 cold-account split counters
-///       `cold_account_code_count` / `cold_account_nocode_count` (EIP-8038 prices a cold account
-///       access at 9131 with code vs 3140 without; no native revm slot distinguishes them).
-///     * `block_bucket_recipients` → `block_recipients`, re-keyed `(schedule_name, block_number,
-///       class, recipient, top_selector)`; kept `gas_delta_sum_succeeding` (the halt-gas-excluding
-///       sum).
-///     * `divergences`: dropped `bucket`; added the `outer_limit_only_failure` witness so a
-///       succeeded-only-at-the-bumped-tier tx is distinguishable from a no-OOG break.
-///   There is no in-place migration: opening a pre-v10 database is rejected by
-///   [`enforce_schema_version`] (via `PRAGMA user_version`) — wipe the divergences `SQLite` and
+///   Aggregates are re-keyed by a 2-value execution-fact `class` (`unchanged` / `gas_only`) — the
+///   only txs without a per-tx forensic row; every failure and trace-divergence now gets a per-tx
+///   `divergences` row (strictly more per-tx coverage than the old drill-in buckets).
+///   `block_coverage` drops the 10 `tx_count_<bucket>` editorial counts for fact counts
+///   `tx_count_unchanged` / `tx_count_gas_only` / `tx_count_stored` (keeping the v11
+///   `block_gas_used` / `block_gas_limit`). `block_summaries` is re-keyed on `class` and renames
+///   `opcode_totals_7904` to `opcode_totals` (keeping the v12 `cold_account_code_count` /
+///   `cold_account_nocode_count`). `block_bucket_recipients` becomes `block_recipients`, re-keyed
+///   on `class` (keeping `gas_delta_sum_succeeding`). `divergences` drops `bucket` for the
+///   `outer_limit_only_failure` witness (distinguishes a succeeded-only-at-the-bumped-tier tx from
+///   a no-OOG break). Additive nullable forensic columns make "what failed and why" answerable from
+///   raw facts: `divergences` gains `additional_gas_charged` (F4 total repricing surcharge),
+///   `failure_selector_path` (F6 root-to-divergence selector JSON), `tx_type` / `tx_nonce` /
+///   `entry_selector` / `input_zero_bytes` / `input_nonzero_bytes` / `has_authorization` (F5 tx
+///   identity), `failure_reason` (F1 `HaltReason` discriminant / `Revert` / `Rejected`),
+///   `revert_data` / `revert_decoded` / `tx_output` (F2 capped returndata plus decode), and
+///   `baseline_frame_success` / `baseline_frame_gas_used` / `baseline_frame_gas_provided` (F7
+///   baseline twin of the failing frame); `divergence_call_frames` gains `repricing_gas_delta` (F4
+///   per-frame surcharge). There is no in-place migration: opening a pre-v10 database is rejected
+///   by [`enforce_schema_version`] (via `PRAGMA user_version`) — wipe the divergences `SQLite` and
 ///   re-gather. The archive datadir is never touched.
 pub const SCHEMA_VERSION: u32 = 10;
 
@@ -534,6 +537,12 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             revert_decoded              TEXT,
             tx_output                   BLOB,
 
+            -- F7: baseline counterpart of the frame that failed under the
+            -- schedule (matched by call_index) — wallet-fixable discriminator.
+            baseline_frame_success      INTEGER,
+            baseline_frame_gas_used     INTEGER,
+            baseline_frame_gas_provided INTEGER,
+
             UNIQUE (schedule_name, block_number, tx_index, schedule_config_hash)
         );",
     )?;
@@ -967,6 +976,15 @@ pub struct DivergenceRow {
     /// Top-level tx output bytes, truncated to a bounded prefix (today only a
     /// hash is otherwise kept). (F2)
     pub tx_output: Option<Vec<u8>>,
+
+    /// Baseline counterpart of the frame that failed under the schedule (matched
+    /// by `call_index` when the pre-divergence structure lines up): whether
+    /// baseline ran that frame successfully, and its gas used / provided. The
+    /// wallet-fixable (baseline ran it fine) vs contract-broken discriminator.
+    /// `None` when no failing frame matched a baseline frame. (F7)
+    pub baseline_frame_success: Option<bool>,
+    pub baseline_frame_gas_used: Option<u64>,
+    pub baseline_frame_gas_provided: Option<u64>,
 }
 
 /// One frame row destined for `divergence_call_frames`. `call_index` and
@@ -1573,7 +1591,9 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             additional_gas_charged, failure_selector_path,
             tx_type, tx_nonce, entry_selector,
             input_zero_bytes, input_nonzero_bytes, has_authorization,
-            failure_reason, revert_data, revert_decoded, tx_output
+            failure_reason, revert_data, revert_decoded, tx_output,
+            baseline_frame_success, baseline_frame_gas_used,
+            baseline_frame_gas_provided
         ) VALUES (?, ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?,
@@ -1591,7 +1611,8 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
                   ?, ?,
                   ?, ?, ?,
                   ?, ?, ?,
-                  ?, ?, ?, ?)",
+                  ?, ?, ?, ?,
+                  ?, ?, ?)",
         params![
             row.schedule_name,
             row.schedule_config_hash,
@@ -1657,6 +1678,9 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             row.revert_data,
             row.revert_decoded,
             row.tx_output,
+            row.baseline_frame_success,
+            row.baseline_frame_gas_used.map(|v| v as i64),
+            row.baseline_frame_gas_provided.map(|v| v as i64),
         ],
     )?;
     Ok(tx.last_insert_rowid() as u64)

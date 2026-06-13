@@ -935,7 +935,6 @@ mod tests {
 
     fn dummy_drill_in() -> DrillInRecord {
         use crate::database::DivergenceRow;
-        use alloy_primitives::Address;
         DrillInRecord {
             divergence: DivergenceRow {
                 schedule_name: "test".to_string(),
