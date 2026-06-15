@@ -30,7 +30,7 @@
 //! - `DuckDB` sequences (`CREATE SEQUENCE`, `DEFAULT nextval('seq')`) become `INTEGER PRIMARY KEY
 //!   AUTOINCREMENT`.
 
-use crate::divergence::{AggregateClass, EventLog, FrameOpcodeCounts};
+use crate::divergence::{AggregateClass, EventLog, FrameOpcodeCounts, StorageDrivers};
 use alloy_primitives::{keccak256, Address, B256};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::{
@@ -108,7 +108,11 @@ use thiserror::Error;
 ///   `additional_gas_charged`) plus `tax_intrinsic` (the tx-level intrinsic-gas delta). Two
 ///   zero-information columns are dropped: `divergence_call_frames.state_gas_running` (was always
 ///   NULL) and `divergences.would_fit_in_original_limit` (an exact duplicate of
-///   `schedule_success`). `divergence_call_frames` and `divergence_opcode_counts` gain a
+///   `schedule_success`). F8 storage-reprice drivers — `sload_cold_count` / `sload_warm_count` /
+///   `sstore_cold_count` / `sstore_{set,reset,clear,noop,dirty}_count` — are added to BOTH
+///   `divergences` (per-tx) and `block_summaries` (per-class), attributing the native
+///   `COLD_STORAGE_ACCESS` / `STORAGE_WRITE` / `REFUND_STORAGE_CLEAR` surcharges that never reach
+///   `additional_gas_charged`. `divergence_call_frames` and `divergence_opcode_counts` gain a
 ///   `trace_kind` (`"schedule"` / `"baseline"`) in their primary key, mirroring
 ///   `divergence_event_logs`, so a drill-in whose call tree diverged also stores the baseline call
 ///   tree (F15) and baseline opcode counts (F11). There is no in-place migration: opening a pre-v10
@@ -404,6 +408,14 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             tx_count_no_state       INTEGER,
             cold_account_code_count   INTEGER,
             cold_account_nocode_count INTEGER,
+            sload_cold_count          INTEGER,
+            sload_warm_count          INTEGER,
+            sstore_cold_count         INTEGER,
+            sstore_set_count          INTEGER,
+            sstore_reset_count        INTEGER,
+            sstore_clear_count        INTEGER,
+            sstore_noop_count         INTEGER,
+            sstore_dirty_count        INTEGER,
             PRIMARY KEY (schedule_name, block_number, class)
         );",
     )?;
@@ -575,6 +587,18 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             tax_second_db_read          INTEGER,
             tax_other                   INTEGER,
             tax_intrinsic               INTEGER,
+
+            -- F8: storage-reprice drivers. cold reads/writes drive
+            -- COLD_STORAGE_ACCESS; set/reset/clear drive STORAGE_WRITE; clear
+            -- also drives REFUND_STORAGE_CLEAR.
+            sload_cold_count            INTEGER,
+            sload_warm_count            INTEGER,
+            sstore_cold_count           INTEGER,
+            sstore_set_count            INTEGER,
+            sstore_reset_count          INTEGER,
+            sstore_clear_count          INTEGER,
+            sstore_noop_count           INTEGER,
+            sstore_dirty_count          INTEGER,
 
             UNIQUE (schedule_name, block_number, tx_index, schedule_config_hash)
         );",
@@ -873,6 +897,9 @@ pub struct BlockSummaryRow {
     /// Cold account accesses in this bucket whose target had no code
     /// (EOA / empty / non-existent). `None` when the bucket made no cold access.
     pub cold_account_nocode_count: Option<u64>,
+    /// EIP-8038 storage-reprice drivers (F8) summed over this class's txs.
+    /// `None` when the class saw no SLOAD/SSTORE activity.
+    pub storage_drivers: Option<StorageDrivers>,
 }
 
 /// Per-tx drill-in record: the `divergences` row plus its dependent
@@ -1060,6 +1087,11 @@ pub struct DivergenceRow {
     pub tax_second_db_read: Option<i64>,
     pub tax_other: Option<i64>,
     pub tax_intrinsic: Option<i64>,
+
+    /// EIP-8038 storage-reprice drivers (F8) — the eight SLOAD/SSTORE counts,
+    /// mapped to explicit columns at insert time. `None` on the reject path
+    /// (the replay never executed, so the counts are unknown, not zero).
+    pub storage_drivers: Option<StorageDrivers>,
 }
 
 /// One frame row destined for `divergence_call_frames`. `call_index` and
@@ -1615,7 +1647,10 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             multiplier_log2_hist,
             tx_count_creation, tx_count_authorization,
             tx_count_runtime_state, tx_count_no_state,
-            cold_account_code_count, cold_account_nocode_count
+            cold_account_code_count, cold_account_nocode_count,
+            sload_cold_count, sload_warm_count, sstore_cold_count,
+            sstore_set_count, sstore_reset_count, sstore_clear_count,
+            sstore_noop_count, sstore_dirty_count
         ) VALUES (?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?,
@@ -1623,7 +1658,8 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
                   ?, ?,
                   ?,
                   ?, ?, ?, ?,
-                  ?, ?)
+                  ?, ?,
+                  ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (schedule_name, block_number, class) DO UPDATE SET
             tx_count                = excluded.tx_count,
             gas_delta_sum           = excluded.gas_delta_sum,
@@ -1640,7 +1676,15 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             tx_count_runtime_state  = excluded.tx_count_runtime_state,
             tx_count_no_state       = excluded.tx_count_no_state,
             cold_account_code_count   = excluded.cold_account_code_count,
-            cold_account_nocode_count = excluded.cold_account_nocode_count",
+            cold_account_nocode_count = excluded.cold_account_nocode_count,
+            sload_cold_count    = excluded.sload_cold_count,
+            sload_warm_count    = excluded.sload_warm_count,
+            sstore_cold_count   = excluded.sstore_cold_count,
+            sstore_set_count    = excluded.sstore_set_count,
+            sstore_reset_count  = excluded.sstore_reset_count,
+            sstore_clear_count  = excluded.sstore_clear_count,
+            sstore_noop_count   = excluded.sstore_noop_count,
+            sstore_dirty_count  = excluded.sstore_dirty_count",
         params![
             row.schedule_name,
             row.block_number as i64,
@@ -1661,6 +1705,14 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             row.tx_count_no_state.map(|v| v as i64),
             row.cold_account_code_count.map(|v| v as i64),
             row.cold_account_nocode_count.map(|v| v as i64),
+            row.storage_drivers.map(|s| s.sload_cold as i64),
+            row.storage_drivers.map(|s| s.sload_warm as i64),
+            row.storage_drivers.map(|s| s.sstore_cold as i64),
+            row.storage_drivers.map(|s| s.sstore_set as i64),
+            row.storage_drivers.map(|s| s.sstore_reset as i64),
+            row.storage_drivers.map(|s| s.sstore_clear as i64),
+            row.storage_drivers.map(|s| s.sstore_noop as i64),
+            row.storage_drivers.map(|s| s.sstore_dirty as i64),
         ],
     )?;
     Ok(())
@@ -1695,7 +1747,10 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             baseline_frame_success, baseline_frame_gas_used,
             baseline_frame_gas_provided, surcharge_at_oog,
             gas_div_contract, gas_div_pc, gas_div_call_depth, gas_div_opcode,
-            tax_warm_base, tax_cold_code, tax_second_db_read, tax_other, tax_intrinsic
+            tax_warm_base, tax_cold_code, tax_second_db_read, tax_other, tax_intrinsic,
+            sload_cold_count, sload_warm_count, sstore_cold_count,
+            sstore_set_count, sstore_reset_count, sstore_clear_count,
+            sstore_noop_count, sstore_dirty_count
         ) VALUES (?, ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?,
@@ -1716,7 +1771,8 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
                   ?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?, ?, ?,
-                  ?, ?, ?, ?, ?)",
+                  ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             row.schedule_name,
             row.schedule_config_hash,
@@ -1794,6 +1850,14 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             row.tax_second_db_read,
             row.tax_other,
             row.tax_intrinsic,
+            row.storage_drivers.map(|s| s.sload_cold as i64),
+            row.storage_drivers.map(|s| s.sload_warm as i64),
+            row.storage_drivers.map(|s| s.sstore_cold as i64),
+            row.storage_drivers.map(|s| s.sstore_set as i64),
+            row.storage_drivers.map(|s| s.sstore_reset as i64),
+            row.storage_drivers.map(|s| s.sstore_clear as i64),
+            row.storage_drivers.map(|s| s.sstore_noop as i64),
+            row.storage_drivers.map(|s| s.sstore_dirty as i64),
         ],
     )?;
     Ok(tx.last_insert_rowid() as u64)
@@ -2192,6 +2256,7 @@ mod tests {
                 tx_count_no_state: None,
                 cold_account_code_count: None,
                 cold_account_nocode_count: None,
+                storage_drivers: None,
             }],
             drill_ins: vec![drill_in],
             recipients: vec![],
@@ -2354,6 +2419,78 @@ mod tests {
         let addrs = db.distinct_call_frame_addresses().unwrap();
         assert_eq!(addrs, vec![format!("{implementation:#x}")]);
         assert!(!addrs.contains(&format!("{proxy:#x}")));
+    }
+
+    /// F8: storage-reprice drivers round-trip on both `divergences` (per-tx) and
+    /// `block_summaries` (per-class).
+    #[test]
+    fn storage_drivers_round_trip() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        let sd = StorageDrivers {
+            sload_cold: 2,
+            sload_warm: 5,
+            sstore_cold: 1,
+            sstore_set: 3,
+            sstore_clear: 1,
+            ..Default::default()
+        };
+
+        let mut div = fixture_divergence(9, 0, false, 7);
+        div.storage_drivers = Some(sd);
+        let drill_in = DrillInRecord {
+            divergence: div,
+            call_frames: vec![],
+            opcode_counts: vec![],
+            baseline_call_frames: vec![],
+            baseline_opcode_counts: vec![],
+            baseline_event_logs: vec![],
+            schedule_event_logs: vec![],
+        };
+        let summary = BlockSummaryRow {
+            schedule_name: "test".to_string(),
+            block_number: 9,
+            class: AggregateClass::GasOnly,
+            tx_count: 1,
+            gas_delta_sum: Some(1),
+            gas_delta_sum_sq: Some(1),
+            gas_delta_min: Some(1),
+            gas_delta_max: Some(1),
+            gas_delta_log2_hist: Some([0; 12]),
+            opcode_totals: vec![],
+            state_gas_sum: None,
+            state_gas_spillover_sum: None,
+            multiplier_log2_hist: None,
+            tx_count_creation: None,
+            tx_count_authorization: None,
+            tx_count_runtime_state: None,
+            tx_count_no_state: None,
+            cold_account_code_count: None,
+            cold_account_nocode_count: None,
+            storage_drivers: Some(sd),
+        };
+        db.record_block_output(&BlockOutput {
+            coverage: fixture_coverage("test", 9, 1, 1),
+            summaries: vec![summary],
+            drill_ins: vec![drill_in],
+            recipients: vec![],
+        })
+        .unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let row = |table: &str| -> (i64, i64, i64, i64) {
+            conn.query_row(
+                &format!(
+                    "SELECT sload_cold_count, sstore_set_count, sstore_clear_count, \
+                     sstore_dirty_count FROM {table} WHERE block_number = 9"
+                ),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        };
+        // Same drivers land on both the per-tx and per-class tables.
+        assert_eq!(row("divergences"), (2, 3, 1, 0));
+        assert_eq!(row("block_summaries"), (2, 3, 1, 0));
     }
 
     #[test]

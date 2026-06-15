@@ -43,7 +43,7 @@ use reth_research::{
     },
     divergence::{
         CallFrame, CallType as ResCallType, DivergenceFacts, DivergenceLocation, EventLog,
-        OogPattern, OutOfGasInfo,
+        OogPattern, OutOfGasInfo, StorageDrivers,
     },
     oog_chain::classify_oog_chain,
     schedule::{GasSchedule, RecipientInfo, ScheduleKind, ScheduleRegistry, TxContext},
@@ -1460,6 +1460,8 @@ where
                 tax_cold_code: i64,
                 tax_second_db_read: i64,
                 tax_other: i64,
+                /// F8: storage-reprice drivers; `None` on the reject path.
+                storage_drivers: Option<StorageDrivers>,
                 /// F1: structured failure reason — the `HaltReason` discriminant
                 /// (`OutOfGas`, `StackOverflow`, …), `"Revert"`, or `None` on
                 /// success.
@@ -1753,6 +1755,8 @@ where
                                 tax_cold_code: 0,
                                 tax_second_db_read: 0,
                                 tax_other: 0,
+                                // Rejected replay: storage drivers unknown.
+                                storage_drivers: None,
                                 // Rejected before execution: revm refused the tx
                                 // outright (the `{e:?}` is in `oog_info`).
                                 failure_reason: Some("Rejected".to_string()),
@@ -1940,6 +1944,9 @@ where
                         tax_cold_code: inspector.operation_counts().tax_cold_code,
                         tax_second_db_read: inspector.operation_counts().tax_second_db_read,
                         tax_other: inspector.operation_counts().tax_other,
+                        storage_drivers: Some(StorageDrivers::from_counts(
+                            inspector.operation_counts(),
+                        )),
                         failure_reason,
                         revert_data,
                         revert_decoded,
@@ -2486,6 +2493,8 @@ where
                             tax_other: exec_result.map(|r| r.tax_other),
                             tax_intrinsic: schedule_intrinsic_gas
                                 .map(|s| s as i64 - baseline_intrinsic_gas as i64),
+                            // F8: storage-reprice drivers.
+                            storage_drivers: exec_result.and_then(|r| r.storage_drivers),
                         };
 
                         // Codehashes come from the historical state we already
@@ -2570,6 +2579,7 @@ where
                                 .and_then(|r| r.cold_account_code_count),
                             cold_account_nocode_count: exec_result
                                 .and_then(|r| r.cold_account_nocode_count),
+                            storage_drivers: exec_result.and_then(|r| r.storage_drivers),
                             drill_in_record: drill_in,
                             recipient,
                             // 4-byte selector for calls with >=4 calldata bytes;

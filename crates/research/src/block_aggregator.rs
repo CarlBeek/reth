@@ -16,7 +16,7 @@ use crate::{
         BlockCoverageRow, BlockOutput, BlockSummaryRow, DrillInRecord, OpcodeBucketTotal,
         RecipientRow,
     },
-    divergence::{AggregateClass, FrameOpcodeCounts},
+    divergence::{AggregateClass, FrameOpcodeCounts, StorageDrivers},
 };
 use alloy_primitives::{Address, B256};
 use std::collections::{BTreeMap, HashMap};
@@ -120,6 +120,9 @@ struct ClassAccumulator {
     cold_account_code_sum: u64,
     cold_account_nocode_sum: u64,
 
+    // EIP-8038 storage-reprice drivers (F8) summed over the class's txs.
+    storage_drivers: StorageDrivers,
+
     // Per-opcode totals — counts + baseline / schedule gas — summed
     // across every frame of every tx in this class for this block.
     // Stored dense (256 wide) for cache-friendly accumulation; emitted
@@ -169,6 +172,7 @@ impl Default for ClassAccumulator {
             tx_count_no_state: 0,
             cold_account_code_sum: 0,
             cold_account_nocode_sum: 0,
+            storage_drivers: StorageDrivers::default(),
             opcode_counts: [0; 256],
             opcode_gas_baseline: [0; 256],
             opcode_gas_schedule: [0; 256],
@@ -279,6 +283,9 @@ pub struct TxObservation {
     /// Cold account accesses this tx made whose target had no code
     /// (EOA / empty / non-existent). `None` when unmeasured (see above).
     pub cold_account_nocode_count: Option<u64>,
+    /// EIP-8038 storage-reprice drivers (F8) for this tx. `None` when the replay
+    /// was rejected (unmeasured), so it doesn't dilute the class sum.
+    pub storage_drivers: Option<StorageDrivers>,
     /// Per-tx drill-in record — populated only when `store_full_forensics`
     /// is set; ignored for the aggregate classes.
     pub drill_in_record: Option<DrillInRecord>,
@@ -351,6 +358,11 @@ impl BlockAggregator {
         }
         if let Some(c) = obs.cold_account_nocode_count {
             acc.cold_account_nocode_sum = acc.cold_account_nocode_sum.saturating_add(c);
+        }
+
+        // 8038 storage-reprice drivers (F8). Same measured-only fold.
+        if let Some(sd) = obs.storage_drivers {
+            acc.storage_drivers.add(&sd);
         }
 
         // Multiplier histogram. We bin every tx (including those without
@@ -457,6 +469,10 @@ impl BlockAggregator {
             let cold_account_nocode_count =
                 cold_split_tracked.then_some(acc.cold_account_nocode_sum);
 
+            // F8 storage drivers: emit only when the class saw SLOAD/SSTORE
+            // activity (else the eight columns read NULL).
+            let storage_drivers = acc.storage_drivers.any().then_some(acc.storage_drivers);
+
             // Collapse the dense 256-wide opcode arrays into a sparse
             // list of `OpcodeBucketTotal`. Skip entries where every
             // counter is zero so the JSON column stays compact.
@@ -495,6 +511,7 @@ impl BlockAggregator {
                 tx_count_no_state: Some(acc.tx_count_no_state),
                 cold_account_code_count,
                 cold_account_nocode_count,
+                storage_drivers,
             });
 
             // Fold this class's per-recipient map into top-K rollup rows.
@@ -578,6 +595,7 @@ mod tests {
             has_runtime_state: false,
             cold_account_code_count: None,
             cold_account_nocode_count: None,
+            storage_drivers: None,
             drill_in_record: None,
             recipient: Some(Address::repeat_byte(0xab)),
             selector: Some([0x12, 0x34, 0x56, 0x78]),
@@ -678,6 +696,7 @@ mod tests {
             has_runtime_state: false,
             cold_account_code_count: None,
             cold_account_nocode_count: None,
+            storage_drivers: None,
             drill_in_record: None,
             recipient,
             selector: Some([0xaa, 0xbb, 0xcc, 0xdd]),
@@ -804,6 +823,7 @@ mod tests {
                 has_runtime_state: true,
                 cold_account_code_count: None,
                 cold_account_nocode_count: None,
+                storage_drivers: None,
                 drill_in_record: None,
                 recipient: None,
                 selector: None,

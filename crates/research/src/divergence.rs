@@ -251,6 +251,63 @@ pub struct OperationCounts {
     pub sstore_dirty_count: u64,
 }
 
+/// The EIP-8038 storage-reprice drivers (F8) bundled for the in-memory plumbing
+/// (`PerScheduleResult` / `TxObservation` / the per-class aggregate) — the eight
+/// counts map 1:1 to the explicit `divergences` / `block_summaries` columns at
+/// insert time. See [`OperationCounts`] for the per-field meaning.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct StorageDrivers {
+    pub sload_cold: u64,
+    pub sload_warm: u64,
+    pub sstore_cold: u64,
+    pub sstore_set: u64,
+    pub sstore_reset: u64,
+    pub sstore_clear: u64,
+    pub sstore_noop: u64,
+    pub sstore_dirty: u64,
+}
+
+impl StorageDrivers {
+    /// Snapshot the storage-driver counts out of an [`OperationCounts`].
+    pub const fn from_counts(oc: &OperationCounts) -> Self {
+        Self {
+            sload_cold: oc.sload_cold_count,
+            sload_warm: oc.sload_warm_count,
+            sstore_cold: oc.sstore_cold_count,
+            sstore_set: oc.sstore_set_count,
+            sstore_reset: oc.sstore_reset_count,
+            sstore_clear: oc.sstore_clear_count,
+            sstore_noop: oc.sstore_noop_count,
+            sstore_dirty: oc.sstore_dirty_count,
+        }
+    }
+
+    /// Saturating element-wise accumulation (per-class aggregate).
+    pub const fn add(&mut self, o: &Self) {
+        self.sload_cold = self.sload_cold.saturating_add(o.sload_cold);
+        self.sload_warm = self.sload_warm.saturating_add(o.sload_warm);
+        self.sstore_cold = self.sstore_cold.saturating_add(o.sstore_cold);
+        self.sstore_set = self.sstore_set.saturating_add(o.sstore_set);
+        self.sstore_reset = self.sstore_reset.saturating_add(o.sstore_reset);
+        self.sstore_clear = self.sstore_clear.saturating_add(o.sstore_clear);
+        self.sstore_noop = self.sstore_noop.saturating_add(o.sstore_noop);
+        self.sstore_dirty = self.sstore_dirty.saturating_add(o.sstore_dirty);
+    }
+
+    /// Whether any driver fired — gates emitting the aggregate columns.
+    pub const fn any(&self) -> bool {
+        self.sload_cold != 0 ||
+            self.sload_warm != 0 ||
+            self.sstore_cold != 0 ||
+            self.sstore_set != 0 ||
+            self.sstore_reset != 0 ||
+            self.sstore_clear != 0 ||
+            self.sstore_noop != 0 ||
+            self.sstore_dirty != 0
+    }
+}
+
 /// Location where divergence first occurred.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DivergenceLocation {

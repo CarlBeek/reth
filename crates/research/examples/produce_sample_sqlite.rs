@@ -161,6 +161,7 @@ fn main() {
             tx_count_no_state: None,
             cold_account_code_count: None,
             cold_account_nocode_count: None,
+            storage_drivers: None,
         }],
         drill_ins: vec![drill_in],
         // One recipient rollup row keyed by the same aggregate `class`.
