@@ -212,6 +212,7 @@ fn build_call_frame_rows<D: Database>(
     frames: &[CallFrame],
     db: &mut D,
     codehash_cache: &mut HashMap<Address, Option<B256>>,
+    divergent_call_index: Option<u32>,
 ) -> Vec<CallFrameRow> {
     let parent_call_indices = derive_parent_call_indices(frames);
     frames
@@ -263,6 +264,12 @@ fn build_call_frame_rows<D: Database>(
                 },
                 // F4: per-frame repricing surcharge the inspector accumulated.
                 repricing_gas_delta: f.repricing_gas_delta,
+                // F9: failing-frame context.
+                caller_pc: f.caller_pc.map(|p| p as u32),
+                was_precompile: f.was_precompile,
+                precompile_address: f.precompile_address,
+                gas_remaining_at_fail: f.gas_remaining_at_fail,
+                is_divergent_frame: divergent_call_index == Some(f.call_index as u32),
             }
         })
         .collect()
@@ -1429,6 +1436,9 @@ where
                 oog_info_structured: Option<reth_research::divergence::OutOfGasInfo>,
                 /// Structured `DivergenceLocation`. Same rationale as above.
                 divergence_location_structured: Option<DivergenceLocation>,
+                /// F10: location where the cumulative surcharge first went
+                /// positive (the inspector's `first_gas_divergence`).
+                first_gas_divergence: Option<DivergenceLocation>,
                 /// Per-frame opcode counts captured by the inspector. Used
                 /// to populate `divergence_opcode_counts` rows for drill-in
                 /// buckets.
@@ -1726,6 +1736,7 @@ where
                                 oog_call_depth: Some(synth_oog.call_depth),
                                 oog_info_structured: Some(synth_oog),
                                 divergence_location_structured: None,
+                                first_gas_divergence: None,
                                 frame_opcode_counts: Vec::new(),
                                 // Rejected replay: counts unknown (not zero).
                                 cold_account_code_count: None,
@@ -1907,6 +1918,7 @@ where
                         oog_call_depth: inspector_oog_info.as_ref().map(|oog| oog.call_depth),
                         oog_info_structured: inspector_oog_info.clone(),
                         divergence_location_structured: insp_result.divergence_location.clone(),
+                        first_gas_divergence: insp_result.first_gas_divergence.clone(),
                         frame_opcode_counts: inspector.frame_opcode_counts().frames.clone(),
                         cold_account_code_count: Some(
                             inspector.operation_counts().cold_account_code_count,
@@ -2295,6 +2307,7 @@ where
                             .expect("all schedules should have static metadata");
                         let div_loc =
                             exec_result.and_then(|r| r.divergence_location_structured.clone());
+                        let gas_div = exec_result.and_then(|r| r.first_gas_divergence.clone());
                         let oog_info_s = exec_result.and_then(|r| r.oog_info_structured.clone());
                         let frames_ref: &[CallFrame] =
                             exec_result.map(|r| r.call_frames.as_slice()).unwrap_or(&[]);
@@ -2321,17 +2334,18 @@ where
                         // whether baseline ran that frame and with how much gas.
                         // The cleanest wallet-fixable (baseline succeeded, more
                         // gas would too) vs contract-broken discriminator.
-                        let baseline_twin = frames_ref
-                            .iter()
-                            .filter(|f| !f.success)
-                            .max_by_key(|f| f.depth)
-                            .and_then(|ff| {
-                                baseline_call_frames.iter().find(|bf| {
-                                    bf.call_index == ff.call_index &&
-                                        bf.depth == ff.depth &&
-                                        bf.to == ff.to
-                                })
-                            });
+                        let failing_frame =
+                            frames_ref.iter().filter(|f| !f.success).max_by_key(|f| f.depth);
+                        // F9: the innermost failing frame's call_index marks the
+                        // divergent (bottleneck) frame on the schedule side.
+                        let failing_call_index = failing_frame.map(|f| f.call_index as u32);
+                        let baseline_twin = failing_frame.and_then(|ff| {
+                            baseline_call_frames.iter().find(|bf| {
+                                bf.call_index == ff.call_index &&
+                                    bf.depth == ff.depth &&
+                                    bf.to == ff.to
+                            })
+                        });
 
                         let divergence_row = DivergenceRow {
                             schedule_name: schedule_name.to_string(),
@@ -2446,6 +2460,11 @@ where
                             baseline_frame_gas_provided: baseline_twin.map(|bf| bf.gas_provided),
                             // F13: repricing surcharge at the OOG instant.
                             surcharge_at_oog: oog_info_s.as_ref().map(|o| o.additional_gas_at_oog),
+                            // F10: first opcode where cumulative gas exceeded baseline.
+                            gas_div_contract: gas_div.as_ref().map(|l| l.contract),
+                            gas_div_pc: gas_div.as_ref().map(|l| l.pc as u32),
+                            gas_div_call_depth: gas_div.as_ref().map(|l| l.call_depth as i32),
+                            gas_div_opcode: gas_div.as_ref().map(|l| l.opcode),
                         };
 
                         // Codehashes come from the historical state we already
@@ -2454,14 +2473,19 @@ where
                         // one `basic()` read. Self-destructed / missing accounts
                         // leave the column NULL rather than aborting the record.
                         let mut codehash_cache: HashMap<Address, Option<B256>> = HashMap::new();
-                        let call_frames_rows =
-                            build_call_frame_rows(frames_ref, &mut normal_db, &mut codehash_cache);
+                        let call_frames_rows = build_call_frame_rows(
+                            frames_ref,
+                            &mut normal_db,
+                            &mut codehash_cache,
+                            failing_call_index,
+                        );
                         let opcode_count_rows = OpcodeCountRow::from_frames(opcode_frames_ref);
 
                         // F11/F15: keep the baseline trace too, but only when the
                         // call tree actually diverged (pure-OOG failures already
                         // carry F7's baseline-frame twin, so the full baseline
-                        // tree would be redundant there).
+                        // tree would be redundant there). Baseline frames carry no
+                        // divergent-frame flag (None).
                         let (baseline_call_frame_rows, baseline_opcode_rows) = if call_tree_diverged
                         {
                             (
@@ -2469,6 +2493,7 @@ where
                                     &baseline_call_frames,
                                     &mut normal_db,
                                     &mut codehash_cache,
+                                    None,
                                 ),
                                 OpcodeCountRow::from_frames(&baseline_frame_opcode_counts),
                             )
@@ -3004,6 +3029,10 @@ mod tests {
             gas_requested_on_stack: None,
             parent_gas_at_call: None,
             value_wei: None,
+            caller_pc: None,
+            was_precompile: false,
+            precompile_address: None,
+            gas_remaining_at_fail: None,
         }
     }
 

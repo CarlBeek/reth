@@ -249,6 +249,10 @@ mod tests {
             output: None,
             repricing_gas_delta: 0,
             value_wei: None,
+            caller_pc: None,
+            was_precompile: false,
+            precompile_address: None,
+            gas_remaining_at_fail: None,
             gas_requested_on_stack,
             parent_gas_at_call,
         }

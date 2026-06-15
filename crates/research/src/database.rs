@@ -95,14 +95,17 @@ use thiserror::Error;
 ///   identity), `failure_reason` (F1 `HaltReason` discriminant / `Revert` / `Rejected`),
 ///   `revert_data` / `revert_decoded` / `tx_output` (F2 capped returndata plus decode), and
 ///   `baseline_frame_success` / `baseline_frame_gas_used` / `baseline_frame_gas_provided` (F7
-///   baseline twin of the failing frame) and `surcharge_at_oog` (F13 repricing surcharge at the OOG
-///   instant); `divergence_call_frames` gains `repricing_gas_delta` (F4 per-frame surcharge).
-///   `divergence_call_frames` and `divergence_opcode_counts` gain a `trace_kind` (`"schedule"` /
-///   `"baseline"`) in their primary key, mirroring `divergence_event_logs`, so a drill-in whose
-///   call tree diverged also stores the baseline call tree (F15) and baseline opcode counts (F11).
-///   There is no in-place migration: opening a pre-v10 database is rejected by
-///   [`enforce_schema_version`] (via `PRAGMA user_version`) — wipe the divergences `SQLite` and
-///   re-gather. The archive datadir is never touched.
+///   baseline twin of the failing frame), `surcharge_at_oog` (F13 repricing surcharge at the OOG
+///   instant) and the `gas_div_*` quad (F10 first opcode where cumulative schedule gas exceeded
+///   baseline); `divergence_call_frames` gains `repricing_gas_delta` (F4 per-frame surcharge) and
+///   the F9 failing-frame context (`caller_pc` / `was_precompile` / `precompile_address` /
+///   `gas_remaining_at_fail` / `is_divergent_frame`). `divergence_call_frames` and
+///   `divergence_opcode_counts` gain a `trace_kind` (`"schedule"` / `"baseline"`) in their primary
+///   key, mirroring `divergence_event_logs`, so a drill-in whose call tree diverged also stores the
+///   baseline call tree (F15) and baseline opcode counts (F11). There is no in-place migration:
+///   opening a pre-v10 database is rejected by [`enforce_schema_version`] (via `PRAGMA
+///   user_version`) — wipe the divergences `SQLite` and re-gather. The archive datadir is never
+///   touched.
 pub const SCHEMA_VERSION: u32 = 10;
 
 /// Errors raised by the storage layer.
@@ -550,6 +553,13 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             -- F13: cumulative repricing surcharge at the OOG instant.
             surcharge_at_oog            INTEGER,
 
+            -- F10: first opcode where cumulative schedule gas exceeded baseline
+            -- (distinct from the behavioral divergence_* columns).
+            gas_div_contract            TEXT,
+            gas_div_pc                  INTEGER,
+            gas_div_call_depth          INTEGER,
+            gas_div_opcode              INTEGER,
+
             UNIQUE (schedule_name, block_number, tx_index, schedule_config_hash)
         );",
     )?;
@@ -587,6 +597,12 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             state_gas_running      INTEGER,
             deployed_bytecode_len  INTEGER,
             repricing_gas_delta    INTEGER NOT NULL,
+            -- F9: failing-frame context.
+            caller_pc              INTEGER,
+            was_precompile         INTEGER NOT NULL DEFAULT 0,
+            precompile_address     TEXT,
+            gas_remaining_at_fail  INTEGER,
+            is_divergent_frame     INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (divergence_id, trace_kind, call_index)
         );",
     )?;
@@ -1011,6 +1027,15 @@ pub struct DivergenceRow {
     /// recorded — the absolute gas deficit the repricing introduced. `None` for
     /// non-OOG rows. (F13)
     pub surcharge_at_oog: Option<i64>,
+
+    /// First-gas-divergence location (F10): contract / pc / call depth / opcode
+    /// where the cumulative surcharge first exceeded baseline. Distinct from the
+    /// behavioral `divergence_*` columns (8038's warm-base correction is
+    /// negative, so the first net surcharge can lag the first repriced opcode).
+    pub gas_div_contract: Option<Address>,
+    pub gas_div_pc: Option<u32>,
+    pub gas_div_call_depth: Option<i32>,
+    pub gas_div_opcode: Option<u8>,
 }
 
 /// One frame row destined for `divergence_call_frames`. `call_index` and
@@ -1050,6 +1075,20 @@ pub struct CallFrameRow {
     /// while this frame was on top of the stack). Lets the dashboard attribute
     /// the per-tx tax to the frame that incurred it. Signed. (F4)
     pub repricing_gas_delta: i64,
+
+    /// Caller PC of the CALL/CREATE that opened this frame (F9). `None` for the
+    /// root and baseline frames.
+    pub caller_pc: Option<u32>,
+    /// Whether this frame was served by a precompile (F9).
+    pub was_precompile: bool,
+    /// Precompile address when `was_precompile` (F9), else `None`.
+    pub precompile_address: Option<Address>,
+    /// Gas remaining at the instant this frame failed (F9). `None` unless this
+    /// is a failing schedule frame.
+    pub gas_remaining_at_fail: Option<u64>,
+    /// Whether this is the innermost failing frame under the schedule — the
+    /// bottleneck (F9). False for baseline rows and non-failing frames.
+    pub is_divergent_frame: bool,
 }
 
 /// One row destined for `divergence_opcode_counts`. Producer omits zero-
@@ -1625,7 +1664,8 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             input_zero_bytes, input_nonzero_bytes, has_authorization,
             failure_reason, revert_data, revert_decoded, tx_output,
             baseline_frame_success, baseline_frame_gas_used,
-            baseline_frame_gas_provided, surcharge_at_oog
+            baseline_frame_gas_provided, surcharge_at_oog,
+            gas_div_contract, gas_div_pc, gas_div_call_depth, gas_div_opcode
         ) VALUES (?, ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?,
@@ -1643,6 +1683,7 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
                   ?, ?,
                   ?, ?, ?,
                   ?, ?, ?,
+                  ?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?, ?, ?)",
         params![
@@ -1714,6 +1755,10 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             row.baseline_frame_gas_used.map(|v| v as i64),
             row.baseline_frame_gas_provided.map(|v| v as i64),
             row.surcharge_at_oog,
+            row.gas_div_contract.map(|a| format!("{a:#x}")),
+            row.gas_div_pc.map(|v| v as i64),
+            row.gas_div_call_depth,
+            row.gas_div_opcode.map(|v| v as i64),
         ],
     )?;
     Ok(tx.last_insert_rowid() as u64)
@@ -1732,8 +1777,11 @@ fn insert_call_frame(
             selector, value_wei, gas_provided, gas_used, gas_margin,
             success, parent_gas_at_call, gas_requested_on_stack,
             eip150_cap_binding, state_gas_running, deployed_bytecode_len,
-            repricing_gas_delta
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            repricing_gas_delta,
+            caller_pc, was_precompile, precompile_address,
+            gas_remaining_at_fail, is_divergent_frame
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?)",
         params![
             divergence_id as i64,
             trace_kind,
@@ -1757,6 +1805,11 @@ fn insert_call_frame(
             row.state_gas_running.map(|v| v as i64),
             row.deployed_bytecode_len.map(|v| v as i64),
             row.repricing_gas_delta,
+            row.caller_pc.map(|v| v as i64),
+            row.was_precompile,
+            row.precompile_address.map(|a| format!("{a:#x}")),
+            row.gas_remaining_at_fail.map(|v| v as i64),
+            row.is_divergent_frame,
         ],
     )?;
     Ok(())
@@ -2059,6 +2112,7 @@ mod tests {
                 state_gas_running: None,
                 deployed_bytecode_len: None,
                 repricing_gas_delta: 0,
+                ..Default::default()
             }],
             opcode_counts: vec![OpcodeCountRow {
                 call_index: 0,
@@ -2256,6 +2310,7 @@ mod tests {
                     state_gas_running: None,
                     deployed_bytecode_len: None,
                     repricing_gas_delta: 0,
+                    ..Default::default()
                 }],
                 opcode_counts: vec![],
                 baseline_call_frames: vec![],
@@ -2387,6 +2442,7 @@ mod tests {
                     state_gas_running: None,
                     deployed_bytecode_len: None,
                     repricing_gas_delta: 0,
+                    ..Default::default()
                 }],
                 opcode_counts: vec![],
                 baseline_call_frames: vec![],
@@ -2448,6 +2504,7 @@ mod tests {
                     state_gas_running: None,
                     deployed_bytecode_len: None,
                     repricing_gas_delta: 0,
+                    ..Default::default()
                 }],
                 opcode_counts: vec![],
                 baseline_call_frames: vec![],
@@ -2518,6 +2575,7 @@ mod tests {
                 state_gas_running: None,
                 deployed_bytecode_len: None,
                 repricing_gas_delta: 0,
+                ..Default::default()
             }],
             opcode_counts: vec![],
             baseline_call_frames: vec![],
@@ -2583,6 +2641,7 @@ mod tests {
                     state_gas_running: None,
                     deployed_bytecode_len: None,
                     repricing_gas_delta: 0,
+                    ..Default::default()
                 }],
                 opcode_counts: vec![],
                 baseline_call_frames: vec![],

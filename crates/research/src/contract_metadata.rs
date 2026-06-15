@@ -616,6 +616,7 @@ mod tests {
                 state_gas_running: None,
                 deployed_bytecode_len: None,
                 repricing_gas_delta: 0,
+                ..Default::default()
             }],
             opcode_counts: vec![],
             baseline_call_frames: vec![],

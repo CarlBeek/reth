@@ -317,6 +317,10 @@ where
                 gas_requested_on_stack: None,
                 parent_gas_at_call: None,
                 value_wei: None,
+                caller_pc: None,
+                was_precompile: false,
+                precompile_address: None,
+                gas_remaining_at_fail: None,
             });
         }
     }
@@ -378,6 +382,10 @@ where
                 gas_requested_on_stack: None,
                 parent_gas_at_call: None,
                 value_wei: None,
+                caller_pc: None,
+                was_precompile: false,
+                precompile_address: None,
+                gas_remaining_at_fail: None,
             });
         }
     }

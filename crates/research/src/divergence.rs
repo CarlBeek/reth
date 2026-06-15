@@ -372,6 +372,27 @@ pub struct CallFrame {
     /// well above any realistic ETH amount.
     #[serde(default)]
     pub value_wei: Option<u128>,
+
+    /// Program counter of the CALL/CREATE opcode in the caller's bytecode that
+    /// opened this frame (F9). `None` for the root frame and baseline frames.
+    /// Excluded from the structural call-tree comparison.
+    #[serde(default)]
+    pub caller_pc: Option<usize>,
+
+    /// Whether this frame was served by a precompile (F9). Captured only on the
+    /// schedule side; baseline frames are `false`.
+    #[serde(default)]
+    pub was_precompile: bool,
+
+    /// Precompile address when `was_precompile` is set (F9), else `None`.
+    #[serde(default)]
+    pub precompile_address: Option<Address>,
+
+    /// Gas remaining in this frame at the moment it failed (F9). `Some` only on
+    /// the schedule side for a `!success` frame; `None` otherwise. Excluded from
+    /// the structural call-tree comparison.
+    #[serde(default)]
+    pub gas_remaining_at_fail: Option<u64>,
 }
 
 /// Type of call.

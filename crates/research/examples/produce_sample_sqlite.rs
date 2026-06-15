@@ -100,6 +100,7 @@ fn main() {
             state_gas_running: None,
             deployed_bytecode_len: None,
             repricing_gas_delta: 0,
+            ..Default::default()
         }],
         opcode_counts: vec![OpcodeCountRow {
             call_index: 0,

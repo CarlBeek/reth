@@ -227,8 +227,16 @@ pub struct ScheduleInspector {
     /// OOG diagnostic info (first OOG only)
     oog_info: Option<OutOfGasInfo>,
 
-    /// Location of first gas divergence
+    /// Location of the first per-opcode gas delta of *any* sign (first opcode
+    /// the schedule repriced). Note 8038's warm-base correction is negative, so
+    /// this can precede the first *net* surcharge — see `first_gas_divergence`.
     divergence_location: Option<DivergenceLocation>,
+
+    /// Location where the cumulative repricing surcharge (`additional_gas_charged`)
+    /// first crossed from ≤0 to >0 — the first opcode at which the schedule's
+    /// running gas genuinely exceeds baseline (F10). Distinct from the
+    /// behavioral `divergence_location`.
+    first_gas_divergence: Option<DivergenceLocation>,
 
     /// Whether a CALL/CREATE delta was pre-applied in `step()` and should be
     /// skipped in `step_end()`.
@@ -283,8 +291,11 @@ pub struct ScheduleResult {
     /// OOG diagnostic information (first OOG occurrence only).
     pub oog_info: Option<OutOfGasInfo>,
 
-    /// Location of first gas divergence.
+    /// Location of the first per-opcode delta of any sign.
     pub divergence_location: Option<DivergenceLocation>,
+
+    /// Location where the cumulative surcharge first went positive (F10).
+    pub first_gas_divergence: Option<DivergenceLocation>,
 }
 
 /// Entry in the call stack.
@@ -367,6 +378,7 @@ impl ScheduleInspector {
             oog_occurred: false,
             oog_info: None,
             divergence_location: None,
+            first_gas_divergence: None,
             call_delta_pre_applied: false,
             gas_opcode_usage: VecDeque::new(),
             max_gas_events: 1000,
@@ -419,6 +431,7 @@ impl ScheduleInspector {
             would_oog: self.oog_occurred,
             oog_info: self.oog_info.clone(),
             divergence_location: self.divergence_location.clone(),
+            first_gas_divergence: self.first_gas_divergence.clone(),
         }
     }
 
@@ -708,7 +721,30 @@ impl ScheduleInspector {
         opcode: u8,
     ) -> bool {
         self.record_divergence(interp, opcode);
+        let surcharge_before = self.additional_gas_charged;
         self.additional_gas_charged += gas_delta;
+        // F10: first opcode where the cumulative surcharge crosses into the
+        // positive (schedule's running gas first exceeds baseline). Distinct
+        // from `divergence_location`, which fires on the first delta of any
+        // sign — 8038's warm-base correction is negative and can precede this.
+        if self.first_gas_divergence.is_none() &&
+            surcharge_before <= 0 &&
+            self.additional_gas_charged > 0
+        {
+            let contract = self.call_stack.last().map(|e| e.contract).unwrap_or(Address::ZERO);
+            self.first_gas_divergence = Some(DivergenceLocation {
+                contract,
+                function_selectors: self
+                    .call_stack
+                    .iter()
+                    .map(|entry| entry.function_selector)
+                    .collect(),
+                pc: interp.bytecode.pc(),
+                call_depth: self.call_stack.len() + 1,
+                opcode,
+                opcode_name: Self::opcode_name(opcode),
+            });
+        }
         if let Some(frame) = self.call_stack.last_mut() {
             frame.repricing_gas_delta += gas_delta;
         }
@@ -1215,6 +1251,13 @@ where
                 gas_requested_on_stack: entry.gas_requested_on_stack,
                 parent_gas_at_call: entry.parent_gas_at_call,
                 value_wei,
+                // F9: failing-frame context.
+                caller_pc: Some(entry.caller_pc),
+                was_precompile: outcome.was_precompile_called,
+                precompile_address: outcome
+                    .was_precompile_called
+                    .then_some(inputs.bytecode_address),
+                gas_remaining_at_fail: (!call_success).then(|| outcome.result.gas.remaining()),
             });
 
             // Propagate per-frame positive delta flag to parent.
@@ -1353,6 +1396,11 @@ where
                 gas_requested_on_stack: entry.gas_requested_on_stack,
                 parent_gas_at_call: entry.parent_gas_at_call,
                 value_wei,
+                // F9: failing-frame context. CREATE never hits a precompile.
+                caller_pc: Some(entry.caller_pc),
+                was_precompile: false,
+                precompile_address: None,
+                gas_remaining_at_fail: (!create_success).then(|| outcome.result.gas.remaining()),
             });
 
             // Propagate per-frame positive delta flag to parent.
