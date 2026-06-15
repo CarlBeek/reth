@@ -618,6 +618,8 @@ mod tests {
                 repricing_gas_delta: 0,
             }],
             opcode_counts: vec![],
+            baseline_call_frames: vec![],
+            baseline_opcode_counts: vec![],
             baseline_event_logs: vec![],
             schedule_event_logs: vec![],
         };

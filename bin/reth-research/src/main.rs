@@ -203,6 +203,71 @@ fn derive_parent_call_indices(frames: &[reth_research::divergence::CallFrame]) -
     parents
 }
 
+/// Convert an inspector's `CallFrame` trace into the persisted `CallFrameRow`
+/// shape: parent indices, per-frame codehash pulled from historical state
+/// (`db`), selector, EIP-150 binding, deployed-bytecode length, repricing.
+/// Shared by the schedule trace and the baseline trace (F15); `codehash_cache`
+/// is shared across both so a repeat target costs one DB read.
+fn build_call_frame_rows<D: Database>(
+    frames: &[CallFrame],
+    db: &mut D,
+    codehash_cache: &mut HashMap<Address, Option<B256>>,
+) -> Vec<CallFrameRow> {
+    let parent_call_indices = derive_parent_call_indices(frames);
+    frames
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let codehash = f.to.and_then(|addr| {
+                *codehash_cache.entry(addr).or_insert_with(|| match db.basic(addr) {
+                    Ok(Some(info)) if info.code_hash != KECCAK_EMPTY => Some(info.code_hash),
+                    _ => None,
+                })
+            });
+            CallFrameRow {
+                call_index: f.call_index as u32,
+                parent_call_index: parent_call_indices[i],
+                depth: f.depth as u32,
+                from_address: f.from,
+                to_address: f.to.unwrap_or_default(),
+                // For non-DELEGATECALL frames this equals `to_address`; once the
+                // inspector splits storage-context vs code-holder for
+                // DELEGATECALL, this column will carry the code holder while
+                // `to_address` carries the storage target. Today both come from
+                // the same source.
+                code_address: f.to,
+                codehash,
+                call_type: format_call_type(&f.call_type),
+                selector: extract_selector_bytes(&f.input),
+                value_wei: f.value_wei.map(|v| v.to_string()),
+                gas_provided: f.gas_provided,
+                gas_used: f.gas_used,
+                gas_margin: Some((f.gas_provided as i64).saturating_sub(f.gas_used as i64)),
+                success: f.success,
+                parent_gas_at_call: f.parent_gas_at_call,
+                gas_requested_on_stack: f.gas_requested_on_stack,
+                eip150_cap_binding: eip150_cap_binding(
+                    f.gas_requested_on_stack,
+                    f.parent_gas_at_call,
+                ),
+                state_gas_running: None,
+                // For successful CREATE/CREATE2 frames the inspector stashes the
+                // deployed runtime code in `output`; its length is the
+                // deployed-bytecode size EIP-8037 charges CPSB per byte for. All
+                // other frames leave this NULL.
+                deployed_bytecode_len: match f.call_type {
+                    ResCallType::Create | ResCallType::Create2 if f.success => {
+                        f.output.as_ref().map(|b| b.len() as u32)
+                    }
+                    _ => None,
+                },
+                // F4: per-frame repricing surcharge the inspector accumulated.
+                repricing_gas_delta: f.repricing_gas_delta,
+            }
+        })
+        .collect()
+}
+
 /// Analyzer state shared between the live arm and concurrent backfill workers.
 ///
 /// This struct holds everything needed to analyze a single block: the node
@@ -1305,6 +1370,10 @@ where
             };
             drop(normal_evm);
             let baseline_call_frames = baseline_inspector.call_frames().to_vec();
+            // Baseline per-frame opcode counts (F11) — stored with
+            // `trace_kind="baseline"` for drill-ins whose call tree diverged.
+            let baseline_frame_opcode_counts =
+                baseline_inspector.frame_opcode_counts().frames.clone();
             let baseline_event_logs = baseline_inspector.event_logs().to_vec();
             let (baseline_output_hash, baseline_output_len) =
                 Self::output_hash_and_len(&normal_result.result);
@@ -1637,6 +1706,8 @@ where
                                 call_depth: 1,
                                 gas_remaining: 0,
                                 pattern: OogPattern::Unknown,
+                                // Rejected before execution — no surcharge applied.
+                                additional_gas_at_oog: 0,
                             };
                             last_attempt = Some(PerScheduleResult {
                                 success: false,
@@ -1803,6 +1874,8 @@ where
                                 call_depth: 1,
                                 gas_remaining: 0,
                                 pattern: OogPattern::Unknown,
+                                // Synthesized at the producer — surcharge unknown here.
+                                additional_gas_at_oog: 0,
                             })
                         } else {
                             None
@@ -2371,91 +2444,44 @@ where
                             baseline_frame_success: baseline_twin.map(|bf| bf.success),
                             baseline_frame_gas_used: baseline_twin.map(|bf| bf.gas_used),
                             baseline_frame_gas_provided: baseline_twin.map(|bf| bf.gas_provided),
+                            // F13: repricing surcharge at the OOG instant.
+                            surcharge_at_oog: oog_info_s.as_ref().map(|o| o.additional_gas_at_oog),
                         };
 
-                        // Inspector emits frames in post-order DFS — children
-                        // come before their parent. The parent of a frame at
-                        // index `i` (with depth `d > 0`) is the first
-                        // subsequent frame at depth `d - 1`.
-                        let parent_call_indices = derive_parent_call_indices(frames_ref);
-
-                        // Pull codehashes for every distinct frame target
-                        // out of the historical state we already loaded
-                        // for analysis (`normal_db`). One revm `basic()`
-                        // lookup per address; results cached so repeat
-                        // hits in the same drill-in tx are free. Failures
-                        // — self-destructed contracts, missing accounts —
-                        // leave the column NULL rather than aborting the
-                        // drill-in record.
+                        // Codehashes come from the historical state we already
+                        // loaded (`normal_db`); the cache is shared across the
+                        // schedule and baseline traces so a repeat target costs
+                        // one `basic()` read. Self-destructed / missing accounts
+                        // leave the column NULL rather than aborting the record.
                         let mut codehash_cache: HashMap<Address, Option<B256>> = HashMap::new();
-                        let call_frames_rows: Vec<CallFrameRow> = frames_ref
-                            .iter()
-                            .enumerate()
-                            .map(|(i, f)| {
-                                let codehash = f.to.and_then(|addr| {
-                                    *codehash_cache.entry(addr).or_insert_with(|| {
-                                        match normal_db.basic(addr) {
-                                            Ok(Some(info)) if info.code_hash != KECCAK_EMPTY => {
-                                                Some(info.code_hash)
-                                            }
-                                            _ => None,
-                                        }
-                                    })
-                                });
-                                CallFrameRow {
-                                    call_index: f.call_index as u32,
-                                    parent_call_index: parent_call_indices[i],
-                                    depth: f.depth as u32,
-                                    from_address: f.from,
-                                    to_address: f.to.unwrap_or_default(),
-                                    // For non-DELEGATECALL frames this equals
-                                    // `to_address`; once the inspector splits
-                                    // storage-context vs code-holder for
-                                    // DELEGATECALL, this column will carry the
-                                    // code holder while `to_address` carries
-                                    // the storage target. Today both come from
-                                    // the same source.
-                                    code_address: f.to,
-                                    codehash,
-                                    call_type: format_call_type(&f.call_type),
-                                    selector: extract_selector_bytes(&f.input),
-                                    value_wei: f.value_wei.map(|v| v.to_string()),
-                                    gas_provided: f.gas_provided,
-                                    gas_used: f.gas_used,
-                                    gas_margin: Some(
-                                        (f.gas_provided as i64).saturating_sub(f.gas_used as i64),
-                                    ),
-                                    success: f.success,
-                                    parent_gas_at_call: f.parent_gas_at_call,
-                                    gas_requested_on_stack: f.gas_requested_on_stack,
-                                    eip150_cap_binding: eip150_cap_binding(
-                                        f.gas_requested_on_stack,
-                                        f.parent_gas_at_call,
-                                    ),
-                                    state_gas_running: None,
-                                    // For successful CREATE/CREATE2 frames the inspector stashes
-                                    // the deployed runtime code in `output`; its length is the
-                                    // deployed-bytecode size EIP-8037 charges CPSB per byte for.
-                                    // All other frames leave this NULL.
-                                    deployed_bytecode_len: match f.call_type {
-                                        ResCallType::Create | ResCallType::Create2 if f.success => {
-                                            f.output.as_ref().map(|b| b.len() as u32)
-                                        }
-                                        _ => None,
-                                    },
-                                    // F4: per-frame repricing surcharge the
-                                    // inspector accumulated for this frame.
-                                    repricing_gas_delta: f.repricing_gas_delta,
-                                }
-                            })
-                            .collect();
-
+                        let call_frames_rows =
+                            build_call_frame_rows(frames_ref, &mut normal_db, &mut codehash_cache);
                         let opcode_count_rows = OpcodeCountRow::from_frames(opcode_frames_ref);
+
+                        // F11/F15: keep the baseline trace too, but only when the
+                        // call tree actually diverged (pure-OOG failures already
+                        // carry F7's baseline-frame twin, so the full baseline
+                        // tree would be redundant there).
+                        let (baseline_call_frame_rows, baseline_opcode_rows) = if call_tree_diverged
+                        {
+                            (
+                                build_call_frame_rows(
+                                    &baseline_call_frames,
+                                    &mut normal_db,
+                                    &mut codehash_cache,
+                                ),
+                                OpcodeCountRow::from_frames(&baseline_frame_opcode_counts),
+                            )
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
 
                         Some(DrillInRecord {
                             divergence: divergence_row,
                             call_frames: call_frames_rows,
                             opcode_counts: opcode_count_rows,
+                            baseline_call_frames: baseline_call_frame_rows,
+                            baseline_opcode_counts: baseline_opcode_rows,
                             baseline_event_logs: baseline_event_logs.clone(),
                             schedule_event_logs: sched_logs_ref.to_vec(),
                         })

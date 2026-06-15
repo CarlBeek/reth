@@ -108,6 +108,8 @@ fn main() {
             gas_baseline: 60_000,
             gas_schedule: 75_000,
         }],
+        baseline_call_frames: vec![],
+        baseline_opcode_counts: vec![],
         baseline_event_logs: vec![],
         schedule_event_logs: vec![EventLog {
             log_index: 0,

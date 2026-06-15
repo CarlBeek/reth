@@ -475,6 +475,7 @@ impl ScheduleInspector {
             call_depth: self.call_stack.len() + 1,
             gas_remaining: interp.gas.remaining(),
             pattern,
+            additional_gas_at_oog: self.additional_gas_charged,
         });
         self.oog_occurred = true;
     }
@@ -566,6 +567,7 @@ impl ScheduleInspector {
             call_depth: popped.depth + 1,
             gas_remaining,
             pattern,
+            additional_gas_at_oog: self.additional_gas_charged,
         });
     }
 
@@ -1145,6 +1147,7 @@ where
                                     call_depth: entry.depth + 1,
                                     gas_remaining: gas_after_precompile,
                                     pattern: OogPattern::CallChain,
+                                    additional_gas_at_oog: self.additional_gas_charged,
                                 });
                             }
                         } else {
@@ -1243,6 +1246,7 @@ where
                         call_depth: entry.depth + 1,
                         gas_remaining: 0,
                         pattern: OogPattern::CallChain,
+                        additional_gas_at_oog: self.additional_gas_charged,
                     });
                 }
             }
@@ -1373,6 +1377,7 @@ where
                         call_depth: entry.depth + 1,
                         gas_remaining: 0,
                         pattern: OogPattern::CallChain,
+                        additional_gas_at_oog: self.additional_gas_charged,
                     });
                 }
             }

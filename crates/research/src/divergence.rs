@@ -253,6 +253,13 @@ pub struct OutOfGasInfo {
 
     /// Detected pattern (heuristic)
     pub pattern: OogPattern,
+
+    /// Cumulative repricing surcharge (`additional_gas_charged`) the schedule
+    /// had applied at the instant OOG was first recorded (F13) — the absolute
+    /// gas deficit the repricing introduced up to the failure. `#[serde(default)]`
+    /// so older serialized infos deserialize to 0.
+    #[serde(default)]
+    pub additional_gas_at_oog: i64,
 }
 
 /// Pattern that caused out-of-gas.

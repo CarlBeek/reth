@@ -947,6 +947,8 @@ mod tests {
             },
             call_frames: vec![],
             opcode_counts: vec![],
+            baseline_call_frames: vec![],
+            baseline_opcode_counts: vec![],
             baseline_event_logs: vec![],
             schedule_event_logs: vec![],
         }

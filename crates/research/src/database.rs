@@ -95,9 +95,13 @@ use thiserror::Error;
 ///   identity), `failure_reason` (F1 `HaltReason` discriminant / `Revert` / `Rejected`),
 ///   `revert_data` / `revert_decoded` / `tx_output` (F2 capped returndata plus decode), and
 ///   `baseline_frame_success` / `baseline_frame_gas_used` / `baseline_frame_gas_provided` (F7
-///   baseline twin of the failing frame); `divergence_call_frames` gains `repricing_gas_delta` (F4
-///   per-frame surcharge). There is no in-place migration: opening a pre-v10 database is rejected
-///   by [`enforce_schema_version`] (via `PRAGMA user_version`) — wipe the divergences `SQLite` and
+///   baseline twin of the failing frame) and `surcharge_at_oog` (F13 repricing surcharge at the OOG
+///   instant); `divergence_call_frames` gains `repricing_gas_delta` (F4 per-frame surcharge).
+///   `divergence_call_frames` and `divergence_opcode_counts` gain a `trace_kind` (`"schedule"` /
+///   `"baseline"`) in their primary key, mirroring `divergence_event_logs`, so a drill-in whose
+///   call tree diverged also stores the baseline call tree (F15) and baseline opcode counts (F11).
+///   There is no in-place migration: opening a pre-v10 database is rejected by
+///   [`enforce_schema_version`] (via `PRAGMA user_version`) — wipe the divergences `SQLite` and
 ///   re-gather. The archive datadir is never touched.
 pub const SCHEMA_VERSION: u32 = 10;
 
@@ -543,13 +547,17 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             baseline_frame_gas_used     INTEGER,
             baseline_frame_gas_provided INTEGER,
 
+            -- F13: cumulative repricing surcharge at the OOG instant.
+            surcharge_at_oog            INTEGER,
+
             UNIQUE (schedule_name, block_number, tx_index, schedule_config_hash)
         );",
     )?;
 
-    // One row per call frame in the schedule trace of a drill-in
-    // divergence. Baseline frames are NOT stored separately — derived
-    // baseline costs live in divergence_opcode_counts.gas_baseline.
+    // One row per call frame of a drill-in divergence. `trace_kind`
+    // ("schedule" / "baseline") partitions the two traces in one table,
+    // mirroring `divergence_event_logs`; baseline rows (F15) are written only
+    // when the call tree diverged.
     //
     // FK constraints from child tables to `divergences` are documented in
     // the design doc but omitted at the DDL level; the producer maintains
@@ -558,6 +566,7 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS divergence_call_frames (
             divergence_id          INTEGER NOT NULL,
+            trace_kind             TEXT    NOT NULL DEFAULT 'schedule',
             call_index             INTEGER NOT NULL,
             parent_call_index      INTEGER,
             depth                  INTEGER NOT NULL,
@@ -578,21 +587,24 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             state_gas_running      INTEGER,
             deployed_bytecode_len  INTEGER,
             repricing_gas_delta    INTEGER NOT NULL,
-            PRIMARY KEY (divergence_id, call_index)
+            PRIMARY KEY (divergence_id, trace_kind, call_index)
         );",
     )?;
 
     // Sparse opcode counts keyed by frame. Zero rows omitted by the
-    // producer at insert time.
+    // producer at insert time. `trace_kind` partitions schedule vs baseline
+    // (F11) — baseline rows carry the baseline opcode counts (where
+    // gas_baseline == gas_schedule).
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS divergence_opcode_counts (
             divergence_id INTEGER NOT NULL,
+            trace_kind    TEXT    NOT NULL DEFAULT 'schedule',
             call_index    INTEGER NOT NULL,
             opcode        INTEGER NOT NULL,
             count         INTEGER NOT NULL,
             gas_baseline  INTEGER NOT NULL,
             gas_schedule  INTEGER NOT NULL,
-            PRIMARY KEY (divergence_id, call_index, opcode)
+            PRIMARY KEY (divergence_id, trace_kind, call_index, opcode)
         );",
     )?;
 
@@ -834,10 +846,13 @@ pub struct BlockSummaryRow {
 
 /// Per-tx drill-in record: the `divergences` row plus its dependent
 /// `divergence_call_frames`, `divergence_opcode_counts`, and
-/// `divergence_event_logs` rows. Emitted only for the
-/// `EventLogsChanged`, `InconclusiveNeedsHigherSweep`, and
-/// `ContractBroken` buckets — aggregate buckets collapse into
-/// `BlockSummaryRow`.
+/// `divergence_event_logs` rows. Emitted for every stored tx (a failure or a
+/// trace divergence — see `DivergenceFacts::store_full_forensics`).
+///
+/// Call-frame and opcode-count rows carry a `trace_kind` (`"schedule"` /
+/// `"baseline"`), mirroring the event-log table. The `baseline_*` vecs are
+/// populated only when the call tree diverged (where the baseline path differs
+/// and is worth keeping); otherwise they're empty and only schedule rows land.
 #[allow(missing_docs)]
 #[derive(Debug, Clone)]
 pub struct DrillInRecord {
@@ -846,6 +861,12 @@ pub struct DrillInRecord {
     /// Per-frame opcode counts. The producer omits zero-count rows; this
     /// vec is what `FrameOpcodeCounts::nonzero()` yielded for the tx.
     pub opcode_counts: Vec<OpcodeCountRow>,
+    /// Baseline-side call frames (F15) — populated only on call-tree
+    /// divergence, written with `trace_kind="baseline"`.
+    pub baseline_call_frames: Vec<CallFrameRow>,
+    /// Baseline-side per-opcode counts (F11) — populated only on call-tree
+    /// divergence, written with `trace_kind="baseline"`.
+    pub baseline_opcode_counts: Vec<OpcodeCountRow>,
     pub baseline_event_logs: Vec<EventLog>,
     pub schedule_event_logs: Vec<EventLog>,
 }
@@ -985,6 +1006,11 @@ pub struct DivergenceRow {
     pub baseline_frame_success: Option<bool>,
     pub baseline_frame_gas_used: Option<u64>,
     pub baseline_frame_gas_provided: Option<u64>,
+
+    /// Cumulative repricing surcharge applied at the instant OOG was first
+    /// recorded — the absolute gas deficit the repricing introduced. `None` for
+    /// non-OOG rows. (F13)
+    pub surcharge_at_oog: Option<i64>,
 }
 
 /// One frame row destined for `divergence_call_frames`. `call_index` and
@@ -1090,10 +1116,16 @@ impl DivergenceDatabase {
         for drill_in in &output.drill_ins {
             let divergence_id = insert_divergence(&tx, &drill_in.divergence)?;
             for frame in &drill_in.call_frames {
-                insert_call_frame(&tx, divergence_id, frame)?;
+                insert_call_frame(&tx, divergence_id, "schedule", frame)?;
+            }
+            for frame in &drill_in.baseline_call_frames {
+                insert_call_frame(&tx, divergence_id, "baseline", frame)?;
             }
             for opc in &drill_in.opcode_counts {
-                insert_opcode_count(&tx, divergence_id, opc)?;
+                insert_opcode_count(&tx, divergence_id, "schedule", opc)?;
+            }
+            for opc in &drill_in.baseline_opcode_counts {
+                insert_opcode_count(&tx, divergence_id, "baseline", opc)?;
             }
             for log in &drill_in.baseline_event_logs {
                 insert_event_log(&tx, divergence_id, "baseline", log)?;
@@ -1593,7 +1625,7 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             input_zero_bytes, input_nonzero_bytes, has_authorization,
             failure_reason, revert_data, revert_decoded, tx_output,
             baseline_frame_success, baseline_frame_gas_used,
-            baseline_frame_gas_provided
+            baseline_frame_gas_provided, surcharge_at_oog
         ) VALUES (?, ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?,
@@ -1612,7 +1644,7 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
                   ?, ?, ?,
                   ?, ?, ?,
                   ?, ?, ?, ?,
-                  ?, ?, ?)",
+                  ?, ?, ?, ?)",
         params![
             row.schedule_name,
             row.schedule_config_hash,
@@ -1681,6 +1713,7 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             row.baseline_frame_success,
             row.baseline_frame_gas_used.map(|v| v as i64),
             row.baseline_frame_gas_provided.map(|v| v as i64),
+            row.surcharge_at_oog,
         ],
     )?;
     Ok(tx.last_insert_rowid() as u64)
@@ -1689,19 +1722,21 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
 fn insert_call_frame(
     tx: &Transaction<'_>,
     divergence_id: u64,
+    trace_kind: &str,
     row: &CallFrameRow,
 ) -> Result<(), DatabaseError> {
     tx.execute(
         "INSERT INTO divergence_call_frames (
-            divergence_id, call_index, parent_call_index, depth,
+            divergence_id, trace_kind, call_index, parent_call_index, depth,
             from_address, to_address, code_address, codehash, call_type,
             selector, value_wei, gas_provided, gas_used, gas_margin,
             success, parent_gas_at_call, gas_requested_on_stack,
             eip150_cap_binding, state_gas_running, deployed_bytecode_len,
             repricing_gas_delta
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             divergence_id as i64,
+            trace_kind,
             row.call_index as i64,
             row.parent_call_index.map(|v| v as i64),
             row.depth as i64,
@@ -1730,14 +1765,16 @@ fn insert_call_frame(
 fn insert_opcode_count(
     tx: &Transaction<'_>,
     divergence_id: u64,
+    trace_kind: &str,
     row: &OpcodeCountRow,
 ) -> Result<(), DatabaseError> {
     tx.execute(
         "INSERT INTO divergence_opcode_counts (
-            divergence_id, call_index, opcode, count, gas_baseline, gas_schedule
-        ) VALUES (?, ?, ?, ?, ?, ?)",
+            divergence_id, trace_kind, call_index, opcode, count, gas_baseline, gas_schedule
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)",
         params![
             divergence_id as i64,
+            trace_kind,
             row.call_index as i64,
             row.opcode as i64,
             row.count as i64,
@@ -2030,6 +2067,8 @@ mod tests {
                 gas_baseline: 60_000,
                 gas_schedule: 75_000,
             }],
+            baseline_call_frames: vec![],
+            baseline_opcode_counts: vec![],
             baseline_event_logs: vec![],
             schedule_event_logs: vec![EventLog {
                 log_index: 0,
@@ -2124,6 +2163,71 @@ mod tests {
         assert_eq!(log_count, 1);
     }
 
+    /// Baseline call frames (F15) and opcode counts (F11) coexist with the
+    /// schedule rows under one `divergence_id`, partitioned by `trace_kind`.
+    #[test]
+    fn baseline_trace_stored_with_trace_kind() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+
+        let frame = |from: u8| CallFrameRow {
+            call_index: 0,
+            from_address: Address::repeat_byte(from),
+            to_address: Address::repeat_byte(0x22),
+            call_type: "CALL".to_string(),
+            success: true,
+            ..Default::default()
+        };
+        let opc = |count: u64| OpcodeCountRow {
+            call_index: 0,
+            opcode: 0x54,
+            count,
+            gas_baseline: 100,
+            gas_schedule: 100,
+        };
+
+        let drill_in = DrillInRecord {
+            divergence: fixture_divergence(7, 0, false, 42),
+            call_frames: vec![frame(0x11)],
+            opcode_counts: vec![opc(5)],
+            baseline_call_frames: vec![frame(0xaa)],
+            baseline_opcode_counts: vec![opc(3)],
+            baseline_event_logs: vec![],
+            schedule_event_logs: vec![],
+        };
+        let output = BlockOutput {
+            coverage: fixture_coverage("test", 7, 1, 0),
+            summaries: vec![],
+            drill_ins: vec![drill_in],
+            recipients: vec![],
+        };
+        db.record_block_output(&output).unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+
+        assert_eq!(
+            count("SELECT COUNT(*) FROM divergence_call_frames WHERE trace_kind='schedule'"),
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM divergence_call_frames WHERE trace_kind='baseline'"),
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM divergence_opcode_counts WHERE trace_kind='baseline'"),
+            1
+        );
+        // The baseline opcode row carries the baseline count (3), distinct from
+        // the schedule row's count (5).
+        assert_eq!(
+            count(
+                "SELECT count FROM divergence_opcode_counts \
+                 WHERE trace_kind='baseline' AND opcode=84"
+            ),
+            3
+        );
+    }
+
     #[test]
     fn delete_block_range_clears_all_per_block_tables() {
         let db = DivergenceDatabase::in_memory().unwrap();
@@ -2154,6 +2258,8 @@ mod tests {
                     repricing_gas_delta: 0,
                 }],
                 opcode_counts: vec![],
+                baseline_call_frames: vec![],
+                baseline_opcode_counts: vec![],
                 baseline_event_logs: vec![],
                 schedule_event_logs: vec![],
             };
@@ -2283,6 +2389,8 @@ mod tests {
                     repricing_gas_delta: 0,
                 }],
                 opcode_counts: vec![],
+                baseline_call_frames: vec![],
+                baseline_opcode_counts: vec![],
                 baseline_event_logs: vec![],
                 schedule_event_logs: vec![],
             };
@@ -2342,6 +2450,8 @@ mod tests {
                     repricing_gas_delta: 0,
                 }],
                 opcode_counts: vec![],
+                baseline_call_frames: vec![],
+                baseline_opcode_counts: vec![],
                 baseline_event_logs: vec![],
                 schedule_event_logs: vec![],
             };
@@ -2410,6 +2520,8 @@ mod tests {
                 repricing_gas_delta: 0,
             }],
             opcode_counts: vec![],
+            baseline_call_frames: vec![],
+            baseline_opcode_counts: vec![],
             baseline_event_logs: vec![],
             schedule_event_logs: vec![],
         };
@@ -2473,6 +2585,8 @@ mod tests {
                     repricing_gas_delta: 0,
                 }],
                 opcode_counts: vec![],
+                baseline_call_frames: vec![],
+                baseline_opcode_counts: vec![],
                 baseline_event_logs: vec![],
                 schedule_event_logs: vec![],
             };
