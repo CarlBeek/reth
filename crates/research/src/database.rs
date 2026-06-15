@@ -105,13 +105,15 @@ use thiserror::Error;
 ///   `bytecode_address`); `codehash` and the metadata backfill resolve from `code_address` (F14).
 ///   `divergences` also gains the F12 per-category tax decomposition `tax_warm_base` /
 ///   `tax_cold_code` / `tax_second_db_read` / `tax_other` (these four sum to
-///   `additional_gas_charged`) plus `tax_intrinsic` (the tx-level intrinsic-gas delta).
-///   `divergence_call_frames` and `divergence_opcode_counts` gain a `trace_kind` (`"schedule"` /
-///   `"baseline"`) in their primary key, mirroring `divergence_event_logs`, so a drill-in whose
-///   call tree diverged also stores the baseline call tree (F15) and baseline opcode counts (F11).
-///   There is no in-place migration: opening a pre-v10 database is rejected by
-///   [`enforce_schema_version`] (via `PRAGMA user_version`) — wipe the divergences `SQLite` and
-///   re-gather. The archive datadir is never touched.
+///   `additional_gas_charged`) plus `tax_intrinsic` (the tx-level intrinsic-gas delta). Two
+///   zero-information columns are dropped: `divergence_call_frames.state_gas_running` (was always
+///   NULL) and `divergences.would_fit_in_original_limit` (an exact duplicate of
+///   `schedule_success`). `divergence_call_frames` and `divergence_opcode_counts` gain a
+///   `trace_kind` (`"schedule"` / `"baseline"`) in their primary key, mirroring
+///   `divergence_event_logs`, so a drill-in whose call tree diverged also stores the baseline call
+///   tree (F15) and baseline opcode counts (F11). There is no in-place migration: opening a pre-v10
+///   database is rejected by [`enforce_schema_version`] (via `PRAGMA user_version`) — wipe the
+///   divergences `SQLite` and re-gather. The archive datadir is never touched.
 pub const SCHEMA_VERSION: u32 = 10;
 
 /// Errors raised by the storage layer.
@@ -477,7 +479,6 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             schedule_gas_refunded    INTEGER,
             schedule_intrinsic_gas   INTEGER,
             schedule_floor_gas       INTEGER,
-            would_fit_in_original_limit INTEGER,
             min_multiplier_to_succeed   REAL,
 
             divergence_contract   TEXT,
@@ -609,7 +610,6 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             parent_gas_at_call     INTEGER,
             gas_requested_on_stack INTEGER,
             eip150_cap_binding     INTEGER,
-            state_gas_running      INTEGER,
             deployed_bytecode_len  INTEGER,
             repricing_gas_delta    INTEGER NOT NULL,
             -- F9: failing-frame context.
@@ -944,7 +944,6 @@ pub struct DivergenceRow {
     pub schedule_gas_refunded: Option<u64>,
     pub schedule_intrinsic_gas: Option<u64>,
     pub schedule_floor_gas: Option<u64>,
-    pub would_fit_in_original_limit: Option<bool>,
     pub min_multiplier_to_succeed: Option<f64>,
 
     pub divergence_contract: Option<Address>,
@@ -1088,7 +1087,6 @@ pub struct CallFrameRow {
     pub parent_gas_at_call: Option<u64>,
     pub gas_requested_on_stack: Option<u64>,
     pub eip150_cap_binding: Option<bool>,
-    pub state_gas_running: Option<u64>,
     /// Length of the deployed bytecode in bytes. Set only on successful
     /// CREATE / CREATE2 frames (`call_type` is `CREATE`/`CREATE2` and
     /// `success` is true); `None` everywhere else. Used by the EIP-8037
@@ -1680,7 +1678,7 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             baseline_total_gas_spent, baseline_gas_refunded,
             schedule_total_gas_spent, schedule_gas_refunded,
             schedule_intrinsic_gas, schedule_floor_gas,
-            would_fit_in_original_limit, min_multiplier_to_succeed,
+            min_multiplier_to_succeed,
             divergence_contract, divergence_pc, divergence_call_depth, divergence_opcode,
             oog_contract, oog_pc, oog_call_depth, oog_opcode, oog_pattern, oog_gas_remaining,
             oog_chain_proportional, oog_bottleneck_depth, oog_bottleneck_kind,
@@ -1705,7 +1703,7 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
                   ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?,
-                  ?, ?,
+                  ?,
                   ?, ?, ?, ?,
                   ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?,
@@ -1746,7 +1744,6 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             row.schedule_gas_refunded.map(|v| v as i64),
             row.schedule_intrinsic_gas.map(|v| v as i64),
             row.schedule_floor_gas.map(|v| v as i64),
-            row.would_fit_in_original_limit,
             row.min_multiplier_to_succeed,
             row.divergence_contract.map(|a| format!("{a:#x}")),
             row.divergence_pc.map(|v| v as i64),
@@ -1814,11 +1811,11 @@ fn insert_call_frame(
             from_address, to_address, code_address, codehash, call_type,
             selector, value_wei, gas_provided, gas_used, gas_margin,
             success, parent_gas_at_call, gas_requested_on_stack,
-            eip150_cap_binding, state_gas_running, deployed_bytecode_len,
+            eip150_cap_binding, deployed_bytecode_len,
             repricing_gas_delta,
             caller_pc, was_precompile, precompile_address,
             gas_remaining_at_fail, is_divergent_frame
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?, ?)",
         params![
             divergence_id as i64,
@@ -1840,7 +1837,6 @@ fn insert_call_frame(
             row.parent_gas_at_call.map(|v| v as i64),
             row.gas_requested_on_stack.map(|v| v as i64),
             row.eip150_cap_binding,
-            row.state_gas_running.map(|v| v as i64),
             row.deployed_bytecode_len.map(|v| v as i64),
             row.repricing_gas_delta,
             row.caller_pc.map(|v| v as i64),
@@ -2147,7 +2143,6 @@ mod tests {
                 parent_gas_at_call: None,
                 gas_requested_on_stack: None,
                 eip150_cap_binding: None,
-                state_gas_running: None,
                 deployed_bytecode_len: None,
                 repricing_gas_delta: 0,
                 ..Default::default()
@@ -2386,7 +2381,6 @@ mod tests {
                     parent_gas_at_call: None,
                     gas_requested_on_stack: None,
                     eip150_cap_binding: None,
-                    state_gas_running: None,
                     deployed_bytecode_len: None,
                     repricing_gas_delta: 0,
                     ..Default::default()
@@ -2518,7 +2512,6 @@ mod tests {
                     parent_gas_at_call: None,
                     gas_requested_on_stack: None,
                     eip150_cap_binding: None,
-                    state_gas_running: None,
                     deployed_bytecode_len: None,
                     repricing_gas_delta: 0,
                     ..Default::default()
@@ -2580,7 +2573,6 @@ mod tests {
                     parent_gas_at_call: None,
                     gas_requested_on_stack: None,
                     eip150_cap_binding: None,
-                    state_gas_running: None,
                     deployed_bytecode_len: None,
                     repricing_gas_delta: 0,
                     ..Default::default()
@@ -2651,7 +2643,6 @@ mod tests {
                 parent_gas_at_call: None,
                 gas_requested_on_stack: None,
                 eip150_cap_binding: None,
-                state_gas_running: None,
                 deployed_bytecode_len: None,
                 repricing_gas_delta: 0,
                 ..Default::default()
@@ -2717,7 +2708,6 @@ mod tests {
                     parent_gas_at_call: None,
                     gas_requested_on_stack: None,
                     eip150_cap_binding: None,
-                    state_gas_running: None,
                     deployed_bytecode_len: None,
                     repricing_gas_delta: 0,
                     ..Default::default()

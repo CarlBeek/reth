@@ -251,7 +251,6 @@ fn build_call_frame_rows<D: Database>(
                     f.gas_requested_on_stack,
                     f.parent_gas_at_call,
                 ),
-                state_gas_running: None,
                 // For successful CREATE/CREATE2 frames the inspector stashes the
                 // deployed runtime code in `output`; its length is the
                 // deployed-bytecode size EIP-8037 charges CPSB per byte for. All
@@ -2393,7 +2392,6 @@ where
                             schedule_gas_refunded: Some(schedule_gas_refunded),
                             schedule_intrinsic_gas,
                             schedule_floor_gas: Some(schedule_floor_gas),
-                            would_fit_in_original_limit: Some(schedule_success),
                             min_multiplier_to_succeed,
                             divergence_contract: div_loc.as_ref().map(|l| l.contract),
                             divergence_pc: div_loc.as_ref().map(|l| l.pc as u32),

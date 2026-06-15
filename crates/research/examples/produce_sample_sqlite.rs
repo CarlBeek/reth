@@ -60,7 +60,6 @@ fn main() {
             schedule_gas_refunded: Some(0),
             schedule_intrinsic_gas: Some(21_000),
             schedule_floor_gas: Some(21_000),
-            would_fit_in_original_limit: Some(false),
             min_multiplier_to_succeed: Some(1.25),
             divergence_contract: Some(Address::repeat_byte(0x22)),
             divergence_pc: Some(123),
@@ -97,7 +96,6 @@ fn main() {
             parent_gas_at_call: None,
             gas_requested_on_stack: None,
             eip150_cap_binding: None,
-            state_gas_running: None,
             deployed_bytecode_len: None,
             repricing_gas_delta: 0,
             ..Default::default()

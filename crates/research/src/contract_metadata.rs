@@ -615,7 +615,6 @@ mod tests {
                 parent_gas_at_call: None,
                 gas_requested_on_stack: None,
                 eip150_cap_binding: None,
-                state_gas_running: None,
                 deployed_bytecode_len: None,
                 repricing_gas_delta: 0,
                 ..Default::default()
