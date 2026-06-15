@@ -98,7 +98,7 @@ use crate::{
     },
     schedule::{GasSchedule, GasTaxBreakdown, OpcodeContext},
 };
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use revm::{
     bytecode::opcode::OpCode,
     context_interface::ContextTr,
@@ -107,7 +107,7 @@ use revm::{
     },
     Inspector,
 };
-use revm_interpreter::interpreter_types::Jumps;
+use revm_interpreter::interpreter_types::{InputsTr, Jumps, RuntimeFlag};
 use std::{collections::VecDeque, sync::Arc};
 
 /// Whether the instruction result is an OOG-class error (as opposed to a
@@ -866,6 +866,68 @@ where
     (true, is_code)
 }
 
+/// Classify a storage slot for the EIP-8038 storage-reprice drivers (F8),
+/// **read-only**. Returns `(is_cold, current)`.
+///
+/// `sload_skip_cold_load(.., skip_cold_load = true)` never warms the slot:
+/// `Ok` for an already-warm slot (carrying its current journaled value) and
+/// `ColdLoadSkipped` for a cold one (short-circuiting before any DB load). A
+/// cold slot's current value equals its committed `original`, so `current` is
+/// `None` there and the caller substitutes the committed value.
+fn classify_storage_slot<CTX>(context: &mut CTX, addr: Address, key: U256) -> (bool, Option<U256>)
+where
+    CTX: ContextTr,
+{
+    use revm::context_interface::{journaled_state::JournalLoadError, JournalTr};
+
+    match context.journal_mut().sload_skip_cold_load(addr, key, true) {
+        Ok(load) => (false, Some(load.data)),
+        Err(JournalLoadError::ColdLoadSkipped) => (true, None),
+        Err(JournalLoadError::DBError(err)) => {
+            tracing::warn!(target: "exex::research", %addr, ?err, "cold-storage classification: journal load failed; treating as warm");
+            (false, None)
+        }
+    }
+}
+
+/// EIP-2200 / EIP-3529 SSTORE outcome buckets (mutually exclusive), the
+/// repricing drivers for EIP-8038's `STORAGE_WRITE` / `REFUND_STORAGE_CLEAR`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SstoreTransition {
+    /// `current == new` — no state change (warm read cost only).
+    Noop,
+    /// Clean slot (`original == current`), `original == 0`, `new != 0` — a fresh
+    /// set. Charged `STORAGE_WRITE`.
+    Set,
+    /// Clean slot, `original != 0`, `new != 0`, `new != original` — overwrite.
+    /// Charged `STORAGE_WRITE`.
+    Reset,
+    /// Clean slot, `original != 0`, `new == 0` — clear. Charged `STORAGE_WRITE`
+    /// and earns `REFUND_STORAGE_CLEAR`.
+    Clear,
+    /// Slot already dirtied earlier this tx (`original != current`) — rewrite at
+    /// the warm rate, no fresh write surcharge.
+    Dirty,
+}
+
+/// Classify an SSTORE from its EIP-2200 `(original, current, new)` triple.
+fn classify_sstore_transition(original: U256, current: U256, new: U256) -> SstoreTransition {
+    if current == new {
+        return SstoreTransition::Noop;
+    }
+    if original != current {
+        return SstoreTransition::Dirty;
+    }
+    // Clean slot (this is the first write to it this tx).
+    if original.is_zero() {
+        SstoreTransition::Set
+    } else if new.is_zero() {
+        SstoreTransition::Clear
+    } else {
+        SstoreTransition::Reset
+    }
+}
+
 impl<CTX> Inspector<CTX, revm::interpreter::interpreter::EthInterpreter> for ScheduleInspector
 where
     CTX: ContextTr,
@@ -934,6 +996,51 @@ where
                     self.op_counts.cold_account_nocode_count += 1;
                 }
             }
+        }
+
+        // EIP-8038 storage-reprice drivers (F8): classify SLOAD/SSTORE slot
+        // cold/warm read-only, and the SSTORE (original, current, new)
+        // transition. The storage context is the executing frame's
+        // `target_address` — revm's own source for these opcodes
+        // (`instructions::host::{sload,sstore}`) — so DELEGATECALL and the root
+        // frame are handled uniformly. Classified *before* execution so the
+        // cold/warm read mirrors what revm charges, without warming the slot.
+        use revm::context_interface::Database;
+        match self.current_opcode {
+            0x54 => {
+                if let Ok(key) = interp.stack.peek(0) {
+                    let addr = interp.input.target_address();
+                    let (is_cold, _current) = classify_storage_slot(context, addr, key);
+                    if is_cold {
+                        self.op_counts.sload_cold_count += 1;
+                    } else {
+                        self.op_counts.sload_warm_count += 1;
+                    }
+                }
+            }
+            // A static-context SSTORE is rejected by revm before it writes, so
+            // skip it rather than count a write that never happens.
+            0x55 if !interp.runtime_flag.is_static() => {
+                if let (Ok(key), Ok(new)) = (interp.stack.peek(0), interp.stack.peek(1)) {
+                    let addr = interp.input.target_address();
+                    let (is_cold, current) = classify_storage_slot(context, addr, key);
+                    if is_cold {
+                        self.op_counts.sstore_cold_count += 1;
+                    }
+                    // `original` = committed value (DB layer, below the journal's
+                    // warm set). For a cold slot `current` equals `original`.
+                    let original = context.db_mut().storage(addr, key).unwrap_or(U256::ZERO);
+                    let current = current.unwrap_or(original);
+                    match classify_sstore_transition(original, current, new) {
+                        SstoreTransition::Noop => self.op_counts.sstore_noop_count += 1,
+                        SstoreTransition::Set => self.op_counts.sstore_set_count += 1,
+                        SstoreTransition::Reset => self.op_counts.sstore_reset_count += 1,
+                        SstoreTransition::Clear => self.op_counts.sstore_clear_count += 1,
+                        SstoreTransition::Dirty => self.op_counts.sstore_dirty_count += 1,
+                    }
+                }
+            }
+            _ => {}
         }
 
         // Cache variable-cost opcode parameters from the stack before execution
@@ -1486,6 +1593,25 @@ where
 mod tests {
     use super::*;
     use crate::schedule::{BaselineSchedule, CsvPricingSchedule};
+
+    /// F8: the EIP-2200 SSTORE transition buckets over the canonical
+    /// (original, current, new) cases.
+    #[test]
+    fn sstore_transition_classification() {
+        let z = U256::ZERO;
+        let a = U256::from(1);
+        let b = U256::from(2);
+        // current == new → no-op, regardless of original.
+        assert_eq!(classify_sstore_transition(a, b, b), SstoreTransition::Noop);
+        assert_eq!(classify_sstore_transition(z, z, z), SstoreTransition::Noop);
+        // Clean slot (original == current):
+        assert_eq!(classify_sstore_transition(z, z, a), SstoreTransition::Set); // 0 → nonzero
+        assert_eq!(classify_sstore_transition(a, a, z), SstoreTransition::Clear); // nonzero → 0
+        assert_eq!(classify_sstore_transition(a, a, b), SstoreTransition::Reset); // nonzero → other nonzero
+                                                                                  // Already dirtied this tx (original != current) → dirty re-write.
+        assert_eq!(classify_sstore_transition(z, a, b), SstoreTransition::Dirty);
+        assert_eq!(classify_sstore_transition(a, b, z), SstoreTransition::Dirty);
+    }
 
     #[test]
     fn test_schedule_inspector_new() {

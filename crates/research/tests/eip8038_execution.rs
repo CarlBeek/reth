@@ -266,3 +266,33 @@ fn cold_new_slot_sstore_charges_8038_cost() {
          got gas_used={gas_used}"
     );
 }
+
+/// F8: the storage-reprice driver counters populate from a real execution
+/// covering a cold fresh-set, a same-tx dirty re-write, and a cold + a warm
+/// SLOAD.
+#[test]
+fn storage_reprice_drivers_counted() {
+    // PUSH1 1, PUSH1 0, SSTORE   → slot0 = 1 (cold, set)
+    // PUSH1 2, PUSH1 0, SSTORE   → slot0 = 2 (warm, dirty: original 0, current 1, new 2)
+    // PUSH1 0, SLOAD, POP        → SLOAD slot0 (warm — already touched by the SSTOREs)
+    // PUSH1 1, SLOAD, POP        → SLOAD slot1 (cold — never touched)
+    // STOP
+    let code = [
+        0x60, 0x01, 0x60, 0x00, 0x55, // SSTORE slot0 = 1
+        0x60, 0x02, 0x60, 0x00, 0x55, // SSTORE slot0 = 2
+        0x60, 0x00, 0x54, 0x50, // SLOAD slot0, POP
+        0x60, 0x01, 0x54, 0x50, // SLOAD slot1, POP
+        0x00, // STOP
+    ];
+    let (_, insp) = run_eip8038_inspected(&code, &[]);
+    let oc = insp.operation_counts();
+
+    assert_eq!(oc.sstore_set_count, 1, "0→1 on a clean slot is a set");
+    assert_eq!(oc.sstore_dirty_count, 1, "1→2 on an already-written slot is dirty");
+    assert_eq!(oc.sstore_reset_count, 0);
+    assert_eq!(oc.sstore_clear_count, 0);
+    assert_eq!(oc.sstore_noop_count, 0);
+    assert_eq!(oc.sstore_cold_count, 1, "only the first SSTORE touched slot0 cold");
+    assert_eq!(oc.sload_cold_count, 1, "slot1 SLOAD is cold");
+    assert_eq!(oc.sload_warm_count, 1, "slot0 SLOAD is warm (touched by the SSTOREs)");
+}

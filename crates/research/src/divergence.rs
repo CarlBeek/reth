@@ -219,6 +219,36 @@ pub struct OperationCounts {
     /// Running sum of the unclassified category — multipliers, CSV deltas (F12).
     #[serde(default)]
     pub tax_other: i64,
+
+    // EIP-8038 storage-reprice drivers (F8) — read-only per-opcode counts that
+    // attribute the native storage surcharges (`COLD_STORAGE_ACCESS`,
+    // `STORAGE_WRITE`, `REFUND_STORAGE_CLEAR`), which never touch
+    // `additional_gas_charged`. Collected for every schedule.
+    /// Cold SLOAD accesses (drive `COLD_STORAGE_ACCESS` on reads).
+    #[serde(default)]
+    pub sload_cold_count: u64,
+    /// Warm SLOAD accesses.
+    #[serde(default)]
+    pub sload_warm_count: u64,
+    /// SSTOREs touching a cold slot (cold first-touch → `COLD_STORAGE_ACCESS`).
+    #[serde(default)]
+    pub sstore_cold_count: u64,
+    /// SSTORE fresh-set transitions (0 → nonzero on a clean slot) → `STORAGE_WRITE`.
+    #[serde(default)]
+    pub sstore_set_count: u64,
+    /// SSTORE reset transitions (nonzero → other nonzero on a clean slot) → `STORAGE_WRITE`.
+    #[serde(default)]
+    pub sstore_reset_count: u64,
+    /// SSTORE clear transitions (nonzero → 0 on a clean slot) → `STORAGE_WRITE` +
+    /// `REFUND_STORAGE_CLEAR`.
+    #[serde(default)]
+    pub sstore_clear_count: u64,
+    /// SSTORE no-ops (`current == new`) — warm read cost only.
+    #[serde(default)]
+    pub sstore_noop_count: u64,
+    /// SSTORE re-writes of a slot already changed this tx (`original != current`) — warm rate.
+    #[serde(default)]
+    pub sstore_dirty_count: u64,
 }
 
 /// Location where divergence first occurred.
