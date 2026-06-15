@@ -52,7 +52,7 @@
 
 use super::{
     context::{OpcodeContext, TxContext},
-    traits::{GasSchedule, ScheduleKind},
+    traits::{GasSchedule, GasTaxBreakdown, ScheduleKind},
 };
 use reth_evm::EvmEnv;
 use revm::{
@@ -258,7 +258,12 @@ impl GasSchedule for Eip8038Schedule {
     }
 
     fn opcode_gas_delta(&self, opcode: u8, ctx: &OpcodeContext) -> i64 {
-        let mut delta: i64 = 0;
+        // Single source of truth: the per-category breakdown's total (F12).
+        self.opcode_gas_tax_breakdown(opcode, ctx).total()
+    }
+
+    fn opcode_gas_tax_breakdown(&self, opcode: u8, ctx: &OpcodeContext) -> GasTaxBreakdown {
+        let mut b = GasTaxBreakdown::default();
 
         // Warm-base correction (the misilva73 WARM_ACCESS 100 → 62 decrease).
         // revm charges these opcodes' warm static leg from a hardcoded const gas
@@ -268,13 +273,14 @@ impl GasSchedule for Eip8038Schedule {
         // back-solved against the 62 warm base, so warm and cold totals both land
         // on the proposed values once this delta is applied.
         if has_native_warm_static(opcode) {
-            delta += Eip8038Constants::WARM_ACCESS.1 as i64 - NATIVE_WARM_STORAGE_READ_GAS as i64;
+            b.warm_base +=
+                Eip8038Constants::WARM_ACCESS.1 as i64 - NATIVE_WARM_STORAGE_READ_GAS as i64;
         }
 
         // EXTCODESIZE / EXTCODECOPY model a second DB read: a flat extra warm
         // access on top of the normal account-access charge.
         if matches!(opcode, 0x3B | 0x3C) {
-            delta += Eip8038Constants::WARM_ACCESS.1 as i64;
+            b.second_db_read += Eip8038Constants::WARM_ACCESS.1 as i64;
         }
 
         // Cold-account CODE surcharge: revm charged the `NO_CODE` baseline (set in
@@ -282,10 +288,10 @@ impl GasSchedule for Eip8038Schedule {
         // code. The inspector populates the classification on `OpcodeContext`;
         // for non-account opcodes / pure EOAs the flags are false.
         if ctx.target_is_cold && ctx.target_is_code && is_account_access_opcode(opcode) {
-            delta += Eip8038Constants::COLD_ACCOUNT_CODE_SURCHARGE as i64;
+            b.cold_code += Eip8038Constants::COLD_ACCOUNT_CODE_SURCHARGE as i64;
         }
 
-        delta
+        b
     }
 
     fn configure_evm_env(&self, env: &mut EvmEnv<SpecId>) -> bool {
@@ -431,6 +437,36 @@ mod tests {
         assert_eq!(s.opcode_gas_delta(0x3C, &cold_code), warm_fix + 62 + 5_991);
         // SLOAD is storage, not an account access: warm-base correction, no surcharge.
         assert_eq!(s.opcode_gas_delta(0x54, &cold_code), warm_fix);
+    }
+
+    /// F12: the per-category breakdown decomposes the delta correctly and its
+    /// total always reconciles to `opcode_gas_delta`.
+    #[test]
+    fn opcode_gas_tax_breakdown_decomposes_and_reconciles() {
+        let s = Eip8038Schedule::new();
+        let warm_fix = Eip8038Constants::WARM_ACCESS.1 as i64 - NATIVE_WARM_STORAGE_READ_GAS as i64;
+        let cold_code = OpcodeContext::default().with_target_classification(true, true);
+
+        // Cold EXTCODECOPY to a contract: all three opcode-delta categories fire.
+        let b = s.opcode_gas_tax_breakdown(0x3C, &cold_code);
+        assert_eq!(b.warm_base, warm_fix);
+        assert_eq!(b.second_db_read, 62);
+        assert_eq!(b.cold_code, 5_991);
+        assert_eq!(b.other, 0);
+        // Invariant: total() == opcode_gas_delta for every opcode/context.
+        for opcode in [0x00u8, 0x31, 0x3B, 0x3C, 0x3F, 0x54, 0xF1, 0xFA] {
+            for ctx in [
+                OpcodeContext::default(),
+                OpcodeContext::default().with_target_classification(true, true),
+                OpcodeContext::default().with_target_classification(true, false),
+            ] {
+                assert_eq!(
+                    s.opcode_gas_tax_breakdown(opcode, &ctx).total(),
+                    s.opcode_gas_delta(opcode, &ctx),
+                    "breakdown total must equal delta for opcode {opcode:#x}"
+                );
+            }
+        }
     }
 
     fn ctx(is_create: bool, accounts: u64, slots: u64) -> TxContext {

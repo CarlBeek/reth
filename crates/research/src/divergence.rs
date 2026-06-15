@@ -204,6 +204,21 @@ pub struct OperationCounts {
     /// empty / non-existent) — the EIP-8038 `NO_CODE` cohort.
     #[serde(default)]
     pub cold_account_nocode_count: u64,
+
+    /// Running sum of the warm-base-correction repricing category (F12). The
+    /// four `tax_*` sums reconcile to the tx's `additional_gas_charged`. See
+    /// `schedule::GasTaxBreakdown`.
+    #[serde(default)]
+    pub tax_warm_base: i64,
+    /// Running sum of the cold-account-CODE-surcharge category (F12).
+    #[serde(default)]
+    pub tax_cold_code: i64,
+    /// Running sum of the EXTCODE* second-DB-read category (F12).
+    #[serde(default)]
+    pub tax_second_db_read: i64,
+    /// Running sum of the unclassified category — multipliers, CSV deltas (F12).
+    #[serde(default)]
+    pub tax_other: i64,
 }
 
 /// Location where divergence first occurred.

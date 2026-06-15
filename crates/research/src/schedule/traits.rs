@@ -19,6 +19,37 @@ pub enum ScheduleKind {
     None,
 }
 
+/// Per-category decomposition of a single opcode's gas delta (F12).
+///
+/// The fields sum to [`GasSchedule::opcode_gas_delta`] for the same opcode and
+/// context — an invariant the inspector relies on so per-category running sums
+/// reconcile to the total repricing surcharge. Categories reflect EIP-8038's
+/// layer-3 deltas; schedules that don't decompose put the whole delta in
+/// `other` (the default).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GasTaxBreakdown {
+    /// Warm-base correction (the misilva73 `WARM_ACCESS` 100 → 62 decrease).
+    pub warm_base: i64,
+    /// Cold-account CODE surcharge (cold target carrying code).
+    pub cold_code: i64,
+    /// EXTCODESIZE / EXTCODECOPY second-DB-read flat add-on.
+    pub second_db_read: i64,
+    /// Everything else (uniform multipliers, CSV deltas, unclassified).
+    pub other: i64,
+}
+
+impl GasTaxBreakdown {
+    /// A breakdown that attributes the whole delta to `other`.
+    pub const fn other(delta: i64) -> Self {
+        Self { warm_base: 0, cold_code: 0, second_db_read: 0, other: delta }
+    }
+
+    /// Total delta — must equal `opcode_gas_delta` for the same inputs.
+    pub const fn total(&self) -> i64 {
+        self.warm_base + self.cold_code + self.second_db_read + self.other
+    }
+}
+
 /// Defines how gas costs are modified for a specific experiment.
 ///
 /// Implementations of this trait represent different gas schedule experiments
@@ -117,6 +148,16 @@ pub trait GasSchedule: Send + Sync + Debug {
     fn opcode_gas_delta(&self, opcode: u8, ctx: &OpcodeContext) -> i64 {
         let _ = (opcode, ctx);
         0
+    }
+
+    /// Per-category decomposition of [`Self::opcode_gas_delta`] (F12).
+    ///
+    /// The returned [`GasTaxBreakdown`]'s `total()` MUST equal
+    /// `opcode_gas_delta(opcode, ctx)`. The default attributes the whole delta
+    /// to `other`; only schedules whose delta combines distinct repricing
+    /// effects (EIP-8038) override this to split them.
+    fn opcode_gas_tax_breakdown(&self, opcode: u8, ctx: &OpcodeContext) -> GasTaxBreakdown {
+        GasTaxBreakdown::other(self.opcode_gas_delta(opcode, ctx))
     }
 
     /// Get additional gas to charge for a precompile call.

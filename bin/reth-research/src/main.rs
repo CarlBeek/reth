@@ -1455,6 +1455,12 @@ where
                 /// F4: cumulative repricing surcharge the inspector charged
                 /// this tx (`ScheduleResult::additional_gas`). Signed.
                 additional_gas: i64,
+                /// F12: per-category decomposition of `additional_gas` (their
+                /// sum reconciles to it).
+                tax_warm_base: i64,
+                tax_cold_code: i64,
+                tax_second_db_read: i64,
+                tax_other: i64,
                 /// F1: structured failure reason — the `HaltReason` discriminant
                 /// (`OutOfGas`, `StackOverflow`, …), `"Revert"`, or `None` on
                 /// success.
@@ -1744,6 +1750,10 @@ where
                                 // Rejected replay never executed an opcode → no
                                 // surcharge applied.
                                 additional_gas: 0,
+                                tax_warm_base: 0,
+                                tax_cold_code: 0,
+                                tax_second_db_read: 0,
+                                tax_other: 0,
                                 // Rejected before execution: revm refused the tx
                                 // outright (the `{e:?}` is in `oog_info`).
                                 failure_reason: Some("Rejected".to_string()),
@@ -1927,6 +1937,10 @@ where
                             inspector.operation_counts().cold_account_nocode_count,
                         ),
                         additional_gas: insp_result.additional_gas,
+                        tax_warm_base: inspector.operation_counts().tax_warm_base,
+                        tax_cold_code: inspector.operation_counts().tax_cold_code,
+                        tax_second_db_read: inspector.operation_counts().tax_second_db_read,
+                        tax_other: inspector.operation_counts().tax_other,
                         failure_reason,
                         revert_data,
                         revert_decoded,
@@ -2465,6 +2479,15 @@ where
                             gas_div_pc: gas_div.as_ref().map(|l| l.pc as u32),
                             gas_div_call_depth: gas_div.as_ref().map(|l| l.call_depth as i32),
                             gas_div_opcode: gas_div.as_ref().map(|l| l.opcode),
+                            // F12: per-category tax breakdown. The opcode-delta
+                            // categories sum to additional_gas_charged; intrinsic
+                            // is the separate tx-level intrinsic delta.
+                            tax_warm_base: exec_result.map(|r| r.tax_warm_base),
+                            tax_cold_code: exec_result.map(|r| r.tax_cold_code),
+                            tax_second_db_read: exec_result.map(|r| r.tax_second_db_read),
+                            tax_other: exec_result.map(|r| r.tax_other),
+                            tax_intrinsic: schedule_intrinsic_gas
+                                .map(|s| s as i64 - baseline_intrinsic_gas as i64),
                         };
 
                         // Codehashes come from the historical state we already

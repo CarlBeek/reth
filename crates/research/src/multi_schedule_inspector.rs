@@ -96,7 +96,7 @@ use crate::{
         CallFrame, CallType, DivergenceLocation, EventLog, FrameOpcodeCounts, OogPattern,
         OperationCounts, OutOfGasInfo, PerFrameCapture, MAX_TRACKED_FRAMES,
     },
-    schedule::{GasSchedule, OpcodeContext},
+    schedule::{GasSchedule, GasTaxBreakdown, OpcodeContext},
 };
 use alloy_primitives::Address;
 use revm::{
@@ -710,6 +710,15 @@ impl ScheduleInspector {
         }
     }
 
+    /// Accumulate a per-opcode tax breakdown into the tx's running per-category
+    /// sums (F12). The sum of these reconciles to `additional_gas_charged`.
+    const fn accumulate_tax(op_counts: &mut OperationCounts, b: &GasTaxBreakdown) {
+        op_counts.tax_warm_base += b.warm_base;
+        op_counts.tax_cold_code += b.cold_code;
+        op_counts.tax_second_db_read += b.second_db_read;
+        op_counts.tax_other += b.other;
+    }
+
     /// Apply a gas delta to the interpreter, recording divergence/OOG as needed.
     ///
     /// Returns `true` if execution should continue, `false` if OOG halted the
@@ -1010,11 +1019,16 @@ where
         // feeds into the 63/64 gas forwarding rule for the subcall.
         if Self::is_call_or_create(self.current_opcode) {
             let opcode_ctx = self.build_opcode_context(interp);
-            let gas_delta = self.schedule.opcode_gas_delta(self.current_opcode, &opcode_ctx);
+            // F12: the breakdown's total equals `opcode_gas_delta`, so gas
+            // behavior is unchanged; we additionally fold the categories in.
+            let breakdown =
+                self.schedule.opcode_gas_tax_breakdown(self.current_opcode, &opcode_ctx);
+            let gas_delta = breakdown.total();
             if gas_delta != 0 {
                 self.call_delta_pre_applied = true;
                 self.pending_pre_applied_delta = gas_delta;
                 Self::record_opcode_gas_delta(&mut self.op_counts, self.current_opcode, gas_delta);
+                Self::accumulate_tax(&mut self.op_counts, &breakdown);
                 if !self.apply_gas_delta(interp, gas_delta, self.current_opcode) { // OOG — interpreter is halted, don't continue
                 }
             }
@@ -1046,17 +1060,22 @@ where
         };
 
         let opcode_ctx = self.build_opcode_context(interp);
-        let explicit_gas_delta = if self.call_delta_pre_applied {
-            0
+        // F12: explicit breakdown (empty when the delta was pre-applied in
+        // step()); its total equals the old `explicit_gas_delta`.
+        let explicit_breakdown = if self.call_delta_pre_applied {
+            GasTaxBreakdown::default()
         } else {
-            self.schedule.opcode_gas_delta(current_opcode, &opcode_ctx)
+            self.schedule.opcode_gas_tax_breakdown(current_opcode, &opcode_ctx)
         };
         // Uniform multipliers are derived from the EVM's observed native cost
         // after the opcode has executed. That makes them work for the live
         // schedule path, but unlike explicit additive deltas they do not feed
-        // into CALL/CREATE gas forwarding before dispatch.
+        // into CALL/CREATE gas forwarding before dispatch. Multipliers are
+        // unclassified → `other`.
         let multiplier_gas_delta = self.multiplier_gas_delta(actual_gas_cost);
-        let gas_delta = explicit_gas_delta.saturating_add(multiplier_gas_delta);
+        let mut tax_breakdown = explicit_breakdown;
+        tax_breakdown.other = tax_breakdown.other.saturating_add(multiplier_gas_delta);
+        let gas_delta = tax_breakdown.total();
 
         // Per-frame gas accounting. `actual_gas_cost` includes any delta
         // pre-applied in `step()` (CALL/CREATE pre-deduction); subtract it
@@ -1078,6 +1097,9 @@ where
 
         if gas_delta != 0 {
             Self::record_opcode_gas_delta(&mut self.op_counts, current_opcode, gas_delta);
+            // F12: the step()-pre-applied portion was already folded in; here we
+            // add the step_end portion (explicit-if-not-pre-applied + multiplier).
+            Self::accumulate_tax(&mut self.op_counts, &tax_breakdown);
             self.apply_gas_delta(interp, gas_delta, current_opcode);
         }
     }

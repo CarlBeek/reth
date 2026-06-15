@@ -103,6 +103,9 @@ use thiserror::Error;
 ///   `code_address` are now split (F3): `to_address` is the call/storage target (the proxy under
 ///   DELEGATECALL) while `code_address` is the code holder (the implementation, revm
 ///   `bytecode_address`); `codehash` and the metadata backfill resolve from `code_address` (F14).
+///   `divergences` also gains the F12 per-category tax decomposition `tax_warm_base` /
+///   `tax_cold_code` / `tax_second_db_read` / `tax_other` (these four sum to
+///   `additional_gas_charged`) plus `tax_intrinsic` (the tx-level intrinsic-gas delta).
 ///   `divergence_call_frames` and `divergence_opcode_counts` gain a `trace_kind` (`"schedule"` /
 ///   `"baseline"`) in their primary key, mirroring `divergence_event_logs`, so a drill-in whose
 ///   call tree diverged also stores the baseline call tree (F15) and baseline opcode counts (F11).
@@ -562,6 +565,15 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             gas_div_pc                  INTEGER,
             gas_div_call_depth          INTEGER,
             gas_div_opcode              INTEGER,
+
+            -- F12: per-category decomposition of the repricing tax. The first
+            -- four sum to additional_gas_charged; tax_intrinsic is the separate
+            -- tx-level intrinsic delta.
+            tax_warm_base               INTEGER,
+            tax_cold_code               INTEGER,
+            tax_second_db_read          INTEGER,
+            tax_other                   INTEGER,
+            tax_intrinsic               INTEGER,
 
             UNIQUE (schedule_name, block_number, tx_index, schedule_config_hash)
         );",
@@ -1039,6 +1051,16 @@ pub struct DivergenceRow {
     pub gas_div_pc: Option<u32>,
     pub gas_div_call_depth: Option<i32>,
     pub gas_div_opcode: Option<u8>,
+
+    /// Per-category decomposition of the repricing tax (F12). The opcode-delta
+    /// categories (`warm_base` / `cold_code` / `second_db_read` / `other`) sum
+    /// to `additional_gas_charged`; `tax_intrinsic` is the separate tx-level
+    /// intrinsic-gas delta (schedule − baseline). `None` on the reject path.
+    pub tax_warm_base: Option<i64>,
+    pub tax_cold_code: Option<i64>,
+    pub tax_second_db_read: Option<i64>,
+    pub tax_other: Option<i64>,
+    pub tax_intrinsic: Option<i64>,
 }
 
 /// One frame row destined for `divergence_call_frames`. `call_index` and
@@ -1674,7 +1696,8 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             failure_reason, revert_data, revert_decoded, tx_output,
             baseline_frame_success, baseline_frame_gas_used,
             baseline_frame_gas_provided, surcharge_at_oog,
-            gas_div_contract, gas_div_pc, gas_div_call_depth, gas_div_opcode
+            gas_div_contract, gas_div_pc, gas_div_call_depth, gas_div_opcode,
+            tax_warm_base, tax_cold_code, tax_second_db_read, tax_other, tax_intrinsic
         ) VALUES (?, ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?,
@@ -1694,7 +1717,8 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
                   ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?, ?, ?,
-                  ?, ?, ?, ?)",
+                  ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?)",
         params![
             row.schedule_name,
             row.schedule_config_hash,
@@ -1768,6 +1792,11 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             row.gas_div_pc.map(|v| v as i64),
             row.gas_div_call_depth,
             row.gas_div_opcode.map(|v| v as i64),
+            row.tax_warm_base,
+            row.tax_cold_code,
+            row.tax_second_db_read,
+            row.tax_other,
+            row.tax_intrinsic,
         ],
     )?;
     Ok(tx.last_insert_rowid() as u64)

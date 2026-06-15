@@ -51,4 +51,4 @@ pub use eip8038::{
 };
 pub use multiplier::MultiplierSchedule;
 pub use registry::{ScheduleError, ScheduleRegistry};
-pub use traits::{GasSchedule, ScheduleKind};
+pub use traits::{GasSchedule, GasTaxBreakdown, ScheduleKind};
