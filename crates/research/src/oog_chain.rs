@@ -253,6 +253,7 @@ mod tests {
             was_precompile: false,
             precompile_address: None,
             gas_remaining_at_fail: None,
+            storage_target: None,
             gas_requested_on_stack,
             parent_gas_at_call,
         }

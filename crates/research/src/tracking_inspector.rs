@@ -321,6 +321,9 @@ where
                 was_precompile: false,
                 precompile_address: None,
                 gas_remaining_at_fail: None,
+                // F3: baseline frames don't carry the storage-target split; the
+                // schedule trace is the forensic surface for the code_address.
+                storage_target: None,
             });
         }
     }
@@ -386,6 +389,9 @@ where
                 was_precompile: false,
                 precompile_address: None,
                 gas_remaining_at_fail: None,
+                // F3: baseline frames don't carry the storage-target split; the
+                // schedule trace is the forensic surface for the code_address.
+                storage_target: None,
             });
         }
     }

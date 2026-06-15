@@ -230,12 +230,12 @@ fn build_call_frame_rows<D: Database>(
                 parent_call_index: parent_call_indices[i],
                 depth: f.depth as u32,
                 from_address: f.from,
-                to_address: f.to.unwrap_or_default(),
-                // For non-DELEGATECALL frames this equals `to_address`; once the
-                // inspector splits storage-context vs code-holder for
-                // DELEGATECALL, this column will carry the code holder while
-                // `to_address` carries the storage target. Today both come from
-                // the same source.
+                // F3: `to_address` is the call/storage target (the proxy under
+                // DELEGATECALL); `code_address` is the code holder (the
+                // implementation, revm `bytecode_address`). For ordinary calls
+                // they're equal. `codehash` is fetched from the code holder, so
+                // it identifies the executed code rather than the proxy.
+                to_address: f.storage_target.or(f.to).unwrap_or_default(),
                 code_address: f.to,
                 codehash,
                 call_type: format_call_type(&f.call_type),
@@ -3033,6 +3033,7 @@ mod tests {
             was_precompile: false,
             precompile_address: None,
             gas_remaining_at_fail: None,
+            storage_target: None,
         }
     }
 

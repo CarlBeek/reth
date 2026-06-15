@@ -1258,6 +1258,9 @@ where
                     .was_precompile_called
                     .then_some(inputs.bytecode_address),
                 gas_remaining_at_fail: (!call_success).then(|| outcome.result.gas.remaining()),
+                // F3: storage/call target, distinct from `to` (the code holder)
+                // under DELEGATECALL.
+                storage_target: Some(inputs.target_address),
             });
 
             // Propagate per-frame positive delta flag to parent.
@@ -1401,6 +1404,8 @@ where
                 was_precompile: false,
                 precompile_address: None,
                 gas_remaining_at_fail: (!create_success).then(|| outcome.result.gas.remaining()),
+                // F3: CREATE has no separate storage target.
+                storage_target: None,
             });
 
             // Propagate per-frame positive delta flag to parent.

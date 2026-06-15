@@ -393,6 +393,14 @@ pub struct CallFrame {
     /// the structural call-tree comparison.
     #[serde(default)]
     pub gas_remaining_at_fail: Option<u64>,
+
+    /// Storage/call target (revm `target_address`) when it differs from `to`
+    /// (which carries the code holder / `bytecode_address`) — i.e. the proxy
+    /// under a DELEGATECALL (F3). `None` for CREATE and when uncaptured; equals
+    /// `to` for ordinary calls. Excluded from the structural call-tree
+    /// comparison.
+    #[serde(default)]
+    pub storage_target: Option<Address>,
 }
 
 /// Type of call.

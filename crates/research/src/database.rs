@@ -99,13 +99,16 @@ use thiserror::Error;
 ///   instant) and the `gas_div_*` quad (F10 first opcode where cumulative schedule gas exceeded
 ///   baseline); `divergence_call_frames` gains `repricing_gas_delta` (F4 per-frame surcharge) and
 ///   the F9 failing-frame context (`caller_pc` / `was_precompile` / `precompile_address` /
-///   `gas_remaining_at_fail` / `is_divergent_frame`). `divergence_call_frames` and
-///   `divergence_opcode_counts` gain a `trace_kind` (`"schedule"` / `"baseline"`) in their primary
-///   key, mirroring `divergence_event_logs`, so a drill-in whose call tree diverged also stores the
-///   baseline call tree (F15) and baseline opcode counts (F11). There is no in-place migration:
-///   opening a pre-v10 database is rejected by [`enforce_schema_version`] (via `PRAGMA
-///   user_version`) — wipe the divergences `SQLite` and re-gather. The archive datadir is never
-///   touched.
+///   `gas_remaining_at_fail` / `is_divergent_frame`). `divergence_call_frames.to_address` /
+///   `code_address` are now split (F3): `to_address` is the call/storage target (the proxy under
+///   DELEGATECALL) while `code_address` is the code holder (the implementation, revm
+///   `bytecode_address`); `codehash` and the metadata backfill resolve from `code_address` (F14).
+///   `divergence_call_frames` and `divergence_opcode_counts` gain a `trace_kind` (`"schedule"` /
+///   `"baseline"`) in their primary key, mirroring `divergence_event_logs`, so a drill-in whose
+///   call tree diverged also stores the baseline call tree (F15) and baseline opcode counts (F11).
+///   There is no in-place migration: opening a pre-v10 database is rejected by
+///   [`enforce_schema_version`] (via `PRAGMA user_version`) — wipe the divergences `SQLite` and
+///   re-gather. The archive datadir is never touched.
 pub const SCHEMA_VERSION: u32 = 10;
 
 /// Errors raised by the storage layer.
@@ -1337,36 +1340,42 @@ impl DivergenceDatabase {
         Ok(exists.is_some())
     }
 
-    /// Distinct `to_address` values seen across `divergence_call_frames`.
+    /// Distinct `code_address` values seen across `divergence_call_frames`.
     /// Backfill iterates these, fetches bytecode from reth state, hashes
     /// it, and upserts a `contract_metadata` row keyed by codehash.
+    ///
+    /// Keyed on `code_address` (the code holder / implementation), not
+    /// `to_address` (the call/storage target): under DELEGATECALL the solc
+    /// identity belongs to the implementation, so a proxy `to_address` would
+    /// resolve the wrong (or empty) bytecode. (F14)
     pub fn distinct_call_frame_addresses(&self) -> Result<Vec<String>, DatabaseError> {
         let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT to_address FROM divergence_call_frames
-             WHERE to_address IS NOT NULL AND to_address <> ''
-             ORDER BY to_address",
+            "SELECT DISTINCT code_address FROM divergence_call_frames
+             WHERE code_address IS NOT NULL AND code_address <> ''
+             ORDER BY code_address",
         )?;
         let rows =
             stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    /// Addresses with at least one call frame whose codehash is not yet
+    /// Code addresses with at least one call frame whose codehash is not yet
     /// represented in `contract_metadata`. Drives the periodic incremental
     /// backfill so each tick only re-fetches bytecode for genuinely new
     /// (or never-labeled) contracts. NULL `codehash` values match too —
     /// those rows need a fresh fetch to derive a codehash from current
-    /// state.
+    /// state. Keyed on `code_address` (the implementation) — see
+    /// [`Self::distinct_call_frame_addresses`]. (F14)
     pub fn distinct_unlabeled_call_frame_addresses(&self) -> Result<Vec<String>, DatabaseError> {
         let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT dcf.to_address
+            "SELECT DISTINCT dcf.code_address
              FROM divergence_call_frames dcf
              LEFT JOIN contract_metadata cm ON cm.codehash = dcf.codehash
-             WHERE dcf.to_address IS NOT NULL AND dcf.to_address <> ''
+             WHERE dcf.code_address IS NOT NULL AND dcf.code_address <> ''
                AND cm.codehash IS NULL
-             ORDER BY dcf.to_address",
+             ORDER BY dcf.code_address",
         )?;
         let rows =
             stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
@@ -2282,6 +2291,47 @@ mod tests {
         );
     }
 
+    /// F3/F14: under a DELEGATECALL the call frame splits `to_address` (proxy)
+    /// from `code_address` (implementation), and the metadata backfill keys on
+    /// the implementation — not the proxy.
+    #[test]
+    fn metadata_backfill_keys_on_code_address() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        let proxy = Address::repeat_byte(0x11);
+        let implementation = Address::repeat_byte(0x22);
+
+        let drill_in = DrillInRecord {
+            divergence: fixture_divergence(5, 0, false, 1),
+            call_frames: vec![CallFrameRow {
+                call_index: 0,
+                from_address: Address::repeat_byte(0x01),
+                to_address: proxy,
+                code_address: Some(implementation),
+                codehash: Some(B256::repeat_byte(0xcc)),
+                call_type: "DELEGATECALL".to_string(),
+                success: true,
+                ..Default::default()
+            }],
+            opcode_counts: vec![],
+            baseline_call_frames: vec![],
+            baseline_opcode_counts: vec![],
+            baseline_event_logs: vec![],
+            schedule_event_logs: vec![],
+        };
+        db.record_block_output(&BlockOutput {
+            coverage: fixture_coverage("test", 5, 1, 0),
+            summaries: vec![],
+            drill_ins: vec![drill_in],
+            recipients: vec![],
+        })
+        .unwrap();
+
+        // The backfill returns the implementation (code_address), not the proxy.
+        let addrs = db.distinct_call_frame_addresses().unwrap();
+        assert_eq!(addrs, vec![format!("{implementation:#x}")]);
+        assert!(!addrs.contains(&format!("{proxy:#x}")));
+    }
+
     #[test]
     fn delete_block_range_clears_all_per_block_tables() {
         let db = DivergenceDatabase::in_memory().unwrap();
@@ -2427,7 +2477,7 @@ mod tests {
                     depth: 0,
                     from_address: Address::ZERO,
                     to_address: Address::repeat_byte(0xaa),
-                    code_address: None,
+                    code_address: Some(Address::repeat_byte(0xaa)),
                     codehash: None,
                     call_type: "CALL".to_string(),
                     selector: None,
@@ -2489,7 +2539,7 @@ mod tests {
                     depth: 0,
                     from_address: Address::ZERO,
                     to_address: addr,
-                    code_address: None,
+                    code_address: Some(addr),
                     codehash,
                     call_type: "CALL".to_string(),
                     selector: None,

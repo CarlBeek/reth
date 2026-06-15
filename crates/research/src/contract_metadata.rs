@@ -601,7 +601,9 @@ mod tests {
                 depth: 0,
                 from_address: Address::ZERO,
                 to_address: addr,
-                code_address: None,
+                // Backfill keys on code_address (the implementation); in
+                // production it equals the bytecode address (F14).
+                code_address: Some(addr),
                 codehash: None,
                 call_type: "CALL".to_string(),
                 selector: None,
