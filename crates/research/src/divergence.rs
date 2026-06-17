@@ -200,6 +200,19 @@ pub struct OperationCounts {
     #[serde(default)]
     pub cold_account_access_count: u64,
 
+    /// Number of WARM account accesses (already-touched this tx) for the same
+    /// account-access opcodes as [`Self::cold_account_access_count`]. Together
+    /// with the cold count this gives the full account-access split that drives
+    /// EIP-8038's account-touch repricing. Collected for every schedule. (F2)
+    #[serde(default)]
+    pub warm_account_access_count: u64,
+
+    /// Number of CALL/CALLCODE (`0xF1` / `0xF2`) operations that transferred a
+    /// non-zero value. DELEGATECALL / STATICCALL carry no value and are
+    /// excluded. Collected for every schedule. (F2)
+    #[serde(default)]
+    pub value_transfer_count: u64,
+
     /// Running sum of the EXTCODE* second-DB-read repricing category (F12). The
     /// `tax_*` sums reconcile to the tx's `additional_gas_charged`. See
     /// `schedule::GasTaxBreakdown`.
@@ -294,6 +307,64 @@ impl StorageDrivers {
             self.sstore_clear != 0 ||
             self.sstore_noop != 0 ||
             self.sstore_dirty != 0
+    }
+}
+
+/// Account-side gas-driver counts (F2/F3) bundled for the in-memory plumbing
+/// (`PerScheduleResult` / `TxObservation` / the per-class aggregate), mirroring
+/// [`StorageDrivers`]: the five counts map 1:1 to explicit `divergences` /
+/// `block_summaries` columns at insert time. The first three are runtime
+/// inspector counts; the two access-list counts come from the tx envelope (the
+/// same value for every replay tier).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct AccountDrivers {
+    /// Warm account accesses (`OperationCounts::warm_account_access_count`).
+    pub warm_account_access: u64,
+    /// CALL/CALLCODE with non-zero value (`OperationCounts::value_transfer_count`).
+    pub value_transfer: u64,
+    /// CREATE + CREATE2 opcodes (`OperationCounts::create_count`).
+    pub create_opcode: u64,
+    /// EIP-2930 access-list address entries declared by the tx.
+    pub access_list_address: u64,
+    /// EIP-2930 access-list storage-key entries declared by the tx.
+    pub access_list_storage_key: u64,
+}
+
+impl AccountDrivers {
+    /// Snapshot the inspector-derived counts out of an [`OperationCounts`] and
+    /// pair them with the tx-envelope access-list counts.
+    pub const fn from_parts(
+        oc: &OperationCounts,
+        access_list_address: u64,
+        access_list_storage_key: u64,
+    ) -> Self {
+        Self {
+            warm_account_access: oc.warm_account_access_count,
+            value_transfer: oc.value_transfer_count,
+            create_opcode: oc.create_count,
+            access_list_address,
+            access_list_storage_key,
+        }
+    }
+
+    /// Saturating element-wise accumulation (per-class aggregate).
+    pub const fn add(&mut self, o: &Self) {
+        self.warm_account_access = self.warm_account_access.saturating_add(o.warm_account_access);
+        self.value_transfer = self.value_transfer.saturating_add(o.value_transfer);
+        self.create_opcode = self.create_opcode.saturating_add(o.create_opcode);
+        self.access_list_address = self.access_list_address.saturating_add(o.access_list_address);
+        self.access_list_storage_key =
+            self.access_list_storage_key.saturating_add(o.access_list_storage_key);
+    }
+
+    /// Whether any driver fired — gates emitting the aggregate columns.
+    pub const fn any(&self) -> bool {
+        self.warm_account_access != 0 ||
+            self.value_transfer != 0 ||
+            self.create_opcode != 0 ||
+            self.access_list_address != 0 ||
+            self.access_list_storage_key != 0
     }
 }
 

@@ -16,7 +16,7 @@ use crate::{
         BlockCoverageRow, BlockOutput, BlockSummaryRow, DrillInRecord, OpcodeBucketTotal,
         RecipientRow,
     },
-    divergence::{AggregateClass, FrameOpcodeCounts, StorageDrivers},
+    divergence::{AccountDrivers, AggregateClass, FrameOpcodeCounts, StorageDrivers},
 };
 use alloy_primitives::{Address, B256};
 use std::collections::{BTreeMap, HashMap};
@@ -121,6 +121,9 @@ struct ClassAccumulator {
     // EIP-8038 storage-reprice drivers (F8) summed over the class's txs.
     storage_drivers: StorageDrivers,
 
+    // F2/F3 account-side gas drivers summed over the class's txs.
+    account_drivers: AccountDrivers,
+
     // Per-opcode totals — counts + baseline / schedule gas — summed
     // across every frame of every tx in this class for this block.
     // Stored dense (256 wide) for cache-friendly accumulation; emitted
@@ -170,6 +173,7 @@ impl Default for ClassAccumulator {
             tx_count_no_state: 0,
             cold_account_access_sum: 0,
             storage_drivers: StorageDrivers::default(),
+            account_drivers: AccountDrivers::default(),
             opcode_counts: [0; 256],
             opcode_gas_baseline: [0; 256],
             opcode_gas_schedule: [0; 256],
@@ -279,6 +283,9 @@ pub struct TxObservation {
     /// EIP-8038 storage-reprice drivers (F8) for this tx. `None` when the replay
     /// was rejected (unmeasured), so it doesn't dilute the class sum.
     pub storage_drivers: Option<StorageDrivers>,
+    /// Account-side gas drivers (F2/F3) for this tx. `None` when the replay was
+    /// rejected (unmeasured), so it doesn't dilute the class sum.
+    pub account_drivers: Option<AccountDrivers>,
     /// Per-tx drill-in record — populated only when `store_full_forensics`
     /// is set; ignored for the aggregate classes.
     pub drill_in_record: Option<DrillInRecord>,
@@ -353,6 +360,11 @@ impl BlockAggregator {
         // 8038 storage-reprice drivers (F8). Same measured-only fold.
         if let Some(sd) = obs.storage_drivers {
             acc.storage_drivers.add(&sd);
+        }
+
+        // F2/F3 account-side gas drivers. Same measured-only fold.
+        if let Some(ad) = obs.account_drivers {
+            acc.account_drivers.add(&ad);
         }
 
         // Multiplier histogram. We bin every tx (including those without
@@ -458,6 +470,10 @@ impl BlockAggregator {
             // activity (else the eight columns read NULL).
             let storage_drivers = acc.storage_drivers.any().then_some(acc.storage_drivers);
 
+            // F2/F3 account drivers: emit only when the class saw any
+            // account-side driver (else the five columns read NULL).
+            let account_drivers = acc.account_drivers.any().then_some(acc.account_drivers);
+
             // Collapse the dense 256-wide opcode arrays into a sparse
             // list of `OpcodeBucketTotal`. Skip entries where every
             // counter is zero so the JSON column stays compact.
@@ -496,6 +512,7 @@ impl BlockAggregator {
                 tx_count_no_state: Some(acc.tx_count_no_state),
                 cold_account_access_count,
                 storage_drivers,
+                account_drivers,
             });
 
             // Fold this class's per-recipient map into top-K rollup rows.
@@ -579,6 +596,7 @@ mod tests {
             has_runtime_state: false,
             cold_account_access_count: None,
             storage_drivers: None,
+            account_drivers: None,
             drill_in_record: None,
             recipient: Some(Address::repeat_byte(0xab)),
             selector: Some([0x12, 0x34, 0x56, 0x78]),
@@ -679,6 +697,7 @@ mod tests {
             has_runtime_state: false,
             cold_account_access_count: None,
             storage_drivers: None,
+            account_drivers: None,
             drill_in_record: None,
             recipient,
             selector: Some([0xaa, 0xbb, 0xcc, 0xdd]),
@@ -805,6 +824,7 @@ mod tests {
                 has_runtime_state: true,
                 cold_account_access_count: None,
                 storage_drivers: None,
+                account_drivers: None,
                 drill_in_record: None,
                 recipient: None,
                 selector: None,

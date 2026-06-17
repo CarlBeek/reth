@@ -42,8 +42,8 @@ use reth_research::{
         BlockOutput, CallFrameRow, DivergenceDatabase, DivergenceRow, DrillInRecord, OpcodeCountRow,
     },
     divergence::{
-        CallFrame, CallType as ResCallType, DivergenceFacts, DivergenceLocation, EventLog,
-        OogPattern, OutOfGasInfo, StorageDrivers,
+        AccountDrivers, CallFrame, CallType as ResCallType, DivergenceFacts, DivergenceLocation,
+        EventLog, OogPattern, OutOfGasInfo, StorageDrivers,
     },
     oog_chain::classify_oog_chain,
     schedule::{GasSchedule, RecipientInfo, ScheduleKind, ScheduleRegistry, TxContext},
@@ -1399,6 +1399,26 @@ where
             // IMPORTANT: re-execution happens BEFORE committing baseline state so
             // that schedule runs see the same pre-tx state the baseline saw.
             // The baseline commit is deferred until after all schedule runs.
+            /// F1: 1×-failure forensics. When tier-1 (the mainnet-equivalent
+            /// run) FAILS but the accepted attempt is a bumped tier (rescue) or
+            /// the highest tier (fail-under-both), the accepted attempt's
+            /// oog_/frame fields describe that *other* tier — these preserve
+            /// where/why tier-1 broke. Extracted from tier-1's own
+            /// `PerScheduleResult` + inspector; NO re-execution. Types mirror the
+            /// matching `DivergenceRow` columns so the insert mapping is shared.
+            #[derive(Debug, Clone, Default)]
+            struct Tier1Diagnostics {
+                failure_reason: Option<String>,
+                oog_opcode: Option<u8>,
+                oog_contract: Option<Address>,
+                oog_pc: Option<u32>,
+                oog_depth: Option<i32>,
+                oog_gas_remaining: Option<u64>,
+                failing_selector: Option<[u8; 4]>,
+                failing_gas_provided: Option<u64>,
+                failing_gas_requested: Option<u64>,
+            }
+
             struct PerScheduleResult {
                 success: bool,
                 gas_used: u64,
@@ -1456,6 +1476,11 @@ where
                 tax_other: i64,
                 /// F8: storage-reprice drivers; `None` on the reject path.
                 storage_drivers: Option<StorageDrivers>,
+                /// F2/F3: account-side gas drivers; `None` on the reject path.
+                account_drivers: Option<AccountDrivers>,
+                /// F1: tier-1 failure forensics, attached after the tier sweep.
+                /// `None` unless tier-1 failed.
+                tier1_diag: Option<Tier1Diagnostics>,
                 /// F1: structured failure reason — the `HaltReason` discriminant
                 /// (`OutOfGas`, `StackOverflow`, …), `"Revert"`, or `None` on
                 /// success.
@@ -1581,6 +1606,10 @@ where
                 // behavior.
                 let mut accepted: Option<PerScheduleResult> = None;
                 let mut last_attempt: Option<PerScheduleResult> = None;
+                // F1: tier-1 (mainnet-equivalent) failure forensics, captured
+                // the moment tier-1's result is built and preserved even when a
+                // later tier is accepted (and its psr discarded).
+                let mut tier1_diag: Option<Tier1Diagnostics> = None;
                 // Tier-1 (mainnet-equivalent) env + tx, stashed for the
                 // trace-diff divergence fallback so it can reproduce the
                 // failure at the original gas limit without rebuilding the
@@ -1748,6 +1777,11 @@ where
                                 tax_other: 0,
                                 // Rejected replay: storage drivers unknown.
                                 storage_drivers: None,
+                                // Rejected replay: account drivers unknown.
+                                account_drivers: None,
+                                // Attached after the tier sweep (this is a
+                                // tier-1 reject only when `tier == 1`).
+                                tier1_diag: None,
                                 // Rejected before execution: revm refused the tx
                                 // outright (the `{e:?}` is in `oog_info`).
                                 failure_reason: Some("Rejected".to_string()),
@@ -1933,6 +1967,16 @@ where
                         storage_drivers: Some(StorageDrivers::from_counts(
                             inspector.operation_counts(),
                         )),
+                        // F2/F3: account-side drivers (inspector counts + the
+                        // tx-envelope access-list counts).
+                        account_drivers: Some(AccountDrivers::from_parts(
+                            inspector.operation_counts(),
+                            access_list_accounts,
+                            access_list_storage_slots,
+                        )),
+                        // F1: filled after the tier sweep (see below) only for
+                        // the chosen result, and only when tier-1 failed.
+                        tier1_diag: None,
                         failure_reason,
                         revert_data,
                         revert_decoded,
@@ -1947,6 +1991,36 @@ where
                         log_count,
                         logs_bloom,
                     };
+
+                    // F1: capture tier-1's failure forensics before psr is moved.
+                    // Read entirely from psr (which already folded in the
+                    // inspector's oog_info + call frames). The innermost failing
+                    // frame is the deepest `!success` frame — the same rule that
+                    // marks the divergent/bottleneck frame downstream; `CallFrame`
+                    // carries no `is_divergent_frame`/`selector` of its own, so we
+                    // derive the selector from the frame's input.
+                    if tier == 1 && !sched_success {
+                        let failing =
+                            psr.call_frames.iter().filter(|f| !f.success).max_by_key(|f| f.depth);
+                        tier1_diag = Some(Tier1Diagnostics {
+                            failure_reason: psr.failure_reason.clone(),
+                            oog_opcode: psr.oog_info_structured.as_ref().map(|o| o.opcode),
+                            oog_contract: psr.oog_info_structured.as_ref().map(|o| o.contract),
+                            oog_pc: psr.oog_info_structured.as_ref().map(|o| o.pc as u32),
+                            oog_depth: psr
+                                .oog_info_structured
+                                .as_ref()
+                                .map(|o| o.call_depth as i32),
+                            oog_gas_remaining: psr
+                                .oog_info_structured
+                                .as_ref()
+                                .map(|o| o.gas_remaining),
+                            failing_selector: failing
+                                .and_then(|f| extract_selector_bytes(&f.input)),
+                            failing_gas_provided: failing.map(|f| f.gas_provided),
+                            failing_gas_requested: failing.and_then(|f| f.gas_requested_on_stack),
+                        });
+                    }
 
                     if sched_success {
                         // Smallest tier that succeeded — accept and stop.
@@ -1965,6 +2039,11 @@ where
                 // so unwrapping is safe. Successful sweep wins; otherwise we
                 // keep the highest-tier failure to carry the OOG / halt signal.
                 let mut chosen = accepted.or(last_attempt).expect("tier loop ran at least once");
+                // F1: attach tier-1's failure forensics to whichever attempt was
+                // chosen (a rescue's psr describes the bumped tier, not the 1×
+                // failure; this preserves the 1× break). `None` when tier-1
+                // succeeded.
+                chosen.tier1_diag = tier1_diag.take();
 
                 // Trace-diff divergence for the "non-OOG schedule revert"
                 // cohort: a status flip to failure that the inspector left
@@ -2223,6 +2302,14 @@ where
                 // cascading effects (different execution paths) make the
                 // true difference diverge from the sum of per-opcode
                 // adjustments.
+                //
+                // NOTE: when the tx failed at 1× but was rescued at a bumped
+                // tier (`schedule_success=0 AND replay_halt_oog IS NULL`),
+                // `schedule_gas` is the rescued (N×) tier's gas, so `total_delta`
+                // is NOT a meaningful repricing measure here — and it's
+                // meaningless whenever `baseline_success=0`. Downstream repricing
+                // aggregates must filter on `schedule_success=1` (and
+                // `baseline_success=1`).
                 let total_delta = schedule_gas as i64 - normal_gas_used as i64;
                 // Decompose the outcome flip into its two directions: a break
                 // (baseline succeeded, schedule failed) drives the
@@ -2331,11 +2418,13 @@ where
                             exec_result.map(|r| r.event_logs.as_slice()).unwrap_or(&[]);
 
                         // Cold-account-access count for this tx under this
-                        // schedule. NULL when unmeasured (reject path) or when the
-                        // tx made zero cold accesses; Some(n) only when n > 0.
-                        let cold_account_access_count = exec_result
-                            .and_then(|r| r.cold_account_access_count)
-                            .filter(|&c| c > 0);
+                        // schedule (F4). `Some(0)` is a *measured* zero (the
+                        // replay ran and made no cold access); NULL is reserved
+                        // for the unmeasured reject path (`exec_result` /
+                        // `cold_account_access_count` is None). Do NOT collapse
+                        // measured-zero to NULL — that conflates the two.
+                        let cold_account_access_count =
+                            exec_result.and_then(|r| r.cold_account_access_count);
 
                         // F7: baseline counterpart of the frame that failed under
                         // the schedule. The innermost failing frame (deepest
@@ -2481,6 +2570,38 @@ where
                                 .map(|s| s as i64 - baseline_intrinsic_gas as i64),
                             // F8: storage-reprice drivers.
                             storage_drivers: exec_result.and_then(|r| r.storage_drivers),
+                            // F2/F3: account-side gas drivers.
+                            account_drivers: exec_result.and_then(|r| r.account_drivers),
+                            // F1: tier-1 failure forensics (None unless tier-1
+                            // failed). The accepted attempt's oog_*/frame columns
+                            // describe the chosen tier; these describe the 1× run.
+                            tier1_failure_reason: exec_result
+                                .and_then(|r| r.tier1_diag.as_ref())
+                                .and_then(|d| d.failure_reason.clone()),
+                            tier1_oog_opcode: exec_result
+                                .and_then(|r| r.tier1_diag.as_ref())
+                                .and_then(|d| d.oog_opcode),
+                            tier1_oog_contract: exec_result
+                                .and_then(|r| r.tier1_diag.as_ref())
+                                .and_then(|d| d.oog_contract),
+                            tier1_oog_pc: exec_result
+                                .and_then(|r| r.tier1_diag.as_ref())
+                                .and_then(|d| d.oog_pc),
+                            tier1_oog_depth: exec_result
+                                .and_then(|r| r.tier1_diag.as_ref())
+                                .and_then(|d| d.oog_depth),
+                            tier1_oog_gas_remaining: exec_result
+                                .and_then(|r| r.tier1_diag.as_ref())
+                                .and_then(|d| d.oog_gas_remaining),
+                            tier1_failing_selector: exec_result
+                                .and_then(|r| r.tier1_diag.as_ref())
+                                .and_then(|d| d.failing_selector),
+                            tier1_failing_gas_provided: exec_result
+                                .and_then(|r| r.tier1_diag.as_ref())
+                                .and_then(|d| d.failing_gas_provided),
+                            tier1_failing_gas_requested: exec_result
+                                .and_then(|r| r.tier1_diag.as_ref())
+                                .and_then(|d| d.failing_gas_requested),
                         };
 
                         // Codehashes come from the historical state we already
@@ -2561,10 +2682,13 @@ where
                             is_creation: is_create,
                             has_authorization: authorization_count > 0,
                             has_runtime_state,
+                            // F4: `Some(0)` is a measured zero (folds harmlessly
+                            // in the aggregator); `None` only on the unmeasured
+                            // reject path.
                             cold_account_access_count: exec_result
-                                .and_then(|r| r.cold_account_access_count)
-                                .filter(|&c| c > 0),
+                                .and_then(|r| r.cold_account_access_count),
                             storage_drivers: exec_result.and_then(|r| r.storage_drivers),
+                            account_drivers: exec_result.and_then(|r| r.account_drivers),
                             drill_in_record: drill_in,
                             recipient,
                             // 4-byte selector for calls with >=4 calldata bytes;

@@ -30,7 +30,9 @@
 //! - `DuckDB` sequences (`CREATE SEQUENCE`, `DEFAULT nextval('seq')`) become `INTEGER PRIMARY KEY
 //!   AUTOINCREMENT`.
 
-use crate::divergence::{AggregateClass, EventLog, FrameOpcodeCounts, StorageDrivers};
+use crate::divergence::{
+    AccountDrivers, AggregateClass, EventLog, FrameOpcodeCounts, StorageDrivers,
+};
 use alloy_primitives::{keccak256, Address, B256};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::{
@@ -399,6 +401,9 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             gas_delta_max       INTEGER,
             gas_delta_log2_hist TEXT,
             opcode_totals           TEXT,
+            -- state_gas_sum / state_gas_spillover_sum / tx_count_runtime_state are
+            -- EIP-8037-only (the state-gas reservoir model); inert (0 / NULL) for
+            -- EIP-8038 — exclude them from 8038 analysis.
             state_gas_sum           INTEGER,
             state_gas_spillover_sum INTEGER,
             multiplier_log2_hist    TEXT,
@@ -415,6 +420,15 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             sstore_clear_count        INTEGER,
             sstore_noop_count         INTEGER,
             sstore_dirty_count        INTEGER,
+            -- F2/F3 account-side gas drivers summed over this class's txs:
+            -- warm account accesses, CALL/CALLCODE value transfers, CREATE+CREATE2
+            -- opcodes, and the tx-declared EIP-2930 access-list address / storage
+            -- key counts. NULL when the class saw none of these.
+            warm_account_access_count    INTEGER,
+            value_transfer_count         INTEGER,
+            create_opcode_count          INTEGER,
+            access_list_address_count    INTEGER,
+            access_list_storage_key_count INTEGER,
             PRIMARY KEY (schedule_name, block_number, class)
         );",
     )?;
@@ -438,6 +452,12 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
     // including them would pollute the sum with halt-gas artefacts. Their
     // `tx_count` is still counted, so the failed cohort is attributed by
     // *who/how many*, while gas magnitude reflects only the clean cohort.
+    //
+    // NOTE: this OOG-exclusion gate is a no-op for the only classes that reach
+    // this rollup (`unchanged` / `gas_only`) — those are all tier-1 successes,
+    // so `succeeded_within_limit` is always true for them. The gate is purely
+    // defensive (it would matter only if a failing/OOG tx were ever rolled into
+    // an aggregate class instead of getting its own per-tx `divergences` row).
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS block_recipients (
             schedule_name TEXT    NOT NULL,
@@ -483,6 +503,12 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
 
             baseline_gas_used        INTEGER NOT NULL,
             schedule_gas_used        INTEGER NOT NULL,
+            -- schedule_gas_used - baseline_gas_used. NOTE: for a rescued failure
+            -- (`schedule_success=0 AND replay_halt_oog IS NULL`) the schedule gas
+            -- figures are the bumped (N×) tier's execution, not the 1× run, so
+            -- `gas_delta` is NOT a meaningful repricing measure when
+            -- `baseline_success=0`. Downstream repricing aggregates must filter
+            -- on `schedule_success=1` (and `baseline_success=1`).
             gas_delta                INTEGER NOT NULL,
             baseline_total_gas_spent INTEGER,
             baseline_gas_refunded    INTEGER,
@@ -506,6 +532,9 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             oog_bottleneck_depth   INTEGER,
             oog_bottleneck_kind    TEXT,
 
+            -- EIP-8037-only: the state-gas reservoir model is an 8037 construct.
+            -- These columns are inert (0 / NULL) for EIP-8038 (and 7904/baseline)
+            -- and should be excluded from 8038 analysis.
             schedule_state_gas_spent    INTEGER,
             schedule_state_gas_demanded INTEGER,
             schedule_initial_state_gas  INTEGER,
@@ -579,6 +608,9 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             -- two sum to additional_gas_charged; tax_intrinsic is the separate
             -- tx-level intrinsic delta.
             tax_second_db_read          INTEGER,
+            -- Reserved for multiplier / CSV schedules (the unclassified delta
+            -- bucket); identically 0 for EIP-8037 and EIP-8038, whose only
+            -- opcode-delta category is `tax_second_db_read`.
             tax_other                   INTEGER,
             tax_intrinsic               INTEGER,
 
@@ -593,6 +625,30 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             sstore_clear_count          INTEGER,
             sstore_noop_count           INTEGER,
             sstore_dirty_count          INTEGER,
+
+            -- F2/F3: account-side gas drivers. warm account accesses + value
+            -- transfers + CREATE/CREATE2 are runtime inspector counts; the two
+            -- access-list counts come from the tx envelope.
+            warm_account_access_count     INTEGER,
+            value_transfer_count          INTEGER,
+            create_opcode_count           INTEGER,
+            access_list_address_count     INTEGER,
+            access_list_storage_key_count INTEGER,
+
+            -- F1: 1×-failure forensics. When a tx fails at the mainnet-equivalent
+            -- tier (1×) but is rescued at a bumped tier (or fails at both), these
+            -- preserve WHERE/WHY it broke at 1× (the rescued/highest-tier figures
+            -- in the columns above describe the accepted attempt, not the 1×
+            -- failure). NULL when 1× succeeded or wasn't a failure.
+            tier1_failure_reason        TEXT,
+            tier1_oog_opcode            INTEGER,
+            tier1_oog_contract          TEXT,
+            tier1_oog_pc                INTEGER,
+            tier1_oog_depth             INTEGER,
+            tier1_oog_gas_remaining     INTEGER,
+            tier1_failing_selector      BLOB,
+            tier1_failing_gas_provided  INTEGER,
+            tier1_failing_gas_requested INTEGER,
 
             UNIQUE (schedule_name, block_number, tx_index, schedule_config_hash)
         );",
@@ -890,6 +946,10 @@ pub struct BlockSummaryRow {
     /// EIP-8038 storage-reprice drivers (F8) summed over this class's txs.
     /// `None` when the class saw no SLOAD/SSTORE activity.
     pub storage_drivers: Option<StorageDrivers>,
+    /// Account-side gas drivers (F2/F3) summed over this class's txs. `None`
+    /// when the class saw none of these (warm account access / value transfer /
+    /// CREATE / access-list entries).
+    pub account_drivers: Option<AccountDrivers>,
 }
 
 /// Per-tx drill-in record: the `divergences` row plus its dependent
@@ -1076,6 +1136,26 @@ pub struct DivergenceRow {
     /// mapped to explicit columns at insert time. `None` on the reject path
     /// (the replay never executed, so the counts are unknown, not zero).
     pub storage_drivers: Option<StorageDrivers>,
+
+    /// Account-side gas drivers (F2/F3) — warm account accesses, value
+    /// transfers, CREATE+CREATE2, and the tx access-list counts, mapped to
+    /// explicit columns at insert time. `None` on the reject path.
+    pub account_drivers: Option<AccountDrivers>,
+
+    /// F1: forensics for the mainnet-equivalent (1×) tier when this tx FAILED
+    /// at 1× but the accepted attempt is a bumped tier (rescue) or the highest
+    /// tier (fail-under-both). The `oog_*`/frame figures above describe the
+    /// accepted attempt; these preserve where/why 1× broke. All `None` when 1×
+    /// succeeded or the tx wasn't a 1× failure.
+    pub tier1_failure_reason: Option<String>,
+    pub tier1_oog_opcode: Option<u8>,
+    pub tier1_oog_contract: Option<Address>,
+    pub tier1_oog_pc: Option<u32>,
+    pub tier1_oog_depth: Option<i32>,
+    pub tier1_oog_gas_remaining: Option<u64>,
+    pub tier1_failing_selector: Option<[u8; 4]>,
+    pub tier1_failing_gas_provided: Option<u64>,
+    pub tier1_failing_gas_requested: Option<u64>,
 }
 
 /// One frame row destined for `divergence_call_frames`. `call_index` and
@@ -1634,7 +1714,9 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             cold_account_access_count,
             sload_cold_count, sload_warm_count, sstore_cold_count,
             sstore_set_count, sstore_reset_count, sstore_clear_count,
-            sstore_noop_count, sstore_dirty_count
+            sstore_noop_count, sstore_dirty_count,
+            warm_account_access_count, value_transfer_count, create_opcode_count,
+            access_list_address_count, access_list_storage_key_count
         ) VALUES (?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?,
@@ -1643,7 +1725,8 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
                   ?,
                   ?, ?, ?, ?,
                   ?,
-                  ?, ?, ?, ?, ?, ?, ?, ?)
+                  ?, ?, ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?)
         ON CONFLICT (schedule_name, block_number, class) DO UPDATE SET
             tx_count                = excluded.tx_count,
             gas_delta_sum           = excluded.gas_delta_sum,
@@ -1667,7 +1750,12 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             sstore_reset_count  = excluded.sstore_reset_count,
             sstore_clear_count  = excluded.sstore_clear_count,
             sstore_noop_count   = excluded.sstore_noop_count,
-            sstore_dirty_count  = excluded.sstore_dirty_count",
+            sstore_dirty_count  = excluded.sstore_dirty_count,
+            warm_account_access_count     = excluded.warm_account_access_count,
+            value_transfer_count          = excluded.value_transfer_count,
+            create_opcode_count           = excluded.create_opcode_count,
+            access_list_address_count     = excluded.access_list_address_count,
+            access_list_storage_key_count = excluded.access_list_storage_key_count",
         params![
             row.schedule_name,
             row.block_number as i64,
@@ -1695,6 +1783,11 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             row.storage_drivers.map(|s| s.sstore_clear as i64),
             row.storage_drivers.map(|s| s.sstore_noop as i64),
             row.storage_drivers.map(|s| s.sstore_dirty as i64),
+            row.account_drivers.map(|a| a.warm_account_access as i64),
+            row.account_drivers.map(|a| a.value_transfer as i64),
+            row.account_drivers.map(|a| a.create_opcode as i64),
+            row.account_drivers.map(|a| a.access_list_address as i64),
+            row.account_drivers.map(|a| a.access_list_storage_key as i64),
         ],
     )?;
     Ok(())
@@ -1732,7 +1825,12 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             tax_second_db_read, tax_other, tax_intrinsic,
             sload_cold_count, sload_warm_count, sstore_cold_count,
             sstore_set_count, sstore_reset_count, sstore_clear_count,
-            sstore_noop_count, sstore_dirty_count
+            sstore_noop_count, sstore_dirty_count,
+            warm_account_access_count, value_transfer_count, create_opcode_count,
+            access_list_address_count, access_list_storage_key_count,
+            tier1_failure_reason, tier1_oog_opcode, tier1_oog_contract,
+            tier1_oog_pc, tier1_oog_depth, tier1_oog_gas_remaining,
+            tier1_failing_selector, tier1_failing_gas_provided, tier1_failing_gas_requested
         ) VALUES (?, ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?,
@@ -1754,7 +1852,9 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
                   ?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?, ?,
-                  ?, ?, ?, ?, ?, ?, ?, ?)",
+                  ?, ?, ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             row.schedule_name,
             row.schedule_config_hash,
@@ -1837,6 +1937,24 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             row.storage_drivers.map(|s| s.sstore_clear as i64),
             row.storage_drivers.map(|s| s.sstore_noop as i64),
             row.storage_drivers.map(|s| s.sstore_dirty as i64),
+            // F2/F3: account-side gas drivers.
+            row.account_drivers.map(|a| a.warm_account_access as i64),
+            row.account_drivers.map(|a| a.value_transfer as i64),
+            row.account_drivers.map(|a| a.create_opcode as i64),
+            row.account_drivers.map(|a| a.access_list_address as i64),
+            row.account_drivers.map(|a| a.access_list_storage_key as i64),
+            // F1: 1×-failure forensics (mirror the existing oog_* / selector
+            // mapping — Address formatted as lowercase hex, opcode/pc/depth as
+            // i64, selector as a byte vec).
+            row.tier1_failure_reason,
+            row.tier1_oog_opcode.map(|v| v as i64),
+            row.tier1_oog_contract.map(|a| format!("{a:#x}")),
+            row.tier1_oog_pc.map(|v| v as i64),
+            row.tier1_oog_depth,
+            row.tier1_oog_gas_remaining.map(|v| v as i64),
+            row.tier1_failing_selector.map(|s| s.to_vec()),
+            row.tier1_failing_gas_provided.map(|v| v as i64),
+            row.tier1_failing_gas_requested.map(|v| v as i64),
         ],
     )?;
     Ok(tx.last_insert_rowid() as u64)
@@ -2235,6 +2353,7 @@ mod tests {
                 tx_count_no_state: None,
                 cold_account_access_count: None,
                 storage_drivers: None,
+                account_drivers: None,
             }],
             drill_ins: vec![drill_in],
             recipients: vec![],
@@ -2399,8 +2518,9 @@ mod tests {
         assert!(!addrs.contains(&format!("{proxy:#x}")));
     }
 
-    /// F8: storage-reprice drivers round-trip on both `divergences` (per-tx) and
-    /// `block_summaries` (per-class).
+    /// F8 storage-reprice drivers + F2/F3 account drivers round-trip on both
+    /// `divergences` (per-tx) and `block_summaries` (per-class); the F1 tier1
+    /// forensic columns round-trip on `divergences`.
     #[test]
     fn storage_drivers_round_trip() {
         let db = DivergenceDatabase::in_memory().unwrap();
@@ -2412,9 +2532,22 @@ mod tests {
             sstore_clear: 1,
             ..Default::default()
         };
+        let ad = AccountDrivers {
+            warm_account_access: 4,
+            value_transfer: 2,
+            create_opcode: 1,
+            access_list_address: 3,
+            access_list_storage_key: 7,
+        };
 
         let mut div = fixture_divergence(9, 0, false, 7);
         div.storage_drivers = Some(sd);
+        div.account_drivers = Some(ad);
+        // F1: a 1×-failure forensic capture (rescued at a bumped tier).
+        div.tier1_failure_reason = Some("OutOfGas".to_string());
+        div.tier1_oog_opcode = Some(0x54);
+        div.tier1_failing_selector = Some([0xde, 0xad, 0xbe, 0xef]);
+        div.tier1_failing_gas_provided = Some(21_000);
         let drill_in = DrillInRecord {
             divergence: div,
             call_frames: vec![],
@@ -2444,6 +2577,7 @@ mod tests {
             tx_count_no_state: None,
             cold_account_access_count: None,
             storage_drivers: Some(sd),
+            account_drivers: Some(ad),
         };
         db.record_block_output(&BlockOutput {
             coverage: fixture_coverage("test", 9, 1, 1),
@@ -2468,6 +2602,41 @@ mod tests {
         // Same drivers land on both the per-tx and per-class tables.
         assert_eq!(row("divergences"), (2, 3, 1, 0));
         assert_eq!(row("block_summaries"), (2, 3, 1, 0));
+
+        // F2/F3 account drivers land on both tables too.
+        let acc = |table: &str| -> (i64, i64, i64, i64, i64) {
+            conn.query_row(
+                &format!(
+                    "SELECT warm_account_access_count, value_transfer_count, \
+                     create_opcode_count, access_list_address_count, \
+                     access_list_storage_key_count FROM {table} WHERE block_number = 9"
+                ),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(acc("divergences"), (4, 2, 1, 3, 7));
+        assert_eq!(acc("block_summaries"), (4, 2, 1, 3, 7));
+
+        // F1 tier1 forensics round-trip on divergences only.
+        let (reason, opcode, sel, provided): (
+            Option<String>,
+            Option<i64>,
+            Option<Vec<u8>>,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT tier1_failure_reason, tier1_oog_opcode, tier1_failing_selector, \
+                 tier1_failing_gas_provided FROM divergences WHERE block_number = 9",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(reason.as_deref(), Some("OutOfGas"));
+        assert_eq!(opcode, Some(0x54));
+        assert_eq!(sel, Some(vec![0xde, 0xad, 0xbe, 0xef]));
+        assert_eq!(provided, Some(21_000));
     }
 
     #[test]

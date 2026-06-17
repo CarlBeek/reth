@@ -959,10 +959,24 @@ where
             let addr = Address::from_slice(&bytes[12..]);
             let is_cold = classify_account_target(context, addr);
             self.cached_target_is_cold = is_cold;
-            // Count the cold-account access for data collection.
+            // Count the cold/warm account-access split for data collection (F2).
             if is_cold {
                 self.op_counts.cold_account_access_count += 1;
+            } else {
+                self.op_counts.warm_account_access_count += 1;
             }
+        }
+
+        // Value-transfer classification (F2): CALL (0xF1) / CALLCODE (0xF2) carry
+        // the transferred value as the 3rd stack item (index 2 — after gas at 0
+        // and target at 1). DELEGATECALL/STATICCALL (0xF4/0xFA) carry no value
+        // and are excluded. Peeked read-only before execution, mirroring the
+        // account-target peek above.
+        if matches!(self.current_opcode, 0xF1 | 0xF2) &&
+            let Ok(value) = interp.stack.peek(2) &&
+            !value.is_zero()
+        {
+            self.op_counts.value_transfer_count += 1;
         }
 
         // EIP-8038 storage-reprice drivers (F8): classify SLOAD/SSTORE slot
