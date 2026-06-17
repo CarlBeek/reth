@@ -28,10 +28,6 @@ pub enum ScheduleKind {
 /// `other` (the default).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GasTaxBreakdown {
-    /// Warm-base correction (the misilva73 `WARM_ACCESS` 100 → 62 decrease).
-    pub warm_base: i64,
-    /// Cold-account CODE surcharge (cold target carrying code).
-    pub cold_code: i64,
     /// EXTCODESIZE / EXTCODECOPY second-DB-read flat add-on.
     pub second_db_read: i64,
     /// Everything else (uniform multipliers, CSV deltas, unclassified).
@@ -41,12 +37,12 @@ pub struct GasTaxBreakdown {
 impl GasTaxBreakdown {
     /// A breakdown that attributes the whole delta to `other`.
     pub const fn other(delta: i64) -> Self {
-        Self { warm_base: 0, cold_code: 0, second_db_read: 0, other: delta }
+        Self { second_db_read: 0, other: delta }
     }
 
     /// Total delta — must equal `opcode_gas_delta` for the same inputs.
     pub const fn total(&self) -> i64 {
-        self.warm_base + self.cold_code + self.second_db_read + self.other
+        self.second_db_read + self.other
     }
 }
 

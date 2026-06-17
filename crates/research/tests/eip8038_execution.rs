@@ -1,10 +1,13 @@
-//! End-to-end gas validation for the EIP-8038 (misilva73) schedule.
+//! End-to-end gas validation for the EIP-8038 (PR 11802 uniform) schedule.
 //!
 //! Runs real transactions in an in-memory `CacheDB` (no reth datadir is touched)
-//! under the schedule's `gas_params` override and asserts the exact gas charged.
-//! This validates the error-prone Layer-1 back-solve (warm base + cold add-on +
-//! write surcharge), which the schedule's unit tests only confirm at the slot
-//! level — here revm actually charges it.
+//! under the schedule's `gas_params` overrides and asserts the exact gas charged.
+//! This validates the error-prone back-solve — each cold add-on is stored as
+//! `value − WARM_ACCESS` and revm adds it back on top of the warm base — which the
+//! schedule's unit tests only confirm at the slot level; here revm actually
+//! charges it. The single non-`gas_params` charge (the EXTCODESIZE/EXTCODECOPY
+//! second-read `+WARM_ACCESS`) rides the inspector, so it's exercised via the
+//! inspected path.
 
 use reth_research::{
     schedule::{apply_eip8038_gas_overrides, Eip8038Schedule},
@@ -22,6 +25,14 @@ use revm::{
 };
 use std::sync::Arc;
 
+const EXECUTOR: Address = Address::new([0x11u8; 20]);
+const CALLER: Address = Address::new([0x22u8; 20]);
+const PROBE: Address = Address::new([0x33u8; 20]);
+
+// Intrinsic (21000) + PUSH20 (3) for a `one_access` bytecode; the opcode cost is
+// then `gas_used - ONE_ACCESS_OVERHEAD`.
+const ONE_ACCESS_OVERHEAD: u64 = 21_000 + 3;
+
 fn code_account(code: &[u8]) -> AccountInfo {
     AccountInfo {
         code_hash: keccak256(code),
@@ -30,32 +41,64 @@ fn code_account(code: &[u8]) -> AccountInfo {
     }
 }
 
-/// Execute `code` as a CALL target under native OSAKA gas params + EIP-8038's
-/// overrides, returning the transaction's total `gas_used`.
-fn run_eip8038(code: &[u8]) -> u64 {
-    let target = Address::from([0x11u8; 20]);
-    let caller = Address::from([0x22u8; 20]);
+/// A pure EOA (balance, no code).
+fn eoa_account() -> AccountInfo {
+    AccountInfo { balance: U256::from(1u64), ..Default::default() }
+}
 
+/// `PUSH20 <addr>; <op>; STOP` — a single account-access opcode against `addr`.
+fn one_access(addr: Address, op: u8) -> Vec<u8> {
+    let mut c = Vec::with_capacity(23);
+    c.push(0x73); // PUSH20
+    c.extend_from_slice(addr.as_slice());
+    c.push(op);
+    c.push(0x00); // STOP
+    c
+}
+
+/// `CALL(gas=0xFFFF, addr, value, 0,0,0,0); POP; STOP` — one CALL to `addr`.
+fn call_with_value(addr: Address, value: u8) -> Vec<u8> {
+    let mut c = Vec::new();
+    c.extend_from_slice(&[0x60, 0x00]); // PUSH1 0   retLen
+    c.extend_from_slice(&[0x60, 0x00]); // PUSH1 0   retOffset
+    c.extend_from_slice(&[0x60, 0x00]); // PUSH1 0   argsLen
+    c.extend_from_slice(&[0x60, 0x00]); // PUSH1 0   argsOffset
+    c.extend_from_slice(&[0x60, value]); // PUSH1 value
+    c.push(0x73); // PUSH20 addr
+    c.extend_from_slice(addr.as_slice());
+    c.extend_from_slice(&[0x61, 0xFF, 0xFF]); // PUSH2 0xFFFF  gas
+    c.push(0xF1); // CALL
+    c.push(0x50); // POP success
+    c.push(0x00); // STOP
+    c
+}
+
+/// Build the EVM for `code` as the called contract, optionally applying EIP-8038's
+/// overrides, optionally with extra `probes` accounts inserted. Returns `gas_used`.
+fn run(code: &[u8], apply_8038: bool, probes: &[(Address, AccountInfo)]) -> u64 {
     let mut db = CacheDB::<EmptyDB>::default();
-    db.insert_account_info(target, code_account(code));
+    db.insert_account_info(EXECUTOR, code_account(code));
     db.insert_account_info(
-        caller,
+        CALLER,
         AccountInfo { balance: U256::from(1u64) << 100, ..Default::default() },
     );
+    for (addr, info) in probes {
+        db.insert_account_info(*addr, info.clone());
+    }
 
     let mut evm = Context::mainnet()
         .with_db(db)
         .modify_cfg_chained(|cfg| {
-            // Native OSAKA table, then EIP-8038's absolute slot overrides on top
-            // (the exact override `configure_evm_env` applies).
             *cfg = cfg.clone().with_spec_and_mainnet_gas_params(SpecId::OSAKA);
-            apply_eip8038_gas_overrides(&mut cfg.gas_params);
+            if apply_8038 {
+                apply_eip8038_gas_overrides(&mut cfg.gas_params);
+            }
         })
         .build_mainnet();
 
     let tx = TxEnv::builder()
-        .caller(caller)
-        .kind(TxKind::Call(target))
+        .caller(CALLER)
+        .kind(TxKind::Call(EXECUTOR))
         .gas_limit(2_000_000)
         .gas_price(0)
         .build()
@@ -64,30 +107,25 @@ fn run_eip8038(code: &[u8]) -> u64 {
     evm.transact(tx).expect("execution completes").result.tx_gas_used()
 }
 
-const EXECUTOR: Address = Address::new([0x11u8; 20]);
-const CALLER: Address = Address::new([0x22u8; 20]);
-
-/// A pure EOA (balance, no code) — `code_hash == KECCAK_EMPTY` → `NO_CODE`.
-fn eoa_account() -> AccountInfo {
-    AccountInfo { balance: U256::from(1u64), ..Default::default() }
+/// Native OSAKA baseline (no 8038 overrides).
+fn run_native(code: &[u8], probes: &[(Address, AccountInfo)]) -> u64 {
+    run(code, false, probes)
 }
 
-/// Run `exec_code` as the called contract under the FULL EIP-8038 schedule:
-/// Layer-1 `gas_params` overrides AND the Layer-3 inspector deltas (the warm-base
-/// correction, cold-account CODE surcharge, EXT* second-read). `probes` are extra
-/// accounts the bytecode accesses. Returns `(gas_used, inspector)` so tests can
-/// assert both the charged gas and the cold-account classification counters.
-///
-/// Unlike [`run_eip8038`] (Layer-1 only), this attaches a [`ScheduleInspector`]
-/// via `inspect_tx`, which is the only path that applies `opcode_gas_delta` — so
-/// it's required to observe the warm-base / surcharge magnitudes for every opcode
-/// except SSTORE.
+/// EIP-8038 `gas_params` overrides, no inspector (validates the slot back-solve).
+fn run_eip8038(code: &[u8], probes: &[(Address, AccountInfo)]) -> u64 {
+    run(code, true, probes)
+}
+
+/// Full schedule path: EIP-8038 overrides AND the [`ScheduleInspector`] (the only
+/// path that applies `opcode_gas_delta` — required for the EXTCODE* second read
+/// and to read the classification counters). Returns `(gas_used, inspector)`.
 fn run_eip8038_inspected(
-    exec_code: &[u8],
+    code: &[u8],
     probes: &[(Address, AccountInfo)],
 ) -> (u64, ScheduleInspector) {
     let mut db = CacheDB::<EmptyDB>::default();
-    db.insert_account_info(EXECUTOR, code_account(exec_code));
+    db.insert_account_info(EXECUTOR, code_account(code));
     db.insert_account_info(
         CALLER,
         AccountInfo { balance: U256::from(1u64) << 100, ..Default::default() },
@@ -117,171 +155,161 @@ fn run_eip8038_inspected(
     (gas, evm.inspector)
 }
 
-/// `PUSH20 <addr>; <op>; STOP` — a single account-access opcode against `addr`.
-fn one_access(addr: Address, op: u8) -> Vec<u8> {
-    let mut c = Vec::with_capacity(23);
-    c.push(0x73); // PUSH20
-    c.extend_from_slice(addr.as_slice());
-    c.push(op);
-    c.push(0x00); // STOP
-    c
-}
-
-const PROBE: Address = Address::new([0x33u8; 20]);
-// Intrinsic (21000) + PUSH20 (3) for a `one_access` bytecode; the opcode cost is
-// then `gas_used - ONE_ACCESS_OVERHEAD`.
-const ONE_ACCESS_OVERHEAD: u64 = 21_000 + 3;
-
-// --- C1 regression guards: SLOAD warm/cold flow through the inspector ----------
+// --- Storage access: SLOAD / SSTORE ---------------------------------------------
 
 #[test]
-fn cold_sload_charges_8038_cost() {
+fn cold_sload_charges_cold_storage_access() {
     // PUSH1 0; SLOAD; STOP.
-    let (gas, _) = run_eip8038_inspected(&[0x60, 0x00, 0x54, 0x00], &[]);
+    let gas = run_eip8038(&[0x60, 0x00, 0x54, 0x00], &[]);
     // intrinsic(21000) + PUSH1(3) + cold SLOAD.
-    assert_eq!(gas - 21_003, 2_735, "cold SLOAD = COLD_STORAGE_ACCESS 2735; got {gas}");
+    assert_eq!(gas - 21_003, 3_000, "cold SLOAD = COLD_STORAGE_ACCESS 3000; got {gas}");
 }
 
 #[test]
-fn warm_sload_charges_8038_cost() {
+fn warm_sload_charges_warm_access() {
     // PUSH1 0; SLOAD(cold); POP; PUSH1 0; SLOAD(warm); STOP.
-    let (gas, _) = run_eip8038_inspected(&[0x60, 0x00, 0x54, 0x50, 0x60, 0x00, 0x54, 0x00], &[]);
-    // intrinsic + PUSH1(3) + cold(2735) + POP(2) + PUSH1(3) + warm.
-    let warm = gas - 21_003 - 2_735 - 2 - 3;
-    assert_eq!(warm, 62, "warm SLOAD = WARM_ACCESS 62; got gas_used={gas} (warm={warm})");
+    let gas = run_eip8038(&[0x60, 0x00, 0x54, 0x50, 0x60, 0x00, 0x54, 0x00], &[]);
+    // intrinsic + PUSH1(3) + cold(3000) + POP(2) + PUSH1(3) + warm.
+    let warm = gas - 21_003 - 3_000 - 2 - 3;
+    assert_eq!(warm, 100, "warm SLOAD = WARM_ACCESS 100 (unchanged); got gas_used={gas}");
 }
 
-// --- Cold-account code/no-code split via real execution ------------------------
-
+/// A cold 0→nonzero SSTORE ("new slot") charges
+/// `COLD_STORAGE_ACCESS (3000) + STORAGE_WRITE (10000) = 13000` — proving the
+/// warm-base / cold-add-on / set-surcharge decomposition (revm composes it as
+/// `sstore_static(100) + cold_storage_cost(2900) + sstore_set_without_load(10000)`).
 #[test]
-fn cold_balance_to_contract_charges_8038_code_cost() {
-    let (gas, _) =
-        run_eip8038_inspected(&one_access(PROBE, 0x31), &[(PROBE, code_account(&[0x00]))]);
-    assert_eq!(gas - ONE_ACCESS_OVERHEAD, 9_131, "cold BALANCE to contract = CODE 9131; got {gas}");
-}
-
-#[test]
-fn cold_balance_to_eoa_charges_8038_nocode_cost() {
-    let (gas, _) = run_eip8038_inspected(&one_access(PROBE, 0x31), &[(PROBE, eoa_account())]);
-    assert_eq!(gas - ONE_ACCESS_OVERHEAD, 3_140, "cold BALANCE to EOA = NO_CODE 3140; got {gas}");
-}
-
-#[test]
-fn cold_balance_to_empty_account_charges_nocode() {
-    // Empty-but-existent account (Maria: NO_CODE).
-    let (gas, _) =
-        run_eip8038_inspected(&one_access(PROBE, 0x31), &[(PROBE, AccountInfo::default())]);
+fn cold_new_slot_sstore_charges_access_plus_write() {
+    // PUSH1 1, PUSH1 0, SSTORE, STOP.
+    let gas = run_eip8038(&[0x60, 0x01, 0x60, 0x00, 0x55, 0x00], &[]);
+    // gas = intrinsic(21000) + 2×PUSH1(6) + SSTORE + STOP(0).
     assert_eq!(
-        gas - ONE_ACCESS_OVERHEAD,
-        3_140,
-        "cold BALANCE to empty acct = NO_CODE 3140; got {gas}"
+        gas - 21_006,
+        3_000 + 10_000,
+        "cold new-slot SSTORE = COLD_STORAGE_ACCESS + STORAGE_WRITE = 13000; got {gas}"
     );
 }
 
+// --- Account access: BALANCE / EXTCODE* (uniform — no code/no-code split) --------
+
+/// PR 11802 dropped the code/no-code split: a cold account access costs
+/// `COLD_ACCOUNT_ACCESS (3000)` regardless of whether the target has code.
 #[test]
-fn cold_balance_to_nonexistent_charges_nocode() {
-    // PROBE not inserted → db.basic() == None → NO_CODE.
-    let (gas, _) = run_eip8038_inspected(&one_access(PROBE, 0x31), &[]);
-    assert_eq!(
-        gas - ONE_ACCESS_OVERHEAD,
-        3_140,
-        "cold BALANCE to non-existent = NO_CODE 3140; got {gas}"
-    );
+fn cold_account_access_is_uniform_3000() {
+    let to_contract = run_eip8038(&one_access(PROBE, 0x31), &[(PROBE, code_account(&[0x00]))]);
+    let to_eoa = run_eip8038(&one_access(PROBE, 0x31), &[(PROBE, eoa_account())]);
+    let to_absent = run_eip8038(&one_access(PROBE, 0x31), &[]);
+    assert_eq!(to_contract - ONE_ACCESS_OVERHEAD, 3_000, "cold BALANCE to contract = 3000");
+    assert_eq!(to_eoa - ONE_ACCESS_OVERHEAD, 3_000, "cold BALANCE to EOA = 3000");
+    assert_eq!(to_absent - ONE_ACCESS_OVERHEAD, 3_000, "cold BALANCE to absent = 3000");
+    // The whole point of PR 11802: all three are identical.
+    assert_eq!(to_contract, to_eoa);
+    assert_eq!(to_eoa, to_absent);
 }
 
 #[test]
-fn cold_balance_to_7702_delegated_charges_code_cost() {
-    // EIP-7702 designator code → code_hash != KECCAK_EMPTY → ALWAYS CODE (Maria).
-    let delegated = AccountInfo {
-        code: Some(Bytecode::new_eip7702(Address::from([0xAAu8; 20]))),
-        ..Default::default()
-    };
-    let (gas, _) = run_eip8038_inspected(&one_access(PROBE, 0x31), &[(PROBE, delegated)]);
-    assert_eq!(gas - ONE_ACCESS_OVERHEAD, 9_131, "cold BALANCE to 7702 = CODE 9131; got {gas}");
-}
-
-#[test]
-fn warm_balance_charges_8038_cost() {
+fn warm_account_access_charges_warm_access() {
     // PUSH20; BALANCE(cold); POP; PUSH20; BALANCE(warm); STOP — to an EOA.
     let mut code = one_access(PROBE, 0x31);
     code.pop(); // drop the STOP
     code.push(0x50); // POP the first BALANCE result
     code.extend_from_slice(&one_access(PROBE, 0x31));
-    let (gas, _) = run_eip8038_inspected(&code, &[(PROBE, eoa_account())]);
-    // intrinsic + PUSH20(3) + cold(3140) + POP(2) + PUSH20(3) + warm.
-    let warm = gas - 21_003 - 3_140 - 2 - 3;
-    assert_eq!(warm, 62, "warm BALANCE = WARM_ACCESS 62; got gas_used={gas} (warm={warm})");
+    let gas = run_eip8038(&code, &[(PROBE, eoa_account())]);
+    // intrinsic + PUSH20(3) + cold(3000) + POP(2) + PUSH20(3) + warm.
+    let warm = gas - 21_003 - 3_000 - 2 - 3;
+    assert_eq!(warm, 100, "warm BALANCE = WARM_ACCESS 100; got gas_used={gas}");
 }
 
+/// EIP-8038 §"EXT* family update": EXTCODESIZE/EXTCODECOPY are charged an extra
+/// `WARM_ACCESS` for the second database read. revm charges a single access, so
+/// the `+100` rides the inspector — present on the inspected path, absent without.
 #[test]
-fn cold_extcodesize_to_contract_adds_second_read() {
-    // EXTCODESIZE (0x3B): cold CODE access (9131) + the modelled second DB read (+62).
-    let (gas, _) =
-        run_eip8038_inspected(&one_access(PROBE, 0x3B), &[(PROBE, code_account(&[0x00]))]);
+fn cold_extcodesize_adds_second_read_via_inspector() {
+    let (inspected, _) = run_eip8038_inspected(&one_access(PROBE, 0x3B), &[]);
+    let bare = run_eip8038(&one_access(PROBE, 0x3B), &[]);
     assert_eq!(
-        gas - ONE_ACCESS_OVERHEAD,
-        9_131 + 62,
-        "cold EXTCODESIZE to contract = CODE 9131 + second-read 62 = 9193; got {gas}"
+        bare - ONE_ACCESS_OVERHEAD,
+        3_000,
+        "EXTCODESIZE gas_params charge = COLD_ACCOUNT_ACCESS 3000 (no second read); got {bare}"
+    );
+    assert_eq!(
+        inspected - ONE_ACCESS_OVERHEAD,
+        3_000 + 100,
+        "EXTCODESIZE inspected = 3000 + second-read 100 = 3100; got {inspected}"
     );
 }
 
-// --- Classification counters populate from a real execution --------------------
+// --- Value transfer / CREATE: baseline-vs-8038 delta isolates the slot ----------
 
+/// The net cost a value-transfer CALL adds, when the callee (an EOA) leaves the
+/// 2300 stipend unused, is `ACCOUNT_WRITE = 8000`: revm charges the caller
+/// `CALL_VALUE = transfer_value_cost (10300) = ACCOUNT_WRITE + CALL_STIPEND`, and
+/// the unused stipend returns to the caller (10300 − 2300 = 8000). The slot value
+/// itself (10300) is asserted by the schedule's `configure_evm_env` unit test;
+/// here we confirm the meaningful net charge composes to `ACCOUNT_WRITE`.
+/// Isolated as the delta between a value=1 and value=0 CALL to the same EOA.
 #[test]
-fn classification_counters_match_real_accesses() {
-    // Cold contract → code counter.
-    let (_, insp) =
-        run_eip8038_inspected(&one_access(PROBE, 0x31), &[(PROBE, code_account(&[0x00]))]);
-    assert_eq!(insp.operation_counts().cold_account_code_count, 1);
-    assert_eq!(insp.operation_counts().cold_account_nocode_count, 0);
-
-    // Cold EOA → nocode counter.
-    let (_, insp) = run_eip8038_inspected(&one_access(PROBE, 0x31), &[(PROBE, eoa_account())]);
-    assert_eq!(insp.operation_counts().cold_account_code_count, 0);
-    assert_eq!(insp.operation_counts().cold_account_nocode_count, 1);
-
-    // 7702-delegated → code counter.
-    let delegated = AccountInfo {
-        code: Some(Bytecode::new_eip7702(Address::from([0xAAu8; 20]))),
-        ..Default::default()
-    };
-    let (_, insp) = run_eip8038_inspected(&one_access(PROBE, 0x31), &[(PROBE, delegated)]);
-    assert_eq!(insp.operation_counts().cold_account_code_count, 1);
+fn value_transfer_call_net_cost_is_account_write() {
+    let with_value = run_eip8038(&call_with_value(PROBE, 1), &[(PROBE, eoa_account())]);
+    let no_value = run_eip8038(&call_with_value(PROBE, 0), &[(PROBE, eoa_account())]);
+    assert_eq!(
+        with_value - no_value,
+        8_000,
+        "net value-transfer cost = ACCOUNT_WRITE 8000 (CALL_VALUE 10300 − stipend 2300); \
+         with={with_value} without={no_value}"
+    );
 }
 
-/// A cold 0→nonzero SSTORE ("new slot") must charge
-/// `COLD_STORAGE_ACCESS (2735) + STORAGE_WRITE (15391) = 18126`, proving the
-/// warm-base / cold-add-on / set-surcharge decomposition is correct (revm
-/// composes it as `sstore_static(62) + cold_storage_additional(2673) +
-/// sstore_set_without_load(15391)`).
+/// The CREATE opcode is repriced from native `GAS_CREATE` (32000) to
+/// `CREATE_ACCESS` (11000). Isolated as the baseline-minus-8038 delta over an
+/// empty-initcode CREATE (the inner frame and everything else cancel).
 #[test]
-fn cold_new_slot_sstore_charges_8038_cost() {
-    // PUSH1 1, PUSH1 0, SSTORE, STOP.
-    let gas_used = run_eip8038(&[0x60, 0x01, 0x60, 0x00, 0x55, 0x00]);
-    // gas_used = intrinsic(21000) + 2×PUSH1(3) + SSTORE + STOP(0).
+fn create_opcode_reprices_to_create_access() {
+    // PUSH1 0 (size), PUSH1 0 (offset), PUSH1 0 (value), CREATE, POP, STOP.
+    let code = [0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xF0, 0x50, 0x00];
+    let native = run_native(&code, &[]);
+    let eip8038 = run_eip8038(&code, &[]);
     assert_eq!(
-        gas_used - 21_006,
-        2_735 + 15_391,
-        "cold new-slot SSTORE should charge COLD_STORAGE_ACCESS + STORAGE_WRITE = 18126; \
-         got gas_used={gas_used}"
+        native - eip8038,
+        32_000 - 11_000,
+        "CREATE 8038 cheaper by GAS_CREATE − CREATE_ACCESS = 21000; native={native} 8038={eip8038}"
+    );
+}
+
+// --- Classification counter (single, uniform) -----------------------------------
+
+#[test]
+fn cold_account_access_count_is_single_and_uniform() {
+    // One cold access, regardless of whether the target has code.
+    let (_, to_contract) =
+        run_eip8038_inspected(&one_access(PROBE, 0x31), &[(PROBE, code_account(&[0x00]))]);
+    assert_eq!(to_contract.operation_counts().cold_account_access_count, 1);
+
+    let (_, to_eoa) = run_eip8038_inspected(&one_access(PROBE, 0x31), &[(PROBE, eoa_account())]);
+    assert_eq!(to_eoa.operation_counts().cold_account_access_count, 1);
+
+    // A warm re-access does not increment the cold counter.
+    let mut code = one_access(PROBE, 0x31);
+    code.pop();
+    code.push(0x50);
+    code.extend_from_slice(&one_access(PROBE, 0x31));
+    let (_, warm_reaccess) = run_eip8038_inspected(&code, &[(PROBE, eoa_account())]);
+    assert_eq!(
+        warm_reaccess.operation_counts().cold_account_access_count,
+        1,
+        "only the first (cold) access counts"
     );
 }
 
 /// F8: the storage-reprice driver counters populate from a real execution
-/// covering a cold fresh-set, a same-tx dirty re-write, and a cold + a warm
-/// SLOAD.
+/// covering a cold fresh-set, a same-tx dirty re-write, and a cold + a warm SLOAD.
 #[test]
 fn storage_reprice_drivers_counted() {
-    // PUSH1 1, PUSH1 0, SSTORE   → slot0 = 1 (cold, set)
-    // PUSH1 2, PUSH1 0, SSTORE   → slot0 = 2 (warm, dirty: original 0, current 1, new 2)
-    // PUSH1 0, SLOAD, POP        → SLOAD slot0 (warm — already touched by the SSTOREs)
-    // PUSH1 1, SLOAD, POP        → SLOAD slot1 (cold — never touched)
-    // STOP
     let code = [
-        0x60, 0x01, 0x60, 0x00, 0x55, // SSTORE slot0 = 1
-        0x60, 0x02, 0x60, 0x00, 0x55, // SSTORE slot0 = 2
-        0x60, 0x00, 0x54, 0x50, // SLOAD slot0, POP
-        0x60, 0x01, 0x54, 0x50, // SLOAD slot1, POP
+        0x60, 0x01, 0x60, 0x00, 0x55, // SSTORE slot0 = 1 (cold, set)
+        0x60, 0x02, 0x60, 0x00, 0x55, // SSTORE slot0 = 2 (warm, dirty)
+        0x60, 0x00, 0x54, 0x50, // SLOAD slot0 (warm), POP
+        0x60, 0x01, 0x54, 0x50, // SLOAD slot1 (cold), POP
         0x00, // STOP
     ];
     let (_, insp) = run_eip8038_inspected(&code, &[]);

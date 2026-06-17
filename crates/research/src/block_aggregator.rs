@@ -112,13 +112,11 @@ struct ClassAccumulator {
     tx_count_runtime_state: u32,
     tx_count_no_state: u32,
 
-    // Cold-account code/no-code split (EIP-8038). Sum over the class's txs
-    // of cold account accesses whose target carried code
-    // (`code_hash != KECCAK_EMPTY`, incl. EIP-7702 delegated) vs not (EOA /
-    // empty / non-existent). Zero for schedules that don't price the split;
-    // emitted as None when the class saw no cold account accesses.
-    cold_account_code_sum: u64,
-    cold_account_nocode_sum: u64,
+    // Cold-account accesses summed over the class's txs (account-access
+    // opcodes: BALANCE / EXTCODE* / CALL family / SELFDESTRUCT). Zero for
+    // schedules that make none; emitted as None when the class saw no cold
+    // account accesses.
+    cold_account_access_sum: u64,
 
     // EIP-8038 storage-reprice drivers (F8) summed over the class's txs.
     storage_drivers: StorageDrivers,
@@ -170,8 +168,7 @@ impl Default for ClassAccumulator {
             tx_count_authorization: 0,
             tx_count_runtime_state: 0,
             tx_count_no_state: 0,
-            cold_account_code_sum: 0,
-            cold_account_nocode_sum: 0,
+            cold_account_access_sum: 0,
             storage_drivers: StorageDrivers::default(),
             opcode_counts: [0; 256],
             opcode_gas_baseline: [0; 256],
@@ -275,14 +272,10 @@ pub struct TxObservation {
     /// post-intrinsic). False when the tx only paid the initial state-gas
     /// allotment with no spillover.
     pub has_runtime_state: bool,
-    /// Cold account accesses this tx made whose target carried code
-    /// (`code_hash != KECCAK_EMPTY`, incl. EIP-7702 delegated). `None` when the
-    /// replay was rejected before classification completed (vs `Some(0)` = ran,
-    /// no cold-code access), so unmeasured txs don't dilute the class sum.
-    pub cold_account_code_count: Option<u64>,
-    /// Cold account accesses this tx made whose target had no code
-    /// (EOA / empty / non-existent). `None` when unmeasured (see above).
-    pub cold_account_nocode_count: Option<u64>,
+    /// Cold account accesses this tx made (account-access opcodes). `None` when
+    /// the replay was rejected before classification completed (vs `Some(0)` =
+    /// ran, no cold access), so unmeasured txs don't dilute the class sum.
+    pub cold_account_access_count: Option<u64>,
     /// EIP-8038 storage-reprice drivers (F8) for this tx. `None` when the replay
     /// was rejected (unmeasured), so it doesn't dilute the class sum.
     pub storage_drivers: Option<StorageDrivers>,
@@ -350,14 +343,11 @@ impl BlockAggregator {
         acc.state_gas_spillover_sum =
             acc.state_gas_spillover_sum.saturating_add(obs.state_gas_spillover);
 
-        // 8038 cold-account code/no-code split aggregates. Fold only *measured*
-        // counts (`Some`); a reject-path tx (`None`) contributes nothing rather
-        // than a phantom zero that would bias the class sum low.
-        if let Some(c) = obs.cold_account_code_count {
-            acc.cold_account_code_sum = acc.cold_account_code_sum.saturating_add(c);
-        }
-        if let Some(c) = obs.cold_account_nocode_count {
-            acc.cold_account_nocode_sum = acc.cold_account_nocode_sum.saturating_add(c);
+        // Cold-account-access aggregate. Fold only *measured* counts (`Some`); a
+        // reject-path tx (`None`) contributes nothing rather than a phantom zero
+        // that would bias the class sum low.
+        if let Some(c) = obs.cold_account_access_count {
+            acc.cold_account_access_sum = acc.cold_account_access_sum.saturating_add(c);
         }
 
         // 8038 storage-reprice drivers (F8). Same measured-only fold.
@@ -458,16 +448,11 @@ impl BlockAggregator {
             let multiplier_log2_hist =
                 (acc.multiplier_observations > 0).then_some(acc.multiplier_log2_hist);
 
-            // Emit the cold-account split as a pair: if the class saw any
-            // cold account access at all, both columns carry a real count
-            // (so a genuine zero on one side reads as Some(0), not "n/a").
-            // Schedules that don't price the split leave both sums at 0 and
-            // both columns read None.
-            let cold_split_tracked =
-                acc.cold_account_code_sum > 0 || acc.cold_account_nocode_sum > 0;
-            let cold_account_code_count = cold_split_tracked.then_some(acc.cold_account_code_sum);
-            let cold_account_nocode_count =
-                cold_split_tracked.then_some(acc.cold_account_nocode_sum);
+            // Emit the cold-account-access count only when the class saw at
+            // least one cold account access; otherwise the column reads None
+            // ("n/a").
+            let cold_account_access_count =
+                (acc.cold_account_access_sum > 0).then_some(acc.cold_account_access_sum);
 
             // F8 storage drivers: emit only when the class saw SLOAD/SSTORE
             // activity (else the eight columns read NULL).
@@ -509,8 +494,7 @@ impl BlockAggregator {
                 tx_count_authorization: Some(acc.tx_count_authorization),
                 tx_count_runtime_state: Some(acc.tx_count_runtime_state),
                 tx_count_no_state: Some(acc.tx_count_no_state),
-                cold_account_code_count,
-                cold_account_nocode_count,
+                cold_account_access_count,
                 storage_drivers,
             });
 
@@ -593,8 +577,7 @@ mod tests {
             is_creation: false,
             has_authorization: false,
             has_runtime_state: false,
-            cold_account_code_count: None,
-            cold_account_nocode_count: None,
+            cold_account_access_count: None,
             storage_drivers: None,
             drill_in_record: None,
             recipient: Some(Address::repeat_byte(0xab)),
@@ -694,8 +677,7 @@ mod tests {
             is_creation: recipient.is_none(),
             has_authorization: false,
             has_runtime_state: false,
-            cold_account_code_count: None,
-            cold_account_nocode_count: None,
+            cold_account_access_count: None,
             storage_drivers: None,
             drill_in_record: None,
             recipient,
@@ -821,8 +803,7 @@ mod tests {
                 is_creation: true,
                 has_authorization: true,
                 has_runtime_state: true,
-                cold_account_code_count: None,
-                cold_account_nocode_count: None,
+                cold_account_access_count: None,
                 storage_drivers: None,
                 drill_in_record: None,
                 recipient: None,
@@ -851,23 +832,20 @@ mod tests {
     }
 
     #[test]
-    fn cold_account_split_sums_per_class_and_gates_as_a_pair() {
+    fn cold_account_access_sums_per_class_and_gates_on_measured() {
         let mut agg = BlockAggregator::start_block(meta(), 4);
 
         // Two GasOnly txs accumulate into one class aggregate.
         let mut a = obs(AggregateClass::GasOnly, 0);
-        a.cold_account_code_count = Some(3);
-        a.cold_account_nocode_count = Some(2);
+        a.cold_account_access_count = Some(5);
         agg.observe_tx(a, &[]);
         let mut b = obs(AggregateClass::GasOnly, 0);
-        b.cold_account_code_count = Some(1);
-        b.cold_account_nocode_count = Some(4);
+        b.cold_account_access_count = Some(5);
         agg.observe_tx(b, &[]);
         // A reject-path tx (unmeasured) in the same class must NOT dilute the
-        // sums — `None` is skipped, not folded as a phantom zero.
+        // sum — `None` is skipped, not folded as a phantom zero.
         let mut unmeasured = obs(AggregateClass::GasOnly, 0);
-        unmeasured.cold_account_code_count = None;
-        unmeasured.cold_account_nocode_count = None;
+        unmeasured.cold_account_access_count = None;
         agg.observe_tx(unmeasured, &[]);
 
         // A class that made no cold account accesses at all.
@@ -877,18 +855,11 @@ mod tests {
         let by = |class: AggregateClass| out.summaries.iter().find(|s| s.class == class).unwrap();
 
         let gas_only = by(AggregateClass::GasOnly);
-        assert_eq!(gas_only.cold_account_code_count, Some(4));
-        assert_eq!(gas_only.cold_account_nocode_count, Some(6));
-        // code + nocode == total cold account accesses in the class.
-        assert_eq!(
-            gas_only.cold_account_code_count.unwrap() + gas_only.cold_account_nocode_count.unwrap(),
-            10
-        );
+        assert_eq!(gas_only.cold_account_access_count, Some(10));
 
-        // No cold accesses → both columns read None (n/a), not Some(0).
+        // No cold accesses → the column reads None (n/a), not Some(0).
         let unchanged = by(AggregateClass::Unchanged);
-        assert_eq!(unchanged.cold_account_code_count, None);
-        assert_eq!(unchanged.cold_account_nocode_count, None);
+        assert_eq!(unchanged.cold_account_access_count, None);
     }
 
     #[test]

@@ -192,28 +192,17 @@ pub struct OperationCounts {
     #[serde(default)]
     pub keccak256_gas_delta: i64,
 
-    /// Number of COLD account accesses whose target has code (`code_hash !=
-    /// KECCAK_EMPTY`, incl. EIP-7702 delegated) — the EIP-8038 CODE cohort.
+    /// Number of COLD account accesses (first access this tx) for the
+    /// account-access opcodes (BALANCE / EXTCODE\* / CALL family / SELFDESTRUCT).
     ///
     /// Collected for **every** schedule (not just EIP-8038): the classification
-    /// is a near-free native baseline, so 7904/8037 rows carry it too. Only
-    /// EIP-8038 *prices* the code/no-code split.
+    /// is a near-free native baseline, so 7904/8037 rows carry it too.
     #[serde(default)]
-    pub cold_account_code_count: u64,
-    /// Number of COLD account accesses whose target has no code (pure EOA /
-    /// empty / non-existent) — the EIP-8038 `NO_CODE` cohort.
-    #[serde(default)]
-    pub cold_account_nocode_count: u64,
+    pub cold_account_access_count: u64,
 
-    /// Running sum of the warm-base-correction repricing category (F12). The
-    /// four `tax_*` sums reconcile to the tx's `additional_gas_charged`. See
+    /// Running sum of the EXTCODE* second-DB-read repricing category (F12). The
+    /// `tax_*` sums reconcile to the tx's `additional_gas_charged`. See
     /// `schedule::GasTaxBreakdown`.
-    #[serde(default)]
-    pub tax_warm_base: i64,
-    /// Running sum of the cold-account-CODE-surcharge category (F12).
-    #[serde(default)]
-    pub tax_cold_code: i64,
-    /// Running sum of the EXTCODE* second-DB-read category (F12).
     #[serde(default)]
     pub tax_second_db_read: i64,
     /// Running sum of the unclassified category — multipliers, CSV deltas (F12).

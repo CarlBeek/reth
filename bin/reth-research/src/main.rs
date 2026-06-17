@@ -1442,22 +1442,16 @@ where
                 /// to populate `divergence_opcode_counts` rows for drill-in
                 /// buckets.
                 frame_opcode_counts: Vec<reth_research::divergence::FrameOpcodeCounts>,
-                /// Cold account accesses this tx made whose target carried
-                /// code (`code_hash != KECCAK_EMPTY`, incl. EIP-7702
-                /// delegated), captured from the inspector's operation counts.
-                /// `None` when the replay was rejected before execution (so the
-                /// counts are unknown, not a real zero).
-                cold_account_code_count: Option<u64>,
-                /// Cold account accesses whose target had no code
-                /// (EOA / empty / non-existent). `None` when unmeasured.
-                cold_account_nocode_count: Option<u64>,
+                /// Cold account accesses this tx made (account-access opcodes),
+                /// captured from the inspector's operation counts. `None` when
+                /// the replay was rejected before execution (so the counts are
+                /// unknown, not a real zero).
+                cold_account_access_count: Option<u64>,
                 /// F4: cumulative repricing surcharge the inspector charged
                 /// this tx (`ScheduleResult::additional_gas`). Signed.
                 additional_gas: i64,
                 /// F12: per-category decomposition of `additional_gas` (their
                 /// sum reconciles to it).
-                tax_warm_base: i64,
-                tax_cold_code: i64,
                 tax_second_db_read: i64,
                 tax_other: i64,
                 /// F8: storage-reprice drivers; `None` on the reject path.
@@ -1746,13 +1740,10 @@ where
                                 first_gas_divergence: None,
                                 frame_opcode_counts: Vec::new(),
                                 // Rejected replay: counts unknown (not zero).
-                                cold_account_code_count: None,
-                                cold_account_nocode_count: None,
+                                cold_account_access_count: None,
                                 // Rejected replay never executed an opcode → no
                                 // surcharge applied.
                                 additional_gas: 0,
-                                tax_warm_base: 0,
-                                tax_cold_code: 0,
                                 tax_second_db_read: 0,
                                 tax_other: 0,
                                 // Rejected replay: storage drivers unknown.
@@ -1933,15 +1924,10 @@ where
                         divergence_location_structured: insp_result.divergence_location.clone(),
                         first_gas_divergence: insp_result.first_gas_divergence.clone(),
                         frame_opcode_counts: inspector.frame_opcode_counts().frames.clone(),
-                        cold_account_code_count: Some(
-                            inspector.operation_counts().cold_account_code_count,
-                        ),
-                        cold_account_nocode_count: Some(
-                            inspector.operation_counts().cold_account_nocode_count,
+                        cold_account_access_count: Some(
+                            inspector.operation_counts().cold_account_access_count,
                         ),
                         additional_gas: insp_result.additional_gas,
-                        tax_warm_base: inspector.operation_counts().tax_warm_base,
-                        tax_cold_code: inspector.operation_counts().tax_cold_code,
                         tax_second_db_read: inspector.operation_counts().tax_second_db_read,
                         tax_other: inspector.operation_counts().tax_other,
                         storage_drivers: Some(StorageDrivers::from_counts(
@@ -2069,11 +2055,23 @@ where
                     ScheduleKind::None => continue,
                 };
 
-                // Look up the re-execution result for this schedule.
-                // For Both schedules the execution ran with an adjusted gas_limit
-                // so the EVM had the correct execution gas budget. The reported
-                // gas_used includes baseline intrinsic, so we add intrinsic_delta
-                // to get the true schedule gas_used (with schedule intrinsic).
+                // Native-intrinsic schedules (EIP-8037, EIP-8038) have the EVM
+                // charge the schedule intrinsic directly — the vendored handler's
+                // `validate_initial_tx_gas` reads `cfg.gas_params`, which
+                // `configure_evm_env` overrode — and EIP-8037's reservoir path
+                // already normalized the stored regular gas in the execution loop.
+                // So the analyze-path re-add below must fire ONLY for non-native
+                // intrinsic schedules; re-adding it for a native one would count
+                // the schedule intrinsic twice (C1). The true `intrinsic_delta` is
+                // still recorded via `schedule_intrinsic_gas` / `tax_intrinsic`.
+                let report_intrinsic_delta =
+                    if schedule.uses_native_intrinsic_gas() { 0 } else { intrinsic_delta };
+
+                // Look up the re-execution result for this schedule. For a
+                // non-native "Both" schedule the EVM deducted the block's native
+                // intrinsic, so we add `report_intrinsic_delta` to recover the
+                // schedule's true gas_used; for native schedules it is already
+                // included (report_intrinsic_delta == 0).
                 let exec_result = self
                     .execution_schedule_indices
                     .get(schedule_name)
@@ -2113,18 +2111,14 @@ where
                     logs_bloom_changed,
                 ) = match exec_result {
                     Some(r) => {
-                        // EVM reports gas_used including baseline intrinsic.
-                        // Replace baseline intrinsic with schedule intrinsic to
-                        // get the true schedule total:
-                        //   gas_used - baseline_intrinsic + schedule_intrinsic
-                        //   = gas_used + intrinsic_delta
-                        //
-                        // For "Both" schedules where gas_limit was clamped
-                        // (negative intrinsic_delta), the execution portion may
-                        // be inaccurate (see clamping comment above), but the
-                        // intrinsic substitution is still correct.
-                        let gas = if intrinsic_delta != 0 {
-                            (r.gas_used as i64 + intrinsic_delta).max(0) as u64
+                        // Non-native "Both" schedules: the EVM deducted the
+                        // block's native intrinsic, so replace it with the
+                        // schedule intrinsic (`gas_used + report_intrinsic_delta`).
+                        // Native schedules (EIP-8037/8038) already have the
+                        // schedule intrinsic in `r.gas_used`, so
+                        // `report_intrinsic_delta == 0` and gas_used is unchanged.
+                        let gas = if report_intrinsic_delta != 0 {
+                            (r.gas_used as i64 + report_intrinsic_delta).max(0) as u64
                         } else {
                             r.gas_used
                         };
@@ -2185,7 +2179,7 @@ where
                         // Intrinsic-only schedule: no execution result, so the
                         // schedule-side state-gas / reservoir / refund counters
                         // stay zero — only the baseline equivalents are meaningful.
-                        let gas = (normal_gas_used as i64 + intrinsic_delta).max(0) as u64;
+                        let gas = (normal_gas_used as i64 + report_intrinsic_delta).max(0) as u64;
                         let success = normal_success && gas <= gas_limit;
                         (
                             gas,
@@ -2336,15 +2330,12 @@ where
                         let sched_logs_ref: &[EventLog] =
                             exec_result.map(|r| r.event_logs.as_slice()).unwrap_or(&[]);
 
-                        // Cold-account code/no-code split for this tx under this
-                        // schedule (`None` = unmeasured/reject). Emit the pair only
-                        // when the tx made at least one cold account access, so a
-                        // genuine zero on one side reads as Some(0); unmeasured or
-                        // measured-zero both read as NULL.
-                        let cold_code = exec_result.and_then(|r| r.cold_account_code_count);
-                        let cold_nocode = exec_result.and_then(|r| r.cold_account_nocode_count);
-                        let cold_split_seen =
-                            cold_code.unwrap_or(0) > 0 || cold_nocode.unwrap_or(0) > 0;
+                        // Cold-account-access count for this tx under this
+                        // schedule. NULL when unmeasured (reject path) or when the
+                        // tx made zero cold accesses; Some(n) only when n > 0.
+                        let cold_account_access_count = exec_result
+                            .and_then(|r| r.cold_account_access_count)
+                            .filter(|&c| c > 0);
 
                         // F7: baseline counterpart of the frame that failed under
                         // the schedule. The innermost failing frame (deepest
@@ -2441,10 +2432,7 @@ where
                             // Set from the tier-sweep loop above: Some(true/false)
                             // when no tier succeeded, None when at least one did.
                             replay_halt_oog,
-                            cold_account_code_count: cold_split_seen
-                                .then_some(cold_code.unwrap_or(0)),
-                            cold_account_nocode_count: cold_split_seen
-                                .then_some(cold_nocode.unwrap_or(0)),
+                            cold_account_access_count,
                             // F4: total repricing surcharge across all frames.
                             additional_gas_charged: exec_result.map(|r| r.additional_gas),
                             // F6: root→divergence 4-byte selector path as a JSON
@@ -2487,8 +2475,6 @@ where
                             // F12: per-category tax breakdown. The opcode-delta
                             // categories sum to additional_gas_charged; intrinsic
                             // is the separate tx-level intrinsic delta.
-                            tax_warm_base: exec_result.map(|r| r.tax_warm_base),
-                            tax_cold_code: exec_result.map(|r| r.tax_cold_code),
                             tax_second_db_read: exec_result.map(|r| r.tax_second_db_read),
                             tax_other: exec_result.map(|r| r.tax_other),
                             tax_intrinsic: schedule_intrinsic_gas
@@ -2575,10 +2561,9 @@ where
                             is_creation: is_create,
                             has_authorization: authorization_count > 0,
                             has_runtime_state,
-                            cold_account_code_count: exec_result
-                                .and_then(|r| r.cold_account_code_count),
-                            cold_account_nocode_count: exec_result
-                                .and_then(|r| r.cold_account_nocode_count),
+                            cold_account_access_count: exec_result
+                                .and_then(|r| r.cold_account_access_count)
+                                .filter(|&c| c > 0),
                             storage_drivers: exec_result.and_then(|r| r.storage_drivers),
                             drill_in_record: drill_in,
                             recipient,

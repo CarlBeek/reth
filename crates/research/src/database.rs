@@ -84,16 +84,16 @@ use thiserror::Error;
 ///   `block_coverage` drops the 10 `tx_count_<bucket>` editorial counts for fact counts
 ///   `tx_count_unchanged` / `tx_count_gas_only` / `tx_count_stored` (keeping the v11
 ///   `block_gas_used` / `block_gas_limit`). `block_summaries` is re-keyed on `class` and renames
-///   `opcode_totals_7904` to `opcode_totals` (keeping the v12 `cold_account_code_count` /
-///   `cold_account_nocode_count`). `block_bucket_recipients` becomes `block_recipients`, re-keyed
-///   on `class` (keeping `gas_delta_sum_succeeding`). `divergences` drops `bucket` for the
-///   `outer_limit_only_failure` witness (distinguishes a succeeded-only-at-the-bumped-tier tx from
-///   a no-OOG break). Additive nullable forensic columns make "what failed and why" answerable from
-///   raw facts: `divergences` gains `additional_gas_charged` (F4 total repricing surcharge),
-///   `failure_selector_path` (F6 root-to-divergence selector JSON), `tx_type` / `tx_nonce` /
-///   `entry_selector` / `input_zero_bytes` / `input_nonzero_bytes` / `has_authorization` (F5 tx
-///   identity), `failure_reason` (F1 `HaltReason` discriminant / `Revert` / `Rejected`),
-///   `revert_data` / `revert_decoded` / `tx_output` (F2 capped returndata plus decode), and
+///   `opcode_totals_7904` to `opcode_totals` (keeping the v12 `cold_account_access_count`).
+///   `block_bucket_recipients` becomes `block_recipients`, re-keyed on `class` (keeping
+///   `gas_delta_sum_succeeding`). `divergences` drops `bucket` for the `outer_limit_only_failure`
+///   witness (distinguishes a succeeded-only-at-the-bumped-tier tx from a no-OOG break). Additive
+///   nullable forensic columns make "what failed and why" answerable from raw facts: `divergences`
+///   gains `additional_gas_charged` (F4 total repricing surcharge), `failure_selector_path` (F6
+///   root-to-divergence selector JSON), `tx_type` / `tx_nonce` / `entry_selector` /
+///   `input_zero_bytes` / `input_nonzero_bytes` / `has_authorization` (F5 tx identity),
+///   `failure_reason` (F1 `HaltReason` discriminant / `Revert` / `Rejected`), `revert_data` /
+///   `revert_decoded` / `tx_output` (F2 capped returndata plus decode), and
 ///   `baseline_frame_success` / `baseline_frame_gas_used` / `baseline_frame_gas_provided` (F7
 ///   baseline twin of the failing frame), `surcharge_at_oog` (F13 repricing surcharge at the OOG
 ///   instant) and the `gas_div_*` quad (F10 first opcode where cumulative schedule gas exceeded
@@ -103,21 +103,21 @@ use thiserror::Error;
 ///   `code_address` are now split (F3): `to_address` is the call/storage target (the proxy under
 ///   DELEGATECALL) while `code_address` is the code holder (the implementation, revm
 ///   `bytecode_address`); `codehash` and the metadata backfill resolve from `code_address` (F14).
-///   `divergences` also gains the F12 per-category tax decomposition `tax_warm_base` /
-///   `tax_cold_code` / `tax_second_db_read` / `tax_other` (these four sum to
-///   `additional_gas_charged`) plus `tax_intrinsic` (the tx-level intrinsic-gas delta). Two
-///   zero-information columns are dropped: `divergence_call_frames.state_gas_running` (was always
-///   NULL) and `divergences.would_fit_in_original_limit` (an exact duplicate of
-///   `schedule_success`). F8 storage-reprice drivers — `sload_cold_count` / `sload_warm_count` /
-///   `sstore_cold_count` / `sstore_{set,reset,clear,noop,dirty}_count` — are added to BOTH
-///   `divergences` (per-tx) and `block_summaries` (per-class), attributing the native
-///   `COLD_STORAGE_ACCESS` / `STORAGE_WRITE` / `REFUND_STORAGE_CLEAR` surcharges that never reach
-///   `additional_gas_charged`. `divergence_call_frames` and `divergence_opcode_counts` gain a
-///   `trace_kind` (`"schedule"` / `"baseline"`) in their primary key, mirroring
-///   `divergence_event_logs`, so a drill-in whose call tree diverged also stores the baseline call
-///   tree (F15) and baseline opcode counts (F11). There is no in-place migration: opening a pre-v10
-///   database is rejected by [`enforce_schema_version`] (via `PRAGMA user_version`) — wipe the
-///   divergences `SQLite` and re-gather. The archive datadir is never touched.
+///   `divergences` also gains the F12 per-category tax decomposition `tax_second_db_read` /
+///   `tax_other` (these two sum to `additional_gas_charged`) plus `tax_intrinsic` (the tx-level
+///   intrinsic-gas delta). Two zero-information columns are dropped:
+///   `divergence_call_frames.state_gas_running` (was always NULL) and
+///   `divergences.would_fit_in_original_limit` (an exact duplicate of `schedule_success`). F8
+///   storage-reprice drivers — `sload_cold_count` / `sload_warm_count` / `sstore_cold_count` /
+///   `sstore_{set,reset,clear,noop,dirty}_count` — are added to BOTH `divergences` (per-tx) and
+///   `block_summaries` (per-class), attributing the native `COLD_STORAGE_ACCESS` / `STORAGE_WRITE`
+///   / `REFUND_STORAGE_CLEAR` surcharges that never reach `additional_gas_charged`.
+///   `divergence_call_frames` and `divergence_opcode_counts` gain a `trace_kind` (`"schedule"` /
+///   `"baseline"`) in their primary key, mirroring `divergence_event_logs`, so a drill-in whose
+///   call tree diverged also stores the baseline call tree (F15) and baseline opcode counts (F11).
+///   There is no in-place migration: opening a pre-v10 database is rejected by
+///   [`enforce_schema_version`] (via `PRAGMA user_version`) — wipe the divergences `SQLite` and
+///   re-gather. The archive datadir is never touched.
 pub const SCHEMA_VERSION: u32 = 10;
 
 /// Errors raised by the storage layer.
@@ -406,8 +406,7 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             tx_count_authorization  INTEGER,
             tx_count_runtime_state  INTEGER,
             tx_count_no_state       INTEGER,
-            cold_account_code_count   INTEGER,
-            cold_account_nocode_count INTEGER,
+            cold_account_access_count INTEGER,
             sload_cold_count          INTEGER,
             sload_warm_count          INTEGER,
             sstore_cold_count         INTEGER,
@@ -528,13 +527,10 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             -- needs-more-gas vs permanently-broken-under-this-schedule.
             replay_halt_oog             INTEGER,
 
-            -- Per-tx count of cold account accesses split by whether the
-            -- target carried code (`code_hash != KECCAK_EMPTY`, incl. EIP-7702
-            -- delegated) vs not (EOA / empty / non-existent). Under EIP-8038
-            -- the two are priced differently (9131 vs 3140), so the split is
-            -- what drives this tx's account-access delta.
-            cold_account_code_count     INTEGER,
-            cold_account_nocode_count   INTEGER,
+            -- Per-tx count of cold account accesses (first access this tx) for
+            -- the account-access opcodes (BALANCE / EXTCODE* / CALL family /
+            -- SELFDESTRUCT). Collected for every schedule.
+            cold_account_access_count   INTEGER,
 
             -- F4: total repricing surcharge charged across all frames
             -- (signed; the summed per-opcode deltas). Per-frame breakdown
@@ -580,10 +576,8 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             gas_div_opcode              INTEGER,
 
             -- F12: per-category decomposition of the repricing tax. The first
-            -- four sum to additional_gas_charged; tax_intrinsic is the separate
+            -- two sum to additional_gas_charged; tax_intrinsic is the separate
             -- tx-level intrinsic delta.
-            tax_warm_base               INTEGER,
-            tax_cold_code               INTEGER,
             tax_second_db_read          INTEGER,
             tax_other                   INTEGER,
             tax_intrinsic               INTEGER,
@@ -890,13 +884,9 @@ pub struct BlockSummaryRow {
     pub tx_count_authorization: Option<u32>,
     pub tx_count_runtime_state: Option<u32>,
     pub tx_count_no_state: Option<u32>,
-    /// Cold account accesses in this bucket whose target carried code
-    /// (`code_hash != KECCAK_EMPTY`, incl. EIP-7702 delegated). Populated for
-    /// every schedule; `None` when the bucket made no cold account access.
-    pub cold_account_code_count: Option<u64>,
-    /// Cold account accesses in this bucket whose target had no code
-    /// (EOA / empty / non-existent). `None` when the bucket made no cold access.
-    pub cold_account_nocode_count: Option<u64>,
+    /// Cold account accesses in this bucket (account-access opcodes). Populated
+    /// for every schedule; `None` when the bucket made no cold account access.
+    pub cold_account_access_count: Option<u64>,
     /// EIP-8038 storage-reprice drivers (F8) summed over this class's txs.
     /// `None` when the class saw no SLOAD/SSTORE activity.
     pub storage_drivers: Option<StorageDrivers>,
@@ -1004,14 +994,10 @@ pub struct DivergenceRow {
     /// halts/reverts; `None` when at least one tier succeeded.
     pub replay_halt_oog: Option<bool>,
 
-    /// Cold account accesses in this tx whose target carried code
-    /// (`code_hash != KECCAK_EMPTY`, incl. EIP-7702 delegated). Populated for
+    /// Cold account accesses in this tx (account-access opcodes). Populated for
     /// every schedule; `None` when the tx made no cold account access, or when
     /// the schedule replay was rejected before classification completed.
-    pub cold_account_code_count: Option<u64>,
-    /// Cold account accesses in this tx whose target had no code
-    /// (EOA / empty / non-existent). `None` as above.
-    pub cold_account_nocode_count: Option<u64>,
+    pub cold_account_access_count: Option<u64>,
 
     /// Total repricing surcharge the schedule charged this tx across all frames
     /// (`ScheduleResult::additional_gas` — the summed per-opcode deltas). The
@@ -1079,11 +1065,9 @@ pub struct DivergenceRow {
     pub gas_div_opcode: Option<u8>,
 
     /// Per-category decomposition of the repricing tax (F12). The opcode-delta
-    /// categories (`warm_base` / `cold_code` / `second_db_read` / `other`) sum
-    /// to `additional_gas_charged`; `tax_intrinsic` is the separate tx-level
-    /// intrinsic-gas delta (schedule − baseline). `None` on the reject path.
-    pub tax_warm_base: Option<i64>,
-    pub tax_cold_code: Option<i64>,
+    /// categories (`second_db_read` / `other`) sum to `additional_gas_charged`;
+    /// `tax_intrinsic` is the separate tx-level intrinsic-gas delta
+    /// (schedule − baseline). `None` on the reject path.
     pub tax_second_db_read: Option<i64>,
     pub tax_other: Option<i64>,
     pub tax_intrinsic: Option<i64>,
@@ -1647,7 +1631,7 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             multiplier_log2_hist,
             tx_count_creation, tx_count_authorization,
             tx_count_runtime_state, tx_count_no_state,
-            cold_account_code_count, cold_account_nocode_count,
+            cold_account_access_count,
             sload_cold_count, sload_warm_count, sstore_cold_count,
             sstore_set_count, sstore_reset_count, sstore_clear_count,
             sstore_noop_count, sstore_dirty_count
@@ -1658,7 +1642,7 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
                   ?, ?,
                   ?,
                   ?, ?, ?, ?,
-                  ?, ?,
+                  ?,
                   ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (schedule_name, block_number, class) DO UPDATE SET
             tx_count                = excluded.tx_count,
@@ -1675,8 +1659,7 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             tx_count_authorization  = excluded.tx_count_authorization,
             tx_count_runtime_state  = excluded.tx_count_runtime_state,
             tx_count_no_state       = excluded.tx_count_no_state,
-            cold_account_code_count   = excluded.cold_account_code_count,
-            cold_account_nocode_count = excluded.cold_account_nocode_count,
+            cold_account_access_count = excluded.cold_account_access_count,
             sload_cold_count    = excluded.sload_cold_count,
             sload_warm_count    = excluded.sload_warm_count,
             sstore_cold_count   = excluded.sstore_cold_count,
@@ -1703,8 +1686,7 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             row.tx_count_authorization.map(|v| v as i64),
             row.tx_count_runtime_state.map(|v| v as i64),
             row.tx_count_no_state.map(|v| v as i64),
-            row.cold_account_code_count.map(|v| v as i64),
-            row.cold_account_nocode_count.map(|v| v as i64),
+            row.cold_account_access_count.map(|v| v as i64),
             row.storage_drivers.map(|s| s.sload_cold as i64),
             row.storage_drivers.map(|s| s.sload_warm as i64),
             row.storage_drivers.map(|s| s.sstore_cold as i64),
@@ -1739,7 +1721,7 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             runtime_state_gas, runtime_state_gas_spillover,
             state_gas_category, reservoir_exhausted,
             replay_halt_oog,
-            cold_account_code_count, cold_account_nocode_count,
+            cold_account_access_count,
             additional_gas_charged, failure_selector_path,
             tx_type, tx_nonce, entry_selector,
             input_zero_bytes, input_nonzero_bytes, has_authorization,
@@ -1747,7 +1729,7 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             baseline_frame_success, baseline_frame_gas_used,
             baseline_frame_gas_provided, surcharge_at_oog,
             gas_div_contract, gas_div_pc, gas_div_call_depth, gas_div_opcode,
-            tax_warm_base, tax_cold_code, tax_second_db_read, tax_other, tax_intrinsic,
+            tax_second_db_read, tax_other, tax_intrinsic,
             sload_cold_count, sload_warm_count, sstore_cold_count,
             sstore_set_count, sstore_reset_count, sstore_clear_count,
             sstore_noop_count, sstore_dirty_count
@@ -1764,14 +1746,14 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
                   ?, ?, ?, ?,
                   ?, ?, ?, ?, ?, ?, ?,
                   ?,
-                  ?, ?,
+                  ?,
                   ?, ?,
                   ?, ?, ?,
                   ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?, ?, ?,
-                  ?, ?, ?, ?, ?,
+                  ?, ?, ?,
                   ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             row.schedule_name,
@@ -1823,8 +1805,7 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             row.state_gas_category,
             row.reservoir_exhausted,
             row.replay_halt_oog,
-            row.cold_account_code_count.map(|v| v as i64),
-            row.cold_account_nocode_count.map(|v| v as i64),
+            row.cold_account_access_count.map(|v| v as i64),
             row.additional_gas_charged,
             row.failure_selector_path,
             row.tx_type.map(|v| v as i64),
@@ -1845,8 +1826,6 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             row.gas_div_pc.map(|v| v as i64),
             row.gas_div_call_depth,
             row.gas_div_opcode.map(|v| v as i64),
-            row.tax_warm_base,
-            row.tax_cold_code,
             row.tax_second_db_read,
             row.tax_other,
             row.tax_intrinsic,
@@ -2254,8 +2233,7 @@ mod tests {
                 tx_count_authorization: None,
                 tx_count_runtime_state: None,
                 tx_count_no_state: None,
-                cold_account_code_count: None,
-                cold_account_nocode_count: None,
+                cold_account_access_count: None,
                 storage_drivers: None,
             }],
             drill_ins: vec![drill_in],
@@ -2464,8 +2442,7 @@ mod tests {
             tx_count_authorization: None,
             tx_count_runtime_state: None,
             tx_count_no_state: None,
-            cold_account_code_count: None,
-            cold_account_nocode_count: None,
+            cold_account_access_count: None,
             storage_drivers: Some(sd),
         };
         db.record_block_output(&BlockOutput {

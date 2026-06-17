@@ -161,12 +161,10 @@ pub struct ScheduleInspector {
     cached_keccak_msg_size: Option<usize>,
     cached_exp_byte_size: Option<usize>,
 
-    /// EIP-8038 cold-account split: for account-access opcodes, whether the
-    /// target is touched cold and whether it has code (`code_hash !=
-    /// KECCAK_EMPTY`). Classified read-only from the journal in `step()` before
-    /// execution and consumed via `build_opcode_context`. Reset each step.
+    /// For account-access opcodes, whether the target is touched cold.
+    /// Classified read-only from the journal in `step()` before execution and
+    /// consumed via `build_opcode_context`. Reset each step.
     cached_target_is_cold: bool,
-    cached_target_is_code: bool,
 
     /// Captured at `step()` for the upcoming CALL/CALLCODE/DELEGATECALL/
     /// STATICCALL opcode: the raw gas argument the caller pushed onto the
@@ -363,7 +361,6 @@ impl ScheduleInspector {
             cached_keccak_msg_size: None,
             cached_exp_byte_size: None,
             cached_target_is_cold: false,
-            cached_target_is_code: false,
             pending_call_stack_gas: None,
             frame_capture: PerFrameCapture::new(),
             active_frame_stack: Vec::new(),
@@ -623,10 +620,9 @@ impl ScheduleInspector {
             exp_byte_size: self.cached_exp_byte_size,
             memory_offset: None,
             memory_access_size: None,
-            // Populated for account-access opcodes by the cold/code classification
-            // cached in `step()` (added with the EIP-8038 cold-account split).
+            // Populated for account-access opcodes by the cold classification
+            // cached in `step()`.
             target_is_cold: self.cached_target_is_cold,
-            target_is_code: self.cached_target_is_code,
         }
     }
 
@@ -713,8 +709,6 @@ impl ScheduleInspector {
     /// Accumulate a per-opcode tax breakdown into the tx's running per-category
     /// sums (F12). The sum of these reconciles to `additional_gas_charged`.
     const fn accumulate_tax(op_counts: &mut OperationCounts, b: &GasTaxBreakdown) {
-        op_counts.tax_warm_base += b.warm_base;
-        op_counts.tax_cold_code += b.cold_code;
         op_counts.tax_second_db_read += b.second_db_read;
         op_counts.tax_other += b.other;
     }
@@ -817,53 +811,32 @@ impl ScheduleInspector {
     }
 }
 
-/// Classify a cold-account-access target for the EIP-8038 code/no-code split,
-/// **read-only**. Returns `(is_cold, is_code)`.
+/// Classify whether a cold-account-access target is touched cold this tx,
+/// **read-only**. Returns the cold-ness only (no code/no-code classification).
 ///
 /// `load_account_info_skip_cold_load(skip_cold_load = true)` never warms the
 /// target: it returns `Ok` for an already-warm account and `ColdLoadSkipped`
-/// for a cold one. For a cold target we read `code_hash` straight from the DB
-/// (which does not touch the journal's EIP-2929 warm set), so the replay's own
-/// cold/warm accounting is preserved. Warm targets get no surcharge — so we
-/// short-circuit without the DB read. `is_code` follows the misilva73 rule:
-/// `code_hash != KECCAK_EMPTY` (contracts + EIP-7702 delegated; pure EOA /
-/// empty / non-existent are `NO_CODE`).
+/// for a cold one, so the replay's own cold/warm accounting is preserved.
 ///
-/// Invoked for **every** schedule (not just EIP-8038): the cold-account split is
-/// a near-free native baseline, and schedules that don't price it simply ignore
-/// the classification. See [`OperationCounts::cold_account_code_count`].
-fn classify_account_target<CTX>(context: &mut CTX, addr: Address) -> (bool, bool)
+/// Invoked for **every** schedule (not just EIP-8038): the cold-account
+/// classification is a near-free native baseline, and schedules that don't price
+/// it simply ignore it. See [`OperationCounts::cold_account_access_count`].
+fn classify_account_target<CTX>(context: &mut CTX, addr: Address) -> bool
 where
     CTX: ContextTr,
 {
-    use revm::context_interface::{journaled_state::JournalLoadError, Database, JournalTr};
+    use revm::context_interface::{journaled_state::JournalLoadError, JournalTr};
 
-    let is_cold = match context.journal_mut().load_account_info_skip_cold_load(addr, false, true) {
+    match context.journal_mut().load_account_info_skip_cold_load(addr, false, true) {
         Ok(_) => false,
         Err(JournalLoadError::ColdLoadSkipped) => true,
         Err(JournalLoadError::DBError(err)) => {
             // A real DB error here would also fail revm's own account load and
             // abort the tx; surface it rather than silently classifying as warm.
             tracing::warn!(target: "exex::research", %addr, ?err, "cold-account classification: journal load failed; treating as warm");
-            return (false, false);
-        }
-    };
-    if !is_cold {
-        return (false, false);
-    }
-    // Read `code_hash` for the cold target without warming it. Distinguish a
-    // genuinely non-existent account (`Ok(None)` → `NO_CODE`) from a DB read error
-    // — collapsing the latter to `NO_CODE` would silently drop the 5991 CODE
-    // surcharge on a real contract.
-    let is_code = match context.db_mut().basic(addr) {
-        Ok(Some(info)) => !info.is_empty_code_hash(),
-        Ok(None) => false,
-        Err(err) => {
-            tracing::warn!(target: "exex::research", %addr, ?err, "cold-account classification: code-hash read failed; treating as no-code");
             false
         }
-    };
-    (true, is_code)
+    }
 }
 
 /// Classify a storage slot for the EIP-8038 storage-reprice drivers (F8),
@@ -965,16 +938,15 @@ where
         // calls step → execute → step_end within a single loop iteration.
         self.call_delta_pre_applied = false;
 
-        // Reset the EIP-8038 cold-account classification; it is populated below
-        // only for account-access opcodes (default = not an account access).
+        // Reset the cold-account classification; it is populated below only for
+        // account-access opcodes (default = not an account access).
         self.cached_target_is_cold = false;
-        self.cached_target_is_code = false;
 
-        // EIP-8038 cold-account split: classify the account-access target
-        // (cold? has code?) read-only *before* execution, so opcode_gas_delta can
-        // apply the CODE surcharge — and, for the CALL family, before the gas is
-        // forwarded. The target's stack position differs by opcode: top-of-stack
-        // for BALANCE / EXTCODE* / SELFDESTRUCT, index 1 for the CALL family.
+        // Cold-account classification: classify the account-access target
+        // (cold?) read-only *before* execution — and, for the CALL family,
+        // before the gas is forwarded. The target's stack position differs by
+        // opcode: top-of-stack for BALANCE / EXTCODE* / SELFDESTRUCT, index 1
+        // for the CALL family.
         let target_pos = match self.current_opcode {
             0x31 | 0x3B | 0x3C | 0x3F | 0xFF => Some(0),
             0xF1 | 0xF2 | 0xF4 | 0xFA => Some(1),
@@ -985,16 +957,11 @@ where
         {
             let bytes = word.to_be_bytes::<32>();
             let addr = Address::from_slice(&bytes[12..]);
-            let (is_cold, is_code) = classify_account_target(context, addr);
+            let is_cold = classify_account_target(context, addr);
             self.cached_target_is_cold = is_cold;
-            self.cached_target_is_code = is_code;
-            // Count the cold-account access by code/no-code for data collection.
+            // Count the cold-account access for data collection.
             if is_cold {
-                if is_code {
-                    self.op_counts.cold_account_code_count += 1;
-                } else {
-                    self.op_counts.cold_account_nocode_count += 1;
-                }
+                self.op_counts.cold_account_access_count += 1;
             }
         }
 

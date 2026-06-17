@@ -166,12 +166,6 @@ pub struct OpcodeContext {
     /// access this tx). Populated by the inspector from the journal warm-set
     /// before the opcode executes; `false` for non-account opcodes.
     pub target_is_cold: bool,
-
-    /// For account-access opcodes: whether the target account **has code**
-    /// (`code_hash != KECCAK_EMPTY`, which includes EIP-7702 delegated
-    /// accounts). Drives the EIP-8038 cold-account CODE / `NO_CODE` split.
-    /// `false` for non-account opcodes / pure EOAs / empty / non-existent.
-    pub target_is_code: bool,
 }
 
 impl OpcodeContext {
@@ -188,16 +182,13 @@ impl OpcodeContext {
             memory_offset: None,
             memory_access_size: None,
             target_is_cold: false,
-            target_is_code: false,
         }
     }
 
-    /// Set the account-access target classification (cold/code) for the
-    /// EIP-8038 cold-account CODE/`NO_CODE` split. Called by the inspector for
+    /// Set the account-access target cold-ness. Called by the inspector for
     /// BALANCE / EXTCODE\* / CALL-family / SELFDESTRUCT opcodes.
-    pub const fn with_target_classification(mut self, is_cold: bool, is_code: bool) -> Self {
+    pub const fn with_target_classification(mut self, is_cold: bool) -> Self {
         self.target_is_cold = is_cold;
-        self.target_is_code = is_code;
         self
     }
 

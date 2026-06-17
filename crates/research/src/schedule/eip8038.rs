@@ -1,177 +1,173 @@
-//! EIP-8038: state access / write gas repricing schedule (misilva73 parameters).
+//! EIP-8038: state access / write gas repricing schedule (PR ethereum/EIPs#11802).
 //!
 //! EIP-8038 reprices state-access and state-write gas from client runtime
-//! benchmarks. The proposed values are **non-uniform** (one — `WARM_ACCESS` — is a
-//! decrease), and 8038 changes *how* charging is done for SSTORE and account
-//! writes — not just magnitudes. This schedule
-//! applies it on the block's native OSAKA spec, as an **independent** experiment
-//! (its own `config_fingerprint` → its own dataset; never benchmarked against
-//! EIP-8037, and it does NOT pull in 8037's state-gas reservoir or 7976 floor).
+//! benchmarks. PR 11802 made the schedule **uniform**: it dropped the earlier
+//! code/no-code account distinction and left `WARM_ACCESS` unchanged at 100.
+//! This schedule applies it on the block's native spec as an **independent**
+//! experiment (its own `config_fingerprint` → its own dataset; never benchmarked
+//! against EIP-8037, and it does NOT pull in 8037's state-gas reservoir or 7976
+//! floor). 8038-standalone therefore isolates the *regular-gas* reprice: the
+//! state-gas portion that EIP-8037 would add (e.g. `GAS_NEW_ACCOUNT`,
+//! `GAS_STORAGE_SET`) is **not** charged here.
 //!
-//! Proposed parameters (current → proposed):
+//! Proposed parameters (current → PR-11802):
 //! ```text
-//!   WARM_ACCESS                 100 →     62   (decrease)
-//!   COLD_STORAGE_ACCESS        2100 →   2735
-//!   COLD_ACCOUNT_NOCODE_ACCESS 2600 →   3140
-//!   COLD_ACCOUNT_CODE_ACCESS   2600 →   9131
-//!   STORAGE_WRITE              2800 →  15391
-//!   ACCOUNT_WRITE              6700 →  22866
-//!   REFUND_STORAGE_CLEAR       4800 →  17401
-//!   TX_ACCESS_LIST_STORAGE_KEY 1900 →   2735
-//!   TX_ACCESS_LIST_ADDRESS     2400 →   9131
-//!   CREATE  = ACCOUNT_WRITE + COLD_STORAGE_ACCESS = 25601
+//!   WARM_ACCESS                 100 →    100   (unchanged)
+//!   COLD_ACCOUNT_ACCESS        2600 →   3000
+//!   COLD_STORAGE_ACCESS        2100 →   3000
+//!   STORAGE_WRITE              2800 →  10000   (surcharge, on top of the access)
+//!   ACCOUNT_WRITE              6700 →   8000
+//!   STORAGE_CLEAR_REFUND       4800 →  12480   (= (10000 + 3000) · 0.96)
+//!   CREATE_ACCESS              7000 →  11000   (= ACCOUNT_WRITE + COLD_STORAGE_ACCESS)
+//!   ACCESS_LIST_ADDRESS_COST   2400 →   3000
+//!   ACCESS_LIST_STORAGE_KEY    1900 →   3000
 //! ```
 //!
-//! # Charging is applied in three layers
+//! # Charging — native `gas_params`, plus one inspector delta
 //!
-//! 1. [`configure_evm_env`](Eip8038Schedule::configure_evm_env) overrides the native gas-param
-//!    slots to back-solved **absolute** values: the cold add-ons and write surcharges revm reads
-//!    from `cfg.gas_params` and adds on top of the warm base, back-solved against `WARM_ACCESS`
-//!    (62). revm's own cold/warm/transition branch logic is unchanged — only magnitudes move.
-//!    `cold_account_additional_cost` holds the cold *add-on* (`NO_CODE − warm`), so `warm + add-on`
-//!    is the `NO_CODE` total. **Caveat:** revm sources the *warm static* leg of SLOAD/BALANCE/
-//!    EXTCODE*/CALL from a hardcoded const gas table (100), not `gas_params`, so the override only
-//!    reaches SSTORE's warm base + the EIP-7702 second read — the warm reduction for the other
-//!    opcodes is applied in Layer 3.
-//! 2. [`intrinsic_gas`](Eip8038Schedule::intrinsic_gas) applies the per-item access-list /
-//!    create-tx deltas (revm ignores `cfg.gas_params` for intrinsic gas).
-//! 3. [`opcode_gas_delta`](Eip8038Schedule::opcode_gas_delta) (inspector-applied) adds the
-//!    state-/opcode-dependent charges that no gas-param slot covers: the **warm-base correction**
-//!    (62 − 100 = −38 for the native-warm-100 opcodes, since their warm static leg is hardcoded —
-//!    see [`has_native_warm_static`]), the **cold-account CODE surcharge** (lift a cold access
-//!    whose target has code from `NO_CODE` 3140 to CODE 9131), and the EXTCODESIZE/EXTCODECOPY
-//!    **second-DB-read** flat `+WARM_ACCESS`. The inspector classifies the target (cold? has code?)
-//!    read-only from the journal and supplies it on [`OpcodeContext`].
+//! Because `WARM_ACCESS` is unchanged and there is no code/no-code split, **every**
+//! 8038 cost is a stock revm `gas_params` slot that revm already reads at charge
+//! time — so charging is native (no vendored revm changes for 8038):
 //!
-//! # Cold-account CODE / `NO_CODE` rule (misilva73-confirmed)
+//! 1. [`apply_gas_overrides`] writes the back-solved **absolute** slot values onto the block's
+//!    native gas-param table. revm adds the cold add-ons / write surcharges on top of the warm
+//!    base, so each add-on is `value − WARM_ACCESS`. The intrinsic access-list slots are overridden
+//!    here too, so the EVM charges the repriced intrinsic itself (the vendored handler's
+//!    `validate_initial_tx_gas` reads `cfg.gas_params`); hence
+//!    [`uses_native_intrinsic_gas`](Eip8038Schedule::uses_native_intrinsic_gas) is `true` and the
+//!    runner applies no intrinsic compensation.
+//! 2. [`opcode_gas_delta`](Eip8038Schedule::opcode_gas_delta) carries the **only** charge with no
+//!    gas-param slot: `EXTCODESIZE`/`EXTCODECOPY` are charged an additional `WARM_ACCESS` for their
+//!    second database read (EIP-8038 §"EXT* family update"). Stock revm charges a single access, so
+//!    the `+100` rides the inspector. Everything else has `opcode_gas_delta == 0`.
 //!
-//! A cold account access costs CODE (9131) iff the target's `code_hash !=
-//! KECCAK_EMPTY` — i.e. contracts **and** EIP-7702 delegated accounts. Pure EOAs,
-//! empty-but-existent, and non-existent accounts are `NO_CODE` (3140). Precompiles
-//! are pre-warmed, so the split never applies to them.
+//! # Create transactions (deliberately not repriced)
+//!
+//! `CREATE_ACCESS` is scoped to the `CREATE`/`CREATE2` **opcodes** (PR 11802
+//! §"`CREATE`/`CREATE2`"); the EIP gives no formula for the create-**transaction**
+//! intrinsic. We therefore leave `tx_create_cost` at revm's native value rather
+//! than guess — recorded in the fingerprint as `tx_create_repriced=false`. Revisit
+//! if the EIP later specifies the create-tx intrinsic.
 
 use super::{
+    common::initial_and_floor_gas_for,
     context::{OpcodeContext, TxContext},
     traits::{GasSchedule, GasTaxBreakdown, ScheduleKind},
 };
 use reth_evm::EvmEnv;
 use revm::{
-    context_interface::cfg::gas_params::{GasId, GasParams},
+    context_interface::cfg::{
+        gas::InitialAndFloorGas,
+        gas_params::{GasId, GasParams},
+    },
     primitives::hardfork::SpecId,
 };
 
-/// Reference spec used to read the protocol-stable per-item intrinsic costs
-/// (access-list address/key, create-transaction). Only their *deltas* are used,
-/// so the block-spec base/calldata costs cancel; any post-Berlin spec yields the
-/// same values. `OSAKA` is the current mainnet default.
+/// Reference spec for the native intrinsic calculation. EIP-8038 stays on the
+/// block's native spec for execution; the intrinsic helper needs a concrete spec,
+/// and the only repriced intrinsic items (access-list address/key) are
+/// protocol-stable since Berlin, so the spec base cancels in the runner's delta.
+/// `OSAKA` is the current mainnet default.
 const REF_SPEC: SpecId = SpecId::OSAKA;
 
-/// EIP-8038 gas constants (misilva73 proposed parameters). Stored as
+/// EIP-8038 gas constants (PR 11802 uniform parameters). Stored as
 /// `(current, proposed)` pairs for the `config_fingerprint`, golden tests, and
 /// documentation; the schedule applies the proposed column as absolute slot
-/// overrides + inspector deltas (see the module docs).
+/// overrides (see [`apply_gas_overrides`]).
 #[derive(Debug, Clone, Copy)]
 pub struct Eip8038Constants;
 
 impl Eip8038Constants {
-    /// Warm storage / account access (a *decrease* under 8038).
-    pub const WARM_ACCESS: (u64, u64) = (100, 62);
+    /// Warm storage / account access. Unchanged by EIP-8038.
+    pub const WARM_ACCESS: (u64, u64) = (100, 100);
+    /// Cold account access (`*CALL` / `BALANCE` / `EXT*` / `SELFDESTRUCT`). Single
+    /// value — PR 11802 dropped the code/no-code distinction.
+    pub const COLD_ACCOUNT_ACCESS: (u64, u64) = (2_600, 3_000);
     /// Cold storage slot access (SLOAD / cold SSTORE first touch).
-    pub const COLD_STORAGE_ACCESS: (u64, u64) = (2_100, 2_735);
-    /// Cold account access to a target with no code (pure EOA / empty /
-    /// non-existent).
-    pub const COLD_ACCOUNT_NOCODE_ACCESS: (u64, u64) = (2_600, 3_140);
-    /// Cold account access to a target with code (contract / EIP-7702 delegated).
-    pub const COLD_ACCOUNT_CODE_ACCESS: (u64, u64) = (2_600, 9_131);
-    /// Regular gas surcharge for a first-time storage write (SSTORE set/reset).
-    pub const STORAGE_WRITE: (u64, u64) = (2_800, 15_391);
-    /// Regular gas for account writes (CALL/CALLCODE/CREATE/CREATE2/SELFDESTRUCT
-    /// value transfer / new account).
-    pub const ACCOUNT_WRITE: (u64, u64) = (6_700, 22_866);
-    /// Refund for clearing a storage slot (set → zero).
-    pub const REFUND_STORAGE_CLEAR: (u64, u64) = (4_800, 17_401);
-    /// Intrinsic cost per access-list storage key (EIP-2930).
-    pub const TX_ACCESS_LIST_STORAGE_KEY: (u64, u64) = (1_900, 2_735);
+    pub const COLD_STORAGE_ACCESS: (u64, u64) = (2_100, 3_000);
+    /// SSTORE write surcharge, charged on top of the storage access on a
+    /// first-time value change (set or reset).
+    pub const STORAGE_WRITE: (u64, u64) = (2_800, 10_000);
+    /// Account write surcharge (new account via CALL / SELFDESTRUCT to empty /
+    /// value transfer).
+    pub const ACCOUNT_WRITE: (u64, u64) = (6_700, 8_000);
+    /// Refund for clearing a storage slot (non-zero → zero).
+    pub const REFUND_STORAGE_CLEAR: (u64, u64) = (4_800, 12_480);
     /// Intrinsic cost per access-list address (EIP-2930).
-    pub const TX_ACCESS_LIST_ADDRESS: (u64, u64) = (2_400, 9_131);
+    pub const TX_ACCESS_LIST_ADDRESS: (u64, u64) = (2_400, 3_000);
+    /// Intrinsic cost per access-list storage key (EIP-2930).
+    pub const TX_ACCESS_LIST_STORAGE_KEY: (u64, u64) = (1_900, 3_000);
 
-    /// CREATE / CREATE2 regular gas = `ACCOUNT_WRITE + COLD_STORAGE_ACCESS`
-    /// (misilva73-confirmed; there is no standalone CREATE parameter).
-    pub const CREATE: u64 = Self::ACCOUNT_WRITE.1 + Self::COLD_STORAGE_ACCESS.1; // 25_601
-    /// Per-access surcharge lifting a cold account access from the `NO_CODE`
-    /// baseline up to the CODE cost. Applied by the inspector on cold targets
-    /// whose `code_hash != KECCAK_EMPTY`.
-    pub const COLD_ACCOUNT_CODE_SURCHARGE: u64 =
-        Self::COLD_ACCOUNT_CODE_ACCESS.1 - Self::COLD_ACCOUNT_NOCODE_ACCESS.1; // 5_991
+    /// `CALL_STIPEND` (2300) — unchanged by EIP-8038; used to derive the
+    /// value-transfer charge.
+    pub const CALL_STIPEND: u64 = 2_300;
+
+    /// `CREATE_ACCESS` = `ACCOUNT_WRITE` + `COLD_STORAGE_ACCESS` (PR 11802); the
+    /// regular gas for the `CREATE`/`CREATE2` opcodes.
+    pub const CREATE: u64 = Self::ACCOUNT_WRITE.1 + Self::COLD_STORAGE_ACCESS.1; // 11_000
+
+    /// `CALL_VALUE` = `ACCOUNT_WRITE` + `CALL_STIPEND` (PR 11802 §"`CALL`/
+    /// `CALLCODE`") — the caller's value-transfer charge (revm's
+    /// `transfer_value_cost` slot, native `CALLVALUE` = 9000 = 6700 + 2300).
+    pub const CALL_VALUE: u64 = Self::ACCOUNT_WRITE.1 + Self::CALL_STIPEND; // 10_300
+
+    /// `EXTCODESIZE`/`EXTCODECOPY` second-database-read surcharge = `WARM_ACCESS`.
+    pub const EXT_SECOND_READ: u64 = Self::WARM_ACCESS.1; // 100
 }
 
-/// Account-access opcodes the cold-account CODE/`NO_CODE` split applies to.
-const fn is_account_access_opcode(opcode: u8) -> bool {
-    matches!(opcode, 0x31 | 0x3B | 0x3C | 0x3F | 0xF1 | 0xF2 | 0xF4 | 0xFA | 0xFF)
-}
-
-/// revm's hardcoded warm static gas (`WARM_STORAGE_READ_COST`) for the
-/// state-access opcodes. **Coupled to a revm invariant:** revm charges this warm
-/// leg from a const per-spec gas table (`gas_table_spec`), NOT from
-/// `cfg.gas_params` — so overriding the `warm_storage_read_cost` slot is *inert*
-/// for these opcodes (only SSTORE's warm base, sourced from `sstore_static`, is
-/// overridable). 8038's warm reduction (→ [`Eip8038Constants::WARM_ACCESS`]) is
-/// therefore applied here in Layer 3, not Layer 1. A revm bump must re-validate
-/// this constant; the `warm_sload`/`cold_sload` execution tests are the guard.
-const NATIVE_WARM_STORAGE_READ_GAS: u64 = 100;
-
-/// Opcodes whose warm static gas is the hardcoded [`NATIVE_WARM_STORAGE_READ_GAS`]
-/// (so 8038's warm reduction must ride `opcode_gas_delta`, not the inert slot):
-/// SLOAD plus the eight account-access reads. **Excludes** SELFDESTRUCT (0xFF),
-/// whose cost is an account-write, not a warm read.
-const fn has_native_warm_static(opcode: u8) -> bool {
-    matches!(opcode, 0x31 | 0x3B | 0x3C | 0x3F | 0x54 | 0xF1 | 0xF2 | 0xF4 | 0xFA)
-}
-
-/// Apply EIP-8038's absolute gas-param slot overrides to `gas_params`. Shared by
-/// [`Eip8038Schedule::configure_evm_env`] and the execution tests so they never
-/// drift. revm adds the cold add-ons / write surcharges from these slots on top of
-/// a warm base, so each is back-solved against `WARM_ACCESS` (62).
+/// EIP-8038's absolute `gas_params` slot overrides (PR 11802), shared by
+/// [`apply_gas_overrides`] (runtime charging) and the native intrinsic path
+/// ([`initial_and_floor_gas_for`]) so they never drift.
 ///
-/// Note: the `warm_storage_read_cost` slot only governs SSTORE's warm base (via
-/// `sstore_static`) and the EIP-7702 second read — revm sources the warm static
-/// leg of SLOAD/BALANCE/EXTCODE*/CALL from a hardcoded table
-/// ([`NATIVE_WARM_STORAGE_READ_GAS`]), so 8038's warm reduction for those reaches
-/// them via [`Eip8038Schedule::opcode_gas_delta`], not this override.
-/// `cold_account_additional_cost` is the cold *add-on* (`warm + add-on = NO_CODE`);
-/// the CODE surcharge is applied per-access by `opcode_gas_delta`.
-pub fn apply_gas_overrides(gas_params: &mut GasParams) {
+/// revm adds the cold add-ons / write surcharges on top of a warm base, so each
+/// cold add-on is `total − WARM_ACCESS`. `WARM_ACCESS` is set explicitly (though
+/// unchanged at 100) so the back-solve is self-consistent. `tx_create_cost` is
+/// intentionally absent — see the module docs.
+const fn eip8038_overrides() -> [(GasId, u64); 16] {
     let warm = Eip8038Constants::WARM_ACCESS.1;
-    let cold_storage = Eip8038Constants::COLD_STORAGE_ACCESS.1;
-    let cold_account_nocode = Eip8038Constants::COLD_ACCOUNT_NOCODE_ACCESS.1;
-    let storage_write = Eip8038Constants::STORAGE_WRITE.1;
-    let account_write = Eip8038Constants::ACCOUNT_WRITE.1;
-    let clear_refund = Eip8038Constants::REFUND_STORAGE_CLEAR.1;
+    let cold_account_addon = Eip8038Constants::COLD_ACCOUNT_ACCESS.1 - warm; // 2900
+    let cold_storage_addon = Eip8038Constants::COLD_STORAGE_ACCESS.1 - warm; // 2900
+    let storage_write = Eip8038Constants::STORAGE_WRITE.1; // 10000
+    let account_write = Eip8038Constants::ACCOUNT_WRITE.1; // 8000
 
-    let overrides: [(GasId, u64); 14] = [
+    [
+        // Warm access (unchanged at 100; explicit for a self-consistent back-solve).
         (GasId::warm_storage_read_cost(), warm),
         (GasId::sstore_static(), warm),
-        // Both cold-storage slots are the cold *add-on* over the warm base:
-        // SLOAD charges `warm + cold_storage_additional`, SSTORE charges
-        // `sstore_static(warm) + cold_storage_cost`, so each = warm + add-on =
-        // COLD_STORAGE_ACCESS. (Verified by the SSTORE execution test.)
-        (GasId::cold_storage_cost(), cold_storage - warm),
-        (GasId::cold_storage_additional_cost(), cold_storage - warm),
-        (GasId::cold_account_additional_cost(), cold_account_nocode - warm),
+        // Cold add-ons over the warm base. SLOAD = warm + cold_storage_additional;
+        // cold SSTORE = sstore_static(warm) + cold_storage_cost — both reach
+        // COLD_STORAGE_ACCESS.
+        (GasId::cold_storage_cost(), cold_storage_addon),
+        (GasId::cold_storage_additional_cost(), cold_storage_addon),
+        // Account cold add-on: warm + add-on = COLD_ACCOUNT_ACCESS.
+        (GasId::cold_account_additional_cost(), cold_account_addon),
+        // SSTORE write surcharge (set & reset), on top of the storage access.
         (GasId::sstore_set_without_load_cost(), storage_write),
         (GasId::sstore_reset_without_cold_load_cost(), storage_write),
+        // Refunds: STORAGE_WRITE refunded on reset-to-original; STORAGE_CLEAR on clear.
         (GasId::sstore_set_refund(), storage_write),
         (GasId::sstore_reset_refund(), storage_write),
-        (GasId::sstore_clearing_slot_refund(), clear_refund),
+        (GasId::sstore_clearing_slot_refund(), Eip8038Constants::REFUND_STORAGE_CLEAR.1),
+        // Account writes: new account via CALL / SELFDESTRUCT-to-empty.
         (GasId::new_account_cost(), account_write),
         (GasId::new_account_cost_for_selfdestruct(), account_write),
-        (GasId::transfer_value_cost(), account_write),
+        // Value-transfer CALL charge: CALL_VALUE = ACCOUNT_WRITE + CALL_STIPEND.
+        (GasId::transfer_value_cost(), Eip8038Constants::CALL_VALUE),
+        // CREATE/CREATE2 opcode regular gas (CREATE_ACCESS).
         (GasId::create(), Eip8038Constants::CREATE),
-    ];
-    gas_params.override_gas(overrides);
+        // Intrinsic per-item access-list costs (EIP-2930 access list).
+        (GasId::tx_access_list_address_cost(), Eip8038Constants::TX_ACCESS_LIST_ADDRESS.1),
+        (GasId::tx_access_list_storage_key_cost(), Eip8038Constants::TX_ACCESS_LIST_STORAGE_KEY.1),
+    ]
 }
 
-/// EIP-8038 (misilva73) state access/write repricing on the block's native spec.
+/// Apply EIP-8038's absolute `gas_params` slot overrides to `gas_params`.
+pub fn apply_gas_overrides(gas_params: &mut GasParams) {
+    gas_params.override_gas(eip8038_overrides());
+}
+
+/// EIP-8038 (PR 11802) uniform state access/write repricing on the block's native
+/// spec.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Eip8038Schedule;
 
@@ -188,31 +184,29 @@ impl GasSchedule for Eip8038Schedule {
     }
 
     fn description(&self) -> &str {
-        "EIP-8038 (misilva73 proposed gas): non-uniform state access/write reprice + cold-account code/no-code split, native OSAKA, independent of EIP-8037"
+        "EIP-8038 (PR 11802 uniform reprice): state access/write repricing, no code/no-code split, native spec, independent of EIP-8037"
     }
 
     fn config_fingerprint(&self) -> String {
-        // Every proposed value + the algorithmic-model tag, so any renumber or
-        // model change invalidates only the eip-8038 rows. `model` should carry
-        // misilva73's pinned commit/run id before a long backfill.
+        // Every proposed value + the model tag, so any renumber invalidates only
+        // the eip-8038 rows. `tx_create_repriced=false` records that the
+        // create-transaction intrinsic is left at revm's native value.
         format!(
-            "name=eip-8038|model=misilva73-absolute-v2-warm-static-L3|warm={:?}|cold_storage={:?}|\
-             cold_account_nocode={:?}|cold_account_code={:?}|storage_write={:?}|account_write={:?}|\
-             refund_storage_clear={:?}|access_list_key={:?}|access_list_address={:?}|create={}|\
-             ext_second_read={}|native_warm_static={}|baseline=native-osaka-absolute|ref_spec={:?}",
-            Eip8038Constants::WARM_ACCESS,
-            Eip8038Constants::COLD_STORAGE_ACCESS,
-            Eip8038Constants::COLD_ACCOUNT_NOCODE_ACCESS,
-            Eip8038Constants::COLD_ACCOUNT_CODE_ACCESS,
-            Eip8038Constants::STORAGE_WRITE,
-            Eip8038Constants::ACCOUNT_WRITE,
-            Eip8038Constants::REFUND_STORAGE_CLEAR,
-            Eip8038Constants::TX_ACCESS_LIST_STORAGE_KEY,
-            Eip8038Constants::TX_ACCESS_LIST_ADDRESS,
-            Eip8038Constants::CREATE,
+            "name=eip-8038|model=pr-11802-unified|warm={}|cold_account={}|cold_storage={}|\
+             storage_write={}|account_write={}|refund_storage_clear={}|create={}|call_value={}|\
+             access_list_address={}|access_list_key={}|ext_second_read={}|tx_create_repriced=false|\
+             baseline=native-osaka-absolute|ref_spec={REF_SPEC:?}",
             Eip8038Constants::WARM_ACCESS.1,
-            NATIVE_WARM_STORAGE_READ_GAS,
-            REF_SPEC,
+            Eip8038Constants::COLD_ACCOUNT_ACCESS.1,
+            Eip8038Constants::COLD_STORAGE_ACCESS.1,
+            Eip8038Constants::STORAGE_WRITE.1,
+            Eip8038Constants::ACCOUNT_WRITE.1,
+            Eip8038Constants::REFUND_STORAGE_CLEAR.1,
+            Eip8038Constants::CREATE,
+            Eip8038Constants::CALL_VALUE,
+            Eip8038Constants::TX_ACCESS_LIST_ADDRESS.1,
+            Eip8038Constants::TX_ACCESS_LIST_STORAGE_KEY.1,
+            Eip8038Constants::EXT_SECOND_READ,
         )
     }
 
@@ -225,80 +219,47 @@ impl GasSchedule for Eip8038Schedule {
     }
 
     fn intrinsic_gas(&self, ctx: &TxContext) -> Option<u64> {
-        // Per-item ABSOLUTE deltas (proposed − native), non-uniform. revm's
-        // initial-tx-gas helper ignores `cfg.gas_params`, so we model the
-        // intrinsic change as a delta on the canonical intrinsic; block-spec
-        // base/calldata costs cancel and the native per-item costs are
-        // protocol-stable.
-        let base = GasParams::new_spec(REF_SPEC);
-        let item_delta = |proposed: u64, id: GasId| proposed as i64 - base.get(id) as i64;
+        // Native intrinsic through the overridden gas-param table. The overrides
+        // touch only the access-list slots, so this differs from the native
+        // intrinsic exactly by the access-list reprice (the create-tx intrinsic is
+        // left native — see the module docs).
+        Some(initial_and_floor_gas_for(ctx, REF_SPEC, &eip8038_overrides()).initial_total_gas())
+    }
 
-        let addr_delta = item_delta(
-            Eip8038Constants::TX_ACCESS_LIST_ADDRESS.1,
-            GasId::tx_access_list_address_cost(),
-        );
-        let key_delta = item_delta(
-            Eip8038Constants::TX_ACCESS_LIST_STORAGE_KEY.1,
-            GasId::tx_access_list_storage_key_cost(),
-        );
-
-        let mut extra: i64 = (ctx.access_list_accounts as i64).saturating_mul(addr_delta);
-        extra =
-            extra.saturating_add((ctx.access_list_storage_slots as i64).saturating_mul(key_delta));
-        if ctx.is_create {
-            // Create-transaction intrinsic repriced to the CREATE regular gas.
-            // (Open item: whether the create-tx intrinsic is repriced alongside
-            // the CREATE/CREATE2 opcode — validate with misilva73.)
-            extra =
-                extra.saturating_add(item_delta(Eip8038Constants::CREATE, GasId::tx_create_cost()));
-        }
-
-        let total = (ctx.baseline_intrinsic_gas as i64).saturating_add(extra).max(0) as u64;
-        Some(total)
+    fn initial_and_floor_gas(&self, ctx: &TxContext) -> Option<InitialAndFloorGas> {
+        Some(initial_and_floor_gas_for(ctx, REF_SPEC, &eip8038_overrides()))
     }
 
     fn opcode_gas_delta(&self, opcode: u8, ctx: &OpcodeContext) -> i64 {
-        // Single source of truth: the per-category breakdown's total (F12).
         self.opcode_gas_tax_breakdown(opcode, ctx).total()
     }
 
-    fn opcode_gas_tax_breakdown(&self, opcode: u8, ctx: &OpcodeContext) -> GasTaxBreakdown {
+    fn opcode_gas_tax_breakdown(&self, opcode: u8, _ctx: &OpcodeContext) -> GasTaxBreakdown {
         let mut b = GasTaxBreakdown::default();
 
-        // Warm-base correction (the misilva73 WARM_ACCESS 100 → 62 decrease).
-        // revm charges these opcodes' warm static leg from a hardcoded const gas
-        // table (NATIVE_WARM_STORAGE_READ_GAS), ignoring the `warm_storage_read_cost`
-        // override, so the reduction can only be applied here as an additive delta
-        // (= 62 - 100 = -38). The cold add-ons in `configure_evm_env` are
-        // back-solved against the 62 warm base, so warm and cold totals both land
-        // on the proposed values once this delta is applied.
-        if has_native_warm_static(opcode) {
-            b.warm_base +=
-                Eip8038Constants::WARM_ACCESS.1 as i64 - NATIVE_WARM_STORAGE_READ_GAS as i64;
-        }
-
-        // EXTCODESIZE / EXTCODECOPY model a second DB read: a flat extra warm
-        // access on top of the normal account-access charge.
+        // EIP-8038 §"EXT* family update": EXTCODESIZE / EXTCODECOPY make a second
+        // database read (to fetch the code) and are charged an additional
+        // WARM_ACCESS on top of the normal account access. Stock revm charges a
+        // single access, so this surcharge rides the inspector. Unconditional
+        // (independent of cold/warm). Every other 8038 cost is a native
+        // gas_params slot, so its opcode delta is 0.
         if matches!(opcode, 0x3B | 0x3C) {
-            b.second_db_read += Eip8038Constants::WARM_ACCESS.1 as i64;
-        }
-
-        // Cold-account CODE surcharge: revm charged the `NO_CODE` baseline (set in
-        // `configure_evm_env`); lift it to the CODE cost when the cold target has
-        // code. The inspector populates the classification on `OpcodeContext`;
-        // for non-account opcodes / pure EOAs the flags are false.
-        if ctx.target_is_cold && ctx.target_is_code && is_account_access_opcode(opcode) {
-            b.cold_code += Eip8038Constants::COLD_ACCOUNT_CODE_SURCHARGE as i64;
+            b.second_db_read += Eip8038Constants::EXT_SECOND_READ as i64;
         }
 
         b
     }
 
     fn configure_evm_env(&self, env: &mut EvmEnv<SpecId>) -> bool {
-        let mut cfg = env.cfg_env.clone();
+        // Stay on the block's native spec; only overlay the repriced slots.
+        apply_gas_overrides(&mut env.cfg_env.gas_params);
+        true
+    }
 
-        apply_gas_overrides(&mut cfg.gas_params);
-        env.cfg_env = cfg;
+    fn uses_native_intrinsic_gas(&self) -> bool {
+        // The intrinsic access-list slots are overridden in `configure_evm_env`,
+        // so the EVM (vendored handler reading `cfg.gas_params`) charges the
+        // repriced intrinsic itself — the runner must not compensate.
         true
     }
 
@@ -338,18 +299,24 @@ mod tests {
     use alloy_primitives::{Address, Bytes, U256};
 
     #[test]
-    fn constants_match_misilva73_proposed() {
-        assert_eq!(Eip8038Constants::WARM_ACCESS.1, 62);
-        assert_eq!(Eip8038Constants::COLD_STORAGE_ACCESS.1, 2_735);
-        assert_eq!(Eip8038Constants::COLD_ACCOUNT_NOCODE_ACCESS.1, 3_140);
-        assert_eq!(Eip8038Constants::COLD_ACCOUNT_CODE_ACCESS.1, 9_131);
-        assert_eq!(Eip8038Constants::STORAGE_WRITE.1, 15_391);
-        assert_eq!(Eip8038Constants::ACCOUNT_WRITE.1, 22_866);
-        assert_eq!(Eip8038Constants::REFUND_STORAGE_CLEAR.1, 17_401);
-        assert_eq!(Eip8038Constants::TX_ACCESS_LIST_STORAGE_KEY.1, 2_735);
-        assert_eq!(Eip8038Constants::TX_ACCESS_LIST_ADDRESS.1, 9_131);
-        assert_eq!(Eip8038Constants::CREATE, 25_601);
-        assert_eq!(Eip8038Constants::COLD_ACCOUNT_CODE_SURCHARGE, 5_991);
+    fn constants_match_pr11802() {
+        assert_eq!(Eip8038Constants::WARM_ACCESS.1, 100);
+        assert_eq!(Eip8038Constants::COLD_ACCOUNT_ACCESS.1, 3_000);
+        assert_eq!(Eip8038Constants::COLD_STORAGE_ACCESS.1, 3_000);
+        assert_eq!(Eip8038Constants::STORAGE_WRITE.1, 10_000);
+        assert_eq!(Eip8038Constants::ACCOUNT_WRITE.1, 8_000);
+        assert_eq!(Eip8038Constants::REFUND_STORAGE_CLEAR.1, 12_480);
+        assert_eq!(Eip8038Constants::TX_ACCESS_LIST_ADDRESS.1, 3_000);
+        assert_eq!(Eip8038Constants::TX_ACCESS_LIST_STORAGE_KEY.1, 3_000);
+        assert_eq!(Eip8038Constants::CREATE, 11_000);
+        assert_eq!(Eip8038Constants::CALL_VALUE, 10_300);
+        assert_eq!(Eip8038Constants::EXT_SECOND_READ, 100);
+        // STORAGE_CLEAR_REFUND = (STORAGE_WRITE + COLD_STORAGE_ACCESS) · 0.96.
+        assert_eq!(
+            Eip8038Constants::REFUND_STORAGE_CLEAR.1,
+            (Eip8038Constants::STORAGE_WRITE.1 + Eip8038Constants::COLD_STORAGE_ACCESS.1) * 96 /
+                100
+        );
     }
 
     #[test]
@@ -359,13 +326,14 @@ mod tests {
         assert_eq!(s.kind(), ScheduleKind::Both);
         assert!(s.modifies_intrinsic());
         assert!(s.modifies_execution());
-        assert!(!s.uses_native_intrinsic_gas());
+        // PR 11802: intrinsic is charged natively via overridden gas_params.
+        assert!(s.uses_native_intrinsic_gas());
         assert!(s.affected_opcodes().contains(&0x55)); // SSTORE
         assert_eq!(s.replay_bump_multiplier(), Some(4)); // single [1,4] conditional bump
     }
 
     #[test]
-    fn configure_evm_env_sets_proposed_absolute_values() {
+    fn configure_evm_env_sets_unified_absolute_values() {
         let schedule = Eip8038Schedule::new();
         let mut env = EvmEnv::default();
         let original_spec = env.cfg_env.spec;
@@ -375,97 +343,71 @@ mod tests {
         assert_eq!(env.cfg_env.spec, original_spec);
 
         let g = |id| env.cfg_env.gas_params.get(id);
-        // Warm base.
-        assert_eq!(g(GasId::warm_storage_read_cost()), 62);
-        assert_eq!(g(GasId::sstore_static()), 62);
-        // Both cold-storage slots are the add-on over the warm base (warm +
-        // add-on = COLD_STORAGE_ACCESS 2735); validated end-to-end by the SSTORE
-        // execution test.
-        assert_eq!(g(GasId::cold_storage_cost()), 2_735 - 62);
-        assert_eq!(g(GasId::cold_storage_additional_cost()), 2_735 - 62);
-        // Cold-account `NO_CODE` total = warm + additional.
+        // Warm base unchanged.
+        assert_eq!(g(GasId::warm_storage_read_cost()), 100);
+        assert_eq!(g(GasId::sstore_static()), 100);
+        // Cold add-ons: warm + add-on = COLD_*_ACCESS (3000).
+        assert_eq!(g(GasId::warm_storage_read_cost()) + g(GasId::cold_storage_cost()), 3_000);
+        assert_eq!(
+            g(GasId::warm_storage_read_cost()) + g(GasId::cold_storage_additional_cost()),
+            3_000
+        );
         assert_eq!(
             g(GasId::warm_storage_read_cost()) + g(GasId::cold_account_additional_cost()),
-            Eip8038Constants::COLD_ACCOUNT_NOCODE_ACCESS.1
+            3_000
         );
-        // The previously-missing SSTORE reset/refund slots are now repriced.
-        assert_eq!(g(GasId::sstore_set_without_load_cost()), 15_391);
-        assert_eq!(g(GasId::sstore_reset_without_cold_load_cost()), 15_391);
-        assert_eq!(g(GasId::sstore_set_refund()), 15_391);
-        assert_eq!(g(GasId::sstore_reset_refund()), 15_391);
-        assert_eq!(g(GasId::sstore_clearing_slot_refund()), 17_401);
-        // Account write slots.
-        assert_eq!(g(GasId::new_account_cost()), 22_866);
-        assert_eq!(g(GasId::new_account_cost_for_selfdestruct()), 22_866);
-        assert_eq!(g(GasId::transfer_value_cost()), 22_866);
-        assert_eq!(g(GasId::create()), 25_601);
+        // SSTORE write surcharge + refunds.
+        assert_eq!(g(GasId::sstore_set_without_load_cost()), 10_000);
+        assert_eq!(g(GasId::sstore_reset_without_cold_load_cost()), 10_000);
+        assert_eq!(g(GasId::sstore_set_refund()), 10_000);
+        assert_eq!(g(GasId::sstore_reset_refund()), 10_000);
+        assert_eq!(g(GasId::sstore_clearing_slot_refund()), 12_480);
+        // Account writes + value transfer + create opcode.
+        assert_eq!(g(GasId::new_account_cost()), 8_000);
+        assert_eq!(g(GasId::new_account_cost_for_selfdestruct()), 8_000);
+        assert_eq!(g(GasId::transfer_value_cost()), 10_300);
+        assert_eq!(g(GasId::create()), 11_000);
+        // Intrinsic access-list slots.
+        assert_eq!(g(GasId::tx_access_list_address_cost()), 3_000);
+        assert_eq!(g(GasId::tx_access_list_storage_key_cost()), 3_000);
+        // The create-TRANSACTION intrinsic is left at revm's native value.
+        assert_eq!(
+            g(GasId::tx_create_cost()),
+            GasParams::new_spec(REF_SPEC).get(GasId::tx_create_cost())
+        );
     }
 
-    /// The Layer-3 delta of every native-warm-100 opcode carries the warm-base
-    /// correction (62 − 100 = −38); EXTCODESIZE/EXTCODECOPY add the +62 second read
-    /// on top. (Slot-level arithmetic; the execution tests in
-    /// `tests/eip8038_execution.rs` validate the totals revm actually charges.)
     #[test]
-    fn opcode_gas_delta_warm_base_and_second_read() {
+    fn opcode_gas_delta_only_extcode_second_read() {
         let s = Eip8038Schedule::new();
         let ctx = OpcodeContext::default();
-        let warm_fix = Eip8038Constants::WARM_ACCESS.1 as i64 - NATIVE_WARM_STORAGE_READ_GAS as i64;
-        assert_eq!(warm_fix, -38);
-        assert_eq!(s.opcode_gas_delta(0x3B, &ctx), warm_fix + 62); // EXTCODESIZE + 2nd read
-        assert_eq!(s.opcode_gas_delta(0x3C, &ctx), warm_fix + 62); // EXTCODECOPY + 2nd read
-        assert_eq!(s.opcode_gas_delta(0x3F, &ctx), warm_fix); // EXTCODEHASH: no 2nd read
-        assert_eq!(s.opcode_gas_delta(0x31, &ctx), warm_fix); // BALANCE
-        assert_eq!(s.opcode_gas_delta(0x54, &ctx), warm_fix); // SLOAD
-        assert_eq!(s.opcode_gas_delta(0x00, &ctx), 0); // STOP: not a state access
+        // EXTCODESIZE / EXTCODECOPY: +WARM_ACCESS for the second DB read.
+        assert_eq!(s.opcode_gas_delta(0x3B, &ctx), 100); // EXTCODESIZE
+        assert_eq!(s.opcode_gas_delta(0x3C, &ctx), 100); // EXTCODECOPY
+                                                         // Every other affected opcode is repriced via native gas_params → delta 0.
+        assert_eq!(s.opcode_gas_delta(0x3F, &ctx), 0); // EXTCODEHASH
+        assert_eq!(s.opcode_gas_delta(0x31, &ctx), 0); // BALANCE
+        assert_eq!(s.opcode_gas_delta(0x54, &ctx), 0); // SLOAD
+        assert_eq!(s.opcode_gas_delta(0x55, &ctx), 0); // SSTORE
+        assert_eq!(s.opcode_gas_delta(0xF1, &ctx), 0); // CALL
+        assert_eq!(s.opcode_gas_delta(0x00, &ctx), 0); // STOP
     }
 
     #[test]
-    fn opcode_gas_delta_cold_account_code_surcharge() {
+    fn opcode_gas_tax_breakdown_reconciles() {
         let s = Eip8038Schedule::new();
-        let warm_fix = Eip8038Constants::WARM_ACCESS.1 as i64 - NATIVE_WARM_STORAGE_READ_GAS as i64;
-        let cold_code = OpcodeContext::default().with_target_classification(true, true);
-        let cold_nocode = OpcodeContext::default().with_target_classification(true, false);
-        let warm_code = OpcodeContext::default().with_target_classification(false, true);
-
-        // Cold CALL to a contract: warm-base correction + 5991 code surcharge.
-        assert_eq!(s.opcode_gas_delta(0xF1, &cold_code), warm_fix + 5_991);
-        // Cold CALL to an EOA: warm-base correction only (no code surcharge).
-        assert_eq!(s.opcode_gas_delta(0xF1, &cold_nocode), warm_fix);
-        // Warm CALL: warm-base correction only.
-        assert_eq!(s.opcode_gas_delta(0xF1, &warm_code), warm_fix);
-        // Cold EXTCODECOPY to a contract: warm-base + second-read (+62) + code surcharge.
-        assert_eq!(s.opcode_gas_delta(0x3C, &cold_code), warm_fix + 62 + 5_991);
-        // SLOAD is storage, not an account access: warm-base correction, no surcharge.
-        assert_eq!(s.opcode_gas_delta(0x54, &cold_code), warm_fix);
-    }
-
-    /// F12: the per-category breakdown decomposes the delta correctly and its
-    /// total always reconciles to `opcode_gas_delta`.
-    #[test]
-    fn opcode_gas_tax_breakdown_decomposes_and_reconciles() {
-        let s = Eip8038Schedule::new();
-        let warm_fix = Eip8038Constants::WARM_ACCESS.1 as i64 - NATIVE_WARM_STORAGE_READ_GAS as i64;
-        let cold_code = OpcodeContext::default().with_target_classification(true, true);
-
-        // Cold EXTCODECOPY to a contract: all three opcode-delta categories fire.
-        let b = s.opcode_gas_tax_breakdown(0x3C, &cold_code);
-        assert_eq!(b.warm_base, warm_fix);
-        assert_eq!(b.second_db_read, 62);
-        assert_eq!(b.cold_code, 5_991);
+        let ctx = OpcodeContext::default();
+        // EXTCODECOPY's only delta category is the second DB read.
+        let b = s.opcode_gas_tax_breakdown(0x3C, &ctx);
+        assert_eq!(b.second_db_read, 100);
         assert_eq!(b.other, 0);
-        // Invariant: total() == opcode_gas_delta for every opcode/context.
-        for opcode in [0x00u8, 0x31, 0x3B, 0x3C, 0x3F, 0x54, 0xF1, 0xFA] {
-            for ctx in [
-                OpcodeContext::default(),
-                OpcodeContext::default().with_target_classification(true, true),
-                OpcodeContext::default().with_target_classification(true, false),
-            ] {
-                assert_eq!(
-                    s.opcode_gas_tax_breakdown(opcode, &ctx).total(),
-                    s.opcode_gas_delta(opcode, &ctx),
-                    "breakdown total must equal delta for opcode {opcode:#x}"
-                );
-            }
+        // Invariant: total() == opcode_gas_delta for every opcode.
+        for opcode in [0x00u8, 0x31, 0x3B, 0x3C, 0x3F, 0x54, 0x55, 0xF1, 0xFA, 0xFF] {
+            assert_eq!(
+                s.opcode_gas_tax_breakdown(opcode, &ctx).total(),
+                s.opcode_gas_delta(opcode, &ctx),
+                "breakdown total must equal delta for opcode {opcode:#x}"
+            );
         }
     }
 
@@ -486,38 +428,43 @@ mod tests {
     }
 
     #[test]
-    fn intrinsic_adds_access_list_deltas() {
+    fn intrinsic_reprices_access_list_only() {
         let schedule = Eip8038Schedule::new();
+        // Delta vs the native intrinsic = the access-list reprice only.
+        let native =
+            initial_and_floor_gas_for(&ctx(false, 2, 3), REF_SPEC, &[]).initial_total_gas();
+        let sched = schedule.intrinsic_gas(&ctx(false, 2, 3)).unwrap();
         let base = GasParams::new_spec(REF_SPEC);
         let addr_delta = Eip8038Constants::TX_ACCESS_LIST_ADDRESS.1 -
             base.get(GasId::tx_access_list_address_cost());
         let key_delta = Eip8038Constants::TX_ACCESS_LIST_STORAGE_KEY.1 -
             base.get(GasId::tx_access_list_storage_key_cost());
-        let intrinsic = schedule.intrinsic_gas(&ctx(false, 2, 3)).unwrap();
-        assert_eq!(intrinsic, 21_000 + addr_delta * 2 + key_delta * 3);
+        assert_eq!(sched - native, addr_delta * 2 + key_delta * 3);
     }
 
     #[test]
-    fn intrinsic_create_reprices_to_create_regular() {
+    fn intrinsic_does_not_reprice_create_transactions() {
         let schedule = Eip8038Schedule::new();
-        let base = GasParams::new_spec(REF_SPEC);
-        let with_create = schedule.intrinsic_gas(&ctx(true, 0, 0)).unwrap() as i64;
-        let without = schedule.intrinsic_gas(&ctx(false, 0, 0)).unwrap() as i64;
-        let create_delta =
-            Eip8038Constants::CREATE as i64 - base.get(GasId::tx_create_cost()) as i64;
-        assert_eq!(with_create - without, create_delta);
-        assert_eq!(without, 21_000);
+        let with_create = schedule.intrinsic_gas(&ctx(true, 0, 0)).unwrap();
+        let without = schedule.intrinsic_gas(&ctx(false, 0, 0)).unwrap();
+        // CREATE_ACCESS is opcode-only; the create-tx intrinsic stays at revm's
+        // native tx_create_cost (no 8038 override).
+        assert_eq!(
+            with_create - without,
+            GasParams::new_spec(REF_SPEC).get(GasId::tx_create_cost())
+        );
     }
 
     #[test]
-    fn config_fingerprint_reflects_new_model() {
+    fn config_fingerprint_reflects_unified_model() {
         let fp = Eip8038Schedule::new().config_fingerprint();
-        // v2 carries the warm-base-correction model (the −38 Layer-3 fix), so
-        // pre-fix +38 rows get a distinct config_hash.
-        assert!(fp.contains("model=misilva73-absolute-v2-warm-static-L3"));
-        assert!(fp.contains("native_warm_static=100"));
-        assert!(fp.contains("cold_account_code=(2600, 9131)"));
-        assert!(fp.contains("create=25601"));
+        assert!(fp.contains("model=pr-11802-unified"));
+        assert!(fp.contains("warm=100"));
+        assert!(fp.contains("cold_account=3000"));
+        assert!(fp.contains("storage_write=10000"));
+        assert!(fp.contains("create=11000"));
+        assert!(fp.contains("tx_create_repriced=false"));
+        assert!(!fp.contains("nocode"));
         assert!(!fp.contains("multiplier"));
     }
 }
