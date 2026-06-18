@@ -24,7 +24,7 @@ use crate::{
     database::{
         BlockCoverageRow, BlockOutput, BlockSummaryRow, CallFrameRow, DivergenceRow, OpcodeCountRow,
     },
-    divergence::{Bucket, EventLog},
+    divergence::{AggregateClass, EventLog},
     schedule::{GasSchedule, ScheduleRegistry},
 };
 use alloy_primitives::{keccak256, Address, B256};
@@ -36,7 +36,10 @@ use thiserror::Error;
 pub const MANIFEST_FORMAT_VERSION: u16 = 1;
 
 /// Version of the [`ExportEnvelopeV1`] payload format stored in the outbox.
-pub const ENVELOPE_FORMAT_VERSION: u16 = 1;
+/// v2: the `BlockOutput` payload was reshaped for the F-series schema (3-fact
+/// coverage, `class`-keyed summaries, full-parity divergence columns, and the
+/// baseline/schedule trace-kind split).
+pub const ENVELOPE_FORMAT_VERSION: u16 = 2;
 
 /// Replay semantics tag baked into the manifest and every remote row. The
 /// research pipeline replays each tx against canonical pre-tx state.
@@ -50,7 +53,10 @@ pub const PAYLOAD_KIND: &str = "block_output_v1";
 pub const TRACE_FORMAT: &str = "research_drill_in_components_v1";
 
 /// Version of the `trace_payload` format.
-pub const TRACE_FORMAT_VERSION: u16 = 1;
+/// v2: added the baseline call-frame / opcode-count vectors (trace-kind split)
+/// plus the F3 `to_address`/`code_address` and F9 failing-frame fields carried
+/// by the now-`Serialize` [`CallFrameRow`].
+pub const TRACE_FORMAT_VERSION: u16 = 2;
 
 /// ZSTD compression level for the outbox payload. Level 3 is the standard
 /// speed/ratio trade-off; the payload is JSON so it compresses well.
@@ -224,8 +230,8 @@ pub fn coverage_row_id(export_id: &str) -> String {
 }
 
 /// Deterministic `gas_analysis_block_summary.row_id`.
-pub fn summary_row_id(export_id: &str, bucket: Bucket) -> String {
-    framed_keccak(&[export_id.as_bytes(), bucket.as_str().as_bytes(), b"summary"])
+pub fn summary_row_id(export_id: &str, class: AggregateClass) -> String {
+    framed_keccak(&[export_id.as_bytes(), class.as_str().as_bytes(), b"summary"])
 }
 
 /// Deterministic `gas_analysis_divergence.row_id`.
@@ -275,14 +281,10 @@ pub struct CaptureMetadataV1 {
 
 impl CaptureMetadataV1 {
     /// Derive capture metadata from a block's output. The expected drill-in
-    /// count is the sum of the four drill-in bucket counts in coverage.
+    /// count is the coverage `tx_count_stored` fact — every tx that produced a
+    /// per-tx `divergences` (drill-in) row.
     pub const fn from_output(output: &BlockOutput) -> Self {
-        let c = &output.coverage;
-        let expected_drill_in_count = c
-            .tx_count_event_logs_changed
-            .saturating_add(c.tx_count_inconclusive_needs_higher_sweep)
-            .saturating_add(c.tx_count_contract_broken)
-            .saturating_add(c.tx_count_aa_gas_reestimation);
+        let expected_drill_in_count = output.coverage.tx_count_stored;
         let retained_drill_in_count = output.drill_ins.len() as u32;
         Self {
             expected_drill_in_count,
@@ -369,6 +371,16 @@ fn opt_addr42(value: Option<Address>) -> Option<String> {
     value.map(addr42)
 }
 
+/// 4-byte function selector as `0x`-prefixed hex (`ClickHouse` `FixedString(10)`).
+fn opt_selector(value: Option<[u8; 4]>) -> Option<String> {
+    value.map(|s| format!("0x{}", alloy_primitives::hex::encode(s)))
+}
+
+/// Bounded byte blob (revert data / tx output) as `0x`-prefixed hex.
+fn opt_bytes_hex(value: &Option<Vec<u8>>) -> Option<String> {
+    value.as_ref().map(|b| format!("0x{}", alloy_primitives::hex::encode(b)))
+}
+
 /// One row for `gas_analysis_run` — one per deterministic analysis config.
 #[allow(missing_docs)]
 #[derive(Debug, Clone, Serialize)]
@@ -422,15 +434,10 @@ pub struct CoverageRow {
     pub block_timestamp: u64,
     pub tx_count: u32,
     pub tx_count_unchanged: u32,
-    pub tx_count_trace_only: u32,
     pub tx_count_gas_only: u32,
-    pub tx_count_event_logs_changed: u32,
-    pub tx_count_schedule_rescued: u32,
-    pub tx_count_wallet_fixable_shallow: u32,
-    pub tx_count_wallet_fixable_deep_chain: u32,
-    pub tx_count_inconclusive_needs_higher_sweep: u32,
-    pub tx_count_contract_broken: u32,
-    pub tx_count_aa_gas_reestimation: u32,
+    pub tx_count_stored: u32,
+    pub block_gas_used: u64,
+    pub block_gas_limit: u64,
     pub expected_drill_in_count: u32,
     pub retained_drill_in_count: u32,
     pub drill_ins_truncated: bool,
@@ -452,7 +459,7 @@ pub struct SummaryRow {
     pub block_number: u64,
     pub block_hash: String,
     pub block_timestamp: u64,
-    pub bucket: String,
+    pub class: String,
     pub tx_count: u32,
     pub gas_delta_sum: Option<i64>,
     pub gas_delta_sum_sq: Option<f64>,
@@ -470,6 +477,20 @@ pub struct SummaryRow {
     pub tx_count_authorization: Option<u32>,
     pub tx_count_runtime_state: Option<u32>,
     pub tx_count_no_state: Option<u32>,
+    pub cold_account_access_count: Option<u64>,
+    pub sload_cold_count: Option<u64>,
+    pub sload_warm_count: Option<u64>,
+    pub sstore_cold_count: Option<u64>,
+    pub sstore_set_count: Option<u64>,
+    pub sstore_reset_count: Option<u64>,
+    pub sstore_clear_count: Option<u64>,
+    pub sstore_noop_count: Option<u64>,
+    pub sstore_dirty_count: Option<u64>,
+    pub warm_account_access_count: Option<u64>,
+    pub value_transfer_count: Option<u64>,
+    pub create_opcode_count: Option<u64>,
+    pub access_list_address_count: Option<u64>,
+    pub access_list_storage_key_count: Option<u64>,
 }
 
 /// One row for `gas_analysis_divergence`. Copies every scalar from
@@ -493,7 +514,6 @@ pub struct DivergenceExportRow {
     pub block_timestamp: u64,
     pub tx_index: u32,
     pub tx_hash: String,
-    pub bucket: String,
 
     pub sender: String,
     pub recipient: Option<String>,
@@ -516,7 +536,7 @@ pub struct DivergenceExportRow {
     pub schedule_gas_refunded: Option<u64>,
     pub schedule_intrinsic_gas: Option<u64>,
     pub schedule_floor_gas: Option<u64>,
-    pub would_fit_in_original_limit: Option<bool>,
+    pub outer_limit_only_failure: Option<bool>,
     pub min_multiplier_to_succeed: Option<f64>,
 
     pub divergence_contract: Option<String>,
@@ -543,6 +563,60 @@ pub struct DivergenceExportRow {
     pub reservoir_exhausted: Option<bool>,
     pub replay_halt_oog: Option<bool>,
 
+    pub cold_account_access_count: Option<u64>,
+    pub additional_gas_charged: Option<i64>,
+    pub failure_selector_path: Option<String>,
+
+    pub tx_type: Option<u8>,
+    pub tx_nonce: Option<u64>,
+    pub entry_selector: Option<String>,
+    pub input_zero_bytes: Option<u64>,
+    pub input_nonzero_bytes: Option<u64>,
+    pub has_authorization: Option<bool>,
+
+    pub failure_reason: Option<String>,
+    pub revert_data: Option<String>,
+    pub revert_decoded: Option<String>,
+    pub tx_output: Option<String>,
+
+    pub baseline_frame_success: Option<bool>,
+    pub baseline_frame_gas_used: Option<u64>,
+    pub baseline_frame_gas_provided: Option<u64>,
+
+    pub surcharge_at_oog: Option<i64>,
+    pub gas_div_contract: Option<String>,
+    pub gas_div_pc: Option<u32>,
+    pub gas_div_call_depth: Option<i32>,
+    pub gas_div_opcode: Option<u8>,
+
+    pub tax_second_db_read: Option<i64>,
+    pub tax_other: Option<i64>,
+    pub tax_intrinsic: Option<i64>,
+
+    pub sload_cold_count: Option<u64>,
+    pub sload_warm_count: Option<u64>,
+    pub sstore_cold_count: Option<u64>,
+    pub sstore_set_count: Option<u64>,
+    pub sstore_reset_count: Option<u64>,
+    pub sstore_clear_count: Option<u64>,
+    pub sstore_noop_count: Option<u64>,
+    pub sstore_dirty_count: Option<u64>,
+    pub warm_account_access_count: Option<u64>,
+    pub value_transfer_count: Option<u64>,
+    pub create_opcode_count: Option<u64>,
+    pub access_list_address_count: Option<u64>,
+    pub access_list_storage_key_count: Option<u64>,
+
+    pub tier1_failure_reason: Option<String>,
+    pub tier1_oog_opcode: Option<u8>,
+    pub tier1_oog_contract: Option<String>,
+    pub tier1_oog_pc: Option<u32>,
+    pub tier1_oog_depth: Option<i32>,
+    pub tier1_oog_gas_remaining: Option<u64>,
+    pub tier1_failing_selector: Option<String>,
+    pub tier1_failing_gas_provided: Option<u64>,
+    pub tier1_failing_gas_requested: Option<u64>,
+
     pub trace_payload: String,
     pub trace_content_hash: String,
     pub trace_uncompressed_size_bytes: u64,
@@ -566,6 +640,8 @@ struct TracePayloadV1<'a> {
     tx_hash: String,
     call_frames: &'a [CallFrameRow],
     opcode_counts: &'a [OpcodeCountRow],
+    baseline_call_frames: &'a [CallFrameRow],
+    baseline_opcode_counts: &'a [OpcodeCountRow],
     baseline_event_logs: &'a [EventLog],
     schedule_event_logs: &'a [EventLog],
 }
@@ -668,15 +744,10 @@ fn build_coverage_row(
         block_timestamp: coverage.timestamp,
         tx_count: coverage.tx_count,
         tx_count_unchanged: coverage.tx_count_unchanged,
-        tx_count_trace_only: coverage.tx_count_trace_only,
         tx_count_gas_only: coverage.tx_count_gas_only,
-        tx_count_event_logs_changed: coverage.tx_count_event_logs_changed,
-        tx_count_schedule_rescued: coverage.tx_count_schedule_rescued,
-        tx_count_wallet_fixable_shallow: coverage.tx_count_wallet_fixable_shallow,
-        tx_count_wallet_fixable_deep_chain: coverage.tx_count_wallet_fixable_deep_chain,
-        tx_count_inconclusive_needs_higher_sweep: coverage.tx_count_inconclusive_needs_higher_sweep,
-        tx_count_contract_broken: coverage.tx_count_contract_broken,
-        tx_count_aa_gas_reestimation: coverage.tx_count_aa_gas_reestimation,
+        tx_count_stored: coverage.tx_count_stored,
+        block_gas_used: coverage.block_gas_used,
+        block_gas_limit: coverage.block_gas_limit,
         expected_drill_in_count: capture.expected_drill_in_count,
         retained_drill_in_count: capture.retained_drill_in_count,
         drill_ins_truncated: capture.drill_ins_truncated,
@@ -694,11 +765,11 @@ fn build_summary_row(
     updated_at: u64,
 ) -> SummaryRow {
     // Split the sparse opcode struct list into equal-length parallel arrays.
-    let mut opcode = Vec::with_capacity(summary.opcode_totals_7904.len());
-    let mut opcode_count = Vec::with_capacity(summary.opcode_totals_7904.len());
-    let mut opcode_gas_baseline = Vec::with_capacity(summary.opcode_totals_7904.len());
-    let mut opcode_gas_schedule = Vec::with_capacity(summary.opcode_totals_7904.len());
-    for total in &summary.opcode_totals_7904 {
+    let mut opcode = Vec::with_capacity(summary.opcode_totals.len());
+    let mut opcode_count = Vec::with_capacity(summary.opcode_totals.len());
+    let mut opcode_gas_baseline = Vec::with_capacity(summary.opcode_totals.len());
+    let mut opcode_gas_schedule = Vec::with_capacity(summary.opcode_totals.len());
+    for total in &summary.opcode_totals {
         opcode.push(total.opcode);
         opcode_count.push(total.count);
         opcode_gas_baseline.push(total.gas_baseline);
@@ -707,7 +778,7 @@ fn build_summary_row(
 
     SummaryRow {
         updated_at,
-        row_id: summary_row_id(export_id, summary.bucket),
+        row_id: summary_row_id(export_id, summary.class),
         analysis_config_hash: analysis_config_hash.to_string(),
         chain_id: manifest.chain_id,
         producer_schema_version: manifest.producer_schema_version,
@@ -719,7 +790,7 @@ fn build_summary_row(
         block_number: coverage.block_number,
         block_hash: hash66(coverage.block_hash),
         block_timestamp,
-        bucket: summary.bucket.as_str().to_string(),
+        class: summary.class.as_str().to_string(),
         tx_count: summary.tx_count,
         gas_delta_sum: summary.gas_delta_sum,
         gas_delta_sum_sq: summary.gas_delta_sum_sq.map(|v| v as f64),
@@ -737,6 +808,20 @@ fn build_summary_row(
         tx_count_authorization: summary.tx_count_authorization,
         tx_count_runtime_state: summary.tx_count_runtime_state,
         tx_count_no_state: summary.tx_count_no_state,
+        cold_account_access_count: summary.cold_account_access_count,
+        sload_cold_count: summary.storage_drivers.map(|s| s.sload_cold),
+        sload_warm_count: summary.storage_drivers.map(|s| s.sload_warm),
+        sstore_cold_count: summary.storage_drivers.map(|s| s.sstore_cold),
+        sstore_set_count: summary.storage_drivers.map(|s| s.sstore_set),
+        sstore_reset_count: summary.storage_drivers.map(|s| s.sstore_reset),
+        sstore_clear_count: summary.storage_drivers.map(|s| s.sstore_clear),
+        sstore_noop_count: summary.storage_drivers.map(|s| s.sstore_noop),
+        sstore_dirty_count: summary.storage_drivers.map(|s| s.sstore_dirty),
+        warm_account_access_count: summary.account_drivers.map(|a| a.warm_account_access),
+        value_transfer_count: summary.account_drivers.map(|a| a.value_transfer),
+        create_opcode_count: summary.account_drivers.map(|a| a.create_opcode),
+        access_list_address_count: summary.account_drivers.map(|a| a.access_list_address),
+        access_list_storage_key_count: summary.account_drivers.map(|a| a.access_list_storage_key),
     }
 }
 
@@ -760,6 +845,8 @@ fn build_divergence_row(
         tx_hash: hash66(d.tx_hash),
         call_frames: &drill_in.call_frames,
         opcode_counts: &drill_in.opcode_counts,
+        baseline_call_frames: &drill_in.baseline_call_frames,
+        baseline_opcode_counts: &drill_in.baseline_opcode_counts,
         baseline_event_logs: &drill_in.baseline_event_logs,
         schedule_event_logs: &drill_in.schedule_event_logs,
     };
@@ -782,7 +869,6 @@ fn build_divergence_row(
         block_timestamp,
         tx_index: d.tx_index,
         tx_hash: hash66(d.tx_hash),
-        bucket: d.bucket.as_str().to_string(),
 
         sender: addr42(d.sender),
         recipient: opt_addr42(d.recipient),
@@ -805,7 +891,7 @@ fn build_divergence_row(
         schedule_gas_refunded: d.schedule_gas_refunded,
         schedule_intrinsic_gas: d.schedule_intrinsic_gas,
         schedule_floor_gas: d.schedule_floor_gas,
-        would_fit_in_original_limit: d.would_fit_in_original_limit,
+        outer_limit_only_failure: d.outer_limit_only_failure,
         min_multiplier_to_succeed: d.min_multiplier_to_succeed,
 
         divergence_contract: opt_addr42(d.divergence_contract),
@@ -831,6 +917,60 @@ fn build_divergence_row(
         state_gas_category: d.state_gas_category.clone(),
         reservoir_exhausted: d.reservoir_exhausted,
         replay_halt_oog: d.replay_halt_oog,
+
+        cold_account_access_count: d.cold_account_access_count,
+        additional_gas_charged: d.additional_gas_charged,
+        failure_selector_path: d.failure_selector_path.clone(),
+
+        tx_type: d.tx_type,
+        tx_nonce: d.tx_nonce,
+        entry_selector: opt_selector(d.entry_selector),
+        input_zero_bytes: d.input_zero_bytes,
+        input_nonzero_bytes: d.input_nonzero_bytes,
+        has_authorization: d.has_authorization,
+
+        failure_reason: d.failure_reason.clone(),
+        revert_data: opt_bytes_hex(&d.revert_data),
+        revert_decoded: d.revert_decoded.clone(),
+        tx_output: opt_bytes_hex(&d.tx_output),
+
+        baseline_frame_success: d.baseline_frame_success,
+        baseline_frame_gas_used: d.baseline_frame_gas_used,
+        baseline_frame_gas_provided: d.baseline_frame_gas_provided,
+
+        surcharge_at_oog: d.surcharge_at_oog,
+        gas_div_contract: opt_addr42(d.gas_div_contract),
+        gas_div_pc: d.gas_div_pc,
+        gas_div_call_depth: d.gas_div_call_depth,
+        gas_div_opcode: d.gas_div_opcode,
+
+        tax_second_db_read: d.tax_second_db_read,
+        tax_other: d.tax_other,
+        tax_intrinsic: d.tax_intrinsic,
+
+        sload_cold_count: d.storage_drivers.map(|s| s.sload_cold),
+        sload_warm_count: d.storage_drivers.map(|s| s.sload_warm),
+        sstore_cold_count: d.storage_drivers.map(|s| s.sstore_cold),
+        sstore_set_count: d.storage_drivers.map(|s| s.sstore_set),
+        sstore_reset_count: d.storage_drivers.map(|s| s.sstore_reset),
+        sstore_clear_count: d.storage_drivers.map(|s| s.sstore_clear),
+        sstore_noop_count: d.storage_drivers.map(|s| s.sstore_noop),
+        sstore_dirty_count: d.storage_drivers.map(|s| s.sstore_dirty),
+        warm_account_access_count: d.account_drivers.map(|a| a.warm_account_access),
+        value_transfer_count: d.account_drivers.map(|a| a.value_transfer),
+        create_opcode_count: d.account_drivers.map(|a| a.create_opcode),
+        access_list_address_count: d.account_drivers.map(|a| a.access_list_address),
+        access_list_storage_key_count: d.account_drivers.map(|a| a.access_list_storage_key),
+
+        tier1_failure_reason: d.tier1_failure_reason.clone(),
+        tier1_oog_opcode: d.tier1_oog_opcode,
+        tier1_oog_contract: opt_addr42(d.tier1_oog_contract),
+        tier1_oog_pc: d.tier1_oog_pc,
+        tier1_oog_depth: d.tier1_oog_depth,
+        tier1_oog_gas_remaining: d.tier1_oog_gas_remaining,
+        tier1_failing_selector: opt_selector(d.tier1_failing_selector),
+        tier1_failing_gas_provided: d.tier1_failing_gas_provided,
+        tier1_failing_gas_requested: d.tier1_failing_gas_requested,
 
         trace_payload,
         trace_content_hash,
@@ -862,7 +1002,7 @@ mod tests {
     }
 
     fn manifest(reg: &ScheduleRegistry, tiers: Vec<u64>) -> AnalysisManifestV1 {
-        AnalysisManifestV1::build(reg, normalize_gas_tiers(&tiers), Some(50), 1, 9, "deadbeef")
+        AnalysisManifestV1::build(reg, normalize_gas_tiers(&tiers), Some(50), 1, 10, "deadbeef")
     }
 
     #[test]
@@ -918,10 +1058,10 @@ mod tests {
     fn changing_drill_in_cap_changes_hash() {
         let reg = registry_2780_8037();
         let tiers = normalize_gas_tiers(&[1]);
-        let a = AnalysisManifestV1::build(&reg, tiers.clone(), Some(10), 1, 9, "c")
+        let a = AnalysisManifestV1::build(&reg, tiers.clone(), Some(10), 1, 10, "c")
             .analysis_config_hash()
             .unwrap();
-        let b = AnalysisManifestV1::build(&reg, tiers, Some(20), 1, 9, "c")
+        let b = AnalysisManifestV1::build(&reg, tiers, Some(20), 1, 10, "c")
             .analysis_config_hash()
             .unwrap();
         assert_ne!(a, b);
@@ -931,7 +1071,7 @@ mod tests {
     fn changing_commit_or_chain_changes_hash() {
         let reg = registry_2780_8037();
         let tiers = normalize_gas_tiers(&[1]);
-        let base = AnalysisManifestV1::build(&reg, tiers.clone(), None, 1, 9, "aaaa")
+        let base = AnalysisManifestV1::build(&reg, tiers.clone(), None, 1, 10, "aaaa")
             .analysis_config_hash()
             .unwrap();
         let diff_commit = AnalysisManifestV1::build(&reg, tiers.clone(), None, 1, 9, "bbbb")
@@ -982,11 +1122,14 @@ mod tests {
 
         // Child ids derive from the export id and are distinct per kind.
         let cov = coverage_row_id(&eid);
-        let sum = summary_row_id(&eid, Bucket::GasOnly);
+        let sum = summary_row_id(&eid, AggregateClass::GasOnly);
         let div = divergence_row_id(&eid, 3, B256::repeat_byte(0x22));
         assert_ne!(cov, sum);
         assert_ne!(cov, div);
-        assert_ne!(summary_row_id(&eid, Bucket::GasOnly), summary_row_id(&eid, Bucket::TraceOnly));
+        assert_ne!(
+            summary_row_id(&eid, AggregateClass::GasOnly),
+            summary_row_id(&eid, AggregateClass::Unchanged)
+        );
         assert_ne!(
             divergence_row_id(&eid, 3, B256::repeat_byte(0x22)),
             divergence_row_id(&eid, 4, B256::repeat_byte(0x22)),
@@ -1003,15 +1146,10 @@ mod tests {
             timestamp: 1_700_000_000,
             tx_count: 10,
             tx_count_unchanged: 5,
-            tx_count_trace_only: 1,
             tx_count_gas_only: 1,
-            tx_count_event_logs_changed: drill_in_buckets,
-            tx_count_schedule_rescued: 0,
-            tx_count_wallet_fixable_shallow: 0,
-            tx_count_wallet_fixable_deep_chain: 0,
-            tx_count_inconclusive_needs_higher_sweep: 0,
-            tx_count_contract_broken: 0,
-            tx_count_aa_gas_reestimation: 0,
+            tx_count_stored: drill_in_buckets,
+            block_gas_used: 21000,
+            block_gas_limit: 30_000_000,
         }
     }
 
@@ -1023,7 +1161,6 @@ mod tests {
             tx_index: 2,
             tx_hash: B256::repeat_byte(0x33),
             timestamp: 1_700_000_000,
-            bucket: Bucket::EventLogsChanged,
             sender: Address::repeat_byte(0x01),
             recipient: Some(Address::repeat_byte(0x02)),
             is_create: false,
@@ -1043,7 +1180,7 @@ mod tests {
             schedule_gas_refunded: None,
             schedule_intrinsic_gas: Some(21000),
             schedule_floor_gas: None,
-            would_fit_in_original_limit: Some(true),
+            outer_limit_only_failure: Some(true),
             min_multiplier_to_succeed: None,
             divergence_contract: None,
             divergence_pc: None,
@@ -1067,6 +1204,7 @@ mod tests {
             state_gas_category: None,
             reservoir_exhausted: None,
             replay_halt_oog: None,
+            ..Default::default()
         }
     }
 
@@ -1074,14 +1212,14 @@ mod tests {
         BlockSummaryRow {
             schedule_name: "eip-2780".to_string(),
             block_number: 100,
-            bucket: Bucket::GasOnly,
+            class: AggregateClass::GasOnly,
             tx_count: 1,
             gas_delta_sum: Some(10),
             gas_delta_sum_sq: Some(100),
             gas_delta_min: Some(10),
             gas_delta_max: Some(10),
             gas_delta_log2_hist: Some([0; 12]),
-            opcode_totals_7904: vec![
+            opcode_totals: vec![
                 OpcodeBucketTotal { opcode: 0x01, count: 3, gas_baseline: 9, gas_schedule: 12 },
                 OpcodeBucketTotal { opcode: 0x20, count: 1, gas_baseline: 30, gas_schedule: 45 },
             ],
@@ -1092,6 +1230,9 @@ mod tests {
             tx_count_authorization: None,
             tx_count_runtime_state: None,
             tx_count_no_state: None,
+            cold_account_access_count: None,
+            storage_drivers: None,
+            account_drivers: None,
         }
     }
 
@@ -1103,6 +1244,8 @@ mod tests {
                 divergence: sample_divergence(),
                 call_frames: vec![],
                 opcode_counts: vec![],
+                baseline_call_frames: vec![],
+                baseline_opcode_counts: vec![],
                 baseline_event_logs: vec![EventLog {
                     log_index: 0,
                     address: Address::repeat_byte(0x02),
@@ -1111,6 +1254,7 @@ mod tests {
                 }],
                 schedule_event_logs: vec![],
             }],
+            recipients: vec![],
         }
     }
 
@@ -1138,11 +1282,48 @@ mod tests {
     fn capture_metadata_infers_truncation_from_coverage() {
         // Coverage claims 3 drill-in-bucket txs but only 1 retained → truncated.
         let mut output = sample_output();
-        output.coverage.tx_count_event_logs_changed = 3;
+        output.coverage.tx_count_stored = 3;
         let capture = CaptureMetadataV1::from_output(&output);
         assert_eq!(capture.expected_drill_in_count, 3);
         assert_eq!(capture.retained_drill_in_count, 1);
         assert!(capture.drill_ins_truncated);
+    }
+
+    #[test]
+    fn export_row_fields_match_required_columns() {
+        // Guards the three-way contract: each export row struct's serialized field
+        // set MUST equal its `required_columns()` allow-list, so the startup
+        // DESCRIBE check (and the ClickHouse DDL it gates) can never silently drift
+        // from what the producer actually writes.
+        use crate::export::clickhouse::DestinationTable;
+        use std::collections::BTreeSet;
+
+        let reg = registry_2780_8037();
+        let m = manifest(&reg, vec![1, 2, 4]);
+        let ach = m.analysis_config_hash().unwrap();
+        let rows = block_output_to_rows(&sample_output(), &m, &ach, 1_700_000_000).unwrap();
+
+        let assert_match = |table: DestinationTable, value: serde_json::Value| {
+            let serialized: BTreeSet<String> = value
+                .as_object()
+                .expect("row serializes to a JSON object")
+                .keys()
+                .cloned()
+                .collect();
+            let required: BTreeSet<String> =
+                table.required_columns().iter().map(|s| (*s).to_string()).collect();
+            assert_eq!(
+                serialized, required,
+                "{table:?}: export struct fields drift from required_columns()"
+            );
+        };
+
+        assert_match(DestinationTable::Coverage, serde_json::to_value(&rows.coverage).unwrap());
+        assert_match(DestinationTable::Summary, serde_json::to_value(&rows.summaries[0]).unwrap());
+        assert_match(
+            DestinationTable::Divergence,
+            serde_json::to_value(&rows.divergences[0]).unwrap(),
+        );
     }
 
     #[test]

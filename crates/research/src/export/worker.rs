@@ -413,7 +413,7 @@ mod tests {
             BlockCoverageRow, BlockOutput, BlockSummaryRow, DivergenceRow, DrillInRecord,
             EncodedExportEnvelope,
         },
-        divergence::Bucket,
+        divergence::AggregateClass,
         export::{
             config::ExportConfig,
             model::{export_id, normalize_gas_tiers, AnalysisManifestV1},
@@ -493,15 +493,10 @@ mod tests {
             timestamp: 1_700_000_000,
             tx_count: 1,
             tx_count_unchanged: 0,
-            tx_count_trace_only: 0,
             tx_count_gas_only: 0,
-            tx_count_event_logs_changed: drill,
-            tx_count_schedule_rescued: 0,
-            tx_count_wallet_fixable_shallow: 0,
-            tx_count_wallet_fixable_deep_chain: 0,
-            tx_count_inconclusive_needs_higher_sweep: 0,
-            tx_count_contract_broken: 0,
-            tx_count_aa_gas_reestimation: 0,
+            tx_count_stored: drill,
+            block_gas_used: 21000,
+            block_gas_limit: 30_000_000,
         }
     }
 
@@ -509,14 +504,14 @@ mod tests {
         BlockSummaryRow {
             schedule_name: "eip-2780".to_string(),
             block_number: block,
-            bucket: Bucket::GasOnly,
+            class: AggregateClass::GasOnly,
             tx_count: 1,
             gas_delta_sum: Some(1),
             gas_delta_sum_sq: Some(1),
             gas_delta_min: Some(1),
             gas_delta_max: Some(1),
             gas_delta_log2_hist: None,
-            opcode_totals_7904: vec![],
+            opcode_totals: vec![],
             state_gas_sum: None,
             state_gas_spillover_sum: None,
             multiplier_log2_hist: None,
@@ -524,6 +519,9 @@ mod tests {
             tx_count_authorization: None,
             tx_count_runtime_state: None,
             tx_count_no_state: None,
+            cold_account_access_count: None,
+            storage_drivers: None,
+            account_drivers: None,
         }
     }
 
@@ -536,53 +534,21 @@ mod tests {
                 tx_index: 0,
                 tx_hash: B256::repeat_byte(0xd1),
                 timestamp: 1_700_000_000,
-                bucket: Bucket::EventLogsChanged,
                 sender: Address::repeat_byte(0x01),
                 recipient: Some(Address::repeat_byte(0x02)),
                 is_create: false,
                 tx_gas_limit: 100_000,
                 baseline_success: true,
                 schedule_success: true,
-                status_changed: false,
                 event_logs_changed: true,
-                output_changed: false,
-                logs_bloom_changed: false,
                 baseline_gas_used: 21000,
                 schedule_gas_used: 21000,
-                gas_delta: 0,
-                baseline_total_gas_spent: None,
-                baseline_gas_refunded: None,
-                schedule_total_gas_spent: None,
-                schedule_gas_refunded: None,
-                schedule_intrinsic_gas: None,
-                schedule_floor_gas: None,
-                would_fit_in_original_limit: None,
-                min_multiplier_to_succeed: None,
-                divergence_contract: None,
-                divergence_pc: None,
-                divergence_call_depth: None,
-                divergence_opcode: None,
-                oog_contract: None,
-                oog_pc: None,
-                oog_call_depth: None,
-                oog_opcode: None,
-                oog_pattern: None,
-                oog_gas_remaining: None,
-                oog_chain_proportional: None,
-                oog_bottleneck_depth: None,
-                oog_bottleneck_kind: None,
-                schedule_state_gas_spent: None,
-                schedule_state_gas_demanded: None,
-                schedule_initial_state_gas: None,
-                schedule_initial_reservoir: None,
-                runtime_state_gas: None,
-                runtime_state_gas_spillover: None,
-                state_gas_category: None,
-                reservoir_exhausted: None,
-                replay_halt_oog: None,
+                ..Default::default()
             },
             call_frames: vec![],
             opcode_counts: vec![],
+            baseline_call_frames: vec![],
+            baseline_opcode_counts: vec![],
             baseline_event_logs: vec![],
             schedule_event_logs: vec![],
         }
@@ -632,6 +598,7 @@ mod tests {
             coverage: coverage(10, 0),
             summaries: vec![summary(10)],
             drill_ins: vec![],
+            recipients: vec![],
         };
         let (_ach, item) = seed(&db, output);
         let sink = FakeSink::new();
@@ -651,6 +618,7 @@ mod tests {
             coverage: coverage(11, 1),
             summaries: vec![summary(11)],
             drill_ins: vec![divergence(11)],
+            recipients: vec![],
         };
         let (_ach, item) = seed(&db, output);
         let sink = FakeSink::new();
@@ -671,8 +639,12 @@ mod tests {
     #[tokio::test]
     async fn coverage_transient_failure_is_retryable() {
         let db = DivergenceDatabase::in_memory().unwrap();
-        let output =
-            BlockOutput { coverage: coverage(12, 0), summaries: vec![], drill_ins: vec![] };
+        let output = BlockOutput {
+            coverage: coverage(12, 0),
+            summaries: vec![],
+            drill_ins: vec![],
+            recipients: vec![],
+        };
         let (_ach, item) = seed(&db, output);
         let sink = FakeSink::new();
         sink.fail_on(DestinationTable::Coverage, ClickHouseError::Transient("503".into()));
@@ -685,8 +657,12 @@ mod tests {
     #[tokio::test]
     async fn auth_failure_is_retryable_not_blocked() {
         let db = DivergenceDatabase::in_memory().unwrap();
-        let output =
-            BlockOutput { coverage: coverage(13, 0), summaries: vec![], drill_ins: vec![] };
+        let output = BlockOutput {
+            coverage: coverage(13, 0),
+            summaries: vec![],
+            drill_ins: vec![],
+            recipients: vec![],
+        };
         let (_ach, item) = seed(&db, output);
         let sink = FakeSink::new();
         sink.fail_on(DestinationTable::Run, ClickHouseError::Auth("401".into()));
@@ -699,8 +675,12 @@ mod tests {
     #[tokio::test]
     async fn oversized_row_is_permanently_blocked() {
         let db = DivergenceDatabase::in_memory().unwrap();
-        let output =
-            BlockOutput { coverage: coverage(14, 0), summaries: vec![], drill_ins: vec![] };
+        let output = BlockOutput {
+            coverage: coverage(14, 0),
+            summaries: vec![],
+            drill_ins: vec![],
+            recipients: vec![],
+        };
         let (_ach, item) = seed(&db, output);
         let sink = FakeSink::new();
         let mut config = test_config();
@@ -713,8 +693,12 @@ mod tests {
     #[tokio::test]
     async fn sqlite_lock_not_held_while_sink_awaits() {
         let db = DivergenceDatabase::in_memory().unwrap();
-        let output =
-            BlockOutput { coverage: coverage(15, 0), summaries: vec![], drill_ins: vec![] };
+        let output = BlockOutput {
+            coverage: coverage(15, 0),
+            summaries: vec![],
+            drill_ins: vec![],
+            recipients: vec![],
+        };
         let (_ach, item) = seed(&db, output);
         let sink = FakeSink::new();
         // During each insert, perform a real DB read. If the worker held the
@@ -735,8 +719,12 @@ mod tests {
     #[tokio::test]
     async fn run_loop_exports_then_stops_on_shutdown() {
         let db = DivergenceDatabase::in_memory().unwrap();
-        let output =
-            BlockOutput { coverage: coverage(16, 0), summaries: vec![], drill_ins: vec![] };
+        let output = BlockOutput {
+            coverage: coverage(16, 0),
+            summaries: vec![],
+            drill_ins: vec![],
+            recipients: vec![],
+        };
         let (_ach, item) = seed(&db, output);
         let export_id = item.export_id.clone();
         let sink = FakeSink::new();
@@ -768,8 +756,12 @@ mod tests {
     #[tokio::test]
     async fn run_loop_leaves_item_pending_on_coverage_failure() {
         let db = DivergenceDatabase::in_memory().unwrap();
-        let output =
-            BlockOutput { coverage: coverage(17, 0), summaries: vec![], drill_ins: vec![] };
+        let output = BlockOutput {
+            coverage: coverage(17, 0),
+            summaries: vec![],
+            drill_ins: vec![],
+            recipients: vec![],
+        };
         let (_ach, item) = seed(&db, output);
         let export_id = item.export_id.clone();
         let sink = FakeSink::new();

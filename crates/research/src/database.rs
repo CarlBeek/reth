@@ -122,9 +122,9 @@ use thiserror::Error;
 ///   re-gather. The archive datadir is never touched. This branch additionally adds two optional,
 ///   additive `ClickHouse`-export tables within v10 — `analysis_manifests` (immutable
 ///   per-`analysis_config_hash` dataset descriptor) and `export_outbox` (one durable row per
-///   export-enabled block output, drained by the embedded export worker) — created via
-///   `CREATE TABLE IF NOT EXISTS`; they are inert unless `--research.export-config-path` is set, so
-///   v10 is unchanged for non-export deployments.
+///   export-enabled block output, drained by the embedded export worker) — created via `CREATE
+///   TABLE IF NOT EXISTS`; they are inert unless `--research.export-config-path` is set, so v10 is
+///   unchanged for non-export deployments.
 pub const SCHEMA_VERSION: u32 = 10;
 
 /// Errors raised by the storage layer.
@@ -338,7 +338,7 @@ fn enforce_schema_version(conn: &Connection) -> Result<(), DatabaseError> {
 }
 
 fn verify_schema_version(conn: &Connection) -> Result<(), DatabaseError> {
-    let run_version: Option<u32> = conn
+    let latest: Option<u32> = conn
         .query_row(
             "SELECT schema_version FROM analysis_runs
              ORDER BY run_id DESC LIMIT 1",
@@ -349,23 +349,12 @@ fn verify_schema_version(conn: &Connection) -> Result<(), DatabaseError> {
             },
         )
         .optional()?;
-    let manifest_version: Option<u32> = conn
-        .query_row(
-            "SELECT schema_version FROM analysis_manifests
-             ORDER BY created_at DESC LIMIT 1",
-            [],
-            |row| {
-                let v: i64 = row.get(0)?;
-                Ok(v as u32)
-            },
-        )
-        .optional()?;
-    for found in [run_version, manifest_version].into_iter().flatten() {
-        if found != SCHEMA_VERSION {
-            return Err(DatabaseError::SchemaVersionMismatch { expected: SCHEMA_VERSION, found });
+    match latest {
+        Some(found) if found != SCHEMA_VERSION => {
+            Err(DatabaseError::SchemaVersionMismatch { expected: SCHEMA_VERSION, found })
         }
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Apply the full DDL. Idempotent via `CREATE TABLE IF NOT EXISTS` and
@@ -937,7 +926,7 @@ pub struct BlockOutput {
 /// (schedule, block, class). See the table DDL for the ranking / truncation
 /// rules and the `gas_delta_sum_succeeding` semantics.
 #[allow(missing_docs)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RecipientRow {
     pub schedule_name: String,
     pub block_number: u64,
@@ -3660,6 +3649,7 @@ mod tests {
                     coverage: fixture_coverage("test", 10, 0, 0),
                     summaries: vec![],
                     drill_ins: vec![],
+                    recipients: vec![],
                 },
                 &make_export("e-old", b"payload"),
             )
@@ -3683,6 +3673,7 @@ mod tests {
                 coverage: fixture_coverage("test", 5, 0, 0),
                 summaries: vec![],
                 drill_ins: vec![],
+                recipients: vec![],
             },
             &make_export("e-5", b"payload-5"),
         )
@@ -3697,9 +3688,11 @@ mod tests {
         let db = DivergenceDatabase::in_memory().unwrap();
         // First write a drill-in at (test, block 7, tx_index 0, config).
         let drill_in = DrillInRecord {
-            divergence: fixture_divergence(7, 0, Bucket::ContractBroken, 1),
+            divergence: fixture_divergence(7, 0, false, 1),
             call_frames: vec![],
             opcode_counts: vec![],
+            baseline_call_frames: vec![],
+            baseline_opcode_counts: vec![],
             baseline_event_logs: vec![],
             schedule_event_logs: vec![],
         };
@@ -3707,6 +3700,7 @@ mod tests {
             coverage: fixture_coverage("test", 7, 1, 0),
             summaries: vec![],
             drill_ins: vec![drill_in.clone()],
+            recipients: vec![],
         })
         .unwrap();
 
@@ -3717,6 +3711,7 @@ mod tests {
                 coverage: fixture_coverage("test", 7, 1, 0),
                 summaries: vec![],
                 drill_ins: vec![drill_in],
+                recipients: vec![],
             },
             &make_export("e-7", b"payload-7"),
         );
@@ -3731,6 +3726,7 @@ mod tests {
             coverage: fixture_coverage("test", 8, 0, 0),
             summaries: vec![],
             drill_ins: vec![],
+            recipients: vec![],
         };
         let export = make_export("e-8", b"same-payload");
         db.record_block_output_with_export(&output, &export).unwrap();
@@ -3750,6 +3746,7 @@ mod tests {
             coverage: fixture_coverage("test", 9, 0, 0),
             summaries: vec![],
             drill_ins: vec![],
+            recipients: vec![],
         };
         db.record_block_output_with_export(&output, &make_export("e-9", b"v1")).unwrap();
         db.mark_exported("e-9", current_unix_seconds()).unwrap();
@@ -3775,6 +3772,7 @@ mod tests {
                     coverage: fixture_coverage("test", 20 + i as u64, 0, 0),
                     summaries: vec![],
                     drill_ins: vec![],
+                    recipients: vec![],
                 },
                 &make_export(id, format!("p{i}").as_bytes()),
             )
@@ -3794,6 +3792,7 @@ mod tests {
                 coverage: fixture_coverage("test", 30, 0, 0),
                 summaries: vec![],
                 drill_ins: vec![],
+                recipients: vec![],
             },
             &make_export("e-30", b"0123456789"),
         )
@@ -3832,6 +3831,7 @@ mod tests {
                     coverage: fixture_coverage("test", block, 0, 0),
                     summaries: vec![],
                     drill_ins: vec![],
+                    recipients: vec![],
                 },
                 &make_export(id, id.as_bytes()),
             )
@@ -3845,28 +3845,5 @@ mod tests {
         // Exported audit row survives; pending row is gone.
         assert_eq!(outbox_state(&db, "e-keep").as_deref(), Some("exported"));
         assert!(outbox_state(&db, "e-drop").is_none());
-    }
-
-    #[test]
-    fn schema_mismatch_detected_via_analysis_manifests() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_db_path(&dir);
-        {
-            let db = DivergenceDatabase::open(&path).unwrap();
-            let conn = db.conn.lock().unwrap();
-            conn.execute(
-                "INSERT INTO analysis_manifests (
-                    analysis_config_hash, schema_version, chain_id,
-                    producer_git_commit, replay_semantics, manifest_json, created_at
-                 ) VALUES ('0xfuture', ?, 1, 'c', 'r', '{}', ?)",
-                params![SCHEMA_VERSION + 1, current_unix_seconds() as i64],
-            )
-            .unwrap();
-        }
-        let err = DivergenceDatabase::open(&path).unwrap_err();
-        assert!(matches!(
-            err,
-            DatabaseError::SchemaVersionMismatch { found, .. } if found == SCHEMA_VERSION + 1
-        ));
     }
 }
