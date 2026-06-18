@@ -43,7 +43,7 @@ use reth_research::{
     },
     divergence::{
         AccountDrivers, CallFrame, CallType as ResCallType, DivergenceFacts, DivergenceLocation,
-        EventLog, OogPattern, OutOfGasInfo, StorageDrivers,
+        EventLog, OutOfGasInfo, StorageDrivers, Tier1Diagnostics,
     },
     oog_chain::classify_oog_chain,
     schedule::{GasSchedule, RecipientInfo, ScheduleKind, ScheduleRegistry, TxContext},
@@ -352,16 +352,8 @@ where
         >,
     >,
 {
-    fn serialize_trace<T: serde::Serialize>(value: &T) -> Option<String> {
-        serde_json::to_string(value).ok()
-    }
-
     fn hash_bytes(bytes: &[u8]) -> String {
         format!("{:#x}", keccak256(bytes))
-    }
-
-    fn hash_serialized<T: serde::Serialize>(value: &T) -> Option<String> {
-        Self::serialize_trace(value).map(|json| Self::hash_bytes(json.as_bytes()))
     }
 
     fn hex_address(address: Address) -> String {
@@ -393,32 +385,6 @@ where
                 l.call_type != r.call_type ||
                 l.success != r.success ||
                 l.input != r.input
-        })
-    }
-
-    /// Synthesize a `DivergenceLocation` from the recorded call frames when the
-    /// inspector didn't capture one itself.
-    ///
-    /// The `ScheduleInspector` records a divergence location whenever
-    /// `apply_gas_delta` triggers OOG (per-opcode deltas) or when a frame ends
-    /// with an OOG-class result (native-revm schedules like EIP-8037). This
-    /// fallback handles the remaining cases — non-OOG schedule-induced
-    /// failures (e.g. revert from a hard-coded gas check, halt for an unrelated
-    /// reason) — by pointing at the deepest failed frame in the schedule run.
-    ///
-    /// Records emitted from this fallback have `pc = 0` / `opcode = 0xfe` (the
-    /// `INVALID` mnemonic, used here as a "post-hoc fallback" sentinel) so
-    /// downstream consumers can distinguish synthesized fallback rows from
-    /// real per-opcode divergence captures.
-    fn derive_divergence_location(call_frames: &[CallFrame]) -> Option<DivergenceLocation> {
-        let deepest_failed = call_frames.iter().filter(|f| !f.success).max_by_key(|f| f.depth)?;
-        Some(DivergenceLocation {
-            contract: deepest_failed.to.unwrap_or(deepest_failed.from),
-            function_selectors: Vec::new(),
-            pc: 0,
-            call_depth: deepest_failed.depth,
-            opcode: 0xfe,
-            opcode_name: "FALLBACK".to_string(),
         })
     }
 
@@ -1190,15 +1156,6 @@ where
     }
 
     /// Analyze a single block using multi-schedule execution.
-    ///
-    /// The per-schedule destructuring tuple still carries several locals
-    /// that were used by the legacy SQLite `ScheduleDivergence` builder
-    /// (formatted_op_counts, the *_json call-frame/event-log fields, the
-    /// hash fields, the output_* fields, etc.). They're kept in the tuple
-    /// so the existing per-schedule analysis remains a one-shot match
-    /// expression; future cleanup can drop them once the SQLite-shape
-    /// code is fully gone.
-    #[allow(unused_variables)]
     fn analyze_block(
         &self,
         block: &reth_primitives_traits::RecoveredBlock<BlockTy<Node::Types>>,
@@ -1307,6 +1264,14 @@ where
                 spec_id,
             );
             let (input_zero_bytes, input_nonzero_bytes) = Self::count_input_bytes(&input);
+            // Top-level 4-byte selector for calls with >=4 calldata bytes; None
+            // for creations (init code, no selector). Computed once per tx and
+            // reused by the divergence row and the drill-in record below.
+            let entry_selector: Option<[u8; 4]> = (!is_create && input.len() >= 4).then(|| {
+                let mut s = [0u8; 4];
+                s.copy_from_slice(&input[..4]);
+                s
+            });
             let tx_context = if self.has_intrinsic_schedules {
                 let recipient_info = match recipient {
                     Some(recipient_addr) => match normal_db.basic(recipient_addr) {
@@ -1385,10 +1350,7 @@ where
                 Self::output_hash_and_len(&normal_result.result);
             let baseline_created_address =
                 normal_result.result.created_address().map(Self::hex_address);
-            let baseline_log_count = normal_result.result.logs().len() as u64;
             let baseline_logs_bloom = Self::logs_bloom_hex(&normal_result.result);
-            let baseline_call_frames_hash = Self::hash_serialized(&baseline_call_frames);
-            let baseline_event_logs_hash = Self::hash_serialized(&baseline_event_logs);
             let baseline_total_gas_spent = normal_result.result.gas().total_gas_spent();
             let baseline_gas_refunded = normal_result.result.gas().inner_refunded();
 
@@ -1399,26 +1361,6 @@ where
             // IMPORTANT: re-execution happens BEFORE committing baseline state so
             // that schedule runs see the same pre-tx state the baseline saw.
             // The baseline commit is deferred until after all schedule runs.
-            /// F1: 1×-failure forensics. When tier-1 (the mainnet-equivalent
-            /// run) FAILS but the accepted attempt is a bumped tier (rescue) or
-            /// the highest tier (fail-under-both), the accepted attempt's
-            /// oog_/frame fields describe that *other* tier — these preserve
-            /// where/why tier-1 broke. Extracted from tier-1's own
-            /// `PerScheduleResult` + inspector; NO re-execution. Types mirror the
-            /// matching `DivergenceRow` columns so the insert mapping is shared.
-            #[derive(Debug, Clone, Default)]
-            struct Tier1Diagnostics {
-                failure_reason: Option<String>,
-                oog_opcode: Option<u8>,
-                oog_contract: Option<Address>,
-                oog_pc: Option<u32>,
-                oog_depth: Option<i32>,
-                oog_gas_remaining: Option<u64>,
-                failing_selector: Option<[u8; 4]>,
-                failing_gas_provided: Option<u64>,
-                failing_gas_requested: Option<u64>,
-            }
-
             struct PerScheduleResult {
                 success: bool,
                 gas_used: u64,
@@ -1432,9 +1374,6 @@ where
                 initial_reservoir: u64,
                 floor_gas: u64,
                 gas_refunded: u64,
-                operation_counts: Option<String>,
-                oog_info: Option<String>,
-                divergence_location: Option<String>,
                 /// `Some(true)` if the schedule replay halted with an
                 /// OOG-class halt reason at the inflated replay gas limit
                 /// (search exhausted — true minimum multiplier exceeds the
@@ -1497,10 +1436,7 @@ where
                 output_hash: Option<String>,
                 output_len: Option<u64>,
                 created_address: Option<String>,
-                log_count: u64,
                 logs_bloom: String,
-                call_frames_hash: Option<String>,
-                event_logs_hash: Option<String>,
             }
 
             // Indexed parallel to self.execution_schedules — accessed by schedule
@@ -1738,17 +1674,8 @@ where
                             // `oog_call_depth = None` and classify as
                             // ContractBroken even though a higher
                             // gas_limit is the only thing needed.
-                            let synth_oog = OutOfGasInfo {
-                                opcode: 0,
-                                opcode_name: "evm_reject_intrinsic".to_string(),
-                                pc: 0,
-                                contract: Address::ZERO,
-                                call_depth: 1,
-                                gas_remaining: 0,
-                                pattern: OogPattern::Unknown,
-                                // Rejected before execution — no surcharge applied.
-                                additional_gas_at_oog: 0,
-                            };
+                            // Rejected before execution — no surcharge applied.
+                            let synth_oog = OutOfGasInfo::synthetic_root("evm_reject_intrinsic");
                             last_attempt = Some(PerScheduleResult {
                                 success: false,
                                 gas_used: gas_limit,
@@ -1759,9 +1686,6 @@ where
                                 initial_reservoir: schedule_initial_reservoir,
                                 floor_gas: 0,
                                 gas_refunded: 0,
-                                operation_counts: None,
-                                oog_info: Some(format!("EVM transact failed: {e:?}")),
-                                divergence_location: None,
                                 replay_halt_oog: Some(true),
                                 oog_call_depth: Some(synth_oog.call_depth),
                                 oog_info_structured: Some(synth_oog),
@@ -1783,7 +1707,7 @@ where
                                 // tier-1 reject only when `tier == 1`).
                                 tier1_diag: None,
                                 // Rejected before execution: revm refused the tx
-                                // outright (the `{e:?}` is in `oog_info`).
+                                // outright.
                                 failure_reason: Some("Rejected".to_string()),
                                 revert_data: None,
                                 revert_decoded: None,
@@ -1793,10 +1717,7 @@ where
                                 output_hash: None,
                                 output_len: None,
                                 created_address: None,
-                                log_count: 0,
                                 logs_bloom: Self::hex_bloom(Bloom::ZERO),
-                                call_frames_hash: None,
-                                event_logs_hash: None,
                             });
                             continue;
                         }
@@ -1835,15 +1756,18 @@ where
                         let Some(ctx) = tx_context.as_ref() &&
                         let Some(schedule_intrinsic) = schedule.intrinsic_gas(ctx)
                     {
-                        // Non-native "Both" schedule (e.g. EIP-8038): revm
-                        // deducted the block's *native* intrinsic during
-                        // execution (its initial-tx-gas helper ignores
-                        // `cfg.gas_params` overrides), so the reported regular
-                        // gas reflects baseline intrinsic, not the schedule's.
-                        // Normalize by the intrinsic delta — mirroring the
-                        // native EIP-8037 path above — so `gas_delta` includes
-                        // the schedule's intrinsic repricing (access-list /
-                        // create-tx). State gas is unaffected (zero here).
+                        // Non-native "Both" schedule (one that reprices
+                        // intrinsic gas via the inspector rather than the EVM
+                        // env — EIP-8038 takes the native path above and never
+                        // reaches here): revm deducted the block's *native*
+                        // intrinsic during execution (its initial-tx-gas helper
+                        // ignores `cfg.gas_params` overrides), so the reported
+                        // regular gas reflects baseline intrinsic, not the
+                        // schedule's. Normalize by the intrinsic delta —
+                        // mirroring the native EIP-8037 path above — so
+                        // `gas_delta` includes the schedule's intrinsic
+                        // repricing (access-list / create-tx). State gas is
+                        // unaffected (zero here).
                         let intrinsic_delta =
                             i128::from(schedule_intrinsic) - i128::from(baseline_intrinsic_gas);
                         sched_gas_used =
@@ -1853,7 +1777,6 @@ where
                     }
                     let sched_floor_gas = result.result.gas().floor_gas();
                     let sched_gas_refunded = result.result.gas().inner_refunded();
-                    let op_counts = Self::serialize_trace(inspector.operation_counts());
                     let insp_result = inspector.result();
                     let halt_reason_debug = match &result.result {
                         revm::context_interface::result::ExecutionResult::Halt {
@@ -1861,9 +1784,6 @@ where
                         } => Some(format!("{reason:?}")),
                         _ => None,
                     };
-                    let halt_info = halt_reason_debug
-                        .as_ref()
-                        .map(|reason| format!("Execution halted: {reason}"));
                     // F1: structured failure reason — halt discriminant, Revert,
                     // or None on success.
                     let failure_reason = match &result.result {
@@ -1904,7 +1824,6 @@ where
                     };
                     let (output_hash, output_len) = Self::output_hash_and_len(&result.result);
                     let created_address = result.result.created_address().map(Self::hex_address);
-                    let log_count = result.result.logs().len() as u64;
                     let logs_bloom = Self::logs_bloom_hex(&result.result);
                     let call_frames = inspector.call_frames().to_vec();
                     let event_logs = inspector.event_logs().to_vec();
@@ -1914,21 +1833,9 @@ where
                     // oog_info. See the equivalent legacy comment for the full
                     // motivation; nothing tier-specific.
                     let inspector_oog_info = insp_result.oog_info.clone().or_else(|| {
-                        if replay_halt_oog == Some(true) {
-                            Some(OutOfGasInfo {
-                                opcode: 0,
-                                opcode_name: "root_halt".to_string(),
-                                pc: 0,
-                                contract: Address::ZERO,
-                                call_depth: 1,
-                                gas_remaining: 0,
-                                pattern: OogPattern::Unknown,
-                                // Synthesized at the producer — surcharge unknown here.
-                                additional_gas_at_oog: 0,
-                            })
-                        } else {
-                            None
-                        }
+                        // Synthesized at the producer — surcharge unknown here.
+                        (replay_halt_oog == Some(true))
+                            .then(|| OutOfGasInfo::synthetic_root("root_halt"))
                     });
 
                     let psr = PerScheduleResult {
@@ -1941,17 +1848,6 @@ where
                         initial_reservoir: schedule_initial_reservoir,
                         floor_gas: sched_floor_gas,
                         gas_refunded: sched_gas_refunded,
-                        operation_counts: op_counts,
-                        oog_info: inspector_oog_info
-                            .as_ref()
-                            .map(|oog| format!("{oog:?}"))
-                            .or(halt_info),
-                        divergence_location: insp_result
-                            .divergence_location
-                            .clone()
-                            .or_else(|| Self::derive_divergence_location(&call_frames))
-                            .as_ref()
-                            .map(|loc| format!("{loc:?}")),
                         replay_halt_oog,
                         oog_call_depth: inspector_oog_info.as_ref().map(|oog| oog.call_depth),
                         oog_info_structured: inspector_oog_info.clone(),
@@ -1981,14 +1877,11 @@ where
                         revert_data,
                         revert_decoded,
                         tx_output,
-                        call_frames_hash: Self::hash_serialized(&call_frames),
-                        event_logs_hash: Self::hash_serialized(&event_logs),
                         call_frames,
                         event_logs,
                         output_hash,
                         output_len,
                         created_address,
-                        log_count,
                         logs_bloom,
                     };
 
@@ -1996,30 +1889,15 @@ where
                     // Read entirely from psr (which already folded in the
                     // inspector's oog_info + call frames). The innermost failing
                     // frame is the deepest `!success` frame — the same rule that
-                    // marks the divergent/bottleneck frame downstream; `CallFrame`
-                    // carries no `is_divergent_frame`/`selector` of its own, so we
-                    // derive the selector from the frame's input.
+                    // marks the divergent/bottleneck frame downstream.
                     if tier == 1 && !sched_success {
                         let failing =
                             psr.call_frames.iter().filter(|f| !f.success).max_by_key(|f| f.depth);
-                        tier1_diag = Some(Tier1Diagnostics {
-                            failure_reason: psr.failure_reason.clone(),
-                            oog_opcode: psr.oog_info_structured.as_ref().map(|o| o.opcode),
-                            oog_contract: psr.oog_info_structured.as_ref().map(|o| o.contract),
-                            oog_pc: psr.oog_info_structured.as_ref().map(|o| o.pc as u32),
-                            oog_depth: psr
-                                .oog_info_structured
-                                .as_ref()
-                                .map(|o| o.call_depth as i32),
-                            oog_gas_remaining: psr
-                                .oog_info_structured
-                                .as_ref()
-                                .map(|o| o.gas_remaining),
-                            failing_selector: failing
-                                .and_then(|f| extract_selector_bytes(&f.input)),
-                            failing_gas_provided: failing.map(|f| f.gas_provided),
-                            failing_gas_requested: failing.and_then(|f| f.gas_requested_on_stack),
-                        });
+                        tier1_diag = Some(Tier1Diagnostics::from_parts(
+                            psr.failure_reason.clone(),
+                            psr.oog_info_structured.as_ref(),
+                            failing,
+                        ));
                     }
 
                     if sched_success {
@@ -2094,7 +1972,6 @@ where
                             if sched_ok && !sched_insp.truncated() {
                                 if let Some(loc) = first_divergence(base_steps, sched_insp.steps())
                                 {
-                                    chosen.divergence_location = Some(format!("{loc:?}"));
                                     chosen.divergence_location_structured = Some(loc);
                                 }
                             }
@@ -2166,25 +2043,9 @@ where
                     schedule_initial_reservoir,
                     schedule_floor_gas,
                     schedule_gas_refunded,
-                    formatted_op_counts,
-                    oog_info,
-                    divergence_location,
                     replay_halt_oog,
                     call_tree_diverged,
                     event_logs_diverged,
-                    baseline_call_frames_json,
-                    schedule_call_frames_json,
-                    baseline_event_logs_json,
-                    schedule_event_logs_json,
-                    baseline_call_frames_hash_row,
-                    schedule_call_frames_hash_row,
-                    baseline_event_logs_hash_row,
-                    schedule_event_logs_hash_row,
-                    schedule_output_hash,
-                    schedule_output_len,
-                    schedule_created_address,
-                    schedule_log_count,
-                    schedule_logs_bloom,
                     output_changed,
                     created_address_changed,
                     logs_bloom_changed,
@@ -2222,33 +2083,9 @@ where
                             r.initial_reservoir,
                             r.floor_gas,
                             r.gas_refunded,
-                            r.operation_counts.clone(),
-                            r.oog_info.clone(),
-                            r.divergence_location.clone(),
                             r.replay_halt_oog,
                             call_tree_diverged,
                             event_logs_diverged,
-                            call_tree_diverged
-                                .then(|| Self::serialize_trace(&baseline_call_frames))
-                                .flatten(),
-                            call_tree_diverged
-                                .then(|| Self::serialize_trace(&r.call_frames))
-                                .flatten(),
-                            event_logs_diverged
-                                .then(|| Self::serialize_trace(&baseline_event_logs))
-                                .flatten(),
-                            event_logs_diverged
-                                .then(|| Self::serialize_trace(&r.event_logs))
-                                .flatten(),
-                            baseline_call_frames_hash.clone(),
-                            r.call_frames_hash.clone(),
-                            baseline_event_logs_hash.clone(),
-                            r.event_logs_hash.clone(),
-                            r.output_hash.clone(),
-                            r.output_len,
-                            r.created_address.clone(),
-                            r.log_count,
-                            r.logs_bloom.clone(),
                             output_changed,
                             created_address_changed,
                             logs_bloom_changed,
@@ -2271,25 +2108,9 @@ where
                             0,
                             0,
                             0,
-                            None,
-                            None,
-                            None,
-                            None,
+                            None, // replay_halt_oog (no schedule run)
                             false,
                             false,
-                            None,
-                            None,
-                            None,
-                            None,
-                            baseline_call_frames_hash.clone(),
-                            baseline_call_frames_hash.clone(),
-                            baseline_event_logs_hash.clone(),
-                            baseline_event_logs_hash.clone(),
-                            baseline_output_hash.clone(),
-                            baseline_output_len,
-                            baseline_created_address.clone(),
-                            baseline_log_count,
-                            baseline_logs_bloom.clone(),
                             false,
                             false,
                             false,
@@ -2410,6 +2231,9 @@ where
                             exec_result.and_then(|r| r.divergence_location_structured.clone());
                         let gas_div = exec_result.and_then(|r| r.first_gas_divergence.clone());
                         let oog_info_s = exec_result.and_then(|r| r.oog_info_structured.clone());
+                        // F1: tier-1 failure forensics, pre-bound once for the
+                        // nine `tier1_*` columns below (None unless tier-1 failed).
+                        let tier1 = exec_result.and_then(|r| r.tier1_diag.as_ref());
                         let frames_ref: &[CallFrame] =
                             exec_result.map(|r| r.call_frames.as_slice()).unwrap_or(&[]);
                         let opcode_frames_ref =
@@ -2537,11 +2361,7 @@ where
                             // F5: top-level tx identity.
                             tx_type: Some(tx.ty()),
                             tx_nonce: Some(tx.nonce()),
-                            entry_selector: (!is_create && input.len() >= 4).then(|| {
-                                let mut s = [0u8; 4];
-                                s.copy_from_slice(&input[..4]);
-                                s
-                            }),
+                            entry_selector,
                             input_zero_bytes: Some(input_zero_bytes),
                             input_nonzero_bytes: Some(input_nonzero_bytes),
                             has_authorization: Some(authorization_count > 0),
@@ -2575,32 +2395,15 @@ where
                             // F1: tier-1 failure forensics (None unless tier-1
                             // failed). The accepted attempt's oog_*/frame columns
                             // describe the chosen tier; these describe the 1× run.
-                            tier1_failure_reason: exec_result
-                                .and_then(|r| r.tier1_diag.as_ref())
-                                .and_then(|d| d.failure_reason.clone()),
-                            tier1_oog_opcode: exec_result
-                                .and_then(|r| r.tier1_diag.as_ref())
-                                .and_then(|d| d.oog_opcode),
-                            tier1_oog_contract: exec_result
-                                .and_then(|r| r.tier1_diag.as_ref())
-                                .and_then(|d| d.oog_contract),
-                            tier1_oog_pc: exec_result
-                                .and_then(|r| r.tier1_diag.as_ref())
-                                .and_then(|d| d.oog_pc),
-                            tier1_oog_depth: exec_result
-                                .and_then(|r| r.tier1_diag.as_ref())
-                                .and_then(|d| d.oog_depth),
-                            tier1_oog_gas_remaining: exec_result
-                                .and_then(|r| r.tier1_diag.as_ref())
-                                .and_then(|d| d.oog_gas_remaining),
-                            tier1_failing_selector: exec_result
-                                .and_then(|r| r.tier1_diag.as_ref())
-                                .and_then(|d| d.failing_selector),
-                            tier1_failing_gas_provided: exec_result
-                                .and_then(|r| r.tier1_diag.as_ref())
-                                .and_then(|d| d.failing_gas_provided),
-                            tier1_failing_gas_requested: exec_result
-                                .and_then(|r| r.tier1_diag.as_ref())
+                            tier1_failure_reason: tier1.and_then(|d| d.failure_reason.clone()),
+                            tier1_oog_opcode: tier1.and_then(|d| d.oog_opcode),
+                            tier1_oog_contract: tier1.and_then(|d| d.oog_contract),
+                            tier1_oog_pc: tier1.and_then(|d| d.oog_pc),
+                            tier1_oog_depth: tier1.and_then(|d| d.oog_depth),
+                            tier1_oog_gas_remaining: tier1.and_then(|d| d.oog_gas_remaining),
+                            tier1_failing_selector: tier1.and_then(|d| d.failing_selector),
+                            tier1_failing_gas_provided: tier1.and_then(|d| d.failing_gas_provided),
+                            tier1_failing_gas_requested: tier1
                                 .and_then(|d| d.failing_gas_requested),
                         };
 
@@ -2692,12 +2495,8 @@ where
                             drill_in_record: drill_in,
                             recipient,
                             // 4-byte selector for calls with >=4 calldata bytes;
-                            // None for creations (init code, no selector).
-                            selector: (!is_create && input.len() >= 4).then(|| {
-                                let mut s = [0u8; 4];
-                                s.copy_from_slice(&input[..4]);
-                                s
-                            }),
+                            // None for creations (computed once per tx above).
+                            selector: entry_selector,
                             // gas_delta is only clean when the schedule replay
                             // fit the original limit; OOG-at-higher-tier txs
                             // carry halt-gas deltas and are excluded from the

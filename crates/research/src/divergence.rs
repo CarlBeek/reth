@@ -3,114 +3,6 @@
 use alloy_primitives::{Address, Bytes, B256};
 use serde::{Deserialize, Serialize};
 
-/// A detected divergence between normal and experimental execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Divergence {
-    /// Block number
-    pub block_number: u64,
-
-    /// Transaction index within the block
-    pub tx_index: u64,
-
-    /// Transaction hash
-    pub tx_hash: B256,
-
-    /// Block timestamp
-    pub timestamp: u64,
-
-    /// Types of divergence detected
-    pub divergence_types: Vec<DivergenceType>,
-
-    /// Gas analysis
-    pub gas_analysis: GasAnalysis,
-
-    /// Operation counts from normal execution
-    pub normal_ops: OperationCounts,
-
-    /// Operation counts from experimental execution
-    pub experimental_ops: OperationCounts,
-
-    /// Location where divergence first occurred
-    pub divergence_location: Option<DivergenceLocation>,
-
-    /// Out-of-gas information (if applicable)
-    pub oog_info: Option<OutOfGasInfo>,
-
-    /// Call trees (only if detailed tracing is enabled)
-    pub call_trees: Option<CallTrees>,
-
-    /// Event logs (only if detailed tracing is enabled)
-    pub event_logs: Option<EventLogs>,
-}
-
-/// Type of divergence detected.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum DivergenceType {
-    /// Post-transaction state root differs
-    StateRoot,
-
-    /// Execution trace differs (different opcodes executed)
-    ExecutionTrace,
-
-    /// Success/revert status differs
-    Status,
-
-    /// Event logs differ
-    EventLogs,
-
-    /// Call tree differs (different external calls made)
-    CallTree,
-
-    /// Gas usage pattern significantly differs (structural difference)
-    GasPattern,
-}
-
-impl std::fmt::Display for DivergenceType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::StateRoot => write!(f, "state_root"),
-            Self::ExecutionTrace => write!(f, "execution_trace"),
-            Self::Status => write!(f, "status"),
-            Self::EventLogs => write!(f, "event_logs"),
-            Self::CallTree => write!(f, "call_tree"),
-            Self::GasPattern => write!(f, "gas_pattern"),
-        }
-    }
-}
-
-/// Gas usage analysis.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GasAnalysis {
-    /// Gas consumed in normal execution
-    pub normal_gas_used: u64,
-
-    /// Gas consumed in experimental execution
-    pub experimental_gas_used: u64,
-
-    /// Gas efficiency ratio: (`experimental_gas` / multiplier) / `normal_gas`
-    /// Values near 1.0 indicate same execution path, just more expensive
-    /// Values != 1.0 indicate different execution path taken
-    pub gas_efficiency_ratio: f64,
-}
-
-impl GasAnalysis {
-    /// Calculate gas efficiency ratio.
-    pub fn calculate_ratio(normal_gas: u64, experimental_gas: u64, gas_multiplier: u64) -> f64 {
-        if normal_gas == 0 {
-            return 1.0;
-        }
-        let normalized_exp_gas = experimental_gas as f64 / gas_multiplier as f64;
-        normalized_exp_gas / normal_gas as f64
-    }
-
-    /// Check if the gas pattern indicates a structural divergence.
-    /// Threshold of 5% difference
-    pub fn is_structural_divergence(&self) -> bool {
-        (self.gas_efficiency_ratio - 1.0).abs() > 0.05
-    }
-}
-
 /// Counts of various operations executed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OperationCounts {
@@ -134,63 +26,6 @@ pub struct OperationCounts {
 
     /// Number of CREATE/CREATE2 operations
     pub create_count: u64,
-
-    // ── Repriced opcode counts and cumulative gas deltas ──
-    /// Number of DIV (0x04) operations
-    #[serde(default)]
-    pub div_count: u64,
-    /// Cumulative additional gas charged for DIV
-    #[serde(default)]
-    pub div_gas_delta: i64,
-
-    /// Number of SDIV (0x05) operations
-    #[serde(default)]
-    pub sdiv_count: u64,
-    /// Cumulative additional gas charged for SDIV
-    #[serde(default)]
-    pub sdiv_gas_delta: i64,
-
-    /// Number of MOD (0x06) operations
-    #[serde(default)]
-    pub mod_count: u64,
-    /// Cumulative additional gas charged for MOD
-    #[serde(default)]
-    pub mod_gas_delta: i64,
-
-    /// Number of SMOD (0x07) operations
-    #[serde(default)]
-    pub smod_count: u64,
-    /// Cumulative additional gas charged for SMOD
-    #[serde(default)]
-    pub smod_gas_delta: i64,
-
-    /// Number of ADDMOD (0x08) operations
-    #[serde(default)]
-    pub addmod_count: u64,
-    /// Cumulative additional gas charged for ADDMOD
-    #[serde(default)]
-    pub addmod_gas_delta: i64,
-
-    /// Number of MULMOD (0x09) operations
-    #[serde(default)]
-    pub mulmod_count: u64,
-    /// Cumulative additional gas charged for MULMOD
-    #[serde(default)]
-    pub mulmod_gas_delta: i64,
-
-    /// Number of EXP (0x0A) operations
-    #[serde(default)]
-    pub exp_count: u64,
-    /// Cumulative additional gas charged for EXP
-    #[serde(default)]
-    pub exp_gas_delta: i64,
-
-    /// Number of KECCAK256 (0x20) operations
-    #[serde(default)]
-    pub keccak256_count: u64,
-    /// Cumulative additional gas charged for KECCAK256
-    #[serde(default)]
-    pub keccak256_gas_delta: i64,
 
     /// Number of COLD account accesses (first access this tx) for the
     /// account-access opcodes (BALANCE / EXTCODE\* / CALL family / SELFDESTRUCT).
@@ -368,6 +203,54 @@ impl AccountDrivers {
     }
 }
 
+/// F1: 1×-failure forensics for a divergence row.
+///
+/// When tier-1 (the mainnet-equivalent run) FAILS but the accepted attempt is a
+/// bumped tier (rescue) or the highest tier (fail-under-both), the accepted
+/// attempt's `oog_*` / frame fields describe that *other* tier — these preserve
+/// where/why tier-1 broke. Built from tier-1's own per-schedule result +
+/// inspector with NO re-execution; the field types mirror the matching
+/// `DivergenceRow` columns so the insert mapping is shared.
+#[derive(Debug, Clone, Default)]
+#[allow(missing_docs)]
+pub struct Tier1Diagnostics {
+    pub failure_reason: Option<String>,
+    pub oog_opcode: Option<u8>,
+    pub oog_contract: Option<Address>,
+    pub oog_pc: Option<u32>,
+    pub oog_depth: Option<i32>,
+    pub oog_gas_remaining: Option<u64>,
+    pub failing_selector: Option<[u8; 4]>,
+    pub failing_gas_provided: Option<u64>,
+    pub failing_gas_requested: Option<u64>,
+}
+
+impl Tier1Diagnostics {
+    /// Assemble tier-1 forensics from the structured pieces of tier-1's result:
+    /// the failure reason, the captured OOG info, and the innermost failing
+    /// call frame (the deepest `!success` frame — the bottleneck).
+    pub fn from_parts(
+        failure_reason: Option<String>,
+        oog: Option<&OutOfGasInfo>,
+        failing: Option<&CallFrame>,
+    ) -> Self {
+        Self {
+            failure_reason,
+            oog_opcode: oog.map(|o| o.opcode),
+            oog_contract: oog.map(|o| o.contract),
+            oog_pc: oog.map(|o| o.pc as u32),
+            oog_depth: oog.map(|o| o.call_depth as i32),
+            oog_gas_remaining: oog.map(|o| o.gas_remaining),
+            failing_selector: failing
+                .and_then(|f| f.input.as_ref())
+                .filter(|b| b.len() >= 4)
+                .map(|b| [b[0], b[1], b[2], b[3]]),
+            failing_gas_provided: failing.map(|f| f.gas_provided),
+            failing_gas_requested: failing.and_then(|f| f.gas_requested_on_stack),
+        }
+    }
+}
+
 /// Location where divergence first occurred.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DivergenceLocation {
@@ -424,6 +307,27 @@ pub struct OutOfGasInfo {
     pub additional_gas_at_oog: i64,
 }
 
+impl OutOfGasInfo {
+    /// Synthesize a 1-based root-frame OOG sentinel (no real opcode captured):
+    /// `pattern = Unknown`, `call_depth = 1`, zeroed pc / contract / gas /
+    /// surcharge. `opcode_name` distinguishes the synthesis site (e.g.
+    /// `"root_halt"`, `"evm_reject_intrinsic"`). Used when a tx halts/rejects
+    /// before the inspector captured a per-frame OOG, so downstream
+    /// classification still sees a gas-class root halt.
+    pub fn synthetic_root(opcode_name: impl Into<String>) -> Self {
+        Self {
+            opcode: 0,
+            opcode_name: opcode_name.into(),
+            pc: 0,
+            contract: Address::ZERO,
+            call_depth: 1,
+            gas_remaining: 0,
+            pattern: OogPattern::Unknown,
+            additional_gas_at_oog: 0,
+        }
+    }
+}
+
 /// Pattern that caused out-of-gas.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -454,16 +358,6 @@ impl std::fmt::Display for OogPattern {
             Self::Unknown => write!(f, "unknown"),
         }
     }
-}
-
-/// Call trees from both executions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CallTrees {
-    /// Call tree from normal execution
-    pub normal: Vec<CallFrame>,
-
-    /// Call tree from experimental execution
-    pub experimental: Vec<CallFrame>,
 }
 
 /// A single call frame in the call tree.
@@ -594,16 +488,6 @@ impl std::fmt::Display for CallType {
             Self::Create2 => write!(f, "CREATE2"),
         }
     }
-}
-
-/// Event logs from both executions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventLogs {
-    /// Logs from normal execution
-    pub normal: Vec<EventLog>,
-
-    /// Logs from experimental execution
-    pub experimental: Vec<EventLog>,
 }
 
 /// A single event log.
@@ -740,18 +624,6 @@ impl std::fmt::Display for AggregateClass {
     }
 }
 
-/// Canonical ERC-4337 `EntryPoint` addresses (v0.6 / v0.7 / v0.8). Preserved as
-/// institutional knowledge for the downstream `ClickHouse` classifier: a gas-class
-/// failure on a tx whose recipient is one of these is a `UserOp` gas
-/// re-estimation problem (the signed off-chain `callGasLimit` /
-/// `verificationGasLimit`), not a contract bug. The producer no longer
-/// classifies this — it stores the raw `recipient` and lets downstream decide.
-pub const ERC4337_ENTRYPOINTS: [Address; 3] = [
-    alloy_primitives::address!("5ff137d4b0fdcd49dca30c7cf57e578a026d2789"), // v0.6
-    alloy_primitives::address!("0000000071727de22e5e9d8baf0edac6f37da032"), // v0.7
-    alloy_primitives::address!("4337084d9e255ff0702461cf8895ce9e3b5ff108"), // v0.8
-];
-
 /// Raw execution facts a tx exposes after the baseline-vs-schedule comparison,
 /// used to decide whether to store a full per-tx forensic record and, if not,
 /// which aggregate class it rolls into. No editorial judgment — pure facts.
@@ -812,45 +684,6 @@ impl DivergenceFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_gas_efficiency_ratio() {
-        // Same execution path: experimental gas is exactly multiplier * normal gas
-        let ratio = GasAnalysis::calculate_ratio(1000, 128_000, 128);
-        assert!((ratio - 1.0).abs() < 0.01);
-        assert!(!GasAnalysis {
-            normal_gas_used: 1000,
-            experimental_gas_used: 128_000,
-            gas_efficiency_ratio: ratio,
-        }
-        .is_structural_divergence());
-
-        // Different execution path: experimental uses less gas (shorter path)
-        let ratio = GasAnalysis::calculate_ratio(1000, 100_000, 128);
-        assert!(ratio < 0.9);
-        assert!(GasAnalysis {
-            normal_gas_used: 1000,
-            experimental_gas_used: 100_000,
-            gas_efficiency_ratio: ratio,
-        }
-        .is_structural_divergence());
-
-        // Different execution path: experimental uses more gas (longer path)
-        let ratio = GasAnalysis::calculate_ratio(1000, 150_000, 128);
-        assert!(ratio > 1.1);
-        assert!(GasAnalysis {
-            normal_gas_used: 1000,
-            experimental_gas_used: 150_000,
-            gas_efficiency_ratio: ratio,
-        }
-        .is_structural_divergence());
-    }
-
-    #[test]
-    fn test_divergence_type_display() {
-        assert_eq!(DivergenceType::StateRoot.to_string(), "state_root");
-        assert_eq!(DivergenceType::CallTree.to_string(), "call_tree");
-    }
 
     #[test]
     fn test_operation_counts_default() {

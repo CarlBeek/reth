@@ -23,9 +23,9 @@ pub enum ScheduleKind {
 ///
 /// The fields sum to [`GasSchedule::opcode_gas_delta`] for the same opcode and
 /// context — an invariant the inspector relies on so per-category running sums
-/// reconcile to the total repricing surcharge. Categories reflect EIP-8038's
-/// layer-3 deltas; schedules that don't decompose put the whole delta in
-/// `other` (the default).
+/// reconcile to the total repricing surcharge. The one non-`other` category,
+/// `second_db_read`, is the EXTCODE* second-read surcharge; schedules that don't
+/// decompose put the whole delta in `other` (the default).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GasTaxBreakdown {
     /// EXTCODESIZE / EXTCODECOPY second-DB-read flat add-on.
@@ -150,8 +150,8 @@ pub trait GasSchedule: Send + Sync + Debug {
     ///
     /// The returned [`GasTaxBreakdown`]'s `total()` MUST equal
     /// `opcode_gas_delta(opcode, ctx)`. The default attributes the whole delta
-    /// to `other`; only schedules whose delta combines distinct repricing
-    /// effects (EIP-8038) override this to split them.
+    /// to `other`; only schedules with a categorizable surcharge (EIP-8038's
+    /// EXTCODE* second-read add-on, the `second_db_read` category) override this.
     fn opcode_gas_tax_breakdown(&self, opcode: u8, ctx: &OpcodeContext) -> GasTaxBreakdown {
         GasTaxBreakdown::other(self.opcode_gas_delta(opcode, ctx))
     }

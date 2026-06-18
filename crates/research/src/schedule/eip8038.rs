@@ -54,6 +54,7 @@ use super::{
     context::{OpcodeContext, TxContext},
     traits::{GasSchedule, GasTaxBreakdown, ScheduleKind},
 };
+use crate::opcode;
 use reth_evm::EvmEnv;
 use revm::{
     context_interface::cfg::{
@@ -243,7 +244,7 @@ impl GasSchedule for Eip8038Schedule {
         // single access, so this surcharge rides the inspector. Unconditional
         // (independent of cold/warm). Every other 8038 cost is a native
         // gas_params slot, so its opcode delta is 0.
-        if matches!(opcode, 0x3B | 0x3C) {
+        if matches!(opcode, crate::opcode::EXTCODESIZE | crate::opcode::EXTCODECOPY) {
             b.second_db_read += Eip8038Constants::EXT_SECOND_READ as i64;
         }
 
@@ -275,19 +276,19 @@ impl GasSchedule for Eip8038Schedule {
 
     fn affected_opcodes(&self) -> Vec<u8> {
         vec![
-            0x31, // BALANCE
-            0x3B, // EXTCODESIZE
-            0x3C, // EXTCODECOPY
-            0x3F, // EXTCODEHASH
-            0x54, // SLOAD
-            0x55, // SSTORE
-            0xF0, // CREATE
-            0xF1, // CALL
-            0xF2, // CALLCODE
-            0xF4, // DELEGATECALL
-            0xF5, // CREATE2
-            0xFA, // STATICCALL
-            0xFF, // SELFDESTRUCT
+            opcode::BALANCE,
+            opcode::EXTCODESIZE,
+            opcode::EXTCODECOPY,
+            opcode::EXTCODEHASH,
+            opcode::SLOAD,
+            opcode::SSTORE,
+            opcode::CREATE,
+            opcode::CALL,
+            opcode::CALLCODE,
+            opcode::DELEGATECALL,
+            opcode::CREATE2,
+            opcode::STATICCALL,
+            opcode::SELFDESTRUCT,
         ]
     }
 }

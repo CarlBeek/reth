@@ -84,14 +84,14 @@ use thiserror::Error;
 ///   only txs without a per-tx forensic row; every failure and trace-divergence now gets a per-tx
 ///   `divergences` row (strictly more per-tx coverage than the old drill-in buckets).
 ///   `block_coverage` drops the 10 `tx_count_<bucket>` editorial counts for fact counts
-///   `tx_count_unchanged` / `tx_count_gas_only` / `tx_count_stored` (keeping the v11
-///   `block_gas_used` / `block_gas_limit`). `block_summaries` is re-keyed on `class` and renames
-///   `opcode_totals_7904` to `opcode_totals` (keeping the v12 `cold_account_access_count`).
-///   `block_bucket_recipients` becomes `block_recipients`, re-keyed on `class` (keeping
-///   `gas_delta_sum_succeeding`). `divergences` drops `bucket` for the `outer_limit_only_failure`
-///   witness (distinguishes a succeeded-only-at-the-bumped-tier tx from a no-OOG break). Additive
-///   nullable forensic columns make "what failed and why" answerable from raw facts: `divergences`
-///   gains `additional_gas_charged` (F4 total repricing surcharge), `failure_selector_path` (F6
+///   `tx_count_unchanged` / `tx_count_gas_only` / `tx_count_stored` (keeping `block_gas_used` /
+///   `block_gas_limit`). `block_summaries` is re-keyed on `class` and renames `opcode_totals_7904`
+///   to `opcode_totals` (keeping `cold_account_access_count`). `block_bucket_recipients` becomes
+///   `block_recipients`, re-keyed on `class` (keeping `gas_delta_sum_succeeding`). `divergences`
+///   drops `bucket` for the `outer_limit_only_failure` witness (distinguishes a
+///   succeeded-only-at-the-bumped-tier tx from a no-OOG break). Additive nullable forensic columns
+///   make "what failed and why" answerable from raw facts: `divergences` gains
+///   `additional_gas_charged` (F4 total repricing surcharge), `failure_selector_path` (F6
 ///   root-to-divergence selector JSON), `tx_type` / `tx_nonce` / `entry_selector` /
 ///   `input_zero_bytes` / `input_nonzero_bytes` / `has_authorization` (F5 tx identity),
 ///   `failure_reason` (F1 `HaltReason` discriminant / `Revert` / `Rejected`), `revert_data` /
@@ -1007,6 +1007,9 @@ pub struct DivergenceRow {
 
     pub baseline_success: bool,
     pub schedule_success: bool,
+    /// Denormalized `baseline_success != schedule_success`. Stored (not derived
+    /// at query time) so the common "did the outcome flip" filter is a single
+    /// indexed column read on the query hot-path.
     pub status_changed: bool,
     pub event_logs_changed: bool,
     pub output_changed: bool,
@@ -1014,6 +1017,8 @@ pub struct DivergenceRow {
 
     pub baseline_gas_used: u64,
     pub schedule_gas_used: u64,
+    /// Denormalized `schedule_gas_used - baseline_gas_used`, kept for the query
+    /// hot-path (the dominant repricing aggregate) rather than recomputed.
     pub gas_delta: i64,
     pub baseline_total_gas_spent: Option<u64>,
     pub baseline_gas_refunded: Option<u64>,
@@ -1117,8 +1122,8 @@ pub struct DivergenceRow {
 
     /// First-gas-divergence location (F10): contract / pc / call depth / opcode
     /// where the cumulative surcharge first exceeded baseline. Distinct from the
-    /// behavioral `divergence_*` columns (8038's warm-base correction is
-    /// negative, so the first net surcharge can lag the first repriced opcode).
+    /// behavioral `divergence_*` columns (a schedule with negative deltas, e.g.
+    /// CSV pricing, can reprice an opcode before its first net surcharge).
     pub gas_div_contract: Option<Address>,
     pub gas_div_pc: Option<u32>,
     pub gas_div_call_depth: Option<i32>,
@@ -1178,6 +1183,8 @@ pub struct CallFrameRow {
     pub value_wei: Option<String>,
     pub gas_provided: u64,
     pub gas_used: u64,
+    /// Denormalized `gas_provided - gas_used`, kept for the query hot-path
+    /// rather than recomputed per row.
     pub gas_margin: Option<i64>,
     pub success: bool,
     pub parent_gas_at_call: Option<u64>,

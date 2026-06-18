@@ -200,15 +200,13 @@ pub mod divergence;
 pub mod external_labels;
 pub mod multi_schedule_inspector;
 pub mod oog_chain;
+pub mod opcode;
 pub mod schedule;
 pub mod step_trace;
 pub mod tracking_inspector;
 
 pub use cli::{CliError, NamedCsvSchedule, NamedMultiplierSchedule, ResearchArgs};
-pub use divergence::{
-    AggregateClass, CallTrees, Divergence, DivergenceFacts, DivergenceType, EventLog, EventLogs,
-    OperationCounts,
-};
+pub use divergence::{AggregateClass, DivergenceFacts, EventLog, OperationCounts};
 pub use multi_schedule_inspector::{ScheduleInspector, ScheduleResult};
 pub use tracking_inspector::{EventLogEntry, TrackingInspector};
 

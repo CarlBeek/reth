@@ -96,6 +96,7 @@ use crate::{
         CallFrame, CallType, DivergenceLocation, EventLog, FrameOpcodeCounts, OogPattern,
         OperationCounts, OutOfGasInfo, PerFrameCapture, MAX_TRACKED_FRAMES,
     },
+    opcode,
     schedule::{GasSchedule, GasTaxBreakdown, OpcodeContext},
 };
 use alloy_primitives::{Address, U256};
@@ -161,11 +162,6 @@ pub struct ScheduleInspector {
     cached_keccak_msg_size: Option<usize>,
     cached_exp_byte_size: Option<usize>,
 
-    /// For account-access opcodes, whether the target is touched cold.
-    /// Classified read-only from the journal in `step()` before execution and
-    /// consumed via `build_opcode_context`. Reset each step.
-    cached_target_is_cold: bool,
-
     /// Captured at `step()` for the upcoming CALL/CALLCODE/DELEGATECALL/
     /// STATICCALL opcode: the raw gas argument the caller pushed onto the
     /// stack (top of stack at CALL invocation). Consumed in `call()` to
@@ -226,8 +222,9 @@ pub struct ScheduleInspector {
     oog_info: Option<OutOfGasInfo>,
 
     /// Location of the first per-opcode gas delta of *any* sign (first opcode
-    /// the schedule repriced). Note 8038's warm-base correction is negative, so
-    /// this can precede the first *net* surcharge — see `first_gas_divergence`.
+    /// the schedule repriced). A schedule with negative deltas (e.g. CSV pricing
+    /// that lowers an opcode's cost) can fire this before the first *net*
+    /// surcharge — see `first_gas_divergence`.
     divergence_location: Option<DivergenceLocation>,
 
     /// Location where the cumulative repricing surcharge (`additional_gas_charged`)
@@ -343,10 +340,6 @@ struct CallStackEntry {
 #[derive(Debug, Clone)]
 struct GasOpcodeEvent {
     pc: usize,
-    #[allow(dead_code)]
-    gas_remaining: u64,
-    #[allow(dead_code)]
-    contract: Address,
 }
 
 impl ScheduleInspector {
@@ -360,7 +353,6 @@ impl ScheduleInspector {
             current_pc: 0,
             cached_keccak_msg_size: None,
             cached_exp_byte_size: None,
-            cached_target_is_cold: false,
             pending_call_stack_gas: None,
             frame_capture: PerFrameCapture::new(),
             active_frame_stack: Vec::new(),
@@ -584,8 +576,10 @@ impl ScheduleInspector {
     /// Infer OOG pattern based on opcode.
     fn infer_oog_pattern(&self, opcode: u8) -> OogPattern {
         match opcode {
-            0x54 | 0x55 => OogPattern::StorageHeavy, // SLOAD, SSTORE
-            0xF1 | 0xF2 | 0xF4 | 0xFA => OogPattern::CallChain, // CALL variants
+            opcode::SLOAD | opcode::SSTORE => OogPattern::StorageHeavy,
+            opcode::CALL | opcode::CALLCODE | opcode::DELEGATECALL | opcode::STATICCALL => {
+                OogPattern::CallChain
+            }
             0x51..=0x53 => OogPattern::MemoryExpansion, // MLOAD, MSTORE, MSTORE8
             _ if self.has_gas_loop_pattern() => OogPattern::Loop,
             _ => OogPattern::Unknown,
@@ -618,11 +612,6 @@ impl ScheduleInspector {
             memory_size: interp.memory.len(),
             keccak_msg_size: self.cached_keccak_msg_size,
             exp_byte_size: self.cached_exp_byte_size,
-            memory_offset: None,
-            memory_access_size: None,
-            // Populated for account-access opcodes by the cold classification
-            // cached in `step()`.
-            target_is_cold: self.cached_target_is_cold,
         }
     }
 
@@ -630,7 +619,8 @@ impl ScheduleInspector {
     /// the caller's remaining gas (CALL, CALLCODE, DELEGATECALL, STATICCALL,
     /// CREATE, CREATE2).
     const fn is_call_or_create(opcode: u8) -> bool {
-        matches!(opcode, 0xF0 | 0xF1 | 0xF2 | 0xF4 | 0xF5 | 0xFA)
+        use crate::opcode::*;
+        matches!(opcode, CREATE | CALL | CALLCODE | DELEGATECALL | CREATE2 | STATICCALL)
     }
 
     /// Push a new per-frame opcode counter and return its stack index.
@@ -691,21 +681,6 @@ impl ScheduleInspector {
         }
     }
 
-    /// Record a gas delta against the per-opcode counters in `OperationCounts`.
-    const fn record_opcode_gas_delta(op_counts: &mut OperationCounts, opcode: u8, delta: i64) {
-        match opcode {
-            0x04 => op_counts.div_gas_delta += delta,
-            0x05 => op_counts.sdiv_gas_delta += delta,
-            0x06 => op_counts.mod_gas_delta += delta,
-            0x07 => op_counts.smod_gas_delta += delta,
-            0x08 => op_counts.addmod_gas_delta += delta,
-            0x09 => op_counts.mulmod_gas_delta += delta,
-            0x0A => op_counts.exp_gas_delta += delta,
-            0x20 => op_counts.keccak256_gas_delta += delta,
-            _ => {}
-        }
-    }
-
     /// Accumulate a per-opcode tax breakdown into the tx's running per-category
     /// sums (F12). The sum of these reconciles to `additional_gas_charged`.
     const fn accumulate_tax(op_counts: &mut OperationCounts, b: &GasTaxBreakdown) {
@@ -729,7 +704,8 @@ impl ScheduleInspector {
         // F10: first opcode where the cumulative surcharge crosses into the
         // positive (schedule's running gas first exceeds baseline). Distinct
         // from `divergence_location`, which fires on the first delta of any
-        // sign — 8038's warm-base correction is negative and can precede this.
+        // sign — a schedule with negative deltas (e.g. CSV pricing) can fire
+        // that earlier than this net-positive crossing.
         if self.first_gas_divergence.is_none() &&
             surcharge_before <= 0 &&
             self.additional_gas_charged > 0
@@ -797,13 +773,7 @@ impl ScheduleInspector {
         &mut self,
         interp: &Interpreter<revm::interpreter::interpreter::EthInterpreter>,
     ) {
-        let contract = self.call_stack.last().map(|e| e.contract).unwrap_or(Address::ZERO);
-
-        self.gas_opcode_usage.push_back(GasOpcodeEvent {
-            pc: interp.bytecode.pc(),
-            gas_remaining: interp.gas.remaining(),
-            contract,
-        });
+        self.gas_opcode_usage.push_back(GasOpcodeEvent { pc: interp.bytecode.pc() });
 
         while self.gas_opcode_usage.len() > self.max_gas_events {
             self.gas_opcode_usage.pop_front();
@@ -938,18 +908,18 @@ where
         // calls step → execute → step_end within a single loop iteration.
         self.call_delta_pre_applied = false;
 
-        // Reset the cold-account classification; it is populated below only for
-        // account-access opcodes (default = not an account access).
-        self.cached_target_is_cold = false;
-
         // Cold-account classification: classify the account-access target
         // (cold?) read-only *before* execution — and, for the CALL family,
         // before the gas is forwarded. The target's stack position differs by
         // opcode: top-of-stack for BALANCE / EXTCODE* / SELFDESTRUCT, index 1
         // for the CALL family.
         let target_pos = match self.current_opcode {
-            0x31 | 0x3B | 0x3C | 0x3F | 0xFF => Some(0),
-            0xF1 | 0xF2 | 0xF4 | 0xFA => Some(1),
+            opcode::BALANCE |
+            opcode::EXTCODESIZE |
+            opcode::EXTCODECOPY |
+            opcode::EXTCODEHASH |
+            opcode::SELFDESTRUCT => Some(0),
+            opcode::CALL | opcode::CALLCODE | opcode::DELEGATECALL | opcode::STATICCALL => Some(1),
             _ => None,
         };
         if let Some(pos) = target_pos &&
@@ -958,7 +928,6 @@ where
             let bytes = word.to_be_bytes::<32>();
             let addr = Address::from_slice(&bytes[12..]);
             let is_cold = classify_account_target(context, addr);
-            self.cached_target_is_cold = is_cold;
             // Count the cold/warm account-access split for data collection (F2).
             if is_cold {
                 self.op_counts.cold_account_access_count += 1;
@@ -967,12 +936,12 @@ where
             }
         }
 
-        // Value-transfer classification (F2): CALL (0xF1) / CALLCODE (0xF2) carry
-        // the transferred value as the 3rd stack item (index 2 — after gas at 0
-        // and target at 1). DELEGATECALL/STATICCALL (0xF4/0xFA) carry no value
-        // and are excluded. Peeked read-only before execution, mirroring the
+        // Value-transfer classification (F2): CALL / CALLCODE carry the
+        // transferred value as the 3rd stack item (index 2 — after gas at 0
+        // and target at 1). DELEGATECALL/STATICCALL carry no value and are
+        // excluded. Peeked read-only before execution, mirroring the
         // account-target peek above.
-        if matches!(self.current_opcode, 0xF1 | 0xF2) &&
+        if matches!(self.current_opcode, opcode::CALL | opcode::CALLCODE) &&
             let Ok(value) = interp.stack.peek(2) &&
             !value.is_zero()
         {
@@ -988,7 +957,7 @@ where
         // cold/warm read mirrors what revm charges, without warming the slot.
         use revm::context_interface::Database;
         match self.current_opcode {
-            0x54 => {
+            opcode::SLOAD => {
                 if let Ok(key) = interp.stack.peek(0) {
                     let addr = interp.input.target_address();
                     let (is_cold, _current) = classify_storage_slot(context, addr, key);
@@ -1001,7 +970,7 @@ where
             }
             // A static-context SSTORE is rejected by revm before it writes, so
             // skip it rather than count a write that never happens.
-            0x55 if !interp.runtime_flag.is_static() => {
+            opcode::SSTORE if !interp.runtime_flag.is_static() => {
                 if let (Ok(key), Ok(new)) = (interp.stack.peek(0), interp.stack.peek(1)) {
                     let addr = interp.input.target_address();
                     let (is_cold, current) = classify_storage_slot(context, addr, key);
@@ -1052,7 +1021,7 @@ where
         // Consumed by `call()` to populate the child frame's
         // `gas_requested_on_stack`.
         self.pending_call_stack_gas = match self.current_opcode {
-            0xF1 | 0xF2 | 0xF4 | 0xFA => {
+            opcode::CALL | opcode::CALLCODE | opcode::DELEGATECALL | opcode::STATICCALL => {
                 interp.stack.peek(0).ok().map(|gas| gas.saturating_to::<u64>())
             }
             _ => None,
@@ -1062,12 +1031,14 @@ where
         self.op_counts.total_ops += 1;
 
         match self.current_opcode {
-            0x54 => self.op_counts.sload_count += 1,
-            0x55 => self.op_counts.sstore_count += 1,
+            opcode::SLOAD => self.op_counts.sload_count += 1,
+            opcode::SSTORE => self.op_counts.sstore_count += 1,
             0xA0..=0xA4 => self.op_counts.log_count += 1,
-            0xF1 | 0xF2 | 0xF4 | 0xFA => self.op_counts.call_count += 1,
-            0xF0 | 0xF5 => self.op_counts.create_count += 1,
-            0x5A if self.detect_gas_loops => self.track_gas_opcode(interp),
+            opcode::CALL | opcode::CALLCODE | opcode::DELEGATECALL | opcode::STATICCALL => {
+                self.op_counts.call_count += 1
+            }
+            opcode::CREATE | opcode::CREATE2 => self.op_counts.create_count += 1,
+            opcode::GAS if self.detect_gas_loops => self.track_gas_opcode(interp),
             _ => {}
         }
 
@@ -1077,19 +1048,6 @@ where
         // Gas baseline/schedule is recorded later in `step_end()`.
         self.ensure_root_frame_counter();
         self.record_opcode_count_in_active_frame(self.current_opcode);
-
-        // Count repriced opcodes
-        match self.current_opcode {
-            0x04 => self.op_counts.div_count += 1,
-            0x05 => self.op_counts.sdiv_count += 1,
-            0x06 => self.op_counts.mod_count += 1,
-            0x07 => self.op_counts.smod_count += 1,
-            0x08 => self.op_counts.addmod_count += 1,
-            0x09 => self.op_counts.mulmod_count += 1,
-            0x0A => self.op_counts.exp_count += 1,
-            0x20 => self.op_counts.keccak256_count += 1,
-            _ => {}
-        }
 
         // Track memory usage
         let memory_words = interp.memory.len().div_ceil(32);
@@ -1115,7 +1073,6 @@ where
             if gas_delta != 0 {
                 self.call_delta_pre_applied = true;
                 self.pending_pre_applied_delta = gas_delta;
-                Self::record_opcode_gas_delta(&mut self.op_counts, self.current_opcode, gas_delta);
                 Self::accumulate_tax(&mut self.op_counts, &breakdown);
                 if !self.apply_gas_delta(interp, gas_delta, self.current_opcode) { // OOG — interpreter is halted, don't continue
                 }
@@ -1184,7 +1141,6 @@ where
         );
 
         if gas_delta != 0 {
-            Self::record_opcode_gas_delta(&mut self.op_counts, current_opcode, gas_delta);
             // F12: the step()-pre-applied portion was already folded in; here we
             // add the step_end portion (explicit-if-not-pre-applied + multiplier).
             Self::accumulate_tax(&mut self.op_counts, &tax_breakdown);
@@ -1194,10 +1150,16 @@ where
 
     fn call(&mut self, _context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
         let (call_type, opcode) = match inputs.scheme {
-            revm::interpreter::CallScheme::Call => (CallType::Call, 0xF1u8),
-            revm::interpreter::CallScheme::CallCode => (CallType::CallCode, 0xF2),
-            revm::interpreter::CallScheme::DelegateCall => (CallType::DelegateCall, 0xF4),
-            revm::interpreter::CallScheme::StaticCall => (CallType::StaticCall, 0xFA),
+            revm::interpreter::CallScheme::Call => (CallType::Call, crate::opcode::CALL),
+            revm::interpreter::CallScheme::CallCode => {
+                (CallType::CallCode, crate::opcode::CALLCODE)
+            }
+            revm::interpreter::CallScheme::DelegateCall => {
+                (CallType::DelegateCall, crate::opcode::DELEGATECALL)
+            }
+            revm::interpreter::CallScheme::StaticCall => {
+                (CallType::StaticCall, crate::opcode::STATICCALL)
+            }
         };
 
         let function_selector = Self::extract_function_selector(&inputs.input);
@@ -1436,9 +1398,13 @@ where
 
     fn create(&mut self, _context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
         let (call_type, opcode) = match inputs.scheme() {
-            revm::context_interface::CreateScheme::Create => (CallType::Create, 0xF0u8),
+            revm::context_interface::CreateScheme::Create => {
+                (CallType::Create, crate::opcode::CREATE)
+            }
             revm::context_interface::CreateScheme::Create2 { .. } |
-            revm::context_interface::CreateScheme::Custom { .. } => (CallType::Create2, 0xF5),
+            revm::context_interface::CreateScheme::Custom { .. } => {
+                (CallType::Create2, crate::opcode::CREATE2)
+            }
         };
 
         let parent_has_positive_delta =

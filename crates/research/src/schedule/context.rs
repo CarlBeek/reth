@@ -76,37 +76,6 @@ impl RecipientInfo {
 }
 
 impl TxContext {
-    /// Create a new transaction context.
-    pub const fn new(
-        baseline_intrinsic_gas: u64,
-        sender: Address,
-        recipient: Option<Address>,
-        value: U256,
-        input: Bytes,
-        gas_limit: u64,
-        is_create: bool,
-    ) -> Self {
-        Self {
-            baseline_intrinsic_gas,
-            sender,
-            recipient,
-            value,
-            input,
-            gas_limit,
-            is_create,
-            recipient_info: None,
-            access_list_accounts: 0,
-            access_list_storage_slots: 0,
-            authorization_count: 0,
-        }
-    }
-
-    /// Add recipient account info to the context.
-    pub const fn with_recipient_info(mut self, info: RecipientInfo) -> Self {
-        self.recipient_info = Some(info);
-        self
-    }
-
     /// Check if this is a self-transfer (sender == recipient).
     pub fn is_self_transfer(&self) -> bool {
         self.recipient.map(|r| r == self.sender).unwrap_or(false)
@@ -154,44 +123,9 @@ pub struct OpcodeContext {
 
     /// For EXP: exponent byte size
     pub exp_byte_size: Option<usize>,
-
-    /// For memory operations: offset being accessed
-    pub memory_offset: Option<usize>,
-
-    /// For memory operations: size being accessed
-    pub memory_access_size: Option<usize>,
-
-    /// For account-access opcodes (BALANCE / EXTCODE\* / CALL family /
-    /// SELFDESTRUCT): whether the target account is touched **cold** (first
-    /// access this tx). Populated by the inspector from the journal warm-set
-    /// before the opcode executes; `false` for non-account opcodes.
-    pub target_is_cold: bool,
 }
 
 impl OpcodeContext {
-    /// Create a new opcode context.
-    pub const fn new(contract: Address, pc: usize, call_depth: usize, gas_remaining: u64) -> Self {
-        Self {
-            contract,
-            pc,
-            call_depth,
-            gas_remaining,
-            memory_size: 0,
-            keccak_msg_size: None,
-            exp_byte_size: None,
-            memory_offset: None,
-            memory_access_size: None,
-            target_is_cold: false,
-        }
-    }
-
-    /// Set the account-access target cold-ness. Called by the inspector for
-    /// BALANCE / EXTCODE\* / CALL-family / SELFDESTRUCT opcodes.
-    pub const fn with_target_classification(mut self, is_cold: bool) -> Self {
-        self.target_is_cold = is_cold;
-        self
-    }
-
     /// Set KECCAK256 message size.
     pub const fn with_keccak_msg_size(mut self, size: usize) -> Self {
         self.keccak_msg_size = Some(size);
@@ -201,13 +135,6 @@ impl OpcodeContext {
     /// Set EXP exponent byte size.
     pub const fn with_exp_byte_size(mut self, size: usize) -> Self {
         self.exp_byte_size = Some(size);
-        self
-    }
-
-    /// Set memory access info.
-    pub const fn with_memory_access(mut self, offset: usize, size: usize) -> Self {
-        self.memory_offset = Some(offset);
-        self.memory_access_size = Some(size);
         self
     }
 
