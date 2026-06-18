@@ -40,6 +40,7 @@
 //!   - [`schedule::GasSchedule`]: Core trait for gas pricing experiments
 //!   - [`schedule::Eip2780Schedule`]: Transaction category-based intrinsic gas
 //!   - [`schedule::Eip8037Schedule`]: Native EIP-8037 state-gas metering
+//!   - [`schedule::Eip8038Schedule`]: EIP-8038 state access/write repricing (3x)
 //!   - [`schedule::CsvPricingSchedule`]: Per-opcode pricing from CSV files
 //!   - [`schedule::MultiplierSchedule`]: Uniform gas multiplier
 //!   - [`schedule::ScheduleRegistry`]: Manages multiple schedules
@@ -199,15 +200,13 @@ pub mod divergence;
 pub mod external_labels;
 pub mod multi_schedule_inspector;
 pub mod oog_chain;
+pub mod opcode;
 pub mod schedule;
 pub mod step_trace;
 pub mod tracking_inspector;
 
 pub use cli::{CliError, NamedCsvSchedule, NamedMultiplierSchedule, ResearchArgs};
-pub use divergence::{
-    Bucket, BucketInput, CallTrees, Divergence, DivergenceType, EventLog, EventLogs,
-    OperationCounts,
-};
+pub use divergence::{AggregateClass, DivergenceFacts, EventLog, OperationCounts};
 pub use multi_schedule_inspector::{ScheduleInspector, ScheduleResult};
 pub use tracking_inspector::{EventLogEntry, TrackingInspector};
 

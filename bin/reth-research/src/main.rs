@@ -20,7 +20,9 @@
 //!   --research.db-path ./divergences.db
 //! ```
 
-use alloy_consensus::{constants::KECCAK_EMPTY, transaction::TxHashRef, BlockHeader, Transaction};
+use alloy_consensus::{
+    constants::KECCAK_EMPTY, transaction::TxHashRef, BlockHeader, Transaction, Typed2718,
+};
 use alloy_eips::BlockHashOrNumber;
 use alloy_primitives::{keccak256, logs_bloom, Address, Bloom, Bytes, B256, U256};
 use clap::Parser;
@@ -40,8 +42,8 @@ use reth_research::{
         BlockOutput, CallFrameRow, DivergenceDatabase, DivergenceRow, DrillInRecord, OpcodeCountRow,
     },
     divergence::{
-        classify_bucket, is_erc4337_entrypoint, BucketInput, CallFrame, CallType as ResCallType,
-        DivergenceLocation, EventLog, OogPattern, OutOfGasInfo,
+        AccountDrivers, CallFrame, CallType as ResCallType, DivergenceFacts, DivergenceLocation,
+        EventLog, OutOfGasInfo, StorageDrivers, Tier1Diagnostics,
     },
     oog_chain::classify_oog_chain,
     schedule::{GasSchedule, RecipientInfo, ScheduleKind, ScheduleRegistry, TxContext},
@@ -70,6 +72,23 @@ enum DbCommand {
     BlockProcessed(BlockOutput),
     DeleteRange { from_block: u64, to_block: u64 },
 }
+
+/// Upper bound on the per-replay gas limit during the tier-multiplier sweep.
+///
+/// At tiers > 1 the sweep lifts `tx_gas_limit_cap` so it can measure how much
+/// extra gas a tx would need. Without a ceiling, a tx that loops until it runs
+/// out of gas executes up to `tx_gas_limit × max_tier` gas (e.g. 8 × a 36M-gas
+/// tx ≈ 288M) — tens of millions of traced opcodes per replay, taking minutes
+/// to hours while holding a long-lived MDBX read transaction that stalls the
+/// whole node (the memory/MDBX runaway observed in production).
+///
+/// Capping here bounds per-tx replay time and read-txn lifetime. Beyond the
+/// ceiling a tx is simply recorded as failing the tier (it needs more gas than
+/// the cap); for repricing analysis "needs > 200M gas" is as actionable as the
+/// exact figure. 200M comfortably fits a true 10× bump of the largest legitimate
+/// tx (EIP-7825 caps real txs at ~16.7M → 10×16.7M = 167M < 200M) so the 8037
+/// conditional-bump tier is honored exactly, while still bounding runaway loops.
+const TIER_REPLAY_GAS_CEILING: u64 = 200_000_000;
 
 /// Per-schedule metadata cached once at startup.
 ///
@@ -114,6 +133,47 @@ fn eip150_cap_binding(stack_gas: Option<u64>, parent_gas: Option<u64>) -> Option
     Some(s >= cap.saturating_sub(100))
 }
 
+/// Truncate returndata to a bounded prefix for storage (F2). 132 bytes holds a
+/// 4-byte error selector plus one 32-byte head word and the start of the
+/// payload — enough to identify the error and read short revert strings — while
+/// bounding a pathological multi-KB return.
+const REVERT_DATA_CAP: usize = 132;
+
+fn cap_bytes(data: &[u8]) -> Vec<u8> {
+    data[..data.len().min(REVERT_DATA_CAP)].to_vec()
+}
+
+/// Best-effort decode of Solidity revert returndata (F2). Recognises the two
+/// canonical errors plus custom 4-byte selectors; the raw (capped) bytes are
+/// stored alongside so downstream can re-decode fully.
+fn decode_revert(data: &[u8]) -> String {
+    if data.is_empty() {
+        return "empty".to_string();
+    }
+    if data.len() < 4 {
+        return format!("short:0x{}", alloy_primitives::hex::encode(data));
+    }
+    match [data[0], data[1], data[2], data[3]] {
+        // Error(string): selector + offset(32) + len(32) + utf8 bytes.
+        [0x08, 0xc3, 0x79, 0xa0] => {
+            if data.len() >= 68 {
+                let len = u32::from_be_bytes([data[64], data[65], data[66], data[67]]) as usize;
+                let end = 68usize.saturating_add(len).min(data.len());
+                let s = String::from_utf8_lossy(&data[68..end]);
+                format!("Error(string): {s}")
+            } else {
+                "Error(string)".to_string()
+            }
+        }
+        // Panic(uint256): selector + 32-byte code (low byte holds the code).
+        [0x4e, 0x48, 0x7b, 0x71] => {
+            let code = data.get(35).copied().unwrap_or(0);
+            format!("Panic(0x{code:02x})")
+        }
+        sel => format!("custom:0x{}", alloy_primitives::hex::encode(sel)),
+    }
+}
+
 /// Reconstruct each frame's parent index from the post-order DFS sequence
 /// the inspector emits.
 ///
@@ -141,6 +201,77 @@ fn derive_parent_call_indices(frames: &[reth_research::divergence::CallFrame]) -
         }
     }
     parents
+}
+
+/// Convert an inspector's `CallFrame` trace into the persisted `CallFrameRow`
+/// shape: parent indices, per-frame codehash pulled from historical state
+/// (`db`), selector, EIP-150 binding, deployed-bytecode length, repricing.
+/// Shared by the schedule trace and the baseline trace (F15); `codehash_cache`
+/// is shared across both so a repeat target costs one DB read.
+fn build_call_frame_rows<D: Database>(
+    frames: &[CallFrame],
+    db: &mut D,
+    codehash_cache: &mut HashMap<Address, Option<B256>>,
+    divergent_call_index: Option<u32>,
+) -> Vec<CallFrameRow> {
+    let parent_call_indices = derive_parent_call_indices(frames);
+    frames
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let codehash = f.to.and_then(|addr| {
+                *codehash_cache.entry(addr).or_insert_with(|| match db.basic(addr) {
+                    Ok(Some(info)) if info.code_hash != KECCAK_EMPTY => Some(info.code_hash),
+                    _ => None,
+                })
+            });
+            CallFrameRow {
+                call_index: f.call_index as u32,
+                parent_call_index: parent_call_indices[i],
+                depth: f.depth as u32,
+                from_address: f.from,
+                // F3: `to_address` is the call/storage target (the proxy under
+                // DELEGATECALL); `code_address` is the code holder (the
+                // implementation, revm `bytecode_address`). For ordinary calls
+                // they're equal. `codehash` is fetched from the code holder, so
+                // it identifies the executed code rather than the proxy.
+                to_address: f.storage_target.or(f.to).unwrap_or_default(),
+                code_address: f.to,
+                codehash,
+                call_type: format_call_type(&f.call_type),
+                selector: extract_selector_bytes(&f.input),
+                value_wei: f.value_wei.map(|v| v.to_string()),
+                gas_provided: f.gas_provided,
+                gas_used: f.gas_used,
+                gas_margin: Some((f.gas_provided as i64).saturating_sub(f.gas_used as i64)),
+                success: f.success,
+                parent_gas_at_call: f.parent_gas_at_call,
+                gas_requested_on_stack: f.gas_requested_on_stack,
+                eip150_cap_binding: eip150_cap_binding(
+                    f.gas_requested_on_stack,
+                    f.parent_gas_at_call,
+                ),
+                // For successful CREATE/CREATE2 frames the inspector stashes the
+                // deployed runtime code in `output`; its length is the
+                // deployed-bytecode size EIP-8037 charges CPSB per byte for. All
+                // other frames leave this NULL.
+                deployed_bytecode_len: match f.call_type {
+                    ResCallType::Create | ResCallType::Create2 if f.success => {
+                        f.output.as_ref().map(|b| b.len() as u32)
+                    }
+                    _ => None,
+                },
+                // F4: per-frame repricing surcharge the inspector accumulated.
+                repricing_gas_delta: f.repricing_gas_delta,
+                // F9: failing-frame context.
+                caller_pc: f.caller_pc.map(|p| p as u32),
+                was_precompile: f.was_precompile,
+                precompile_address: f.precompile_address,
+                gas_remaining_at_fail: f.gas_remaining_at_fail,
+                is_divergent_frame: divergent_call_index == Some(f.call_index as u32),
+            }
+        })
+        .collect()
 }
 
 /// Analyzer state shared between the live arm and concurrent backfill workers.
@@ -221,16 +352,8 @@ where
         >,
     >,
 {
-    fn serialize_trace<T: serde::Serialize>(value: &T) -> Option<String> {
-        serde_json::to_string(value).ok()
-    }
-
     fn hash_bytes(bytes: &[u8]) -> String {
         format!("{:#x}", keccak256(bytes))
-    }
-
-    fn hash_serialized<T: serde::Serialize>(value: &T) -> Option<String> {
-        Self::serialize_trace(value).map(|json| Self::hash_bytes(json.as_bytes()))
     }
 
     fn hex_address(address: Address) -> String {
@@ -262,32 +385,6 @@ where
                 l.call_type != r.call_type ||
                 l.success != r.success ||
                 l.input != r.input
-        })
-    }
-
-    /// Synthesize a `DivergenceLocation` from the recorded call frames when the
-    /// inspector didn't capture one itself.
-    ///
-    /// The `ScheduleInspector` records a divergence location whenever
-    /// `apply_gas_delta` triggers OOG (per-opcode deltas) or when a frame ends
-    /// with an OOG-class result (native-revm schedules like EIP-8037). This
-    /// fallback handles the remaining cases — non-OOG schedule-induced
-    /// failures (e.g. revert from a hard-coded gas check, halt for an unrelated
-    /// reason) — by pointing at the deepest failed frame in the schedule run.
-    ///
-    /// Records emitted from this fallback have `pc = 0` / `opcode = 0xfe` (the
-    /// `INVALID` mnemonic, used here as a "post-hoc fallback" sentinel) so
-    /// downstream consumers can distinguish synthesized fallback rows from
-    /// real per-opcode divergence captures.
-    fn derive_divergence_location(call_frames: &[CallFrame]) -> Option<DivergenceLocation> {
-        let deepest_failed = call_frames.iter().filter(|f| !f.success).max_by_key(|f| f.depth)?;
-        Some(DivergenceLocation {
-            contract: deepest_failed.to.unwrap_or(deepest_failed.from),
-            function_selectors: Vec::new(),
-            pc: 0,
-            call_depth: deepest_failed.depth,
-            opcode: 0xfe,
-            opcode_name: "FALLBACK".to_string(),
         })
     }
 
@@ -450,6 +547,7 @@ where
                                             to_block,
                                             coverage = counts.coverage,
                                             summaries = counts.summaries,
+                                            recipients = counts.recipients,
                                             divergences = counts.divergences,
                                             call_frames = counts.call_frames,
                                             opcode_counts = counts.opcode_counts,
@@ -1058,15 +1156,6 @@ where
     }
 
     /// Analyze a single block using multi-schedule execution.
-    ///
-    /// The per-schedule destructuring tuple still carries several locals
-    /// that were used by the legacy SQLite `ScheduleDivergence` builder
-    /// (formatted_op_counts, the *_json call-frame/event-log fields, the
-    /// hash fields, the output_* fields, etc.). They're kept in the tuple
-    /// so the existing per-schedule analysis remains a one-shot match
-    /// expression; future cleanup can drop them once the SQLite-shape
-    /// code is fully gone.
-    #[allow(unused_variables)]
     fn analyze_block(
         &self,
         block: &reth_primitives_traits::RecoveredBlock<BlockTy<Node::Types>>,
@@ -1135,6 +1224,8 @@ where
                     block_hash,
                     parent_hash,
                     timestamp: block_timestamp,
+                    gas_used: block.header().gas_used(),
+                    gas_limit: block.header().gas_limit(),
                 };
                 (
                     schedule.name().to_string(),
@@ -1173,6 +1264,14 @@ where
                 spec_id,
             );
             let (input_zero_bytes, input_nonzero_bytes) = Self::count_input_bytes(&input);
+            // Top-level 4-byte selector for calls with >=4 calldata bytes; None
+            // for creations (init code, no selector). Computed once per tx and
+            // reused by the divergence row and the drill-in record below.
+            let entry_selector: Option<[u8; 4]> = (!is_create && input.len() >= 4).then(|| {
+                let mut s = [0u8; 4];
+                s.copy_from_slice(&input[..4]);
+                s
+            });
             let tx_context = if self.has_intrinsic_schedules {
                 let recipient_info = match recipient {
                     Some(recipient_addr) => match normal_db.basic(recipient_addr) {
@@ -1242,15 +1341,16 @@ where
             };
             drop(normal_evm);
             let baseline_call_frames = baseline_inspector.call_frames().to_vec();
+            // Baseline per-frame opcode counts (F11) — stored with
+            // `trace_kind="baseline"` for drill-ins whose call tree diverged.
+            let baseline_frame_opcode_counts =
+                baseline_inspector.frame_opcode_counts().frames.clone();
             let baseline_event_logs = baseline_inspector.event_logs().to_vec();
             let (baseline_output_hash, baseline_output_len) =
                 Self::output_hash_and_len(&normal_result.result);
             let baseline_created_address =
                 normal_result.result.created_address().map(Self::hex_address);
-            let baseline_log_count = normal_result.result.logs().len() as u64;
             let baseline_logs_bloom = Self::logs_bloom_hex(&normal_result.result);
-            let baseline_call_frames_hash = Self::hash_serialized(&baseline_call_frames);
-            let baseline_event_logs_hash = Self::hash_serialized(&baseline_event_logs);
             let baseline_total_gas_spent = normal_result.result.gas().total_gas_spent();
             let baseline_gas_refunded = normal_result.result.gas().inner_refunded();
 
@@ -1274,9 +1374,6 @@ where
                 initial_reservoir: u64,
                 floor_gas: u64,
                 gas_refunded: u64,
-                operation_counts: Option<String>,
-                oog_info: Option<String>,
-                divergence_location: Option<String>,
                 /// `Some(true)` if the schedule replay halted with an
                 /// OOG-class halt reason at the inflated replay gas limit
                 /// (search exhausted — true minimum multiplier exceeds the
@@ -1297,19 +1394,49 @@ where
                 oog_info_structured: Option<reth_research::divergence::OutOfGasInfo>,
                 /// Structured `DivergenceLocation`. Same rationale as above.
                 divergence_location_structured: Option<DivergenceLocation>,
+                /// F10: location where the cumulative surcharge first went
+                /// positive (the inspector's `first_gas_divergence`).
+                first_gas_divergence: Option<DivergenceLocation>,
                 /// Per-frame opcode counts captured by the inspector. Used
                 /// to populate `divergence_opcode_counts` rows for drill-in
                 /// buckets.
                 frame_opcode_counts: Vec<reth_research::divergence::FrameOpcodeCounts>,
+                /// Cold account accesses this tx made (account-access opcodes),
+                /// captured from the inspector's operation counts. `None` when
+                /// the replay was rejected before execution (so the counts are
+                /// unknown, not a real zero).
+                cold_account_access_count: Option<u64>,
+                /// F4: cumulative repricing surcharge the inspector charged
+                /// this tx (`ScheduleResult::additional_gas`). Signed.
+                additional_gas: i64,
+                /// F12: per-category decomposition of `additional_gas` (their
+                /// sum reconciles to it).
+                tax_second_db_read: i64,
+                tax_other: i64,
+                /// F8: storage-reprice drivers; `None` on the reject path.
+                storage_drivers: Option<StorageDrivers>,
+                /// F2/F3: account-side gas drivers; `None` on the reject path.
+                account_drivers: Option<AccountDrivers>,
+                /// F1: tier-1 failure forensics, attached after the tier sweep.
+                /// `None` unless tier-1 failed.
+                tier1_diag: Option<Tier1Diagnostics>,
+                /// F1: structured failure reason — the `HaltReason` discriminant
+                /// (`OutOfGas`, `StackOverflow`, …), `"Revert"`, or `None` on
+                /// success.
+                failure_reason: Option<String>,
+                /// F2: raw revert returndata (capped), best-effort decode of it
+                /// (`Error(string)` / `Panic(0xNN)` / `custom:0x…` / `empty`),
+                /// and the top-level tx output bytes (capped) — today only a
+                /// hash is kept.
+                revert_data: Option<Vec<u8>>,
+                revert_decoded: Option<String>,
+                tx_output: Option<Vec<u8>>,
                 call_frames: Vec<CallFrame>,
                 event_logs: Vec<EventLog>,
                 output_hash: Option<String>,
                 output_len: Option<u64>,
                 created_address: Option<String>,
-                log_count: u64,
                 logs_bloom: String,
-                call_frames_hash: Option<String>,
-                event_logs_hash: Option<String>,
             }
 
             // Indexed parallel to self.execution_schedules — accessed by schedule
@@ -1415,13 +1542,29 @@ where
                 // behavior.
                 let mut accepted: Option<PerScheduleResult> = None;
                 let mut last_attempt: Option<PerScheduleResult> = None;
+                // F1: tier-1 (mainnet-equivalent) failure forensics, captured
+                // the moment tier-1's result is built and preserved even when a
+                // later tier is accepted (and its psr discarded).
+                let mut tier1_diag: Option<Tier1Diagnostics> = None;
                 // Tier-1 (mainnet-equivalent) env + tx, stashed for the
                 // trace-diff divergence fallback so it can reproduce the
                 // failure at the original gas limit without rebuilding the
                 // schedule env setup.
                 let mut tier1_envs: Option<(_, _)> = None;
-                for &tier in &self.gas_limit_multipliers {
-                    let schedule_execution_gas_limit = gas_limit.saturating_mul(tier);
+                // Per-schedule conditional bump: a schedule may opt into a single
+                // `[1, n]` sweep (replay at 1×; only on failure, retry once at n×)
+                // instead of the global multiplier sweep — EIP-8037 uses 10,
+                // EIP-8038 uses 4. See `GasSchedule::replay_bump_multiplier`.
+                let tiers: Vec<u64> = match schedule.replay_bump_multiplier() {
+                    Some(bump) => vec![1, bump],
+                    None => self.gas_limit_multipliers.clone(),
+                };
+                for &tier in &tiers {
+                    // Cap the per-replay gas so a single unbounded-gas tx can't
+                    // execute for minutes/hours (and pin a long-lived MDBX read
+                    // txn); see `TIER_REPLAY_GAS_CEILING`.
+                    let schedule_execution_gas_limit =
+                        gas_limit.saturating_mul(tier).min(TIER_REPLAY_GAS_CEILING);
 
                     let mut tier_evm_env = schedule_evm_env.clone();
                     if tier > 1 {
@@ -1531,15 +1674,8 @@ where
                             // `oog_call_depth = None` and classify as
                             // ContractBroken even though a higher
                             // gas_limit is the only thing needed.
-                            let synth_oog = OutOfGasInfo {
-                                opcode: 0,
-                                opcode_name: "evm_reject_intrinsic".to_string(),
-                                pc: 0,
-                                contract: Address::ZERO,
-                                call_depth: 1,
-                                gas_remaining: 0,
-                                pattern: OogPattern::Unknown,
-                            };
+                            // Rejected before execution — no surcharge applied.
+                            let synth_oog = OutOfGasInfo::synthetic_root("evm_reject_intrinsic");
                             last_attempt = Some(PerScheduleResult {
                                 success: false,
                                 gas_used: gas_limit,
@@ -1550,23 +1686,38 @@ where
                                 initial_reservoir: schedule_initial_reservoir,
                                 floor_gas: 0,
                                 gas_refunded: 0,
-                                operation_counts: None,
-                                oog_info: Some(format!("EVM transact failed: {e:?}")),
-                                divergence_location: None,
                                 replay_halt_oog: Some(true),
                                 oog_call_depth: Some(synth_oog.call_depth),
                                 oog_info_structured: Some(synth_oog),
                                 divergence_location_structured: None,
+                                first_gas_divergence: None,
                                 frame_opcode_counts: Vec::new(),
+                                // Rejected replay: counts unknown (not zero).
+                                cold_account_access_count: None,
+                                // Rejected replay never executed an opcode → no
+                                // surcharge applied.
+                                additional_gas: 0,
+                                tax_second_db_read: 0,
+                                tax_other: 0,
+                                // Rejected replay: storage drivers unknown.
+                                storage_drivers: None,
+                                // Rejected replay: account drivers unknown.
+                                account_drivers: None,
+                                // Attached after the tier sweep (this is a
+                                // tier-1 reject only when `tier == 1`).
+                                tier1_diag: None,
+                                // Rejected before execution: revm refused the tx
+                                // outright.
+                                failure_reason: Some("Rejected".to_string()),
+                                revert_data: None,
+                                revert_decoded: None,
+                                tx_output: None,
                                 call_frames: Vec::new(),
                                 event_logs: Vec::new(),
                                 output_hash: None,
                                 output_len: None,
                                 created_address: None,
-                                log_count: 0,
                                 logs_bloom: Self::hex_bloom(Bloom::ZERO),
-                                call_frames_hash: None,
-                                event_logs_hash: None,
                             });
                             continue;
                         }
@@ -1600,10 +1751,32 @@ where
                             sched_state_gas_spent,
                             state_intrinsic_delta,
                         );
+                    } else if schedule.modifies_intrinsic() &&
+                        !schedule.uses_native_intrinsic_gas() &&
+                        let Some(ctx) = tx_context.as_ref() &&
+                        let Some(schedule_intrinsic) = schedule.intrinsic_gas(ctx)
+                    {
+                        // Non-native "Both" schedule (one that reprices
+                        // intrinsic gas via the inspector rather than the EVM
+                        // env — EIP-8038 takes the native path above and never
+                        // reaches here): revm deducted the block's *native*
+                        // intrinsic during execution (its initial-tx-gas helper
+                        // ignores `cfg.gas_params` overrides), so the reported
+                        // regular gas reflects baseline intrinsic, not the
+                        // schedule's. Normalize by the intrinsic delta —
+                        // mirroring the native EIP-8037 path above — so
+                        // `gas_delta` includes the schedule's intrinsic
+                        // repricing (access-list / create-tx). State gas is
+                        // unaffected (zero here).
+                        let intrinsic_delta =
+                            i128::from(schedule_intrinsic) - i128::from(baseline_intrinsic_gas);
+                        sched_gas_used =
+                            Self::apply_signed_gas_delta(sched_gas_used, intrinsic_delta);
+                        sched_total_gas_spent =
+                            Self::apply_signed_gas_delta(sched_total_gas_spent, intrinsic_delta);
                     }
                     let sched_floor_gas = result.result.gas().floor_gas();
                     let sched_gas_refunded = result.result.gas().inner_refunded();
-                    let op_counts = Self::serialize_trace(inspector.operation_counts());
                     let insp_result = inspector.result();
                     let halt_reason_debug = match &result.result {
                         revm::context_interface::result::ExecutionResult::Halt {
@@ -1611,9 +1784,27 @@ where
                         } => Some(format!("{reason:?}")),
                         _ => None,
                     };
-                    let halt_info = halt_reason_debug
-                        .as_ref()
-                        .map(|reason| format!("Execution halted: {reason}"));
+                    // F1: structured failure reason — halt discriminant, Revert,
+                    // or None on success.
+                    let failure_reason = match &result.result {
+                        revm::context_interface::result::ExecutionResult::Halt {
+                            reason, ..
+                        } => Some(format!("{reason:?}")),
+                        revm::context_interface::result::ExecutionResult::Revert { .. } => {
+                            Some("Revert".to_string())
+                        }
+                        revm::context_interface::result::ExecutionResult::Success { .. } => None,
+                    };
+                    // F2: revert returndata (capped) + best-effort decode, and
+                    // the top-level tx output bytes (capped — today hash-only).
+                    let revert_data = match &result.result {
+                        revm::context_interface::result::ExecutionResult::Revert {
+                            output, ..
+                        } => Some(cap_bytes(output)),
+                        _ => None,
+                    };
+                    let revert_decoded = revert_data.as_deref().map(decode_revert);
+                    let tx_output = result.result.output().map(|o| cap_bytes(o));
                     // Halt classification at this tier:
                     //   Halt { OutOfGas* } → Some(true)  (more gas might help)
                     //   Halt { other }     → Some(false) (no amount of gas helps)
@@ -1633,7 +1824,6 @@ where
                     };
                     let (output_hash, output_len) = Self::output_hash_and_len(&result.result);
                     let created_address = result.result.created_address().map(Self::hex_address);
-                    let log_count = result.result.logs().len() as u64;
                     let logs_bloom = Self::logs_bloom_hex(&result.result);
                     let call_frames = inspector.call_frames().to_vec();
                     let event_logs = inspector.event_logs().to_vec();
@@ -1643,19 +1833,9 @@ where
                     // oog_info. See the equivalent legacy comment for the full
                     // motivation; nothing tier-specific.
                     let inspector_oog_info = insp_result.oog_info.clone().or_else(|| {
-                        if replay_halt_oog == Some(true) {
-                            Some(OutOfGasInfo {
-                                opcode: 0,
-                                opcode_name: "root_halt".to_string(),
-                                pc: 0,
-                                contract: Address::ZERO,
-                                call_depth: 1,
-                                gas_remaining: 0,
-                                pattern: OogPattern::Unknown,
-                            })
-                        } else {
-                            None
-                        }
+                        // Synthesized at the producer — surcharge unknown here.
+                        (replay_halt_oog == Some(true))
+                            .then(|| OutOfGasInfo::synthetic_root("root_halt"))
                     });
 
                     let psr = PerScheduleResult {
@@ -1668,32 +1848,57 @@ where
                         initial_reservoir: schedule_initial_reservoir,
                         floor_gas: sched_floor_gas,
                         gas_refunded: sched_gas_refunded,
-                        operation_counts: op_counts,
-                        oog_info: inspector_oog_info
-                            .as_ref()
-                            .map(|oog| format!("{oog:?}"))
-                            .or(halt_info),
-                        divergence_location: insp_result
-                            .divergence_location
-                            .clone()
-                            .or_else(|| Self::derive_divergence_location(&call_frames))
-                            .as_ref()
-                            .map(|loc| format!("{loc:?}")),
                         replay_halt_oog,
                         oog_call_depth: inspector_oog_info.as_ref().map(|oog| oog.call_depth),
                         oog_info_structured: inspector_oog_info.clone(),
                         divergence_location_structured: insp_result.divergence_location.clone(),
+                        first_gas_divergence: insp_result.first_gas_divergence.clone(),
                         frame_opcode_counts: inspector.frame_opcode_counts().frames.clone(),
-                        call_frames_hash: Self::hash_serialized(&call_frames),
-                        event_logs_hash: Self::hash_serialized(&event_logs),
+                        cold_account_access_count: Some(
+                            inspector.operation_counts().cold_account_access_count,
+                        ),
+                        additional_gas: insp_result.additional_gas,
+                        tax_second_db_read: inspector.operation_counts().tax_second_db_read,
+                        tax_other: inspector.operation_counts().tax_other,
+                        storage_drivers: Some(StorageDrivers::from_counts(
+                            inspector.operation_counts(),
+                        )),
+                        // F2/F3: account-side drivers (inspector counts + the
+                        // tx-envelope access-list counts).
+                        account_drivers: Some(AccountDrivers::from_parts(
+                            inspector.operation_counts(),
+                            access_list_accounts,
+                            access_list_storage_slots,
+                        )),
+                        // F1: filled after the tier sweep (see below) only for
+                        // the chosen result, and only when tier-1 failed.
+                        tier1_diag: None,
+                        failure_reason,
+                        revert_data,
+                        revert_decoded,
+                        tx_output,
                         call_frames,
                         event_logs,
                         output_hash,
                         output_len,
                         created_address,
-                        log_count,
                         logs_bloom,
                     };
+
+                    // F1: capture tier-1's failure forensics before psr is moved.
+                    // Read entirely from psr (which already folded in the
+                    // inspector's oog_info + call frames). The innermost failing
+                    // frame is the deepest `!success` frame — the same rule that
+                    // marks the divergent/bottleneck frame downstream.
+                    if tier == 1 && !sched_success {
+                        let failing =
+                            psr.call_frames.iter().filter(|f| !f.success).max_by_key(|f| f.depth);
+                        tier1_diag = Some(Tier1Diagnostics::from_parts(
+                            psr.failure_reason.clone(),
+                            psr.oog_info_structured.as_ref(),
+                            failing,
+                        ));
+                    }
 
                     if sched_success {
                         // Smallest tier that succeeded — accept and stop.
@@ -1712,6 +1917,11 @@ where
                 // so unwrapping is safe. Successful sweep wins; otherwise we
                 // keep the highest-tier failure to carry the OOG / halt signal.
                 let mut chosen = accepted.or(last_attempt).expect("tier loop ran at least once");
+                // F1: attach tier-1's failure forensics to whichever attempt was
+                // chosen (a rescue's psr describes the bumped tier, not the 1×
+                // failure; this preserves the 1× break). `None` when tier-1
+                // succeeded.
+                chosen.tier1_diag = tier1_diag.take();
 
                 // Trace-diff divergence for the "non-OOG schedule revert"
                 // cohort: a status flip to failure that the inspector left
@@ -1762,7 +1972,6 @@ where
                             if sched_ok && !sched_insp.truncated() {
                                 if let Some(loc) = first_divergence(base_steps, sched_insp.steps())
                                 {
-                                    chosen.divergence_location = Some(format!("{loc:?}"));
                                     chosen.divergence_location_structured = Some(loc);
                                 }
                             }
@@ -1802,11 +2011,23 @@ where
                     ScheduleKind::None => continue,
                 };
 
-                // Look up the re-execution result for this schedule.
-                // For Both schedules the execution ran with an adjusted gas_limit
-                // so the EVM had the correct execution gas budget. The reported
-                // gas_used includes baseline intrinsic, so we add intrinsic_delta
-                // to get the true schedule gas_used (with schedule intrinsic).
+                // Native-intrinsic schedules (EIP-8037, EIP-8038) have the EVM
+                // charge the schedule intrinsic directly — the vendored handler's
+                // `validate_initial_tx_gas` reads `cfg.gas_params`, which
+                // `configure_evm_env` overrode — and EIP-8037's reservoir path
+                // already normalized the stored regular gas in the execution loop.
+                // So the analyze-path re-add below must fire ONLY for non-native
+                // intrinsic schedules; re-adding it for a native one would count
+                // the schedule intrinsic twice (C1). The true `intrinsic_delta` is
+                // still recorded via `schedule_intrinsic_gas` / `tax_intrinsic`.
+                let report_intrinsic_delta =
+                    if schedule.uses_native_intrinsic_gas() { 0 } else { intrinsic_delta };
+
+                // Look up the re-execution result for this schedule. For a
+                // non-native "Both" schedule the EVM deducted the block's native
+                // intrinsic, so we add `report_intrinsic_delta` to recover the
+                // schedule's true gas_used; for native schedules it is already
+                // included (report_intrinsic_delta == 0).
                 let exec_result = self
                     .execution_schedule_indices
                     .get(schedule_name)
@@ -1822,42 +2043,22 @@ where
                     schedule_initial_reservoir,
                     schedule_floor_gas,
                     schedule_gas_refunded,
-                    formatted_op_counts,
-                    oog_info,
-                    divergence_location,
                     replay_halt_oog,
                     call_tree_diverged,
                     event_logs_diverged,
-                    baseline_call_frames_json,
-                    schedule_call_frames_json,
-                    baseline_event_logs_json,
-                    schedule_event_logs_json,
-                    baseline_call_frames_hash_row,
-                    schedule_call_frames_hash_row,
-                    baseline_event_logs_hash_row,
-                    schedule_event_logs_hash_row,
-                    schedule_output_hash,
-                    schedule_output_len,
-                    schedule_created_address,
-                    schedule_log_count,
-                    schedule_logs_bloom,
                     output_changed,
                     created_address_changed,
                     logs_bloom_changed,
                 ) = match exec_result {
                     Some(r) => {
-                        // EVM reports gas_used including baseline intrinsic.
-                        // Replace baseline intrinsic with schedule intrinsic to
-                        // get the true schedule total:
-                        //   gas_used - baseline_intrinsic + schedule_intrinsic
-                        //   = gas_used + intrinsic_delta
-                        //
-                        // For "Both" schedules where gas_limit was clamped
-                        // (negative intrinsic_delta), the execution portion may
-                        // be inaccurate (see clamping comment above), but the
-                        // intrinsic substitution is still correct.
-                        let gas = if intrinsic_delta != 0 {
-                            (r.gas_used as i64 + intrinsic_delta).max(0) as u64
+                        // Non-native "Both" schedules: the EVM deducted the
+                        // block's native intrinsic, so replace it with the
+                        // schedule intrinsic (`gas_used + report_intrinsic_delta`).
+                        // Native schedules (EIP-8037/8038) already have the
+                        // schedule intrinsic in `r.gas_used`, so
+                        // `report_intrinsic_delta == 0` and gas_used is unchanged.
+                        let gas = if report_intrinsic_delta != 0 {
+                            (r.gas_used as i64 + report_intrinsic_delta).max(0) as u64
                         } else {
                             r.gas_used
                         };
@@ -1882,33 +2083,9 @@ where
                             r.initial_reservoir,
                             r.floor_gas,
                             r.gas_refunded,
-                            r.operation_counts.clone(),
-                            r.oog_info.clone(),
-                            r.divergence_location.clone(),
                             r.replay_halt_oog,
                             call_tree_diverged,
                             event_logs_diverged,
-                            call_tree_diverged
-                                .then(|| Self::serialize_trace(&baseline_call_frames))
-                                .flatten(),
-                            call_tree_diverged
-                                .then(|| Self::serialize_trace(&r.call_frames))
-                                .flatten(),
-                            event_logs_diverged
-                                .then(|| Self::serialize_trace(&baseline_event_logs))
-                                .flatten(),
-                            event_logs_diverged
-                                .then(|| Self::serialize_trace(&r.event_logs))
-                                .flatten(),
-                            baseline_call_frames_hash.clone(),
-                            r.call_frames_hash.clone(),
-                            baseline_event_logs_hash.clone(),
-                            r.event_logs_hash.clone(),
-                            r.output_hash.clone(),
-                            r.output_len,
-                            r.created_address.clone(),
-                            r.log_count,
-                            r.logs_bloom.clone(),
                             output_changed,
                             created_address_changed,
                             logs_bloom_changed,
@@ -1918,7 +2095,7 @@ where
                         // Intrinsic-only schedule: no execution result, so the
                         // schedule-side state-gas / reservoir / refund counters
                         // stay zero — only the baseline equivalents are meaningful.
-                        let gas = (normal_gas_used as i64 + intrinsic_delta).max(0) as u64;
+                        let gas = (normal_gas_used as i64 + report_intrinsic_delta).max(0) as u64;
                         let success = normal_success && gas <= gas_limit;
                         (
                             gas,
@@ -1931,25 +2108,9 @@ where
                             0,
                             0,
                             0,
-                            None,
-                            None,
-                            None,
-                            None,
+                            None, // replay_halt_oog (no schedule run)
                             false,
                             false,
-                            None,
-                            None,
-                            None,
-                            None,
-                            baseline_call_frames_hash.clone(),
-                            baseline_call_frames_hash.clone(),
-                            baseline_event_logs_hash.clone(),
-                            baseline_event_logs_hash.clone(),
-                            baseline_output_hash.clone(),
-                            baseline_output_len,
-                            baseline_created_address.clone(),
-                            baseline_log_count,
-                            baseline_logs_bloom.clone(),
                             false,
                             false,
                             false,
@@ -1962,13 +2123,19 @@ where
                 // cascading effects (different execution paths) make the
                 // true difference diverge from the sum of per-opcode
                 // adjustments.
+                //
+                // NOTE: when the tx failed at 1× but was rescued at a bumped
+                // tier (`schedule_success=0 AND replay_halt_oog IS NULL`),
+                // `schedule_gas` is the rescued (N×) tier's gas, so `total_delta`
+                // is NOT a meaningful repricing measure here — and it's
+                // meaningless whenever `baseline_success=0`. Downstream repricing
+                // aggregates must filter on `schedule_success=1` (and
+                // `baseline_success=1`).
                 let total_delta = schedule_gas as i64 - normal_gas_used as i64;
-                // Decompose the outcome flip into its two directions so the
-                // bucket classifier can give beneficial flips their own
-                // category (`ScheduleRescued`) instead of folding them into
-                // `ContractBroken`. The legacy bidirectional `status_changed`
-                // value is kept on the `DivergenceRow` for backwards
-                // compatibility with existing DB rows / consumers.
+                // Decompose the outcome flip into its two directions: a break
+                // (baseline succeeded, schedule failed) drives the
+                // `outer_limit_only_failure` witness, while `status_changed`
+                // records the bidirectional flip on the `DivergenceRow`.
                 let baseline_to_schedule_break = normal_success && !schedule_success;
                 let baseline_to_schedule_rescue = !normal_success && schedule_success;
                 let status_changed = baseline_to_schedule_break || baseline_to_schedule_rescue;
@@ -2013,31 +2180,29 @@ where
                         None => (None, None, None),
                     };
 
-                // Classify the tx into one of the storage buckets.
-                // `oog_call_depth` is the 1-based OOG attribution depth from
-                // the inspector (or the producer's Err-branch synthesis when
-                // revm rejected the tx outright). The classifier uses it only
-                // after handling successful higher-gas witnesses, throttled
-                // chains, and sweep-exhausted OOGs.
-                let oog_call_depth = exec_result.and_then(|r| r.oog_call_depth);
-                let bucket = classify_bucket(&BucketInput {
-                    recipient_is_entrypoint: recipient.map(is_erc4337_entrypoint).unwrap_or(false),
-                    baseline_to_schedule_break,
-                    baseline_to_schedule_rescue,
+                // Reduce the comparison to raw execution facts. The producer no
+                // longer applies an editorial taxonomy (wallet-fixable /
+                // contract-broken / aa-reestimation / …); it stores a full
+                // per-tx forensic row for every failure and trace divergence and
+                // rolls the byte-identical / gas-only remainder into a 2-value
+                // aggregate class. Downstream re-derives the old cohorts from the
+                // stored facts.
+                let facts = DivergenceFacts {
+                    baseline_success: normal_success,
+                    schedule_success,
                     gas_delta: total_delta,
                     event_logs_changed: event_logs_diverged,
                     call_tree_changed: call_tree_diverged,
                     output_changed,
                     created_address_changed,
                     logs_bloom_changed,
-                    outer_limit_only_failure,
-                    replay_halt_oog,
-                    oog_call_depth,
-                    oog_chain_proportional,
-                });
+                };
+                let store_full_forensics = facts.store_full_forensics();
+                let aggregate_class = facts.aggregate_class();
 
-                // For drill-in buckets, build the full per-tx record.
-                let drill_in = if bucket.is_drill_in() {
+                // For stored txs (failures + trace divergences), build the full
+                // per-tx record.
+                let drill_in = if store_full_forensics {
                     let cap_reached = self
                         .max_divergences_per_block
                         .map(|max| drill_ins_recorded >= max)
@@ -2064,13 +2229,47 @@ where
                             .expect("all schedules should have static metadata");
                         let div_loc =
                             exec_result.and_then(|r| r.divergence_location_structured.clone());
+                        let gas_div = exec_result.and_then(|r| r.first_gas_divergence.clone());
                         let oog_info_s = exec_result.and_then(|r| r.oog_info_structured.clone());
+                        // F1: tier-1 failure forensics, pre-bound once for the
+                        // nine `tier1_*` columns below (None unless tier-1 failed).
+                        let tier1 = exec_result.and_then(|r| r.tier1_diag.as_ref());
                         let frames_ref: &[CallFrame] =
                             exec_result.map(|r| r.call_frames.as_slice()).unwrap_or(&[]);
                         let opcode_frames_ref =
                             exec_result.map(|r| r.frame_opcode_counts.as_slice()).unwrap_or(&[]);
                         let sched_logs_ref: &[EventLog] =
                             exec_result.map(|r| r.event_logs.as_slice()).unwrap_or(&[]);
+
+                        // Cold-account-access count for this tx under this
+                        // schedule (F4). `Some(0)` is a *measured* zero (the
+                        // replay ran and made no cold access); NULL is reserved
+                        // for the unmeasured reject path (`exec_result` /
+                        // `cold_account_access_count` is None). Do NOT collapse
+                        // measured-zero to NULL — that conflates the two.
+                        let cold_account_access_count =
+                            exec_result.and_then(|r| r.cold_account_access_count);
+
+                        // F7: baseline counterpart of the frame that failed under
+                        // the schedule. The innermost failing frame (deepest
+                        // `!success`) is the bottleneck; its baseline twin —
+                        // matched by call_index when the pre-divergence structure
+                        // lines up (always true for pure-OOG failures) — shows
+                        // whether baseline ran that frame and with how much gas.
+                        // The cleanest wallet-fixable (baseline succeeded, more
+                        // gas would too) vs contract-broken discriminator.
+                        let failing_frame =
+                            frames_ref.iter().filter(|f| !f.success).max_by_key(|f| f.depth);
+                        // F9: the innermost failing frame's call_index marks the
+                        // divergent (bottleneck) frame on the schedule side.
+                        let failing_call_index = failing_frame.map(|f| f.call_index as u32);
+                        let baseline_twin = failing_frame.and_then(|ff| {
+                            baseline_call_frames.iter().find(|bf| {
+                                bf.call_index == ff.call_index &&
+                                    bf.depth == ff.depth &&
+                                    bf.to == ff.to
+                            })
+                        });
 
                         let divergence_row = DivergenceRow {
                             schedule_name: schedule_name.to_string(),
@@ -2079,7 +2278,12 @@ where
                             tx_index: tx_idx as u32,
                             tx_hash,
                             timestamp: block_timestamp,
-                            bucket,
+                            // Witness so a tx that only failed because the
+                            // schedule pushed gas_used past the *original* limit
+                            // (succeeded at the bumped tier, trace matched
+                            // baseline) is distinguishable downstream from a
+                            // genuine OOG break.
+                            outer_limit_only_failure: Some(outer_limit_only_failure),
                             sender,
                             recipient,
                             is_create,
@@ -2099,7 +2303,6 @@ where
                             schedule_gas_refunded: Some(schedule_gas_refunded),
                             schedule_intrinsic_gas,
                             schedule_floor_gas: Some(schedule_floor_gas),
-                            would_fit_in_original_limit: Some(schedule_success),
                             min_multiplier_to_succeed,
                             divergence_contract: div_loc.as_ref().map(|l| l.contract),
                             divergence_pc: div_loc.as_ref().map(|l| l.pc as u32),
@@ -2142,88 +2345,108 @@ where
                             // Set from the tier-sweep loop above: Some(true/false)
                             // when no tier succeeded, None when at least one did.
                             replay_halt_oog,
+                            cold_account_access_count,
+                            // F4: total repricing surcharge across all frames.
+                            additional_gas_charged: exec_result.map(|r| r.additional_gas),
+                            // F6: root→divergence 4-byte selector path as a JSON
+                            // array of nullable hex strings.
+                            failure_selector_path: div_loc.as_ref().and_then(|l| {
+                                let path: Vec<Option<String>> = l
+                                    .function_selectors
+                                    .iter()
+                                    .map(|s| s.map(|b| format!("0x{:08x}", u32::from_be_bytes(b))))
+                                    .collect();
+                                serde_json::to_string(&path).ok()
+                            }),
+                            // F5: top-level tx identity.
+                            tx_type: Some(tx.ty()),
+                            tx_nonce: Some(tx.nonce()),
+                            entry_selector,
+                            input_zero_bytes: Some(input_zero_bytes),
+                            input_nonzero_bytes: Some(input_nonzero_bytes),
+                            has_authorization: Some(authorization_count > 0),
+                            // F1/F2: structured failure reason + revert/return data.
+                            failure_reason: exec_result.and_then(|r| r.failure_reason.clone()),
+                            revert_data: exec_result.and_then(|r| r.revert_data.clone()),
+                            revert_decoded: exec_result.and_then(|r| r.revert_decoded.clone()),
+                            tx_output: exec_result.and_then(|r| r.tx_output.clone()),
+                            // F7: baseline counterpart of the failing frame.
+                            baseline_frame_success: baseline_twin.map(|bf| bf.success),
+                            baseline_frame_gas_used: baseline_twin.map(|bf| bf.gas_used),
+                            baseline_frame_gas_provided: baseline_twin.map(|bf| bf.gas_provided),
+                            // F13: repricing surcharge at the OOG instant.
+                            surcharge_at_oog: oog_info_s.as_ref().map(|o| o.additional_gas_at_oog),
+                            // F10: first opcode where cumulative gas exceeded baseline.
+                            gas_div_contract: gas_div.as_ref().map(|l| l.contract),
+                            gas_div_pc: gas_div.as_ref().map(|l| l.pc as u32),
+                            gas_div_call_depth: gas_div.as_ref().map(|l| l.call_depth as i32),
+                            gas_div_opcode: gas_div.as_ref().map(|l| l.opcode),
+                            // F12: per-category tax breakdown. The opcode-delta
+                            // categories sum to additional_gas_charged; intrinsic
+                            // is the separate tx-level intrinsic delta.
+                            tax_second_db_read: exec_result.map(|r| r.tax_second_db_read),
+                            tax_other: exec_result.map(|r| r.tax_other),
+                            tax_intrinsic: schedule_intrinsic_gas
+                                .map(|s| s as i64 - baseline_intrinsic_gas as i64),
+                            // F8: storage-reprice drivers.
+                            storage_drivers: exec_result.and_then(|r| r.storage_drivers),
+                            // F2/F3: account-side gas drivers.
+                            account_drivers: exec_result.and_then(|r| r.account_drivers),
+                            // F1: tier-1 failure forensics (None unless tier-1
+                            // failed). The accepted attempt's oog_*/frame columns
+                            // describe the chosen tier; these describe the 1× run.
+                            tier1_failure_reason: tier1.and_then(|d| d.failure_reason.clone()),
+                            tier1_oog_opcode: tier1.and_then(|d| d.oog_opcode),
+                            tier1_oog_contract: tier1.and_then(|d| d.oog_contract),
+                            tier1_oog_pc: tier1.and_then(|d| d.oog_pc),
+                            tier1_oog_depth: tier1.and_then(|d| d.oog_depth),
+                            tier1_oog_gas_remaining: tier1.and_then(|d| d.oog_gas_remaining),
+                            tier1_failing_selector: tier1.and_then(|d| d.failing_selector),
+                            tier1_failing_gas_provided: tier1.and_then(|d| d.failing_gas_provided),
+                            tier1_failing_gas_requested: tier1
+                                .and_then(|d| d.failing_gas_requested),
                         };
 
-                        // Inspector emits frames in post-order DFS — children
-                        // come before their parent. The parent of a frame at
-                        // index `i` (with depth `d > 0`) is the first
-                        // subsequent frame at depth `d - 1`.
-                        let parent_call_indices = derive_parent_call_indices(frames_ref);
-
-                        // Pull codehashes for every distinct frame target
-                        // out of the historical state we already loaded
-                        // for analysis (`normal_db`). One revm `basic()`
-                        // lookup per address; results cached so repeat
-                        // hits in the same drill-in tx are free. Failures
-                        // — self-destructed contracts, missing accounts —
-                        // leave the column NULL rather than aborting the
-                        // drill-in record.
+                        // Codehashes come from the historical state we already
+                        // loaded (`normal_db`); the cache is shared across the
+                        // schedule and baseline traces so a repeat target costs
+                        // one `basic()` read. Self-destructed / missing accounts
+                        // leave the column NULL rather than aborting the record.
                         let mut codehash_cache: HashMap<Address, Option<B256>> = HashMap::new();
-                        let call_frames_rows: Vec<CallFrameRow> = frames_ref
-                            .iter()
-                            .enumerate()
-                            .map(|(i, f)| {
-                                let codehash = f.to.and_then(|addr| {
-                                    *codehash_cache.entry(addr).or_insert_with(|| {
-                                        match normal_db.basic(addr) {
-                                            Ok(Some(info)) if info.code_hash != KECCAK_EMPTY => {
-                                                Some(info.code_hash)
-                                            }
-                                            _ => None,
-                                        }
-                                    })
-                                });
-                                CallFrameRow {
-                                    call_index: f.call_index as u32,
-                                    parent_call_index: parent_call_indices[i],
-                                    depth: f.depth as u32,
-                                    from_address: f.from,
-                                    to_address: f.to.unwrap_or_default(),
-                                    // For non-DELEGATECALL frames this equals
-                                    // `to_address`; once the inspector splits
-                                    // storage-context vs code-holder for
-                                    // DELEGATECALL, this column will carry the
-                                    // code holder while `to_address` carries
-                                    // the storage target. Today both come from
-                                    // the same source.
-                                    code_address: f.to,
-                                    codehash,
-                                    call_type: format_call_type(&f.call_type),
-                                    selector: extract_selector_bytes(&f.input),
-                                    value_wei: f.value_wei.map(|v| v.to_string()),
-                                    gas_provided: f.gas_provided,
-                                    gas_used: f.gas_used,
-                                    gas_margin: Some(
-                                        (f.gas_provided as i64).saturating_sub(f.gas_used as i64),
-                                    ),
-                                    success: f.success,
-                                    parent_gas_at_call: f.parent_gas_at_call,
-                                    gas_requested_on_stack: f.gas_requested_on_stack,
-                                    eip150_cap_binding: eip150_cap_binding(
-                                        f.gas_requested_on_stack,
-                                        f.parent_gas_at_call,
-                                    ),
-                                    state_gas_running: None,
-                                    // For successful CREATE/CREATE2 frames the inspector stashes
-                                    // the deployed runtime code in `output`; its length is the
-                                    // deployed-bytecode size EIP-8037 charges CPSB per byte for.
-                                    // All other frames leave this NULL.
-                                    deployed_bytecode_len: match f.call_type {
-                                        ResCallType::Create | ResCallType::Create2 if f.success => {
-                                            f.output.as_ref().map(|b| b.len() as u32)
-                                        }
-                                        _ => None,
-                                    },
-                                }
-                            })
-                            .collect();
-
+                        let call_frames_rows = build_call_frame_rows(
+                            frames_ref,
+                            &mut normal_db,
+                            &mut codehash_cache,
+                            failing_call_index,
+                        );
                         let opcode_count_rows = OpcodeCountRow::from_frames(opcode_frames_ref);
+
+                        // F11/F15: keep the baseline trace too, but only when the
+                        // call tree actually diverged (pure-OOG failures already
+                        // carry F7's baseline-frame twin, so the full baseline
+                        // tree would be redundant there). Baseline frames carry no
+                        // divergent-frame flag (None).
+                        let (baseline_call_frame_rows, baseline_opcode_rows) = if call_tree_diverged
+                        {
+                            (
+                                build_call_frame_rows(
+                                    &baseline_call_frames,
+                                    &mut normal_db,
+                                    &mut codehash_cache,
+                                    None,
+                                ),
+                                OpcodeCountRow::from_frames(&baseline_frame_opcode_counts),
+                            )
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
 
                         Some(DrillInRecord {
                             divergence: divergence_row,
                             call_frames: call_frames_rows,
                             opcode_counts: opcode_count_rows,
+                            baseline_call_frames: baseline_call_frame_rows,
+                            baseline_opcode_counts: baseline_opcode_rows,
                             baseline_event_logs: baseline_event_logs.clone(),
                             schedule_event_logs: sched_logs_ref.to_vec(),
                         })
@@ -2243,9 +2466,9 @@ where
                 let has_runtime_state = runtime_state_gas > 0;
 
                 // `opcode_frames_ref` is built inside the drill-in branch but
-                // the aggregator wants it on every tx so per-bucket
-                // `opcode_totals_7904` covers every cohort, not just drill-ins.
-                // Recompute the slice here from the same source.
+                // the aggregator wants it on every tx so per-class
+                // `opcode_totals` covers the aggregate cohorts, not just
+                // drill-ins. Recompute the slice here from the same source.
                 let opcode_frames_for_agg =
                     exec_result.map(|r| r.frame_opcode_counts.as_slice()).unwrap_or(&[]);
                 aggregators
@@ -2253,7 +2476,8 @@ where
                     .expect("aggregator exists for every schedule")
                     .observe_tx(
                         reth_research::block_aggregator::TxObservation {
-                            bucket,
+                            class: aggregate_class,
+                            store_full_forensics,
                             gas_delta: total_delta,
                             state_gas_spent: schedule_state_gas_spent,
                             state_gas_spillover,
@@ -2261,7 +2485,24 @@ where
                             is_creation: is_create,
                             has_authorization: authorization_count > 0,
                             has_runtime_state,
+                            // F4: `Some(0)` is a measured zero (folds harmlessly
+                            // in the aggregator); `None` only on the unmeasured
+                            // reject path.
+                            cold_account_access_count: exec_result
+                                .and_then(|r| r.cold_account_access_count),
+                            storage_drivers: exec_result.and_then(|r| r.storage_drivers),
+                            account_drivers: exec_result.and_then(|r| r.account_drivers),
                             drill_in_record: drill_in,
+                            recipient,
+                            // 4-byte selector for calls with >=4 calldata bytes;
+                            // None for creations (computed once per tx above).
+                            selector: entry_selector,
+                            // gas_delta is only clean when the schedule replay
+                            // fit the original limit; OOG-at-higher-tier txs
+                            // carry halt-gas deltas and are excluded from the
+                            // recipient gas sum.
+                            succeeded_within_limit: schedule_replay_success &&
+                                schedule_gas <= gas_limit,
                         },
                         opcode_frames_for_agg,
                     );
@@ -2727,7 +2968,47 @@ mod tests {
             gas_requested_on_stack: None,
             parent_gas_at_call: None,
             value_wei: None,
+            caller_pc: None,
+            was_precompile: false,
+            precompile_address: None,
+            gas_remaining_at_fail: None,
+            storage_target: None,
         }
+    }
+
+    /// F2 revert decode: the two canonical Solidity errors, custom selectors,
+    /// and the empty/short edge cases.
+    #[test]
+    fn decode_revert_recognises_canonical_errors() {
+        // Error(string) "boom": selector + offset(32) + len(4) + utf8 + pad.
+        let mut err = vec![0x08, 0xc3, 0x79, 0xa0];
+        err.extend_from_slice(&[0u8; 31]);
+        err.push(0x20); // offset word = 32
+        err.extend_from_slice(&[0u8; 31]);
+        err.push(0x04); // length word = 4
+        err.extend_from_slice(b"boom");
+        err.extend_from_slice(&[0u8; 28]); // pad to a full 32-byte word
+        assert_eq!(decode_revert(&err), "Error(string): boom");
+
+        // Panic(uint256) 0x11 (arithmetic overflow): selector + 32-byte code.
+        let mut panic = vec![0x4e, 0x48, 0x7b, 0x71];
+        panic.extend_from_slice(&[0u8; 31]);
+        panic.push(0x11);
+        assert_eq!(decode_revert(&panic), "Panic(0x11)");
+
+        // Unknown custom-error selector is surfaced as 4 bytes.
+        assert_eq!(decode_revert(&[0xde, 0xad, 0xbe, 0xef]), "custom:0xdeadbeef");
+
+        // Empty / short returndata.
+        assert_eq!(decode_revert(&[]), "empty");
+        assert_eq!(decode_revert(&[0x01, 0x02]), "short:0x0102");
+    }
+
+    /// F2 cap: returndata is truncated to the bounded prefix.
+    #[test]
+    fn cap_bytes_truncates_to_cap() {
+        assert_eq!(cap_bytes(&[0u8; 500]).len(), REVERT_DATA_CAP);
+        assert_eq!(cap_bytes(&[1u8, 2, 3]), vec![1, 2, 3]);
     }
 
     /// Single-frame tx: root only. No parent.

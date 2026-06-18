@@ -144,7 +144,7 @@ impl<'a> Cursor<'a> {
         Self { buf, pos: 0 }
     }
 
-    fn next(&mut self) -> Result<u8, MetadataParseError> {
+    const fn next(&mut self) -> Result<u8, MetadataParseError> {
         if self.pos >= self.buf.len() {
             return Err(MetadataParseError::CborDecode("truncated"));
         }
@@ -545,9 +545,8 @@ mod tests {
         assert!(matches!(res, Err(MetadataParseError::BytecodeTooShort(1))));
     }
 
-    use crate::{
-        database::{BlockCoverageRow, BlockOutput, CallFrameRow, DivergenceRow, DrillInRecord},
-        divergence::Bucket,
+    use crate::database::{
+        BlockCoverageRow, BlockOutput, CallFrameRow, DivergenceRow, DrillInRecord,
     };
     use alloy_primitives::B256;
     use std::{cell::RefCell, collections::HashMap};
@@ -590,52 +589,11 @@ mod tests {
                 schedule_config_hash: "cfg".to_string(),
                 block_number: 1,
                 tx_index,
-                tx_hash: B256::ZERO,
-                timestamp: 0,
-                bucket: Bucket::ContractBroken,
-                sender: Address::ZERO,
                 recipient: Some(addr),
-                is_create: false,
-                tx_gas_limit: 0,
                 baseline_success: true,
                 schedule_success: false,
                 status_changed: true,
-                event_logs_changed: false,
-                output_changed: false,
-                logs_bloom_changed: false,
-                baseline_gas_used: 0,
-                schedule_gas_used: 0,
-                gas_delta: 0,
-                baseline_total_gas_spent: None,
-                baseline_gas_refunded: None,
-                schedule_total_gas_spent: None,
-                schedule_gas_refunded: None,
-                schedule_intrinsic_gas: None,
-                schedule_floor_gas: None,
-                would_fit_in_original_limit: None,
-                min_multiplier_to_succeed: None,
-                divergence_contract: None,
-                divergence_pc: None,
-                divergence_call_depth: None,
-                divergence_opcode: None,
-                oog_contract: None,
-                oog_pc: None,
-                oog_call_depth: None,
-                oog_opcode: None,
-                oog_pattern: None,
-                oog_gas_remaining: None,
-                oog_chain_proportional: None,
-                oog_bottleneck_depth: None,
-                oog_bottleneck_kind: None,
-                schedule_state_gas_spent: None,
-                schedule_state_gas_demanded: None,
-                schedule_initial_state_gas: None,
-                schedule_initial_reservoir: None,
-                runtime_state_gas: None,
-                runtime_state_gas_spillover: None,
-                state_gas_category: None,
-                reservoir_exhausted: None,
-                replay_halt_oog: None,
+                ..Default::default()
             },
             call_frames: vec![CallFrameRow {
                 call_index: 0,
@@ -643,7 +601,9 @@ mod tests {
                 depth: 0,
                 from_address: Address::ZERO,
                 to_address: addr,
-                code_address: None,
+                // Backfill keys on code_address (the implementation); in
+                // production it equals the bytecode address (F14).
+                code_address: Some(addr),
                 codehash: None,
                 call_type: "CALL".to_string(),
                 selector: None,
@@ -655,10 +615,13 @@ mod tests {
                 parent_gas_at_call: None,
                 gas_requested_on_stack: None,
                 eip150_cap_binding: None,
-                state_gas_running: None,
                 deployed_bytecode_len: None,
+                repricing_gas_delta: 0,
+                ..Default::default()
             }],
             opcode_counts: vec![],
+            baseline_call_frames: vec![],
+            baseline_opcode_counts: vec![],
             baseline_event_logs: vec![],
             schedule_event_logs: vec![],
         };
@@ -671,15 +634,10 @@ mod tests {
             timestamp: 0,
             tx_count: 1,
             tx_count_unchanged: 0,
-            tx_count_trace_only: 0,
             tx_count_gas_only: 0,
-            tx_count_event_logs_changed: 0,
-            tx_count_schedule_rescued: 0,
-            tx_count_wallet_fixable_shallow: 0,
-            tx_count_wallet_fixable_deep_chain: 0,
-            tx_count_inconclusive_needs_higher_sweep: 0,
-            tx_count_contract_broken: 1,
-            tx_count_aa_gas_reestimation: 0,
+            tx_count_stored: 1,
+            block_gas_used: 15_000_000,
+            block_gas_limit: 30_000_000,
         };
         // block_hash needs to differ per call to satisfy the PK if we
         // seed multiple times.
@@ -688,7 +646,8 @@ mod tests {
         coverage.block_number = 1 + tx_index as u64;
         let mut div = drill_in;
         div.divergence.block_number = coverage.block_number;
-        let output = BlockOutput { coverage, summaries: vec![], drill_ins: vec![div] };
+        let output =
+            BlockOutput { coverage, summaries: vec![], drill_ins: vec![div], recipients: vec![] };
         db.record_block_output(&output).unwrap();
     }
 

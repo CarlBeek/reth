@@ -18,16 +18,14 @@
 //!   its own `GasParams` from the spec and there's no hook for injecting overrides.
 
 use super::{
+    common::initial_and_floor_gas_for,
     context::TxContext,
     traits::{GasSchedule, ScheduleKind},
 };
 use reth_evm::EvmEnv;
 use revm::{
     context_interface::{
-        cfg::{
-            gas::InitialAndFloorGas,
-            gas_params::{GasId, GasParams},
-        },
+        cfg::{gas::InitialAndFloorGas, gas_params::GasId},
         Cfg,
     },
     primitives::hardfork::SpecId,
@@ -97,50 +95,32 @@ impl Eip8037Constants {
         (Self::STATE_BYTES_PER_NEW_ACCOUNT + Self::STATE_BYTES_PER_AUTH_BASE) * Self::CPSB;
 }
 
-/// Apply PR-11616 state-byte constants on top of revm's hardcoded
-/// `SpecId::AMSTERDAM` gas-param table.
+/// PR-11616 state-byte overrides overlaid on revm's `SpecId::AMSTERDAM`
+/// gas-param table.
 ///
-/// This helper overlays the current constants so both runtime gas charges (via the cfg
-/// env) and the intrinsic-gas computation (via a fresh `GasParams`) end
-/// up using PR-11616 values.
-fn apply_pr11616_overrides(params: &mut GasParams) {
+/// Returned as an explicit `(GasId, value)` list so both the runtime gas
+/// charges (via the cfg env in [`Eip8037Schedule::configure_evm_env`]) and the
+/// intrinsic-gas computation (via [`initial_and_floor_gas_for`]) overlay the
+/// identical PR-11616 numbers. revm 40 splits the EIP-7702 authorization state
+/// gas into a per-account portion (`new_account_state_gas`) and a per-bytecode
+/// portion (`tx_eip7702_state_gas_bytecode` = the 23-byte delegation
+/// designator); `GasParams::initial_tx_gas` recombines them. The regular-gas
+/// slots (`tx_eip7702_per_empty_account_cost` = 7500, `sstore_set_refund`,
+/// `tx_eip7702_auth_refund` = 0) already equal the PR-11616 numbers in revm's
+/// native Amsterdam table, so only the state-gas entries need overriding.
+const fn pr11616_overrides() -> [(GasId, u64); 5] {
     let cpsb = Eip8037Constants::CPSB;
-    let bytes_storage = Eip8037Constants::STATE_BYTES_PER_STORAGE_SET;
-    let bytes_account = Eip8037Constants::STATE_BYTES_PER_NEW_ACCOUNT;
-    let bytes_auth = Eip8037Constants::STATE_BYTES_PER_AUTH_BASE;
+    let storage_set_state = Eip8037Constants::STATE_BYTES_PER_STORAGE_SET * cpsb;
+    let new_account_state = Eip8037Constants::STATE_BYTES_PER_NEW_ACCOUNT * cpsb;
+    let auth_bytecode_state = Eip8037Constants::STATE_BYTES_PER_AUTH_BASE * cpsb;
 
-    // Per-opcode state-gas figures, overlaid on revm's Amsterdam table. revm 40
-    // splits the EIP-7702 authorization state gas into a per-account portion
-    // (`new_account_state_gas`) and a per-bytecode portion
-    // (`tx_eip7702_state_gas_bytecode` = the 23-byte delegation designator);
-    // `GasParams::initial_tx_gas` recombines them. The regular-gas slots
-    // (`tx_eip7702_per_empty_account_cost` = 7500, `sstore_set_refund`,
-    // `tx_eip7702_auth_refund` = 0) are left at revm's native Amsterdam values,
-    // which already equal the PR-11616 numbers, so only the state-gas entries
-    // need overriding.
-    let storage_set_state = bytes_storage * cpsb;
-    let new_account_state = bytes_account * cpsb;
-    let auth_bytecode_state = bytes_auth * cpsb;
-
-    params.override_gas([
+    [
         (GasId::sstore_set_state_gas(), storage_set_state),
         (GasId::new_account_state_gas(), new_account_state),
         (GasId::create_state_gas(), new_account_state),
         (GasId::code_deposit_state_gas(), cpsb),
         (GasId::tx_eip7702_state_gas_bytecode(), auth_bytecode_state),
-    ]);
-}
-
-fn pr11616_initial_and_floor_gas(ctx: &TxContext) -> InitialAndFloorGas {
-    let mut params = GasParams::new_spec(SpecId::AMSTERDAM);
-    apply_pr11616_overrides(&mut params);
-    params.initial_tx_gas(
-        &ctx.input,
-        ctx.is_create,
-        ctx.access_list_accounts,
-        ctx.access_list_storage_slots,
-        ctx.authorization_count,
-    )
+    ]
 }
 
 /// EIP-8037 schedule backed by native revm state-gas accounting with
@@ -190,17 +170,24 @@ impl GasSchedule for Eip8037Schedule {
         ScheduleKind::Both
     }
 
+    fn replay_bump_multiplier(&self) -> Option<u64> {
+        Some(10)
+    }
+
     fn intrinsic_gas(&self, ctx: &TxContext) -> Option<u64> {
         // Build a fresh GasParams for Amsterdam, overlay PR-11616
         // numbers, then drive intrinsic-gas through it directly. The
         // top-level helper `calculate_initial_tx_gas` allocates its own
         // GasParams from the spec — no hook for overrides — so we walk
         // the per-instance path instead.
-        Some(pr11616_initial_and_floor_gas(ctx).initial_total_gas())
+        Some(
+            initial_and_floor_gas_for(ctx, SpecId::AMSTERDAM, &pr11616_overrides())
+                .initial_total_gas(),
+        )
     }
 
     fn initial_and_floor_gas(&self, ctx: &TxContext) -> Option<InitialAndFloorGas> {
-        Some(pr11616_initial_and_floor_gas(ctx))
+        Some(initial_and_floor_gas_for(ctx, SpecId::AMSTERDAM, &pr11616_overrides()))
     }
 
     fn configure_evm_env(&self, env: &mut EvmEnv<SpecId>) -> bool {
@@ -214,7 +201,7 @@ impl GasSchedule for Eip8037Schedule {
         cfg.amsterdam_eip7708_delayed_burn_disabled = true;
 
         // Overlay PR-11616 numbers on top of revm's Amsterdam defaults.
-        apply_pr11616_overrides(&mut cfg.gas_params);
+        cfg.gas_params.override_gas(pr11616_overrides());
 
         env.cfg_env = cfg;
         true
@@ -261,6 +248,12 @@ mod tests {
         assert_eq!(Eip8037Constants::NEW_ACCOUNT_STATE_GAS, 120 * 1_530);
         assert_eq!(Eip8037Constants::STORAGE_SET_STATE_GAS, 64 * 1_530);
         assert_eq!(Eip8037Constants::AUTH_STATE_GAS, (120 + 23) * 1_530);
+    }
+
+    #[test]
+    fn replay_bump_is_single_10x() {
+        // 8037 retries a failed 1× replay exactly once at 10×.
+        assert_eq!(Eip8037Schedule::new().replay_bump_multiplier(), Some(10));
     }
 
     #[test]

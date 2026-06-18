@@ -30,7 +30,9 @@
 //! - `DuckDB` sequences (`CREATE SEQUENCE`, `DEFAULT nextval('seq')`) become `INTEGER PRIMARY KEY
 //!   AUTOINCREMENT`.
 
-use crate::divergence::{Bucket, EventLog, FrameOpcodeCounts};
+use crate::divergence::{
+    AccountDrivers, AggregateClass, EventLog, FrameOpcodeCounts, StorageDrivers,
+};
 use alloy_primitives::{keccak256, Address, B256};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::{
@@ -72,8 +74,53 @@ use thiserror::Error;
 ///   op ran out of gas). Lets the dashboard show "this op needed N state gas" instead of 0.
 /// - v9: added `Bucket::AaGasReestimation` + `block_coverage.tx_count_aa_gas_reestimation` for
 ///   ERC-4337 `EntryPoint` OOG breaks — an off-chain `UserOp` gas re-estimation fix, split out of
-///   `contract_broken` where they were misclassified as `FixedGas` contract bottlenecks.
-pub const SCHEMA_VERSION: u32 = 9;
+///   `contract_broken` where they were misclassified as `FixedGas` contract bottlenecks. This
+///   column was added in-place without bumping `SCHEMA_VERSION`, so a v9 database created before it
+///   lacked the column and every write failed with `no column named …`.
+/// - v10: this PR's schema, a single bump over the v9 merge base. The editorial bucket/analysis-tag
+///   taxonomy (`wallet_fixable_*`, `contract_broken`, `schedule_rescued`, `aa_gas_reestimation`,
+///   `inconclusive_needs_higher_sweep`, `event_logs_changed`, `trace_only`) is removed entirely.
+///   Aggregates are re-keyed by a 2-value execution-fact `class` (`unchanged` / `gas_only`) — the
+///   only txs without a per-tx forensic row; every failure and trace-divergence now gets a per-tx
+///   `divergences` row (strictly more per-tx coverage than the old drill-in buckets).
+///   `block_coverage` drops the 10 `tx_count_<bucket>` editorial counts for fact counts
+///   `tx_count_unchanged` / `tx_count_gas_only` / `tx_count_stored` (keeping `block_gas_used` /
+///   `block_gas_limit`). `block_summaries` is re-keyed on `class` and renames `opcode_totals_7904`
+///   to `opcode_totals` (keeping `cold_account_access_count`). `block_bucket_recipients` becomes
+///   `block_recipients`, re-keyed on `class` (keeping `gas_delta_sum_succeeding`). `divergences`
+///   drops `bucket` for the `outer_limit_only_failure` witness (distinguishes a
+///   succeeded-only-at-the-bumped-tier tx from a no-OOG break). Additive nullable forensic columns
+///   make "what failed and why" answerable from raw facts: `divergences` gains
+///   `additional_gas_charged` (F4 total repricing surcharge), `failure_selector_path` (F6
+///   root-to-divergence selector JSON), `tx_type` / `tx_nonce` / `entry_selector` /
+///   `input_zero_bytes` / `input_nonzero_bytes` / `has_authorization` (F5 tx identity),
+///   `failure_reason` (F1 `HaltReason` discriminant / `Revert` / `Rejected`), `revert_data` /
+///   `revert_decoded` / `tx_output` (F2 capped returndata plus decode), and
+///   `baseline_frame_success` / `baseline_frame_gas_used` / `baseline_frame_gas_provided` (F7
+///   baseline twin of the failing frame), `surcharge_at_oog` (F13 repricing surcharge at the OOG
+///   instant) and the `gas_div_*` quad (F10 first opcode where cumulative schedule gas exceeded
+///   baseline); `divergence_call_frames` gains `repricing_gas_delta` (F4 per-frame surcharge) and
+///   the F9 failing-frame context (`caller_pc` / `was_precompile` / `precompile_address` /
+///   `gas_remaining_at_fail` / `is_divergent_frame`). `divergence_call_frames.to_address` /
+///   `code_address` are now split (F3): `to_address` is the call/storage target (the proxy under
+///   DELEGATECALL) while `code_address` is the code holder (the implementation, revm
+///   `bytecode_address`); `codehash` and the metadata backfill resolve from `code_address` (F14).
+///   `divergences` also gains the F12 per-category tax decomposition `tax_second_db_read` /
+///   `tax_other` (these two sum to `additional_gas_charged`) plus `tax_intrinsic` (the tx-level
+///   intrinsic-gas delta). Two zero-information columns are dropped:
+///   `divergence_call_frames.state_gas_running` (was always NULL) and
+///   `divergences.would_fit_in_original_limit` (an exact duplicate of `schedule_success`). F8
+///   storage-reprice drivers — `sload_cold_count` / `sload_warm_count` / `sstore_cold_count` /
+///   `sstore_{set,reset,clear,noop,dirty}_count` — are added to BOTH `divergences` (per-tx) and
+///   `block_summaries` (per-class), attributing the native `COLD_STORAGE_ACCESS` / `STORAGE_WRITE`
+///   / `REFUND_STORAGE_CLEAR` surcharges that never reach `additional_gas_charged`.
+///   `divergence_call_frames` and `divergence_opcode_counts` gain a `trace_kind` (`"schedule"` /
+///   `"baseline"`) in their primary key, mirroring `divergence_event_logs`, so a drill-in whose
+///   call tree diverged also stores the baseline call tree (F15) and baseline opcode counts (F11).
+///   There is no in-place migration: opening a pre-v10 database is rejected by
+///   [`enforce_schema_version`] (via `PRAGMA user_version`) — wipe the divergences `SQLite` and
+///   re-gather. The archive datadir is never touched.
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Errors raised by the storage layer.
 #[derive(Debug, Error)]
@@ -88,10 +135,11 @@ pub enum DatabaseError {
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     /// The on-disk schema version doesn't match the compiled-in
-    /// `SCHEMA_VERSION`. Replay is required.
+    /// `SCHEMA_VERSION`. There is no in-place migration — wipe & re-gather.
     #[error(
-        "schema version mismatch: producer compiled for v{expected}, \
-         database last written under v{found}. Re-replay required."
+        "research DB schema mismatch: binary expects v{expected}, database is v{found}. \
+         No migration — wipe the divergences SQLite and re-gather (the archive datadir is \
+         unaffected)."
     )]
     SchemaVersionMismatch {
         /// Version the running binary expects.
@@ -165,6 +213,7 @@ impl DivergenceDatabase {
         // consumer dashboard) can keep WAL_pages "in use" indefinitely
         // and the WAL grows past the database size, slowing every read.
         conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
+        enforce_schema_version(&conn)?;
         initialize_schema(&conn)?;
         verify_schema_version(&conn)?;
         Ok(Self {
@@ -233,6 +282,43 @@ fn current_unix_seconds() -> u64 {
 /// A freshly initialised DB has zero rows in `analysis_runs` and passes
 /// trivially; the version is stamped the first time
 /// [`DivergenceDatabase::record_analysis_run_start`] is called.
+/// Enforce the research-DB schema version via `SQLite`'s `PRAGMA user_version`.
+///
+/// There is **no in-place migration**: a [`SCHEMA_VERSION`] bump means wipe the
+/// divergences `SQLite` and re-gather (the archive datadir is unaffected). A
+/// brand-new DB is stamped with the current version; an existing DB whose version
+/// differs — including a legacy/un-stamped DB (`user_version == 0` with tables
+/// already present) — is rejected so the producer fails loudly instead of silently
+/// writing into a stale schema.
+///
+/// Must run BEFORE [`initialize_schema`]: `CREATE TABLE IF NOT EXISTS` would
+/// otherwise no-op against a stale DB's tables, and the missing columns would only
+/// surface as a runtime "no column named …" on the first write. This is the
+/// actually-enforced gate; [`verify_schema_version`] (below) is the older,
+/// inert `analysis_runs`-based check kept for backward compatibility.
+fn enforce_schema_version(conn: &Connection) -> Result<(), DatabaseError> {
+    let user_version: u32 =
+        conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? as u32;
+    let has_schema = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='block_coverage'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+
+    if !has_schema && user_version == 0 {
+        // Brand-new DB: stamp the current version; the DDL then creates current tables.
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        return Ok(());
+    }
+    if user_version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    Err(DatabaseError::SchemaVersionMismatch { expected: SCHEMA_VERSION, found: user_version })
+}
+
 fn verify_schema_version(conn: &Connection) -> Result<(), DatabaseError> {
     let latest: Option<u32> = conn
         .query_row(
@@ -267,26 +353,33 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             parent_hash          BLOB    NOT NULL,
             timestamp            INTEGER NOT NULL,
             tx_count             INTEGER NOT NULL,
-            tx_count_unchanged                 INTEGER NOT NULL,
-            tx_count_trace_only                INTEGER NOT NULL,
-            tx_count_gas_only                  INTEGER NOT NULL,
-            tx_count_event_logs_changed        INTEGER NOT NULL,
-            tx_count_schedule_rescued          INTEGER NOT NULL,
-            tx_count_wallet_fixable_shallow    INTEGER NOT NULL,
-            tx_count_wallet_fixable_deep_chain INTEGER NOT NULL,
-            tx_count_inconclusive_needs_higher_sweep INTEGER NOT NULL,
-            tx_count_contract_broken           INTEGER NOT NULL,
-            tx_count_aa_gas_reestimation       INTEGER NOT NULL DEFAULT 0,
+            -- Execution-fact split of the block's txs (no editorial taxonomy):
+            -- `unchanged` (byte-identical), `gas_only` (only gas differs), and
+            -- `stored` (everything else — a per-tx `divergences` row exists, so
+            -- its cohort is reconstructable downstream). Sum == tx_count.
+            tx_count_unchanged   INTEGER NOT NULL,
+            tx_count_gas_only    INTEGER NOT NULL,
+            tx_count_stored      INTEGER NOT NULL,
+            -- Native block header values (NULL on rows written before v11 / not
+            -- re-touched). gas_used is the actual mainnet baseline the block
+            -- consumed; gas_limit is the protocol cap. Together they anchor
+            -- utilization, block-fullness shift, and gas-limit-exceedance under
+            -- a repricing schedule. Nullable so an additive ADD COLUMN on an
+            -- existing DB leaves historical rows readable as 'n/a'.
+            block_gas_used                     INTEGER,
+            block_gas_limit                    INTEGER,
             PRIMARY KEY (schedule_name, block_number, block_hash)
         );",
     )?;
 
-    // One row per (schedule, block, bucket). Only emitted for buckets that
-    // had at least one tx in the block.
+    // One row per (schedule, block, class) for the aggregate-only fact classes
+    // `{unchanged, gas_only}` — these summarize the txs with no per-tx
+    // `divergences` row (the silent majority). Stored txs are reconstructable
+    // from their per-tx rows, so they get no summary row here.
     //
-    // `opcode_totals_7904` is a sparse JSON array of
+    // `opcode_totals` is a sparse JSON array of
     // `{opcode, count, gas_baseline, gas_schedule}` objects — one entry per
-    // distinct opcode the bucket touched in this block, summed across every
+    // distinct opcode the class touched in this block, summed across every
     // frame of every tx. Lets the dashboard compute both the share of gas
     // each opcode burned and the delta the schedule introduced.
     // `multiplier_log2_hist` and `gas_delta_log2_hist` are JSON arrays of
@@ -300,14 +393,17 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
         "CREATE TABLE IF NOT EXISTS block_summaries (
             schedule_name TEXT    NOT NULL,
             block_number  INTEGER NOT NULL,
-            bucket        TEXT    NOT NULL,
+            class         TEXT    NOT NULL,
             tx_count      INTEGER NOT NULL,
             gas_delta_sum       INTEGER,
             gas_delta_sum_sq    REAL,
             gas_delta_min       INTEGER,
             gas_delta_max       INTEGER,
             gas_delta_log2_hist TEXT,
-            opcode_totals_7904      TEXT,
+            opcode_totals           TEXT,
+            -- state_gas_sum / state_gas_spillover_sum / tx_count_runtime_state are
+            -- EIP-8037-only (the state-gas reservoir model); inert (0 / NULL) for
+            -- EIP-8038 — exclude them from 8038 analysis.
             state_gas_sum           INTEGER,
             state_gas_spillover_sum INTEGER,
             multiplier_log2_hist    TEXT,
@@ -315,7 +411,63 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             tx_count_authorization  INTEGER,
             tx_count_runtime_state  INTEGER,
             tx_count_no_state       INTEGER,
-            PRIMARY KEY (schedule_name, block_number, bucket)
+            cold_account_access_count INTEGER,
+            sload_cold_count          INTEGER,
+            sload_warm_count          INTEGER,
+            sstore_cold_count         INTEGER,
+            sstore_set_count          INTEGER,
+            sstore_reset_count        INTEGER,
+            sstore_clear_count        INTEGER,
+            sstore_noop_count         INTEGER,
+            sstore_dirty_count        INTEGER,
+            -- F2/F3 account-side gas drivers summed over this class's txs:
+            -- warm account accesses, CALL/CALLCODE value transfers, CREATE+CREATE2
+            -- opcodes, and the tx-declared EIP-2930 access-list address / storage
+            -- key counts. NULL when the class saw none of these.
+            warm_account_access_count    INTEGER,
+            value_transfer_count         INTEGER,
+            create_opcode_count          INTEGER,
+            access_list_address_count    INTEGER,
+            access_list_storage_key_count INTEGER,
+            PRIMARY KEY (schedule_name, block_number, class)
+        );",
+    )?;
+
+    // Per-(schedule, block, class) recipient attribution for the aggregate-only
+    // fact classes `{unchanged, gas_only}` — gives the silent-majority cohorts
+    // (whose txs have no per-tx row) destination/selector attribution. Stored txs
+    // carry their own `recipient` on the per-tx row. One row per distinct destination, ranked
+    // and truncated to the top `BUCKET_RECIPIENT_TOP_K` by `tx_count`; the
+    // truncated tail is folded into a single synthetic `recipient='__other__'`
+    // row so the unattributed mass stays quantified (no silent long-tail
+    // blind spot). `recipient` is the tx's to-address as lowercase `{:#x}`
+    // hex (joins `contract_labels.address`), `'__create__'` for contract
+    // creations, or `'__other__'` for the tail. `top_selector` is the 4-byte
+    // function selector (`x'00000000'` when absent / create / tail).
+    //
+    // `gas_delta_sum_succeeding` sums `gas_delta` ONLY over txs that succeeded
+    // under the schedule within their original gas limit. Txs that OOG under
+    // the schedule are deliberately excluded: their `schedule_gas_used` is
+    // revm's all-gas-consumed halt value (≈ the inflated tier limit), so
+    // including them would pollute the sum with halt-gas artefacts. Their
+    // `tx_count` is still counted, so the failed cohort is attributed by
+    // *who/how many*, while gas magnitude reflects only the clean cohort.
+    //
+    // NOTE: this OOG-exclusion gate is a no-op for the only classes that reach
+    // this rollup (`unchanged` / `gas_only`) — those are all tier-1 successes,
+    // so `succeeded_within_limit` is always true for them. The gate is purely
+    // defensive (it would matter only if a failing/OOG tx were ever rolled into
+    // an aggregate class instead of getting its own per-tx `divergences` row).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS block_recipients (
+            schedule_name TEXT    NOT NULL,
+            block_number  INTEGER NOT NULL,
+            class         TEXT    NOT NULL,
+            recipient     TEXT    NOT NULL,
+            top_selector  BLOB    NOT NULL,
+            tx_count      INTEGER NOT NULL,
+            gas_delta_sum_succeeding INTEGER NOT NULL,
+            PRIMARY KEY (schedule_name, block_number, class, recipient, top_selector)
         );",
     )?;
 
@@ -331,7 +483,11 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             tx_index             INTEGER NOT NULL,
             tx_hash              BLOB    NOT NULL,
             timestamp            INTEGER NOT NULL,
-            bucket               TEXT    NOT NULL,
+            -- Execution-fact witness that the schedule replay succeeded only at
+            -- a bumped tier while exceeding the original limit (and matched
+            -- baseline behavior). Lets downstream tell wallet-fixable-by-more-gas
+            -- from a contract break that has no OOG site. NULL = not applicable.
+            outer_limit_only_failure INTEGER,
 
             sender       TEXT    NOT NULL,
             recipient    TEXT,
@@ -347,6 +503,12 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
 
             baseline_gas_used        INTEGER NOT NULL,
             schedule_gas_used        INTEGER NOT NULL,
+            -- schedule_gas_used - baseline_gas_used. NOTE: for a rescued failure
+            -- (`schedule_success=0 AND replay_halt_oog IS NULL`) the schedule gas
+            -- figures are the bumped (N×) tier's execution, not the 1× run, so
+            -- `gas_delta` is NOT a meaningful repricing measure when
+            -- `baseline_success=0`. Downstream repricing aggregates must filter
+            -- on `schedule_success=1` (and `baseline_success=1`).
             gas_delta                INTEGER NOT NULL,
             baseline_total_gas_spent INTEGER,
             baseline_gas_refunded    INTEGER,
@@ -354,7 +516,6 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             schedule_gas_refunded    INTEGER,
             schedule_intrinsic_gas   INTEGER,
             schedule_floor_gas       INTEGER,
-            would_fit_in_original_limit INTEGER,
             min_multiplier_to_succeed   REAL,
 
             divergence_contract   TEXT,
@@ -371,6 +532,9 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             oog_bottleneck_depth   INTEGER,
             oog_bottleneck_kind    TEXT,
 
+            -- EIP-8037-only: the state-gas reservoir model is an 8037 construct.
+            -- These columns are inert (0 / NULL) for EIP-8038 (and 7904/baseline)
+            -- and should be excluded from 8038 analysis.
             schedule_state_gas_spent    INTEGER,
             schedule_state_gas_demanded INTEGER,
             schedule_initial_state_gas  INTEGER,
@@ -392,13 +556,108 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             -- needs-more-gas vs permanently-broken-under-this-schedule.
             replay_halt_oog             INTEGER,
 
+            -- Per-tx count of cold account accesses (first access this tx) for
+            -- the account-access opcodes (BALANCE / EXTCODE* / CALL family /
+            -- SELFDESTRUCT). Collected for every schedule.
+            cold_account_access_count   INTEGER,
+
+            -- F4: total repricing surcharge charged across all frames
+            -- (signed; the summed per-opcode deltas). Per-frame breakdown
+            -- lives in divergence_call_frames.repricing_gas_delta.
+            additional_gas_charged      INTEGER,
+            -- F6: root→divergence 4-byte selector path as a JSON array of
+            -- nullable hex strings (null = a frame with no selector).
+            failure_selector_path       TEXT,
+
+            -- F5: top-level tx identity. tx_type is the EIP-2718 type byte;
+            -- entry_selector is the first 4 calldata bytes; input_zero/nonzero
+            -- are the calldata byte split; has_authorization flags EIP-7702.
+            tx_type                     INTEGER,
+            tx_nonce                    INTEGER,
+            entry_selector              BLOB,
+            input_zero_bytes            INTEGER,
+            input_nonzero_bytes         INTEGER,
+            has_authorization           INTEGER,
+
+            -- F1: structured failure reason (HaltReason discriminant / Revert /
+            -- Rejected / NULL on success).
+            failure_reason              TEXT,
+            -- F2: raw revert returndata (capped), its best-effort decode, and
+            -- the top-level tx output bytes (capped).
+            revert_data                 BLOB,
+            revert_decoded              TEXT,
+            tx_output                   BLOB,
+
+            -- F7: baseline counterpart of the frame that failed under the
+            -- schedule (matched by call_index) — wallet-fixable discriminator.
+            baseline_frame_success      INTEGER,
+            baseline_frame_gas_used     INTEGER,
+            baseline_frame_gas_provided INTEGER,
+
+            -- F13: cumulative repricing surcharge at the OOG instant.
+            surcharge_at_oog            INTEGER,
+
+            -- F10: first opcode where cumulative schedule gas exceeded baseline
+            -- (distinct from the behavioral divergence_* columns).
+            gas_div_contract            TEXT,
+            gas_div_pc                  INTEGER,
+            gas_div_call_depth          INTEGER,
+            gas_div_opcode              INTEGER,
+
+            -- F12: per-category decomposition of the repricing tax. The first
+            -- two sum to additional_gas_charged; tax_intrinsic is the separate
+            -- tx-level intrinsic delta.
+            tax_second_db_read          INTEGER,
+            -- Reserved for multiplier / CSV schedules (the unclassified delta
+            -- bucket); identically 0 for EIP-8037 and EIP-8038, whose only
+            -- opcode-delta category is `tax_second_db_read`.
+            tax_other                   INTEGER,
+            tax_intrinsic               INTEGER,
+
+            -- F8: storage-reprice drivers. cold reads/writes drive
+            -- COLD_STORAGE_ACCESS; set/reset/clear drive STORAGE_WRITE; clear
+            -- also drives REFUND_STORAGE_CLEAR.
+            sload_cold_count            INTEGER,
+            sload_warm_count            INTEGER,
+            sstore_cold_count           INTEGER,
+            sstore_set_count            INTEGER,
+            sstore_reset_count          INTEGER,
+            sstore_clear_count          INTEGER,
+            sstore_noop_count           INTEGER,
+            sstore_dirty_count          INTEGER,
+
+            -- F2/F3: account-side gas drivers. warm account accesses + value
+            -- transfers + CREATE/CREATE2 are runtime inspector counts; the two
+            -- access-list counts come from the tx envelope.
+            warm_account_access_count     INTEGER,
+            value_transfer_count          INTEGER,
+            create_opcode_count           INTEGER,
+            access_list_address_count     INTEGER,
+            access_list_storage_key_count INTEGER,
+
+            -- F1: 1×-failure forensics. When a tx fails at the mainnet-equivalent
+            -- tier (1×) but is rescued at a bumped tier (or fails at both), these
+            -- preserve WHERE/WHY it broke at 1× (the rescued/highest-tier figures
+            -- in the columns above describe the accepted attempt, not the 1×
+            -- failure). NULL when 1× succeeded or wasn't a failure.
+            tier1_failure_reason        TEXT,
+            tier1_oog_opcode            INTEGER,
+            tier1_oog_contract          TEXT,
+            tier1_oog_pc                INTEGER,
+            tier1_oog_depth             INTEGER,
+            tier1_oog_gas_remaining     INTEGER,
+            tier1_failing_selector      BLOB,
+            tier1_failing_gas_provided  INTEGER,
+            tier1_failing_gas_requested INTEGER,
+
             UNIQUE (schedule_name, block_number, tx_index, schedule_config_hash)
         );",
     )?;
 
-    // One row per call frame in the schedule trace of a drill-in
-    // divergence. Baseline frames are NOT stored separately — derived
-    // baseline costs live in divergence_opcode_counts.gas_baseline.
+    // One row per call frame of a drill-in divergence. `trace_kind`
+    // ("schedule" / "baseline") partitions the two traces in one table,
+    // mirroring `divergence_event_logs`; baseline rows (F15) are written only
+    // when the call tree diverged.
     //
     // FK constraints from child tables to `divergences` are documented in
     // the design doc but omitted at the DDL level; the producer maintains
@@ -407,6 +666,7 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS divergence_call_frames (
             divergence_id          INTEGER NOT NULL,
+            trace_kind             TEXT    NOT NULL DEFAULT 'schedule',
             call_index             INTEGER NOT NULL,
             parent_call_index      INTEGER,
             depth                  INTEGER NOT NULL,
@@ -424,23 +684,32 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             parent_gas_at_call     INTEGER,
             gas_requested_on_stack INTEGER,
             eip150_cap_binding     INTEGER,
-            state_gas_running      INTEGER,
             deployed_bytecode_len  INTEGER,
-            PRIMARY KEY (divergence_id, call_index)
+            repricing_gas_delta    INTEGER NOT NULL,
+            -- F9: failing-frame context.
+            caller_pc              INTEGER,
+            was_precompile         INTEGER NOT NULL DEFAULT 0,
+            precompile_address     TEXT,
+            gas_remaining_at_fail  INTEGER,
+            is_divergent_frame     INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (divergence_id, trace_kind, call_index)
         );",
     )?;
 
     // Sparse opcode counts keyed by frame. Zero rows omitted by the
-    // producer at insert time.
+    // producer at insert time. `trace_kind` partitions schedule vs baseline
+    // (F11) — baseline rows carry the baseline opcode counts (where
+    // gas_baseline == gas_schedule).
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS divergence_opcode_counts (
             divergence_id INTEGER NOT NULL,
+            trace_kind    TEXT    NOT NULL DEFAULT 'schedule',
             call_index    INTEGER NOT NULL,
             opcode        INTEGER NOT NULL,
             count         INTEGER NOT NULL,
             gas_baseline  INTEGER NOT NULL,
             gas_schedule  INTEGER NOT NULL,
-            PRIMARY KEY (divergence_id, call_index, opcode)
+            PRIMARY KEY (divergence_id, trace_kind, call_index, opcode)
         );",
     )?;
 
@@ -537,24 +806,23 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_div_schedule      ON divergences(schedule_name);
          CREATE INDEX IF NOT EXISTS idx_div_block         ON divergences(schedule_name, block_number);
-         CREATE INDEX IF NOT EXISTS idx_div_recipient     ON divergences(recipient);
+         CREATE INDEX IF NOT EXISTS idx_div_recipient     ON divergences(schedule_name, recipient);
          CREATE INDEX IF NOT EXISTS idx_div_tx_hash       ON divergences(tx_hash);
-         CREATE INDEX IF NOT EXISTS idx_div_bucket        ON divergences(bucket);
-         CREATE INDEX IF NOT EXISTS idx_div_sched_bucket_recipient
-             ON divergences(schedule_name, bucket, recipient);
-         CREATE INDEX IF NOT EXISTS idx_div_sched_bucket_oog
-             ON divergences(schedule_name, bucket, oog_call_depth, oog_bottleneck_kind);
-         CREATE INDEX IF NOT EXISTS idx_div_sched_bucket_opcode
-             ON divergences(schedule_name, bucket, divergence_opcode);
+         CREATE INDEX IF NOT EXISTS idx_div_sched_oog
+             ON divergences(schedule_name, oog_call_depth, oog_bottleneck_kind);
+         CREATE INDEX IF NOT EXISTS idx_div_sched_opcode
+             ON divergences(schedule_name, divergence_opcode);
          CREATE INDEX IF NOT EXISTS idx_dcf_to_addr       ON divergence_call_frames(to_address);
          CREATE INDEX IF NOT EXISTS idx_dcf_codehash      ON divergence_call_frames(codehash);
          CREATE INDEX IF NOT EXISTS idx_doc_opcode        ON divergence_opcode_counts(opcode);
          CREATE INDEX IF NOT EXISTS idx_bc_schedule_block ON block_coverage(schedule_name, block_number);
          CREATE INDEX IF NOT EXISTS idx_bs_schedule_block ON block_summaries(schedule_name, block_number);
-         CREATE INDEX IF NOT EXISTS idx_bs_schedule_bucket ON block_summaries(schedule_name, bucket);
+         CREATE INDEX IF NOT EXISTS idx_bs_schedule_class ON block_summaries(schedule_name, class);
          CREATE INDEX IF NOT EXISTS idx_bs_schedule_opcode_totals
              ON block_summaries(schedule_name)
-             WHERE opcode_totals_7904 IS NOT NULL AND opcode_totals_7904 <> '[]';",
+             WHERE opcode_totals IS NOT NULL AND opcode_totals <> '[]';
+         CREATE INDEX IF NOT EXISTS idx_br_sched_recipient
+             ON block_recipients(schedule_name, recipient);",
     )?;
 
     Ok(())
@@ -572,11 +840,31 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
 pub struct BlockOutput {
     /// Always present. Counts go to `block_coverage`.
     pub coverage: BlockCoverageRow,
-    /// One per non-empty bucket. Go to `block_summaries`.
+    /// One per non-empty aggregate class (`unchanged` / `gas_only`). Go to
+    /// `block_summaries`.
     pub summaries: Vec<BlockSummaryRow>,
-    /// Drill-in records — one per `EventLogsChanged`, `InconclusiveNeedsHigherSweep`, or
-    /// `ContractBroken` tx.
+    /// Drill-in records — one per tx meeting [`DivergenceFacts::store_full_forensics`].
     pub drill_ins: Vec<DrillInRecord>,
+    /// Per-(class) top-recipient rollup rows. Go to `block_recipients`.
+    pub recipients: Vec<RecipientRow>,
+}
+
+/// One row of the `block_recipients` rollup: a single destination's share of a
+/// (schedule, block, class). See the table DDL for the ranking / truncation
+/// rules and the `gas_delta_sum_succeeding` semantics.
+#[allow(missing_docs)]
+#[derive(Debug, Clone)]
+pub struct RecipientRow {
+    pub schedule_name: String,
+    pub block_number: u64,
+    pub class: AggregateClass,
+    /// Lowercase `{:#x}` to-address, or the `__create__` / `__other__` sentinel.
+    pub recipient: String,
+    /// 4-byte function selector; all-zero when absent / create / tail row.
+    pub top_selector: [u8; 4],
+    pub tx_count: u32,
+    /// Sum of `gas_delta` over the succeeding-within-original-limit cohort only.
+    pub gas_delta_sum_succeeding: i64,
 }
 
 /// Counts per bucket for one (schedule, block, `block_hash`). Always emitted
@@ -592,16 +880,17 @@ pub struct BlockCoverageRow {
     pub parent_hash: B256,
     pub timestamp: u64,
     pub tx_count: u32,
+    /// Execution-fact split (sum == `tx_count`): byte-identical, gas-only, and
+    /// everything-else (a per-tx `divergences` row was stored).
     pub tx_count_unchanged: u32,
-    pub tx_count_trace_only: u32,
     pub tx_count_gas_only: u32,
-    pub tx_count_event_logs_changed: u32,
-    pub tx_count_schedule_rescued: u32,
-    pub tx_count_wallet_fixable_shallow: u32,
-    pub tx_count_wallet_fixable_deep_chain: u32,
-    pub tx_count_inconclusive_needs_higher_sweep: u32,
-    pub tx_count_contract_broken: u32,
-    pub tx_count_aa_gas_reestimation: u32,
+    pub tx_count_stored: u32,
+    /// Native block header `gas_used` — the actual gas the block consumed on
+    /// mainnet (the baseline for utilization and the repricing-tax fraction).
+    pub block_gas_used: u64,
+    /// Native block header `gas_limit` — the protocol cap, for block-fullness
+    /// and gas-limit-exceedance analysis under a repricing schedule.
+    pub block_gas_limit: u64,
 }
 
 /// Per-opcode totals for one (block, bucket) row in `block_summaries`,
@@ -628,7 +917,7 @@ pub struct OpcodeBucketTotal {
 pub struct BlockSummaryRow {
     pub schedule_name: String,
     pub block_number: u64,
-    pub bucket: Bucket,
+    pub class: AggregateClass,
     pub tx_count: u32,
     pub gas_delta_sum: Option<i64>,
     /// Sum of squared `gas_delta` for the bucket. Stored under `SQLite`'s
@@ -640,10 +929,10 @@ pub struct BlockSummaryRow {
     /// 12-bin log2 histogram of `abs(gas_delta)`. `None` for buckets where
     /// no gas delta makes sense. Serialized as JSON.
     pub gas_delta_log2_hist: Option<[i32; 12]>,
-    /// Per-opcode totals across this bucket in this block. Empty when
+    /// Per-opcode totals across this class in this block. Empty when
     /// no opcodes ran (e.g. the aggregator has nothing to fold in).
     /// JSON-encoded in the DB as a sparse list.
-    pub opcode_totals_7904: Vec<OpcodeBucketTotal>,
+    pub opcode_totals: Vec<OpcodeBucketTotal>,
     pub state_gas_sum: Option<u64>,
     pub state_gas_spillover_sum: Option<u64>,
     pub multiplier_log2_hist: Option<[i32; 12]>,
@@ -651,14 +940,27 @@ pub struct BlockSummaryRow {
     pub tx_count_authorization: Option<u32>,
     pub tx_count_runtime_state: Option<u32>,
     pub tx_count_no_state: Option<u32>,
+    /// Cold account accesses in this bucket (account-access opcodes). Populated
+    /// for every schedule; `None` when the bucket made no cold account access.
+    pub cold_account_access_count: Option<u64>,
+    /// EIP-8038 storage-reprice drivers (F8) summed over this class's txs.
+    /// `None` when the class saw no SLOAD/SSTORE activity.
+    pub storage_drivers: Option<StorageDrivers>,
+    /// Account-side gas drivers (F2/F3) summed over this class's txs. `None`
+    /// when the class saw none of these (warm account access / value transfer /
+    /// CREATE / access-list entries).
+    pub account_drivers: Option<AccountDrivers>,
 }
 
 /// Per-tx drill-in record: the `divergences` row plus its dependent
 /// `divergence_call_frames`, `divergence_opcode_counts`, and
-/// `divergence_event_logs` rows. Emitted only for the
-/// `EventLogsChanged`, `InconclusiveNeedsHigherSweep`, and
-/// `ContractBroken` buckets — aggregate buckets collapse into
-/// `BlockSummaryRow`.
+/// `divergence_event_logs` rows. Emitted for every stored tx (a failure or a
+/// trace divergence — see `DivergenceFacts::store_full_forensics`).
+///
+/// Call-frame and opcode-count rows carry a `trace_kind` (`"schedule"` /
+/// `"baseline"`), mirroring the event-log table. The `baseline_*` vecs are
+/// populated only when the call tree diverged (where the baseline path differs
+/// and is worth keeping); otherwise they're empty and only schedule rows land.
 #[allow(missing_docs)]
 #[derive(Debug, Clone)]
 pub struct DrillInRecord {
@@ -667,6 +969,12 @@ pub struct DrillInRecord {
     /// Per-frame opcode counts. The producer omits zero-count rows; this
     /// vec is what `FrameOpcodeCounts::nonzero()` yielded for the tx.
     pub opcode_counts: Vec<OpcodeCountRow>,
+    /// Baseline-side call frames (F15) — populated only on call-tree
+    /// divergence, written with `trace_kind="baseline"`.
+    pub baseline_call_frames: Vec<CallFrameRow>,
+    /// Baseline-side per-opcode counts (F11) — populated only on call-tree
+    /// divergence, written with `trace_kind="baseline"`.
+    pub baseline_opcode_counts: Vec<OpcodeCountRow>,
     pub baseline_event_logs: Vec<EventLog>,
     pub schedule_event_logs: Vec<EventLog>,
 }
@@ -674,8 +982,12 @@ pub struct DrillInRecord {
 /// One row destined for `divergences`. Most fields mirror the column
 /// names; the `schema_version` / `divergence_id` / timestamp are filled in by
 /// the writer.
+///
+/// `Default` is derived so test/example fixtures can spread `..Default::default()`
+/// and set only the fields they care about — new nullable forensic columns then
+/// need no fixture edits.
 #[allow(missing_docs)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DivergenceRow {
     pub schedule_name: String,
     pub schedule_config_hash: String,
@@ -683,7 +995,10 @@ pub struct DivergenceRow {
     pub tx_index: u32,
     pub tx_hash: B256,
     pub timestamp: u64,
-    pub bucket: Bucket,
+    /// Execution-fact witness: the schedule replay succeeded only at a bumped
+    /// tier while exceeding the original gas limit (and matched baseline
+    /// behavior) — wallet-fixable-by-more-gas. `None` when not applicable.
+    pub outer_limit_only_failure: Option<bool>,
 
     pub sender: Address,
     pub recipient: Option<Address>,
@@ -692,6 +1007,9 @@ pub struct DivergenceRow {
 
     pub baseline_success: bool,
     pub schedule_success: bool,
+    /// Denormalized `baseline_success != schedule_success`. Stored (not derived
+    /// at query time) so the common "did the outcome flip" filter is a single
+    /// indexed column read on the query hot-path.
     pub status_changed: bool,
     pub event_logs_changed: bool,
     pub output_changed: bool,
@@ -699,6 +1017,8 @@ pub struct DivergenceRow {
 
     pub baseline_gas_used: u64,
     pub schedule_gas_used: u64,
+    /// Denormalized `schedule_gas_used - baseline_gas_used`, kept for the query
+    /// hot-path (the dominant repricing aggregate) rather than recomputed.
     pub gas_delta: i64,
     pub baseline_total_gas_spent: Option<u64>,
     pub baseline_gas_refunded: Option<u64>,
@@ -706,7 +1026,6 @@ pub struct DivergenceRow {
     pub schedule_gas_refunded: Option<u64>,
     pub schedule_intrinsic_gas: Option<u64>,
     pub schedule_floor_gas: Option<u64>,
-    pub would_fit_in_original_limit: Option<bool>,
     pub min_multiplier_to_succeed: Option<f64>,
 
     pub divergence_contract: Option<Address>,
@@ -739,12 +1058,118 @@ pub struct DivergenceRow {
     /// multiplier exceeds the ceiling); `Some(false)` for non-gas
     /// halts/reverts; `None` when at least one tier succeeded.
     pub replay_halt_oog: Option<bool>,
+
+    /// Cold account accesses in this tx (account-access opcodes). Populated for
+    /// every schedule; `None` when the tx made no cold account access, or when
+    /// the schedule replay was rejected before classification completed.
+    pub cold_account_access_count: Option<u64>,
+
+    /// Total repricing surcharge the schedule charged this tx across all frames
+    /// (`ScheduleResult::additional_gas` — the summed per-opcode deltas). The
+    /// headline "how much more gas did this schedule cost". `None` on the
+    /// reject path (replay never executed). Signed: schedules that only reduce
+    /// costs go negative. (F4)
+    pub additional_gas_charged: Option<i64>,
+    /// Root→divergence function-selector path: the 4-byte selector of each call
+    /// on the stack from the entry frame down to the divergence frame, JSON
+    /// `["0x12345678", null, …]` (null = a frame with no selector, e.g. a value
+    /// transfer or create). `None` when no divergence location was resolved.
+    /// (F6)
+    pub failure_selector_path: Option<String>,
+
+    /// EIP-2718 transaction type byte (0 legacy, 1 EIP-2930, 2 EIP-1559,
+    /// 3 EIP-4844 blob, 4 EIP-7702). (F5)
+    pub tx_type: Option<u8>,
+    /// Sender account nonce of this tx. (F5)
+    pub tx_nonce: Option<u64>,
+    /// Top-level 4-byte entry selector (first 4 calldata bytes). `None` for
+    /// creations and calls with fewer than 4 calldata bytes. (F5)
+    pub entry_selector: Option<[u8; 4]>,
+    /// Calldata zero / nonzero byte split — the intrinsic-gas drivers and a
+    /// cheap calldata-shape fingerprint. (F5)
+    pub input_zero_bytes: Option<u64>,
+    pub input_nonzero_bytes: Option<u64>,
+    /// Whether the tx carries an EIP-7702 authorization list. (F5)
+    pub has_authorization: Option<bool>,
+
+    /// Structured failure reason: the `HaltReason` discriminant (`OutOfGas`,
+    /// `StackOverflow`, …), `"Revert"`, `"Rejected"`, or `None` on success.
+    /// (F1)
+    pub failure_reason: Option<String>,
+    /// Raw revert returndata, truncated to a bounded prefix. `None` unless the
+    /// schedule result was a revert. (F2)
+    pub revert_data: Option<Vec<u8>>,
+    /// Best-effort decode of `revert_data` (`Error(string): …` / `Panic(0xNN)` /
+    /// `custom:0x…` / `empty`). (F2)
+    pub revert_decoded: Option<String>,
+    /// Top-level tx output bytes, truncated to a bounded prefix (today only a
+    /// hash is otherwise kept). (F2)
+    pub tx_output: Option<Vec<u8>>,
+
+    /// Baseline counterpart of the frame that failed under the schedule (matched
+    /// by `call_index` when the pre-divergence structure lines up): whether
+    /// baseline ran that frame successfully, and its gas used / provided. The
+    /// wallet-fixable (baseline ran it fine) vs contract-broken discriminator.
+    /// `None` when no failing frame matched a baseline frame. (F7)
+    pub baseline_frame_success: Option<bool>,
+    pub baseline_frame_gas_used: Option<u64>,
+    pub baseline_frame_gas_provided: Option<u64>,
+
+    /// Cumulative repricing surcharge applied at the instant OOG was first
+    /// recorded — the absolute gas deficit the repricing introduced. `None` for
+    /// non-OOG rows. (F13)
+    pub surcharge_at_oog: Option<i64>,
+
+    /// First-gas-divergence location (F10): contract / pc / call depth / opcode
+    /// where the cumulative surcharge first exceeded baseline. Distinct from the
+    /// behavioral `divergence_*` columns (a schedule with negative deltas, e.g.
+    /// CSV pricing, can reprice an opcode before its first net surcharge).
+    pub gas_div_contract: Option<Address>,
+    pub gas_div_pc: Option<u32>,
+    pub gas_div_call_depth: Option<i32>,
+    pub gas_div_opcode: Option<u8>,
+
+    /// Per-category decomposition of the repricing tax (F12). The opcode-delta
+    /// categories (`second_db_read` / `other`) sum to `additional_gas_charged`;
+    /// `tax_intrinsic` is the separate tx-level intrinsic-gas delta
+    /// (schedule − baseline). `None` on the reject path.
+    pub tax_second_db_read: Option<i64>,
+    pub tax_other: Option<i64>,
+    pub tax_intrinsic: Option<i64>,
+
+    /// EIP-8038 storage-reprice drivers (F8) — the eight SLOAD/SSTORE counts,
+    /// mapped to explicit columns at insert time. `None` on the reject path
+    /// (the replay never executed, so the counts are unknown, not zero).
+    pub storage_drivers: Option<StorageDrivers>,
+
+    /// Account-side gas drivers (F2/F3) — warm account accesses, value
+    /// transfers, CREATE+CREATE2, and the tx access-list counts, mapped to
+    /// explicit columns at insert time. `None` on the reject path.
+    pub account_drivers: Option<AccountDrivers>,
+
+    /// F1: forensics for the mainnet-equivalent (1×) tier when this tx FAILED
+    /// at 1× but the accepted attempt is a bumped tier (rescue) or the highest
+    /// tier (fail-under-both). The `oog_*`/frame figures above describe the
+    /// accepted attempt; these preserve where/why 1× broke. All `None` when 1×
+    /// succeeded or the tx wasn't a 1× failure.
+    pub tier1_failure_reason: Option<String>,
+    pub tier1_oog_opcode: Option<u8>,
+    pub tier1_oog_contract: Option<Address>,
+    pub tier1_oog_pc: Option<u32>,
+    pub tier1_oog_depth: Option<i32>,
+    pub tier1_oog_gas_remaining: Option<u64>,
+    pub tier1_failing_selector: Option<[u8; 4]>,
+    pub tier1_failing_gas_provided: Option<u64>,
+    pub tier1_failing_gas_requested: Option<u64>,
 }
 
 /// One frame row destined for `divergence_call_frames`. `call_index` and
 /// `parent_call_index` match the inspector's frame-open order (root = 0).
+///
+/// `Default` is derived for the same fixture-spread convenience as
+/// [`DivergenceRow`].
 #[allow(missing_docs)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CallFrameRow {
     pub call_index: u32,
     pub parent_call_index: Option<u32>,
@@ -758,18 +1183,38 @@ pub struct CallFrameRow {
     pub value_wei: Option<String>,
     pub gas_provided: u64,
     pub gas_used: u64,
+    /// Denormalized `gas_provided - gas_used`, kept for the query hot-path
+    /// rather than recomputed per row.
     pub gas_margin: Option<i64>,
     pub success: bool,
     pub parent_gas_at_call: Option<u64>,
     pub gas_requested_on_stack: Option<u64>,
     pub eip150_cap_binding: Option<bool>,
-    pub state_gas_running: Option<u64>,
     /// Length of the deployed bytecode in bytes. Set only on successful
     /// CREATE / CREATE2 frames (`call_type` is `CREATE`/`CREATE2` and
     /// `success` is true); `None` everywhere else. Used by the EIP-8037
     /// dashboard to plot true deployment cost without approximating
     /// bytecode size from baseline gas.
     pub deployed_bytecode_len: Option<u32>,
+    /// Repricing surcharge the schedule charged within this frame
+    /// (`CallFrame::repricing_gas_delta` — the summed per-opcode deltas applied
+    /// while this frame was on top of the stack). Lets the dashboard attribute
+    /// the per-tx tax to the frame that incurred it. Signed. (F4)
+    pub repricing_gas_delta: i64,
+
+    /// Caller PC of the CALL/CREATE that opened this frame (F9). `None` for the
+    /// root and baseline frames.
+    pub caller_pc: Option<u32>,
+    /// Whether this frame was served by a precompile (F9).
+    pub was_precompile: bool,
+    /// Precompile address when `was_precompile` (F9), else `None`.
+    pub precompile_address: Option<Address>,
+    /// Gas remaining at the instant this frame failed (F9). `None` unless this
+    /// is a failing schedule frame.
+    pub gas_remaining_at_fail: Option<u64>,
+    /// Whether this is the innermost failing frame under the schedule — the
+    /// bottleneck (F9). False for baseline rows and non-failing frames.
+    pub is_divergent_frame: bool,
 }
 
 /// One row destined for `divergence_opcode_counts`. Producer omits zero-
@@ -830,13 +1275,22 @@ impl DivergenceDatabase {
         for summary in &output.summaries {
             insert_block_summary(&tx, summary)?;
         }
+        for recipient in &output.recipients {
+            insert_recipient(&tx, recipient)?;
+        }
         for drill_in in &output.drill_ins {
             let divergence_id = insert_divergence(&tx, &drill_in.divergence)?;
             for frame in &drill_in.call_frames {
-                insert_call_frame(&tx, divergence_id, frame)?;
+                insert_call_frame(&tx, divergence_id, "schedule", frame)?;
+            }
+            for frame in &drill_in.baseline_call_frames {
+                insert_call_frame(&tx, divergence_id, "baseline", frame)?;
             }
             for opc in &drill_in.opcode_counts {
-                insert_opcode_count(&tx, divergence_id, opc)?;
+                insert_opcode_count(&tx, divergence_id, "schedule", opc)?;
+            }
+            for opc in &drill_in.baseline_opcode_counts {
+                insert_opcode_count(&tx, divergence_id, "baseline", opc)?;
             }
             for log in &drill_in.baseline_event_logs {
                 insert_event_log(&tx, divergence_id, "baseline", log)?;
@@ -909,6 +1363,10 @@ impl DivergenceDatabase {
             "DELETE FROM block_summaries WHERE block_number >= ? AND block_number <= ?",
             params![from_block as i64, to_block as i64],
         )?;
+        let recipients_deleted = tx.execute(
+            "DELETE FROM block_recipients WHERE block_number >= ? AND block_number <= ?",
+            params![from_block as i64, to_block as i64],
+        )?;
         let coverage_deleted = tx.execute(
             "DELETE FROM block_coverage WHERE block_number >= ? AND block_number <= ?",
             params![from_block as i64, to_block as i64],
@@ -918,6 +1376,7 @@ impl DivergenceDatabase {
         Ok(BlockRangeDeleteCounts {
             coverage: coverage_deleted,
             summaries: summaries_deleted,
+            recipients: recipients_deleted,
             divergences: divergences_deleted,
             call_frames: call_frames_deleted,
             opcode_counts: opcode_counts_deleted,
@@ -1004,36 +1463,42 @@ impl DivergenceDatabase {
         Ok(exists.is_some())
     }
 
-    /// Distinct `to_address` values seen across `divergence_call_frames`.
+    /// Distinct `code_address` values seen across `divergence_call_frames`.
     /// Backfill iterates these, fetches bytecode from reth state, hashes
     /// it, and upserts a `contract_metadata` row keyed by codehash.
+    ///
+    /// Keyed on `code_address` (the code holder / implementation), not
+    /// `to_address` (the call/storage target): under DELEGATECALL the solc
+    /// identity belongs to the implementation, so a proxy `to_address` would
+    /// resolve the wrong (or empty) bytecode. (F14)
     pub fn distinct_call_frame_addresses(&self) -> Result<Vec<String>, DatabaseError> {
         let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT to_address FROM divergence_call_frames
-             WHERE to_address IS NOT NULL AND to_address <> ''
-             ORDER BY to_address",
+            "SELECT DISTINCT code_address FROM divergence_call_frames
+             WHERE code_address IS NOT NULL AND code_address <> ''
+             ORDER BY code_address",
         )?;
         let rows =
             stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    /// Addresses with at least one call frame whose codehash is not yet
+    /// Code addresses with at least one call frame whose codehash is not yet
     /// represented in `contract_metadata`. Drives the periodic incremental
     /// backfill so each tick only re-fetches bytecode for genuinely new
     /// (or never-labeled) contracts. NULL `codehash` values match too —
     /// those rows need a fresh fetch to derive a codehash from current
-    /// state.
+    /// state. Keyed on `code_address` (the implementation) — see
+    /// [`Self::distinct_call_frame_addresses`]. (F14)
     pub fn distinct_unlabeled_call_frame_addresses(&self) -> Result<Vec<String>, DatabaseError> {
         let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT dcf.to_address
+            "SELECT DISTINCT dcf.code_address
              FROM divergence_call_frames dcf
              LEFT JOIN contract_metadata cm ON cm.codehash = dcf.codehash
-             WHERE dcf.to_address IS NOT NULL AND dcf.to_address <> ''
+             WHERE dcf.code_address IS NOT NULL AND dcf.code_address <> ''
                AND cm.codehash IS NULL
-             ORDER BY dcf.to_address",
+             ORDER BY dcf.code_address",
         )?;
         let rows =
             stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
@@ -1157,6 +1622,7 @@ impl DivergenceDatabase {
 pub struct BlockRangeDeleteCounts {
     pub coverage: usize,
     pub summaries: usize,
+    pub recipients: usize,
     pub divergences: usize,
     pub call_frames: usize,
     pub opcode_counts: usize,
@@ -1171,30 +1637,19 @@ fn insert_block_coverage(
         "INSERT INTO block_coverage (
             schedule_name, schedule_config_hash, block_number, block_hash,
             parent_hash, timestamp, tx_count,
-            tx_count_unchanged, tx_count_trace_only, tx_count_gas_only,
-            tx_count_event_logs_changed, tx_count_schedule_rescued,
-            tx_count_wallet_fixable_shallow,
-            tx_count_wallet_fixable_deep_chain,
-            tx_count_inconclusive_needs_higher_sweep,
-            tx_count_contract_broken,
-            tx_count_aa_gas_reestimation
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            tx_count_unchanged, tx_count_gas_only, tx_count_stored,
+            block_gas_used, block_gas_limit
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (schedule_name, block_number, block_hash) DO UPDATE SET
-            schedule_config_hash               = excluded.schedule_config_hash,
-            parent_hash                        = excluded.parent_hash,
-            timestamp                          = excluded.timestamp,
-            tx_count                           = excluded.tx_count,
-            tx_count_unchanged                 = excluded.tx_count_unchanged,
-            tx_count_trace_only                = excluded.tx_count_trace_only,
-            tx_count_gas_only                  = excluded.tx_count_gas_only,
-            tx_count_event_logs_changed        = excluded.tx_count_event_logs_changed,
-            tx_count_schedule_rescued          = excluded.tx_count_schedule_rescued,
-            tx_count_wallet_fixable_shallow    = excluded.tx_count_wallet_fixable_shallow,
-            tx_count_wallet_fixable_deep_chain = excluded.tx_count_wallet_fixable_deep_chain,
-            tx_count_inconclusive_needs_higher_sweep =
-                excluded.tx_count_inconclusive_needs_higher_sweep,
-            tx_count_contract_broken           = excluded.tx_count_contract_broken,
-            tx_count_aa_gas_reestimation       = excluded.tx_count_aa_gas_reestimation",
+            schedule_config_hash = excluded.schedule_config_hash,
+            parent_hash          = excluded.parent_hash,
+            timestamp            = excluded.timestamp,
+            tx_count             = excluded.tx_count,
+            tx_count_unchanged   = excluded.tx_count_unchanged,
+            tx_count_gas_only    = excluded.tx_count_gas_only,
+            tx_count_stored      = excluded.tx_count_stored,
+            block_gas_used       = excluded.block_gas_used,
+            block_gas_limit      = excluded.block_gas_limit",
         params![
             row.schedule_name,
             row.schedule_config_hash,
@@ -1204,15 +1659,35 @@ fn insert_block_coverage(
             row.timestamp as i64,
             row.tx_count as i64,
             row.tx_count_unchanged as i64,
-            row.tx_count_trace_only as i64,
             row.tx_count_gas_only as i64,
-            row.tx_count_event_logs_changed as i64,
-            row.tx_count_schedule_rescued as i64,
-            row.tx_count_wallet_fixable_shallow as i64,
-            row.tx_count_wallet_fixable_deep_chain as i64,
-            row.tx_count_inconclusive_needs_higher_sweep as i64,
-            row.tx_count_contract_broken as i64,
-            row.tx_count_aa_gas_reestimation as i64,
+            row.tx_count_stored as i64,
+            row.block_gas_used as i64,
+            row.block_gas_limit as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Insert one `block_recipients` rollup row. Upsert on the natural key
+/// so re-touching a block (idempotent re-replay) refreshes counts in place.
+fn insert_recipient(tx: &Transaction<'_>, row: &RecipientRow) -> Result<(), DatabaseError> {
+    tx.execute(
+        "INSERT INTO block_recipients (
+            schedule_name, block_number, class, recipient, top_selector,
+            tx_count, gas_delta_sum_succeeding
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (schedule_name, block_number, class, recipient, top_selector)
+        DO UPDATE SET
+            tx_count                 = excluded.tx_count,
+            gas_delta_sum_succeeding = excluded.gas_delta_sum_succeeding",
+        params![
+            row.schedule_name,
+            row.block_number as i64,
+            row.class.as_str(),
+            row.recipient,
+            row.top_selector.as_slice(),
+            row.tx_count as i64,
+            row.gas_delta_sum_succeeding,
         ],
     )?;
     Ok(())
@@ -1230,52 +1705,75 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
         Some(arr) => Some(serde_json::to_string(&arr)?),
         None => None,
     };
-    let opcode_totals_7904 = serde_json::to_string(&row.opcode_totals_7904)?;
+    let opcode_totals = serde_json::to_string(&row.opcode_totals)?;
     let gas_delta_sum_sq_real = row.gas_delta_sum_sq.map(|v| v as f64);
 
     tx.execute(
         "INSERT INTO block_summaries (
-            schedule_name, block_number, bucket, tx_count,
+            schedule_name, block_number, class, tx_count,
             gas_delta_sum, gas_delta_sum_sq, gas_delta_min, gas_delta_max,
             gas_delta_log2_hist,
-            opcode_totals_7904,
+            opcode_totals,
             state_gas_sum, state_gas_spillover_sum,
             multiplier_log2_hist,
             tx_count_creation, tx_count_authorization,
-            tx_count_runtime_state, tx_count_no_state
+            tx_count_runtime_state, tx_count_no_state,
+            cold_account_access_count,
+            sload_cold_count, sload_warm_count, sstore_cold_count,
+            sstore_set_count, sstore_reset_count, sstore_clear_count,
+            sstore_noop_count, sstore_dirty_count,
+            warm_account_access_count, value_transfer_count, create_opcode_count,
+            access_list_address_count, access_list_storage_key_count
         ) VALUES (?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?,
                   ?,
                   ?, ?,
                   ?,
-                  ?, ?, ?, ?)
-        ON CONFLICT (schedule_name, block_number, bucket) DO UPDATE SET
+                  ?, ?, ?, ?,
+                  ?,
+                  ?, ?, ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?)
+        ON CONFLICT (schedule_name, block_number, class) DO UPDATE SET
             tx_count                = excluded.tx_count,
             gas_delta_sum           = excluded.gas_delta_sum,
             gas_delta_sum_sq        = excluded.gas_delta_sum_sq,
             gas_delta_min           = excluded.gas_delta_min,
             gas_delta_max           = excluded.gas_delta_max,
             gas_delta_log2_hist     = excluded.gas_delta_log2_hist,
-            opcode_totals_7904      = excluded.opcode_totals_7904,
+            opcode_totals           = excluded.opcode_totals,
             state_gas_sum           = excluded.state_gas_sum,
             state_gas_spillover_sum = excluded.state_gas_spillover_sum,
             multiplier_log2_hist    = excluded.multiplier_log2_hist,
             tx_count_creation       = excluded.tx_count_creation,
             tx_count_authorization  = excluded.tx_count_authorization,
             tx_count_runtime_state  = excluded.tx_count_runtime_state,
-            tx_count_no_state       = excluded.tx_count_no_state",
+            tx_count_no_state       = excluded.tx_count_no_state,
+            cold_account_access_count = excluded.cold_account_access_count,
+            sload_cold_count    = excluded.sload_cold_count,
+            sload_warm_count    = excluded.sload_warm_count,
+            sstore_cold_count   = excluded.sstore_cold_count,
+            sstore_set_count    = excluded.sstore_set_count,
+            sstore_reset_count  = excluded.sstore_reset_count,
+            sstore_clear_count  = excluded.sstore_clear_count,
+            sstore_noop_count   = excluded.sstore_noop_count,
+            sstore_dirty_count  = excluded.sstore_dirty_count,
+            warm_account_access_count     = excluded.warm_account_access_count,
+            value_transfer_count          = excluded.value_transfer_count,
+            create_opcode_count           = excluded.create_opcode_count,
+            access_list_address_count     = excluded.access_list_address_count,
+            access_list_storage_key_count = excluded.access_list_storage_key_count",
         params![
             row.schedule_name,
             row.block_number as i64,
-            row.bucket.as_str(),
+            row.class.as_str(),
             row.tx_count as i64,
             row.gas_delta_sum,
             gas_delta_sum_sq_real,
             row.gas_delta_min,
             row.gas_delta_max,
             gas_delta_log2_hist,
-            opcode_totals_7904,
+            opcode_totals,
             row.state_gas_sum.map(|v| v as i64),
             row.state_gas_spillover_sum.map(|v| v as i64),
             multiplier_log2_hist,
@@ -1283,6 +1781,20 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             row.tx_count_authorization.map(|v| v as i64),
             row.tx_count_runtime_state.map(|v| v as i64),
             row.tx_count_no_state.map(|v| v as i64),
+            row.cold_account_access_count.map(|v| v as i64),
+            row.storage_drivers.map(|s| s.sload_cold as i64),
+            row.storage_drivers.map(|s| s.sload_warm as i64),
+            row.storage_drivers.map(|s| s.sstore_cold as i64),
+            row.storage_drivers.map(|s| s.sstore_set as i64),
+            row.storage_drivers.map(|s| s.sstore_reset as i64),
+            row.storage_drivers.map(|s| s.sstore_clear as i64),
+            row.storage_drivers.map(|s| s.sstore_noop as i64),
+            row.storage_drivers.map(|s| s.sstore_dirty as i64),
+            row.account_drivers.map(|a| a.warm_account_access as i64),
+            row.account_drivers.map(|a| a.value_transfer as i64),
+            row.account_drivers.map(|a| a.create_opcode as i64),
+            row.account_drivers.map(|a| a.access_list_address as i64),
+            row.account_drivers.map(|a| a.access_list_storage_key as i64),
         ],
     )?;
     Ok(())
@@ -1292,7 +1804,7 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
     tx.execute(
         "INSERT INTO divergences (
             schedule_name, schedule_config_hash, block_number, tx_index, tx_hash,
-            timestamp, bucket,
+            timestamp, outer_limit_only_failure,
             sender, recipient, is_create, tx_gas_limit,
             baseline_success, schedule_success,
             status_changed, event_logs_changed, output_changed, logs_bloom_changed,
@@ -1300,7 +1812,7 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             baseline_total_gas_spent, baseline_gas_refunded,
             schedule_total_gas_spent, schedule_gas_refunded,
             schedule_intrinsic_gas, schedule_floor_gas,
-            would_fit_in_original_limit, min_multiplier_to_succeed,
+            min_multiplier_to_succeed,
             divergence_contract, divergence_pc, divergence_call_depth, divergence_opcode,
             oog_contract, oog_pc, oog_call_depth, oog_opcode, oog_pattern, oog_gas_remaining,
             oog_chain_proportional, oog_bottleneck_depth, oog_bottleneck_kind,
@@ -1308,7 +1820,24 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             schedule_initial_state_gas, schedule_initial_reservoir,
             runtime_state_gas, runtime_state_gas_spillover,
             state_gas_category, reservoir_exhausted,
-            replay_halt_oog
+            replay_halt_oog,
+            cold_account_access_count,
+            additional_gas_charged, failure_selector_path,
+            tx_type, tx_nonce, entry_selector,
+            input_zero_bytes, input_nonzero_bytes, has_authorization,
+            failure_reason, revert_data, revert_decoded, tx_output,
+            baseline_frame_success, baseline_frame_gas_used,
+            baseline_frame_gas_provided, surcharge_at_oog,
+            gas_div_contract, gas_div_pc, gas_div_call_depth, gas_div_opcode,
+            tax_second_db_read, tax_other, tax_intrinsic,
+            sload_cold_count, sload_warm_count, sstore_cold_count,
+            sstore_set_count, sstore_reset_count, sstore_clear_count,
+            sstore_noop_count, sstore_dirty_count,
+            warm_account_access_count, value_transfer_count, create_opcode_count,
+            access_list_address_count, access_list_storage_key_count,
+            tier1_failure_reason, tier1_oog_opcode, tier1_oog_contract,
+            tier1_oog_pc, tier1_oog_depth, tier1_oog_gas_remaining,
+            tier1_failing_selector, tier1_failing_gas_provided, tier1_failing_gas_requested
         ) VALUES (?, ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?,
@@ -1316,12 +1845,23 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
                   ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?,
-                  ?, ?,
+                  ?,
                   ?, ?, ?, ?,
                   ?, ?, ?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?, ?, ?, ?, ?, ?, ?,
-                  ?)",
+                  ?,
+                  ?,
+                  ?, ?,
+                  ?, ?, ?,
+                  ?, ?, ?,
+                  ?, ?, ?, ?,
+                  ?, ?, ?, ?,
+                  ?, ?, ?, ?,
+                  ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             row.schedule_name,
             row.schedule_config_hash,
@@ -1329,7 +1869,7 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             row.tx_index as i64,
             row.tx_hash.as_slice(),
             row.timestamp as i64,
-            row.bucket.as_str(),
+            row.outer_limit_only_failure,
             format!("{:#x}", row.sender),
             row.recipient.map(|a| format!("{a:#x}")),
             row.is_create,
@@ -1349,7 +1889,6 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             row.schedule_gas_refunded.map(|v| v as i64),
             row.schedule_intrinsic_gas.map(|v| v as i64),
             row.schedule_floor_gas.map(|v| v as i64),
-            row.would_fit_in_original_limit,
             row.min_multiplier_to_succeed,
             row.divergence_contract.map(|a| format!("{a:#x}")),
             row.divergence_pc.map(|v| v as i64),
@@ -1373,6 +1912,56 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
             row.state_gas_category,
             row.reservoir_exhausted,
             row.replay_halt_oog,
+            row.cold_account_access_count.map(|v| v as i64),
+            row.additional_gas_charged,
+            row.failure_selector_path,
+            row.tx_type.map(|v| v as i64),
+            row.tx_nonce.map(|v| v as i64),
+            row.entry_selector.map(|s| s.to_vec()),
+            row.input_zero_bytes.map(|v| v as i64),
+            row.input_nonzero_bytes.map(|v| v as i64),
+            row.has_authorization,
+            row.failure_reason,
+            row.revert_data,
+            row.revert_decoded,
+            row.tx_output,
+            row.baseline_frame_success,
+            row.baseline_frame_gas_used.map(|v| v as i64),
+            row.baseline_frame_gas_provided.map(|v| v as i64),
+            row.surcharge_at_oog,
+            row.gas_div_contract.map(|a| format!("{a:#x}")),
+            row.gas_div_pc.map(|v| v as i64),
+            row.gas_div_call_depth,
+            row.gas_div_opcode.map(|v| v as i64),
+            row.tax_second_db_read,
+            row.tax_other,
+            row.tax_intrinsic,
+            row.storage_drivers.map(|s| s.sload_cold as i64),
+            row.storage_drivers.map(|s| s.sload_warm as i64),
+            row.storage_drivers.map(|s| s.sstore_cold as i64),
+            row.storage_drivers.map(|s| s.sstore_set as i64),
+            row.storage_drivers.map(|s| s.sstore_reset as i64),
+            row.storage_drivers.map(|s| s.sstore_clear as i64),
+            row.storage_drivers.map(|s| s.sstore_noop as i64),
+            row.storage_drivers.map(|s| s.sstore_dirty as i64),
+            // F2/F3: account-side gas drivers.
+            row.account_drivers.map(|a| a.warm_account_access as i64),
+            row.account_drivers.map(|a| a.value_transfer as i64),
+            row.account_drivers.map(|a| a.create_opcode as i64),
+            row.account_drivers.map(|a| a.access_list_address as i64),
+            row.account_drivers.map(|a| a.access_list_storage_key as i64),
+            // F1: 1×-failure forensics (mirror the existing oog_* / selector
+            // mapping — Address formatted as lowercase hex, opcode/pc/depth as
+            // i64, selector as a byte vec).
+            row.tier1_failure_reason,
+            row.tier1_oog_opcode.map(|v| v as i64),
+            row.tier1_oog_contract.map(|a| format!("{a:#x}")),
+            row.tier1_oog_pc.map(|v| v as i64),
+            row.tier1_oog_depth,
+            row.tier1_oog_gas_remaining.map(|v| v as i64),
+            row.tier1_failing_selector.map(|s| s.to_vec()),
+            row.tier1_failing_gas_provided.map(|v| v as i64),
+            row.tier1_failing_gas_requested.map(|v| v as i64),
         ],
     )?;
     Ok(tx.last_insert_rowid() as u64)
@@ -1381,18 +1970,24 @@ fn insert_divergence(tx: &Transaction<'_>, row: &DivergenceRow) -> Result<u64, D
 fn insert_call_frame(
     tx: &Transaction<'_>,
     divergence_id: u64,
+    trace_kind: &str,
     row: &CallFrameRow,
 ) -> Result<(), DatabaseError> {
     tx.execute(
         "INSERT INTO divergence_call_frames (
-            divergence_id, call_index, parent_call_index, depth,
+            divergence_id, trace_kind, call_index, parent_call_index, depth,
             from_address, to_address, code_address, codehash, call_type,
             selector, value_wei, gas_provided, gas_used, gas_margin,
             success, parent_gas_at_call, gas_requested_on_stack,
-            eip150_cap_binding, state_gas_running, deployed_bytecode_len
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            eip150_cap_binding, deployed_bytecode_len,
+            repricing_gas_delta,
+            caller_pc, was_precompile, precompile_address,
+            gas_remaining_at_fail, is_divergent_frame
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?)",
         params![
             divergence_id as i64,
+            trace_kind,
             row.call_index as i64,
             row.parent_call_index.map(|v| v as i64),
             row.depth as i64,
@@ -1410,8 +2005,13 @@ fn insert_call_frame(
             row.parent_gas_at_call.map(|v| v as i64),
             row.gas_requested_on_stack.map(|v| v as i64),
             row.eip150_cap_binding,
-            row.state_gas_running.map(|v| v as i64),
             row.deployed_bytecode_len.map(|v| v as i64),
+            row.repricing_gas_delta,
+            row.caller_pc.map(|v| v as i64),
+            row.was_precompile,
+            row.precompile_address.map(|a| format!("{a:#x}")),
+            row.gas_remaining_at_fail.map(|v| v as i64),
+            row.is_divergent_frame,
         ],
     )?;
     Ok(())
@@ -1420,14 +2020,16 @@ fn insert_call_frame(
 fn insert_opcode_count(
     tx: &Transaction<'_>,
     divergence_id: u64,
+    trace_kind: &str,
     row: &OpcodeCountRow,
 ) -> Result<(), DatabaseError> {
     tx.execute(
         "INSERT INTO divergence_opcode_counts (
-            divergence_id, call_index, opcode, count, gas_baseline, gas_schedule
-        ) VALUES (?, ?, ?, ?, ?, ?)",
+            divergence_id, trace_kind, call_index, opcode, count, gas_baseline, gas_schedule
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)",
         params![
             divergence_id as i64,
+            trace_kind,
             row.call_index as i64,
             row.opcode as i64,
             row.count as i64,
@@ -1593,12 +2195,53 @@ mod tests {
         let _db = DivergenceDatabase::open(fresh_db_path(&dir)).unwrap();
     }
 
-    /// Minimal `BlockCoverageRow` fixture for write-path tests.
+    #[test]
+    fn pragma_user_version_mismatch_is_rejected() {
+        // A DB created under a different schema version (tables present, wrong
+        // `PRAGMA user_version`) is rejected at open — no migration, wipe & re-gather.
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_db_path(&dir);
+        {
+            // Fresh open stamps user_version = SCHEMA_VERSION and creates tables.
+            let db = DivergenceDatabase::open(&path).unwrap();
+            db.conn
+                .lock()
+                .unwrap()
+                .pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+                .unwrap();
+        }
+        match DivergenceDatabase::open(&path).unwrap_err() {
+            DatabaseError::SchemaVersionMismatch { expected, found } => {
+                assert_eq!(expected, SCHEMA_VERSION);
+                assert_eq!(found, SCHEMA_VERSION - 1);
+            }
+            other => panic!("expected SchemaVersionMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_unstamped_db_is_rejected() {
+        // A pre-versioning DB has our tables but user_version == 0 → rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_db_path(&dir);
+        {
+            let db = DivergenceDatabase::open(&path).unwrap();
+            db.conn.lock().unwrap().pragma_update(None, "user_version", 0i64).unwrap();
+        }
+        assert!(matches!(
+            DivergenceDatabase::open(&path).unwrap_err(),
+            DatabaseError::SchemaVersionMismatch { found: 0, .. }
+        ));
+    }
+
+    /// Minimal `BlockCoverageRow` fixture for write-path tests. `stored` is the
+    /// number of per-tx forensic rows (failures + divergences); `gas_only` the
+    /// silent-majority count whose only change is gas.
     fn fixture_coverage(
         schedule: &str,
         block: u64,
-        broken: u32,
-        log_changed: u32,
+        stored: u32,
+        gas_only: u32,
     ) -> BlockCoverageRow {
         BlockCoverageRow {
             schedule_name: schedule.to_string(),
@@ -1607,17 +2250,12 @@ mod tests {
             block_hash: B256::repeat_byte(0xb0 + (block as u8 & 0x0f)),
             parent_hash: B256::repeat_byte(0xa0),
             timestamp: 1_700_000_000 + block,
-            tx_count: broken + log_changed,
+            tx_count: stored + gas_only,
             tx_count_unchanged: 0,
-            tx_count_trace_only: 0,
-            tx_count_gas_only: 0,
-            tx_count_event_logs_changed: log_changed,
-            tx_count_schedule_rescued: 0,
-            tx_count_wallet_fixable_shallow: 0,
-            tx_count_wallet_fixable_deep_chain: 0,
-            tx_count_inconclusive_needs_higher_sweep: 0,
-            tx_count_contract_broken: broken,
-            tx_count_aa_gas_reestimation: 0,
+            tx_count_gas_only: gas_only,
+            tx_count_stored: stored,
+            block_gas_used: 15_000_000,
+            block_gas_limit: 30_000_000,
         }
     }
 
@@ -1626,7 +2264,7 @@ mod tests {
     fn fixture_divergence(
         block: u64,
         tx_index: u32,
-        bucket: Bucket,
+        schedule_success: bool,
         gas_delta: i64,
     ) -> DivergenceRow {
         DivergenceRow {
@@ -1636,50 +2274,16 @@ mod tests {
             tx_index,
             tx_hash: B256::repeat_byte(0xdd),
             timestamp: 1_700_000_000,
-            bucket,
             sender: Address::repeat_byte(0x11),
             recipient: Some(Address::repeat_byte(0x22)),
-            is_create: false,
             tx_gas_limit: 500_000,
             baseline_success: true,
-            schedule_success: matches!(bucket, Bucket::EventLogsChanged),
-            status_changed: matches!(bucket, Bucket::ContractBroken),
-            event_logs_changed: matches!(bucket, Bucket::EventLogsChanged),
-            output_changed: false,
-            logs_bloom_changed: false,
+            schedule_success,
+            status_changed: !schedule_success,
             baseline_gas_used: 100_000,
             schedule_gas_used: (100_000i64 + gas_delta).max(0) as u64,
             gas_delta,
-            baseline_total_gas_spent: None,
-            baseline_gas_refunded: None,
-            schedule_total_gas_spent: None,
-            schedule_gas_refunded: None,
-            schedule_intrinsic_gas: None,
-            schedule_floor_gas: None,
-            would_fit_in_original_limit: None,
-            min_multiplier_to_succeed: None,
-            divergence_contract: None,
-            divergence_pc: None,
-            divergence_call_depth: None,
-            divergence_opcode: None,
-            oog_contract: None,
-            oog_pc: None,
-            oog_call_depth: None,
-            oog_opcode: None,
-            oog_pattern: None,
-            oog_gas_remaining: None,
-            oog_chain_proportional: None,
-            oog_bottleneck_depth: None,
-            oog_bottleneck_kind: None,
-            schedule_state_gas_spent: None,
-            schedule_state_gas_demanded: None,
-            schedule_initial_state_gas: None,
-            schedule_initial_reservoir: None,
-            runtime_state_gas: None,
-            runtime_state_gas_spillover: None,
-            state_gas_category: None,
-            reservoir_exhausted: None,
-            replay_halt_oog: None,
+            ..Default::default()
         }
     }
 
@@ -1688,7 +2292,7 @@ mod tests {
         let db = DivergenceDatabase::in_memory().unwrap();
 
         let drill_in = DrillInRecord {
-            divergence: fixture_divergence(100, 0, Bucket::ContractBroken, 12_345),
+            divergence: fixture_divergence(100, 0, false, 12_345),
             call_frames: vec![CallFrameRow {
                 call_index: 0,
                 parent_call_index: None,
@@ -1707,8 +2311,9 @@ mod tests {
                 parent_gas_at_call: None,
                 gas_requested_on_stack: None,
                 eip150_cap_binding: None,
-                state_gas_running: None,
                 deployed_bytecode_len: None,
+                repricing_gas_delta: 0,
+                ..Default::default()
             }],
             opcode_counts: vec![OpcodeCountRow {
                 call_index: 0,
@@ -1717,6 +2322,8 @@ mod tests {
                 gas_baseline: 60_000,
                 gas_schedule: 75_000,
             }],
+            baseline_call_frames: vec![],
+            baseline_opcode_counts: vec![],
             baseline_event_logs: vec![],
             schedule_event_logs: vec![EventLog {
                 log_index: 0,
@@ -1731,14 +2338,14 @@ mod tests {
             summaries: vec![BlockSummaryRow {
                 schedule_name: "test".to_string(),
                 block_number: 100,
-                bucket: Bucket::ContractBroken,
+                class: AggregateClass::GasOnly,
                 tx_count: 1,
                 gas_delta_sum: Some(12_345),
                 gas_delta_sum_sq: Some(12_345i64 * 12_345i64),
                 gas_delta_min: Some(12_345),
                 gas_delta_max: Some(12_345),
                 gas_delta_log2_hist: Some([0; 12]),
-                opcode_totals_7904: vec![OpcodeBucketTotal {
+                opcode_totals: vec![OpcodeBucketTotal {
                     opcode: 0x55,
                     count: 3,
                     gas_baseline: 60_000,
@@ -1751,24 +2358,28 @@ mod tests {
                 tx_count_authorization: None,
                 tx_count_runtime_state: None,
                 tx_count_no_state: None,
+                cold_account_access_count: None,
+                storage_drivers: None,
+                account_drivers: None,
             }],
             drill_ins: vec![drill_in],
+            recipients: vec![],
         };
 
         db.record_block_output(&output).unwrap();
 
         let conn = db.conn.lock().unwrap();
 
-        let (tx_count, broken): (i64, i64) = conn
+        let (tx_count, stored): (i64, i64) = conn
             .query_row(
-                "SELECT tx_count, tx_count_contract_broken
+                "SELECT tx_count, tx_count_stored
                  FROM block_coverage WHERE block_number = 100",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(tx_count, 1);
-        assert_eq!(broken, 1);
+        assert_eq!(stored, 1);
 
         let summary_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM block_summaries WHERE block_number = 100", [], |row| {
@@ -1808,13 +2419,240 @@ mod tests {
         assert_eq!(log_count, 1);
     }
 
+    /// Baseline call frames (F15) and opcode counts (F11) coexist with the
+    /// schedule rows under one `divergence_id`, partitioned by `trace_kind`.
+    #[test]
+    fn baseline_trace_stored_with_trace_kind() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+
+        let frame = |from: u8| CallFrameRow {
+            call_index: 0,
+            from_address: Address::repeat_byte(from),
+            to_address: Address::repeat_byte(0x22),
+            call_type: "CALL".to_string(),
+            success: true,
+            ..Default::default()
+        };
+        let opc = |count: u64| OpcodeCountRow {
+            call_index: 0,
+            opcode: 0x54,
+            count,
+            gas_baseline: 100,
+            gas_schedule: 100,
+        };
+
+        let drill_in = DrillInRecord {
+            divergence: fixture_divergence(7, 0, false, 42),
+            call_frames: vec![frame(0x11)],
+            opcode_counts: vec![opc(5)],
+            baseline_call_frames: vec![frame(0xaa)],
+            baseline_opcode_counts: vec![opc(3)],
+            baseline_event_logs: vec![],
+            schedule_event_logs: vec![],
+        };
+        let output = BlockOutput {
+            coverage: fixture_coverage("test", 7, 1, 0),
+            summaries: vec![],
+            drill_ins: vec![drill_in],
+            recipients: vec![],
+        };
+        db.record_block_output(&output).unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+
+        assert_eq!(
+            count("SELECT COUNT(*) FROM divergence_call_frames WHERE trace_kind='schedule'"),
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM divergence_call_frames WHERE trace_kind='baseline'"),
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM divergence_opcode_counts WHERE trace_kind='baseline'"),
+            1
+        );
+        // The baseline opcode row carries the baseline count (3), distinct from
+        // the schedule row's count (5).
+        assert_eq!(
+            count(
+                "SELECT count FROM divergence_opcode_counts \
+                 WHERE trace_kind='baseline' AND opcode=84"
+            ),
+            3
+        );
+    }
+
+    /// F3/F14: under a DELEGATECALL the call frame splits `to_address` (proxy)
+    /// from `code_address` (implementation), and the metadata backfill keys on
+    /// the implementation — not the proxy.
+    #[test]
+    fn metadata_backfill_keys_on_code_address() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        let proxy = Address::repeat_byte(0x11);
+        let implementation = Address::repeat_byte(0x22);
+
+        let drill_in = DrillInRecord {
+            divergence: fixture_divergence(5, 0, false, 1),
+            call_frames: vec![CallFrameRow {
+                call_index: 0,
+                from_address: Address::repeat_byte(0x01),
+                to_address: proxy,
+                code_address: Some(implementation),
+                codehash: Some(B256::repeat_byte(0xcc)),
+                call_type: "DELEGATECALL".to_string(),
+                success: true,
+                ..Default::default()
+            }],
+            opcode_counts: vec![],
+            baseline_call_frames: vec![],
+            baseline_opcode_counts: vec![],
+            baseline_event_logs: vec![],
+            schedule_event_logs: vec![],
+        };
+        db.record_block_output(&BlockOutput {
+            coverage: fixture_coverage("test", 5, 1, 0),
+            summaries: vec![],
+            drill_ins: vec![drill_in],
+            recipients: vec![],
+        })
+        .unwrap();
+
+        // The backfill returns the implementation (code_address), not the proxy.
+        let addrs = db.distinct_call_frame_addresses().unwrap();
+        assert_eq!(addrs, vec![format!("{implementation:#x}")]);
+        assert!(!addrs.contains(&format!("{proxy:#x}")));
+    }
+
+    /// F8 storage-reprice drivers + F2/F3 account drivers round-trip on both
+    /// `divergences` (per-tx) and `block_summaries` (per-class); the F1 tier1
+    /// forensic columns round-trip on `divergences`.
+    #[test]
+    fn storage_drivers_round_trip() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        let sd = StorageDrivers {
+            sload_cold: 2,
+            sload_warm: 5,
+            sstore_cold: 1,
+            sstore_set: 3,
+            sstore_clear: 1,
+            ..Default::default()
+        };
+        let ad = AccountDrivers {
+            warm_account_access: 4,
+            value_transfer: 2,
+            create_opcode: 1,
+            access_list_address: 3,
+            access_list_storage_key: 7,
+        };
+
+        let mut div = fixture_divergence(9, 0, false, 7);
+        div.storage_drivers = Some(sd);
+        div.account_drivers = Some(ad);
+        // F1: a 1×-failure forensic capture (rescued at a bumped tier).
+        div.tier1_failure_reason = Some("OutOfGas".to_string());
+        div.tier1_oog_opcode = Some(0x54);
+        div.tier1_failing_selector = Some([0xde, 0xad, 0xbe, 0xef]);
+        div.tier1_failing_gas_provided = Some(21_000);
+        let drill_in = DrillInRecord {
+            divergence: div,
+            call_frames: vec![],
+            opcode_counts: vec![],
+            baseline_call_frames: vec![],
+            baseline_opcode_counts: vec![],
+            baseline_event_logs: vec![],
+            schedule_event_logs: vec![],
+        };
+        let summary = BlockSummaryRow {
+            schedule_name: "test".to_string(),
+            block_number: 9,
+            class: AggregateClass::GasOnly,
+            tx_count: 1,
+            gas_delta_sum: Some(1),
+            gas_delta_sum_sq: Some(1),
+            gas_delta_min: Some(1),
+            gas_delta_max: Some(1),
+            gas_delta_log2_hist: Some([0; 12]),
+            opcode_totals: vec![],
+            state_gas_sum: None,
+            state_gas_spillover_sum: None,
+            multiplier_log2_hist: None,
+            tx_count_creation: None,
+            tx_count_authorization: None,
+            tx_count_runtime_state: None,
+            tx_count_no_state: None,
+            cold_account_access_count: None,
+            storage_drivers: Some(sd),
+            account_drivers: Some(ad),
+        };
+        db.record_block_output(&BlockOutput {
+            coverage: fixture_coverage("test", 9, 1, 1),
+            summaries: vec![summary],
+            drill_ins: vec![drill_in],
+            recipients: vec![],
+        })
+        .unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let row = |table: &str| -> (i64, i64, i64, i64) {
+            conn.query_row(
+                &format!(
+                    "SELECT sload_cold_count, sstore_set_count, sstore_clear_count, \
+                     sstore_dirty_count FROM {table} WHERE block_number = 9"
+                ),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        };
+        // Same drivers land on both the per-tx and per-class tables.
+        assert_eq!(row("divergences"), (2, 3, 1, 0));
+        assert_eq!(row("block_summaries"), (2, 3, 1, 0));
+
+        // F2/F3 account drivers land on both tables too.
+        let acc = |table: &str| -> (i64, i64, i64, i64, i64) {
+            conn.query_row(
+                &format!(
+                    "SELECT warm_account_access_count, value_transfer_count, \
+                     create_opcode_count, access_list_address_count, \
+                     access_list_storage_key_count FROM {table} WHERE block_number = 9"
+                ),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(acc("divergences"), (4, 2, 1, 3, 7));
+        assert_eq!(acc("block_summaries"), (4, 2, 1, 3, 7));
+
+        // F1 tier1 forensics round-trip on divergences only.
+        let (reason, opcode, sel, provided): (
+            Option<String>,
+            Option<i64>,
+            Option<Vec<u8>>,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT tier1_failure_reason, tier1_oog_opcode, tier1_failing_selector, \
+                 tier1_failing_gas_provided FROM divergences WHERE block_number = 9",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(reason.as_deref(), Some("OutOfGas"));
+        assert_eq!(opcode, Some(0x54));
+        assert_eq!(sel, Some(vec![0xde, 0xad, 0xbe, 0xef]));
+        assert_eq!(provided, Some(21_000));
+    }
+
     #[test]
     fn delete_block_range_clears_all_per_block_tables() {
         let db = DivergenceDatabase::in_memory().unwrap();
 
         for block in [100u64, 200u64] {
             let drill_in = DrillInRecord {
-                divergence: fixture_divergence(block, 0, Bucket::ContractBroken, 100),
+                divergence: fixture_divergence(block, 0, false, 100),
                 call_frames: vec![CallFrameRow {
                     call_index: 0,
                     parent_call_index: None,
@@ -1833,10 +2671,13 @@ mod tests {
                     parent_gas_at_call: None,
                     gas_requested_on_stack: None,
                     eip150_cap_binding: None,
-                    state_gas_running: None,
                     deployed_bytecode_len: None,
+                    repricing_gas_delta: 0,
+                    ..Default::default()
                 }],
                 opcode_counts: vec![],
+                baseline_call_frames: vec![],
+                baseline_opcode_counts: vec![],
                 baseline_event_logs: vec![],
                 schedule_event_logs: vec![],
             };
@@ -1844,6 +2685,7 @@ mod tests {
                 coverage: fixture_coverage("test", block, 1, 0),
                 summaries: vec![],
                 drill_ins: vec![drill_in],
+                recipients: vec![],
             };
             db.record_block_output(&output).unwrap();
         }
@@ -1878,6 +2720,7 @@ mod tests {
             coverage: fixture_coverage("test", 42, 0, 0),
             summaries: vec![],
             drill_ins: vec![],
+            recipients: vec![],
         };
         db.record_block_output(&output).unwrap();
 
@@ -1940,14 +2783,14 @@ mod tests {
         let db = DivergenceDatabase::in_memory().unwrap();
         for tx_index in [0u32, 1u32] {
             let drill_in = DrillInRecord {
-                divergence: fixture_divergence(99, tx_index, Bucket::ContractBroken, 0),
+                divergence: fixture_divergence(99, tx_index, false, 0),
                 call_frames: vec![CallFrameRow {
                     call_index: 0,
                     parent_call_index: None,
                     depth: 0,
                     from_address: Address::ZERO,
                     to_address: Address::repeat_byte(0xaa),
-                    code_address: None,
+                    code_address: Some(Address::repeat_byte(0xaa)),
                     codehash: None,
                     call_type: "CALL".to_string(),
                     selector: None,
@@ -1959,10 +2802,13 @@ mod tests {
                     parent_gas_at_call: None,
                     gas_requested_on_stack: None,
                     eip150_cap_binding: None,
-                    state_gas_running: None,
                     deployed_bytecode_len: None,
+                    repricing_gas_delta: 0,
+                    ..Default::default()
                 }],
                 opcode_counts: vec![],
+                baseline_call_frames: vec![],
+                baseline_opcode_counts: vec![],
                 baseline_event_logs: vec![],
                 schedule_event_logs: vec![],
             };
@@ -1970,6 +2816,7 @@ mod tests {
                 coverage: fixture_coverage("test", 99, 1, 0),
                 summaries: vec![],
                 drill_ins: vec![drill_in],
+                recipients: vec![],
             };
             db.record_block_output(&output).unwrap();
         }
@@ -1997,14 +2844,14 @@ mod tests {
             (null_codehash_addr, None),
         ] {
             let drill_in = DrillInRecord {
-                divergence: fixture_divergence(99, tx_index, Bucket::ContractBroken, 0),
+                divergence: fixture_divergence(99, tx_index, false, 0),
                 call_frames: vec![CallFrameRow {
                     call_index: 0,
                     parent_call_index: None,
                     depth: 0,
                     from_address: Address::ZERO,
                     to_address: addr,
-                    code_address: None,
+                    code_address: Some(addr),
                     codehash,
                     call_type: "CALL".to_string(),
                     selector: None,
@@ -2016,10 +2863,13 @@ mod tests {
                     parent_gas_at_call: None,
                     gas_requested_on_stack: None,
                     eip150_cap_binding: None,
-                    state_gas_running: None,
                     deployed_bytecode_len: None,
+                    repricing_gas_delta: 0,
+                    ..Default::default()
                 }],
                 opcode_counts: vec![],
+                baseline_call_frames: vec![],
+                baseline_opcode_counts: vec![],
                 baseline_event_logs: vec![],
                 schedule_event_logs: vec![],
             };
@@ -2027,6 +2877,7 @@ mod tests {
                 coverage: fixture_coverage("test", 99, 1, 0),
                 summaries: vec![],
                 drill_ins: vec![drill_in],
+                recipients: vec![],
             };
             db.record_block_output(&output).unwrap();
             tx_index += 1;
@@ -2063,7 +2914,7 @@ mod tests {
         let proxy = Address::repeat_byte(0xaa);
         let implementation = Address::repeat_byte(0xbb);
         let drill_in = DrillInRecord {
-            divergence: fixture_divergence(99, 0, Bucket::ContractBroken, 0),
+            divergence: fixture_divergence(99, 0, false, 0),
             call_frames: vec![CallFrameRow {
                 call_index: 0,
                 parent_call_index: None,
@@ -2082,10 +2933,13 @@ mod tests {
                 parent_gas_at_call: None,
                 gas_requested_on_stack: None,
                 eip150_cap_binding: None,
-                state_gas_running: None,
                 deployed_bytecode_len: None,
+                repricing_gas_delta: 0,
+                ..Default::default()
             }],
             opcode_counts: vec![],
+            baseline_call_frames: vec![],
+            baseline_opcode_counts: vec![],
             baseline_event_logs: vec![],
             schedule_event_logs: vec![],
         };
@@ -2093,6 +2947,7 @@ mod tests {
             coverage: fixture_coverage("test", 99, 1, 0),
             summaries: vec![],
             drill_ins: vec![drill_in],
+            recipients: vec![],
         })
         .unwrap();
 
@@ -2124,7 +2979,7 @@ mod tests {
         let approve = [0x09u8, 0x5e, 0xa7, 0xb3];
         for (i, sel) in [transfer, approve].iter().enumerate() {
             let drill_in = DrillInRecord {
-                divergence: fixture_divergence(99, i as u32, Bucket::ContractBroken, 0),
+                divergence: fixture_divergence(99, i as u32, false, 0),
                 call_frames: vec![CallFrameRow {
                     call_index: 0,
                     parent_call_index: None,
@@ -2143,10 +2998,13 @@ mod tests {
                     parent_gas_at_call: None,
                     gas_requested_on_stack: None,
                     eip150_cap_binding: None,
-                    state_gas_running: None,
                     deployed_bytecode_len: None,
+                    repricing_gas_delta: 0,
+                    ..Default::default()
                 }],
                 opcode_counts: vec![],
+                baseline_call_frames: vec![],
+                baseline_opcode_counts: vec![],
                 baseline_event_logs: vec![],
                 schedule_event_logs: vec![],
             };
@@ -2154,6 +3012,7 @@ mod tests {
                 coverage: fixture_coverage("test", 99, 1, 0),
                 summaries: vec![],
                 drill_ins: vec![drill_in],
+                recipients: vec![],
             })
             .unwrap();
         }

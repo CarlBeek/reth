@@ -78,3 +78,7 @@ __pycache__/
 
 # Disable CI workflows on this fork
 .github/workflows/
+
+# Local research run artifacts (PR proof scratch + node logs)
+.pr-body-proof-v2-empty-stack.md
+logs/

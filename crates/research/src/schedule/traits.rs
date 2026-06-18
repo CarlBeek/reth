@@ -19,6 +19,33 @@ pub enum ScheduleKind {
     None,
 }
 
+/// Per-category decomposition of a single opcode's gas delta (F12).
+///
+/// The fields sum to [`GasSchedule::opcode_gas_delta`] for the same opcode and
+/// context — an invariant the inspector relies on so per-category running sums
+/// reconcile to the total repricing surcharge. The one non-`other` category,
+/// `second_db_read`, is the EXTCODE* second-read surcharge; schedules that don't
+/// decompose put the whole delta in `other` (the default).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GasTaxBreakdown {
+    /// EXTCODESIZE / EXTCODECOPY second-DB-read flat add-on.
+    pub second_db_read: i64,
+    /// Everything else (uniform multipliers, CSV deltas, unclassified).
+    pub other: i64,
+}
+
+impl GasTaxBreakdown {
+    /// A breakdown that attributes the whole delta to `other`.
+    pub const fn other(delta: i64) -> Self {
+        Self { second_db_read: 0, other: delta }
+    }
+
+    /// Total delta — must equal `opcode_gas_delta` for the same inputs.
+    pub const fn total(&self) -> i64 {
+        self.second_db_read + self.other
+    }
+}
+
 /// Defines how gas costs are modified for a specific experiment.
 ///
 /// Implementations of this trait represent different gas schedule experiments
@@ -119,6 +146,16 @@ pub trait GasSchedule: Send + Sync + Debug {
         0
     }
 
+    /// Per-category decomposition of [`Self::opcode_gas_delta`] (F12).
+    ///
+    /// The returned [`GasTaxBreakdown`]'s `total()` MUST equal
+    /// `opcode_gas_delta(opcode, ctx)`. The default attributes the whole delta
+    /// to `other`; only schedules with a categorizable surcharge (EIP-8038's
+    /// EXTCODE* second-read add-on, the `second_db_read` category) override this.
+    fn opcode_gas_tax_breakdown(&self, opcode: u8, ctx: &OpcodeContext) -> GasTaxBreakdown {
+        GasTaxBreakdown::other(self.opcode_gas_delta(opcode, ctx))
+    }
+
     /// Get additional gas to charge for a precompile call.
     ///
     /// Returns the additional gas delta (can be positive or negative).
@@ -141,6 +178,18 @@ pub trait GasSchedule: Send + Sync + Debug {
     /// schedules that only use explicit additive repricing via
     /// [`GasSchedule::opcode_gas_delta`] / [`GasSchedule::precompile_gas_delta`].
     fn execution_gas_multiplier(&self) -> Option<u64> {
+        None
+    }
+
+    /// Gas-limit multiplier for the schedule's *conditional bump* replay tier.
+    ///
+    /// `Some(n)` makes the tier sweep run exactly `[1, n]`: replay at the original
+    /// limit, and only if that fails, replay once at `n×`. `None` (default) keeps
+    /// the global `--research.gas-limit-multipliers` sweep. EIP-8037 uses `10`,
+    /// EIP-8038 uses `4` (a tx the reprice breaks at 1× is re-tried once at the
+    /// bump; success there means "wallet-fixable with n× gas", failure means the
+    /// reprice broke it outright).
+    fn replay_bump_multiplier(&self) -> Option<u64> {
         None
     }
 

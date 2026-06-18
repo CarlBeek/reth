@@ -96,9 +96,10 @@ use crate::{
         CallFrame, CallType, DivergenceLocation, EventLog, FrameOpcodeCounts, OogPattern,
         OperationCounts, OutOfGasInfo, PerFrameCapture, MAX_TRACKED_FRAMES,
     },
-    schedule::{GasSchedule, OpcodeContext},
+    opcode,
+    schedule::{GasSchedule, GasTaxBreakdown, OpcodeContext},
 };
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use revm::{
     bytecode::opcode::OpCode,
     context_interface::ContextTr,
@@ -107,7 +108,7 @@ use revm::{
     },
     Inspector,
 };
-use revm_interpreter::interpreter_types::Jumps;
+use revm_interpreter::interpreter_types::{InputsTr, Jumps, RuntimeFlag};
 use std::{collections::VecDeque, sync::Arc};
 
 /// Whether the instruction result is an OOG-class error (as opposed to a
@@ -220,8 +221,17 @@ pub struct ScheduleInspector {
     /// OOG diagnostic info (first OOG only)
     oog_info: Option<OutOfGasInfo>,
 
-    /// Location of first gas divergence
+    /// Location of the first per-opcode gas delta of *any* sign (first opcode
+    /// the schedule repriced). A schedule with negative deltas (e.g. CSV pricing
+    /// that lowers an opcode's cost) can fire this before the first *net*
+    /// surcharge — see `first_gas_divergence`.
     divergence_location: Option<DivergenceLocation>,
+
+    /// Location where the cumulative repricing surcharge (`additional_gas_charged`)
+    /// first crossed from ≤0 to >0 — the first opcode at which the schedule's
+    /// running gas genuinely exceeds baseline (F10). Distinct from the
+    /// behavioral `divergence_location`.
+    first_gas_divergence: Option<DivergenceLocation>,
 
     /// Whether a CALL/CREATE delta was pre-applied in `step()` and should be
     /// skipped in `step_end()`.
@@ -276,8 +286,11 @@ pub struct ScheduleResult {
     /// OOG diagnostic information (first OOG occurrence only).
     pub oog_info: Option<OutOfGasInfo>,
 
-    /// Location of first gas divergence.
+    /// Location of the first per-opcode delta of any sign.
     pub divergence_location: Option<DivergenceLocation>,
+
+    /// Location where the cumulative surcharge first went positive (F10).
+    pub first_gas_divergence: Option<DivergenceLocation>,
 }
 
 /// Entry in the call stack.
@@ -327,10 +340,6 @@ struct CallStackEntry {
 #[derive(Debug, Clone)]
 struct GasOpcodeEvent {
     pc: usize,
-    #[allow(dead_code)]
-    gas_remaining: u64,
-    #[allow(dead_code)]
-    contract: Address,
 }
 
 impl ScheduleInspector {
@@ -358,6 +367,7 @@ impl ScheduleInspector {
             oog_occurred: false,
             oog_info: None,
             divergence_location: None,
+            first_gas_divergence: None,
             call_delta_pre_applied: false,
             gas_opcode_usage: VecDeque::new(),
             max_gas_events: 1000,
@@ -410,6 +420,7 @@ impl ScheduleInspector {
             would_oog: self.oog_occurred,
             oog_info: self.oog_info.clone(),
             divergence_location: self.divergence_location.clone(),
+            first_gas_divergence: self.first_gas_divergence.clone(),
         }
     }
 
@@ -466,6 +477,7 @@ impl ScheduleInspector {
             call_depth: self.call_stack.len() + 1,
             gas_remaining: interp.gas.remaining(),
             pattern,
+            additional_gas_at_oog: self.additional_gas_charged,
         });
         self.oog_occurred = true;
     }
@@ -557,14 +569,17 @@ impl ScheduleInspector {
             call_depth: popped.depth + 1,
             gas_remaining,
             pattern,
+            additional_gas_at_oog: self.additional_gas_charged,
         });
     }
 
     /// Infer OOG pattern based on opcode.
     fn infer_oog_pattern(&self, opcode: u8) -> OogPattern {
         match opcode {
-            0x54 | 0x55 => OogPattern::StorageHeavy, // SLOAD, SSTORE
-            0xF1 | 0xF2 | 0xF4 | 0xFA => OogPattern::CallChain, // CALL variants
+            opcode::SLOAD | opcode::SSTORE => OogPattern::StorageHeavy,
+            opcode::CALL | opcode::CALLCODE | opcode::DELEGATECALL | opcode::STATICCALL => {
+                OogPattern::CallChain
+            }
             0x51..=0x53 => OogPattern::MemoryExpansion, // MLOAD, MSTORE, MSTORE8
             _ if self.has_gas_loop_pattern() => OogPattern::Loop,
             _ => OogPattern::Unknown,
@@ -597,8 +612,6 @@ impl ScheduleInspector {
             memory_size: interp.memory.len(),
             keccak_msg_size: self.cached_keccak_msg_size,
             exp_byte_size: self.cached_exp_byte_size,
-            memory_offset: None,
-            memory_access_size: None,
         }
     }
 
@@ -606,7 +619,8 @@ impl ScheduleInspector {
     /// the caller's remaining gas (CALL, CALLCODE, DELEGATECALL, STATICCALL,
     /// CREATE, CREATE2).
     const fn is_call_or_create(opcode: u8) -> bool {
-        matches!(opcode, 0xF0 | 0xF1 | 0xF2 | 0xF4 | 0xF5 | 0xFA)
+        use crate::opcode::*;
+        matches!(opcode, CREATE | CALL | CALLCODE | DELEGATECALL | CREATE2 | STATICCALL)
     }
 
     /// Push a new per-frame opcode counter and return its stack index.
@@ -667,19 +681,11 @@ impl ScheduleInspector {
         }
     }
 
-    /// Record a gas delta against the per-opcode counters in `OperationCounts`.
-    const fn record_opcode_gas_delta(op_counts: &mut OperationCounts, opcode: u8, delta: i64) {
-        match opcode {
-            0x04 => op_counts.div_gas_delta += delta,
-            0x05 => op_counts.sdiv_gas_delta += delta,
-            0x06 => op_counts.mod_gas_delta += delta,
-            0x07 => op_counts.smod_gas_delta += delta,
-            0x08 => op_counts.addmod_gas_delta += delta,
-            0x09 => op_counts.mulmod_gas_delta += delta,
-            0x0A => op_counts.exp_gas_delta += delta,
-            0x20 => op_counts.keccak256_gas_delta += delta,
-            _ => {}
-        }
+    /// Accumulate a per-opcode tax breakdown into the tx's running per-category
+    /// sums (F12). The sum of these reconciles to `additional_gas_charged`.
+    const fn accumulate_tax(op_counts: &mut OperationCounts, b: &GasTaxBreakdown) {
+        op_counts.tax_second_db_read += b.second_db_read;
+        op_counts.tax_other += b.other;
     }
 
     /// Apply a gas delta to the interpreter, recording divergence/OOG as needed.
@@ -693,7 +699,31 @@ impl ScheduleInspector {
         opcode: u8,
     ) -> bool {
         self.record_divergence(interp, opcode);
+        let surcharge_before = self.additional_gas_charged;
         self.additional_gas_charged += gas_delta;
+        // F10: first opcode where the cumulative surcharge crosses into the
+        // positive (schedule's running gas first exceeds baseline). Distinct
+        // from `divergence_location`, which fires on the first delta of any
+        // sign — a schedule with negative deltas (e.g. CSV pricing) can fire
+        // that earlier than this net-positive crossing.
+        if self.first_gas_divergence.is_none() &&
+            surcharge_before <= 0 &&
+            self.additional_gas_charged > 0
+        {
+            let contract = self.call_stack.last().map(|e| e.contract).unwrap_or(Address::ZERO);
+            self.first_gas_divergence = Some(DivergenceLocation {
+                contract,
+                function_selectors: self
+                    .call_stack
+                    .iter()
+                    .map(|entry| entry.function_selector)
+                    .collect(),
+                pc: interp.bytecode.pc(),
+                call_depth: self.call_stack.len() + 1,
+                opcode,
+                opcode_name: Self::opcode_name(opcode),
+            });
+        }
         if let Some(frame) = self.call_stack.last_mut() {
             frame.repricing_gas_delta += gas_delta;
         }
@@ -743,17 +773,101 @@ impl ScheduleInspector {
         &mut self,
         interp: &Interpreter<revm::interpreter::interpreter::EthInterpreter>,
     ) {
-        let contract = self.call_stack.last().map(|e| e.contract).unwrap_or(Address::ZERO);
-
-        self.gas_opcode_usage.push_back(GasOpcodeEvent {
-            pc: interp.bytecode.pc(),
-            gas_remaining: interp.gas.remaining(),
-            contract,
-        });
+        self.gas_opcode_usage.push_back(GasOpcodeEvent { pc: interp.bytecode.pc() });
 
         while self.gas_opcode_usage.len() > self.max_gas_events {
             self.gas_opcode_usage.pop_front();
         }
+    }
+}
+
+/// Classify whether a cold-account-access target is touched cold this tx,
+/// **read-only**. Returns the cold-ness only (no code/no-code classification).
+///
+/// `load_account_info_skip_cold_load(skip_cold_load = true)` never warms the
+/// target: it returns `Ok` for an already-warm account and `ColdLoadSkipped`
+/// for a cold one, so the replay's own cold/warm accounting is preserved.
+///
+/// Invoked for **every** schedule (not just EIP-8038): the cold-account
+/// classification is a near-free native baseline, and schedules that don't price
+/// it simply ignore it. See [`OperationCounts::cold_account_access_count`].
+fn classify_account_target<CTX>(context: &mut CTX, addr: Address) -> bool
+where
+    CTX: ContextTr,
+{
+    use revm::context_interface::{journaled_state::JournalLoadError, JournalTr};
+
+    match context.journal_mut().load_account_info_skip_cold_load(addr, false, true) {
+        Ok(_) => false,
+        Err(JournalLoadError::ColdLoadSkipped) => true,
+        Err(JournalLoadError::DBError(err)) => {
+            // A real DB error here would also fail revm's own account load and
+            // abort the tx; surface it rather than silently classifying as warm.
+            tracing::warn!(target: "exex::research", %addr, ?err, "cold-account classification: journal load failed; treating as warm");
+            false
+        }
+    }
+}
+
+/// Classify a storage slot for the EIP-8038 storage-reprice drivers (F8),
+/// **read-only**. Returns `(is_cold, current)`.
+///
+/// `sload_skip_cold_load(.., skip_cold_load = true)` never warms the slot:
+/// `Ok` for an already-warm slot (carrying its current journaled value) and
+/// `ColdLoadSkipped` for a cold one (short-circuiting before any DB load). A
+/// cold slot's current value equals its committed `original`, so `current` is
+/// `None` there and the caller substitutes the committed value.
+fn classify_storage_slot<CTX>(context: &mut CTX, addr: Address, key: U256) -> (bool, Option<U256>)
+where
+    CTX: ContextTr,
+{
+    use revm::context_interface::{journaled_state::JournalLoadError, JournalTr};
+
+    match context.journal_mut().sload_skip_cold_load(addr, key, true) {
+        Ok(load) => (false, Some(load.data)),
+        Err(JournalLoadError::ColdLoadSkipped) => (true, None),
+        Err(JournalLoadError::DBError(err)) => {
+            tracing::warn!(target: "exex::research", %addr, ?err, "cold-storage classification: journal load failed; treating as warm");
+            (false, None)
+        }
+    }
+}
+
+/// EIP-2200 / EIP-3529 SSTORE outcome buckets (mutually exclusive), the
+/// repricing drivers for EIP-8038's `STORAGE_WRITE` / `REFUND_STORAGE_CLEAR`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SstoreTransition {
+    /// `current == new` — no state change (warm read cost only).
+    Noop,
+    /// Clean slot (`original == current`), `original == 0`, `new != 0` — a fresh
+    /// set. Charged `STORAGE_WRITE`.
+    Set,
+    /// Clean slot, `original != 0`, `new != 0`, `new != original` — overwrite.
+    /// Charged `STORAGE_WRITE`.
+    Reset,
+    /// Clean slot, `original != 0`, `new == 0` — clear. Charged `STORAGE_WRITE`
+    /// and earns `REFUND_STORAGE_CLEAR`.
+    Clear,
+    /// Slot already dirtied earlier this tx (`original != current`) — rewrite at
+    /// the warm rate, no fresh write surcharge.
+    Dirty,
+}
+
+/// Classify an SSTORE from its EIP-2200 `(original, current, new)` triple.
+fn classify_sstore_transition(original: U256, current: U256, new: U256) -> SstoreTransition {
+    if current == new {
+        return SstoreTransition::Noop;
+    }
+    if original != current {
+        return SstoreTransition::Dirty;
+    }
+    // Clean slot (this is the first write to it this tx).
+    if original.is_zero() {
+        SstoreTransition::Set
+    } else if new.is_zero() {
+        SstoreTransition::Clear
+    } else {
+        SstoreTransition::Reset
     }
 }
 
@@ -764,7 +878,7 @@ where
     fn step(
         &mut self,
         interp: &mut Interpreter<revm::interpreter::interpreter::EthInterpreter>,
-        _context: &mut CTX,
+        context: &mut CTX,
     ) {
         // Once OOG has been triggered, stop applying further deltas. The
         // interpreter should be halted, but guard against revm calling step()
@@ -794,6 +908,91 @@ where
         // calls step → execute → step_end within a single loop iteration.
         self.call_delta_pre_applied = false;
 
+        // Cold-account classification: classify the account-access target
+        // (cold?) read-only *before* execution — and, for the CALL family,
+        // before the gas is forwarded. The target's stack position differs by
+        // opcode: top-of-stack for BALANCE / EXTCODE* / SELFDESTRUCT, index 1
+        // for the CALL family.
+        let target_pos = match self.current_opcode {
+            opcode::BALANCE |
+            opcode::EXTCODESIZE |
+            opcode::EXTCODECOPY |
+            opcode::EXTCODEHASH |
+            opcode::SELFDESTRUCT => Some(0),
+            opcode::CALL | opcode::CALLCODE | opcode::DELEGATECALL | opcode::STATICCALL => Some(1),
+            _ => None,
+        };
+        if let Some(pos) = target_pos &&
+            let Ok(word) = interp.stack.peek(pos)
+        {
+            let bytes = word.to_be_bytes::<32>();
+            let addr = Address::from_slice(&bytes[12..]);
+            let is_cold = classify_account_target(context, addr);
+            // Count the cold/warm account-access split for data collection (F2).
+            if is_cold {
+                self.op_counts.cold_account_access_count += 1;
+            } else {
+                self.op_counts.warm_account_access_count += 1;
+            }
+        }
+
+        // Value-transfer classification (F2): CALL / CALLCODE carry the
+        // transferred value as the 3rd stack item (index 2 — after gas at 0
+        // and target at 1). DELEGATECALL/STATICCALL carry no value and are
+        // excluded. Peeked read-only before execution, mirroring the
+        // account-target peek above.
+        if matches!(self.current_opcode, opcode::CALL | opcode::CALLCODE) &&
+            let Ok(value) = interp.stack.peek(2) &&
+            !value.is_zero()
+        {
+            self.op_counts.value_transfer_count += 1;
+        }
+
+        // EIP-8038 storage-reprice drivers (F8): classify SLOAD/SSTORE slot
+        // cold/warm read-only, and the SSTORE (original, current, new)
+        // transition. The storage context is the executing frame's
+        // `target_address` — revm's own source for these opcodes
+        // (`instructions::host::{sload,sstore}`) — so DELEGATECALL and the root
+        // frame are handled uniformly. Classified *before* execution so the
+        // cold/warm read mirrors what revm charges, without warming the slot.
+        use revm::context_interface::Database;
+        match self.current_opcode {
+            opcode::SLOAD => {
+                if let Ok(key) = interp.stack.peek(0) {
+                    let addr = interp.input.target_address();
+                    let (is_cold, _current) = classify_storage_slot(context, addr, key);
+                    if is_cold {
+                        self.op_counts.sload_cold_count += 1;
+                    } else {
+                        self.op_counts.sload_warm_count += 1;
+                    }
+                }
+            }
+            // A static-context SSTORE is rejected by revm before it writes, so
+            // skip it rather than count a write that never happens.
+            opcode::SSTORE if !interp.runtime_flag.is_static() => {
+                if let (Ok(key), Ok(new)) = (interp.stack.peek(0), interp.stack.peek(1)) {
+                    let addr = interp.input.target_address();
+                    let (is_cold, current) = classify_storage_slot(context, addr, key);
+                    if is_cold {
+                        self.op_counts.sstore_cold_count += 1;
+                    }
+                    // `original` = committed value (DB layer, below the journal's
+                    // warm set). For a cold slot `current` equals `original`.
+                    let original = context.db_mut().storage(addr, key).unwrap_or(U256::ZERO);
+                    let current = current.unwrap_or(original);
+                    match classify_sstore_transition(original, current, new) {
+                        SstoreTransition::Noop => self.op_counts.sstore_noop_count += 1,
+                        SstoreTransition::Set => self.op_counts.sstore_set_count += 1,
+                        SstoreTransition::Reset => self.op_counts.sstore_reset_count += 1,
+                        SstoreTransition::Clear => self.op_counts.sstore_clear_count += 1,
+                        SstoreTransition::Dirty => self.op_counts.sstore_dirty_count += 1,
+                    }
+                }
+            }
+            _ => {}
+        }
+
         // Cache variable-cost opcode parameters from the stack before execution
         // consumes them. These are used in build_opcode_context() during step_end().
         self.cached_keccak_msg_size = if self.current_opcode == 0x20 {
@@ -822,7 +1021,7 @@ where
         // Consumed by `call()` to populate the child frame's
         // `gas_requested_on_stack`.
         self.pending_call_stack_gas = match self.current_opcode {
-            0xF1 | 0xF2 | 0xF4 | 0xFA => {
+            opcode::CALL | opcode::CALLCODE | opcode::DELEGATECALL | opcode::STATICCALL => {
                 interp.stack.peek(0).ok().map(|gas| gas.saturating_to::<u64>())
             }
             _ => None,
@@ -832,12 +1031,14 @@ where
         self.op_counts.total_ops += 1;
 
         match self.current_opcode {
-            0x54 => self.op_counts.sload_count += 1,
-            0x55 => self.op_counts.sstore_count += 1,
+            opcode::SLOAD => self.op_counts.sload_count += 1,
+            opcode::SSTORE => self.op_counts.sstore_count += 1,
             0xA0..=0xA4 => self.op_counts.log_count += 1,
-            0xF1 | 0xF2 | 0xF4 | 0xFA => self.op_counts.call_count += 1,
-            0xF0 | 0xF5 => self.op_counts.create_count += 1,
-            0x5A if self.detect_gas_loops => self.track_gas_opcode(interp),
+            opcode::CALL | opcode::CALLCODE | opcode::DELEGATECALL | opcode::STATICCALL => {
+                self.op_counts.call_count += 1
+            }
+            opcode::CREATE | opcode::CREATE2 => self.op_counts.create_count += 1,
+            opcode::GAS if self.detect_gas_loops => self.track_gas_opcode(interp),
             _ => {}
         }
 
@@ -847,19 +1048,6 @@ where
         // Gas baseline/schedule is recorded later in `step_end()`.
         self.ensure_root_frame_counter();
         self.record_opcode_count_in_active_frame(self.current_opcode);
-
-        // Count repriced opcodes
-        match self.current_opcode {
-            0x04 => self.op_counts.div_count += 1,
-            0x05 => self.op_counts.sdiv_count += 1,
-            0x06 => self.op_counts.mod_count += 1,
-            0x07 => self.op_counts.smod_count += 1,
-            0x08 => self.op_counts.addmod_count += 1,
-            0x09 => self.op_counts.mulmod_count += 1,
-            0x0A => self.op_counts.exp_count += 1,
-            0x20 => self.op_counts.keccak256_count += 1,
-            _ => {}
-        }
 
         // Track memory usage
         let memory_words = interp.memory.len().div_ceil(32);
@@ -877,11 +1065,15 @@ where
         // feeds into the 63/64 gas forwarding rule for the subcall.
         if Self::is_call_or_create(self.current_opcode) {
             let opcode_ctx = self.build_opcode_context(interp);
-            let gas_delta = self.schedule.opcode_gas_delta(self.current_opcode, &opcode_ctx);
+            // F12: the breakdown's total equals `opcode_gas_delta`, so gas
+            // behavior is unchanged; we additionally fold the categories in.
+            let breakdown =
+                self.schedule.opcode_gas_tax_breakdown(self.current_opcode, &opcode_ctx);
+            let gas_delta = breakdown.total();
             if gas_delta != 0 {
                 self.call_delta_pre_applied = true;
                 self.pending_pre_applied_delta = gas_delta;
-                Self::record_opcode_gas_delta(&mut self.op_counts, self.current_opcode, gas_delta);
+                Self::accumulate_tax(&mut self.op_counts, &breakdown);
                 if !self.apply_gas_delta(interp, gas_delta, self.current_opcode) { // OOG — interpreter is halted, don't continue
                 }
             }
@@ -913,17 +1105,22 @@ where
         };
 
         let opcode_ctx = self.build_opcode_context(interp);
-        let explicit_gas_delta = if self.call_delta_pre_applied {
-            0
+        // F12: explicit breakdown (empty when the delta was pre-applied in
+        // step()); its total equals the old `explicit_gas_delta`.
+        let explicit_breakdown = if self.call_delta_pre_applied {
+            GasTaxBreakdown::default()
         } else {
-            self.schedule.opcode_gas_delta(current_opcode, &opcode_ctx)
+            self.schedule.opcode_gas_tax_breakdown(current_opcode, &opcode_ctx)
         };
         // Uniform multipliers are derived from the EVM's observed native cost
         // after the opcode has executed. That makes them work for the live
         // schedule path, but unlike explicit additive deltas they do not feed
-        // into CALL/CREATE gas forwarding before dispatch.
+        // into CALL/CREATE gas forwarding before dispatch. Multipliers are
+        // unclassified → `other`.
         let multiplier_gas_delta = self.multiplier_gas_delta(actual_gas_cost);
-        let gas_delta = explicit_gas_delta.saturating_add(multiplier_gas_delta);
+        let mut tax_breakdown = explicit_breakdown;
+        tax_breakdown.other = tax_breakdown.other.saturating_add(multiplier_gas_delta);
+        let gas_delta = tax_breakdown.total();
 
         // Per-frame gas accounting. `actual_gas_cost` includes any delta
         // pre-applied in `step()` (CALL/CREATE pre-deduction); subtract it
@@ -944,17 +1141,25 @@ where
         );
 
         if gas_delta != 0 {
-            Self::record_opcode_gas_delta(&mut self.op_counts, current_opcode, gas_delta);
+            // F12: the step()-pre-applied portion was already folded in; here we
+            // add the step_end portion (explicit-if-not-pre-applied + multiplier).
+            Self::accumulate_tax(&mut self.op_counts, &tax_breakdown);
             self.apply_gas_delta(interp, gas_delta, current_opcode);
         }
     }
 
     fn call(&mut self, _context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
         let (call_type, opcode) = match inputs.scheme {
-            revm::interpreter::CallScheme::Call => (CallType::Call, 0xF1u8),
-            revm::interpreter::CallScheme::CallCode => (CallType::CallCode, 0xF2),
-            revm::interpreter::CallScheme::DelegateCall => (CallType::DelegateCall, 0xF4),
-            revm::interpreter::CallScheme::StaticCall => (CallType::StaticCall, 0xFA),
+            revm::interpreter::CallScheme::Call => (CallType::Call, crate::opcode::CALL),
+            revm::interpreter::CallScheme::CallCode => {
+                (CallType::CallCode, crate::opcode::CALLCODE)
+            }
+            revm::interpreter::CallScheme::DelegateCall => {
+                (CallType::DelegateCall, crate::opcode::DELEGATECALL)
+            }
+            revm::interpreter::CallScheme::StaticCall => {
+                (CallType::StaticCall, crate::opcode::STATICCALL)
+            }
         };
 
         let function_selector = Self::extract_function_selector(&inputs.input);
@@ -1050,6 +1255,7 @@ where
                                     call_depth: entry.depth + 1,
                                     gas_remaining: gas_after_precompile,
                                     pattern: OogPattern::CallChain,
+                                    additional_gas_at_oog: self.additional_gas_charged,
                                 });
                             }
                         } else {
@@ -1117,6 +1323,16 @@ where
                 gas_requested_on_stack: entry.gas_requested_on_stack,
                 parent_gas_at_call: entry.parent_gas_at_call,
                 value_wei,
+                // F9: failing-frame context.
+                caller_pc: Some(entry.caller_pc),
+                was_precompile: outcome.was_precompile_called,
+                precompile_address: outcome
+                    .was_precompile_called
+                    .then_some(inputs.bytecode_address),
+                gas_remaining_at_fail: (!call_success).then(|| outcome.result.gas.remaining()),
+                // F3: storage/call target, distinct from `to` (the code holder)
+                // under DELEGATECALL.
+                storage_target: Some(inputs.target_address),
             });
 
             // Propagate per-frame positive delta flag to parent.
@@ -1148,6 +1364,7 @@ where
                         call_depth: entry.depth + 1,
                         gas_remaining: 0,
                         pattern: OogPattern::CallChain,
+                        additional_gas_at_oog: self.additional_gas_charged,
                     });
                 }
             }
@@ -1181,9 +1398,13 @@ where
 
     fn create(&mut self, _context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
         let (call_type, opcode) = match inputs.scheme() {
-            revm::context_interface::CreateScheme::Create => (CallType::Create, 0xF0u8),
+            revm::context_interface::CreateScheme::Create => {
+                (CallType::Create, crate::opcode::CREATE)
+            }
             revm::context_interface::CreateScheme::Create2 { .. } |
-            revm::context_interface::CreateScheme::Custom { .. } => (CallType::Create2, 0xF5),
+            revm::context_interface::CreateScheme::Custom { .. } => {
+                (CallType::Create2, crate::opcode::CREATE2)
+            }
         };
 
         let parent_has_positive_delta =
@@ -1254,6 +1475,13 @@ where
                 gas_requested_on_stack: entry.gas_requested_on_stack,
                 parent_gas_at_call: entry.parent_gas_at_call,
                 value_wei,
+                // F9: failing-frame context. CREATE never hits a precompile.
+                caller_pc: Some(entry.caller_pc),
+                was_precompile: false,
+                precompile_address: None,
+                gas_remaining_at_fail: (!create_success).then(|| outcome.result.gas.remaining()),
+                // F3: CREATE has no separate storage target.
+                storage_target: None,
             });
 
             // Propagate per-frame positive delta flag to parent.
@@ -1278,6 +1506,7 @@ where
                         call_depth: entry.depth + 1,
                         gas_remaining: 0,
                         pattern: OogPattern::CallChain,
+                        additional_gas_at_oog: self.additional_gas_charged,
                     });
                 }
             }
@@ -1311,6 +1540,25 @@ where
 mod tests {
     use super::*;
     use crate::schedule::{BaselineSchedule, CsvPricingSchedule};
+
+    /// F8: the EIP-2200 SSTORE transition buckets over the canonical
+    /// (original, current, new) cases.
+    #[test]
+    fn sstore_transition_classification() {
+        let z = U256::ZERO;
+        let a = U256::from(1);
+        let b = U256::from(2);
+        // current == new → no-op, regardless of original.
+        assert_eq!(classify_sstore_transition(a, b, b), SstoreTransition::Noop);
+        assert_eq!(classify_sstore_transition(z, z, z), SstoreTransition::Noop);
+        // Clean slot (original == current):
+        assert_eq!(classify_sstore_transition(z, z, a), SstoreTransition::Set); // 0 → nonzero
+        assert_eq!(classify_sstore_transition(a, a, z), SstoreTransition::Clear); // nonzero → 0
+        assert_eq!(classify_sstore_transition(a, a, b), SstoreTransition::Reset); // nonzero → other nonzero
+                                                                                  // Already dirtied this tx (original != current) → dirty re-write.
+        assert_eq!(classify_sstore_transition(z, a, b), SstoreTransition::Dirty);
+        assert_eq!(classify_sstore_transition(a, b, z), SstoreTransition::Dirty);
+    }
 
     #[test]
     fn test_schedule_inspector_new() {

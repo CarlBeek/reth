@@ -317,6 +317,13 @@ where
                 gas_requested_on_stack: None,
                 parent_gas_at_call: None,
                 value_wei: None,
+                caller_pc: None,
+                was_precompile: false,
+                precompile_address: None,
+                gas_remaining_at_fail: None,
+                // F3: baseline frames don't carry the storage-target split; the
+                // schedule trace is the forensic surface for the code_address.
+                storage_target: None,
             });
         }
     }
@@ -378,6 +385,13 @@ where
                 gas_requested_on_stack: None,
                 parent_gas_at_call: None,
                 value_wei: None,
+                caller_pc: None,
+                was_precompile: false,
+                precompile_address: None,
+                gas_remaining_at_fail: None,
+                // F3: baseline frames don't carry the storage-target split; the
+                // schedule trace is the forensic surface for the code_address.
+                storage_target: None,
             });
         }
     }

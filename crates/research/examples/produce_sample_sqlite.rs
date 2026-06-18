@@ -13,9 +13,9 @@ use alloy_primitives::{Address, Bytes, B256};
 use reth_research::{
     database::{
         BlockCoverageRow, BlockOutput, BlockSummaryRow, CallFrameRow, DivergenceDatabase,
-        DivergenceRow, DrillInRecord, OpcodeBucketTotal, OpcodeCountRow,
+        DivergenceRow, DrillInRecord, OpcodeBucketTotal, OpcodeCountRow, RecipientRow,
     },
-    divergence::{Bucket, EventLog},
+    divergence::{AggregateClass, EventLog},
 };
 
 fn main() {
@@ -39,7 +39,8 @@ fn main() {
             tx_index: 0,
             tx_hash: B256::repeat_byte(0xdd),
             timestamp: 1_700_000_000,
-            bucket: Bucket::ContractBroken,
+            // OOG break (stipend bottleneck), not an outer-limit-only failure.
+            outer_limit_only_failure: Some(false),
             sender: Address::repeat_byte(0x11),
             recipient: Some(Address::repeat_byte(0x22)),
             is_create: false,
@@ -59,7 +60,6 @@ fn main() {
             schedule_gas_refunded: Some(0),
             schedule_intrinsic_gas: Some(21_000),
             schedule_floor_gas: Some(21_000),
-            would_fit_in_original_limit: Some(false),
             min_multiplier_to_succeed: Some(1.25),
             divergence_contract: Some(Address::repeat_byte(0x22)),
             divergence_pc: Some(123),
@@ -74,15 +74,9 @@ fn main() {
             oog_chain_proportional: Some(false),
             oog_bottleneck_depth: Some(1),
             oog_bottleneck_kind: Some("Stipend2300".into()),
-            schedule_state_gas_spent: None,
-            schedule_state_gas_demanded: None,
-            schedule_initial_state_gas: None,
-            schedule_initial_reservoir: None,
-            runtime_state_gas: None,
-            runtime_state_gas_spillover: None,
-            state_gas_category: None,
-            reservoir_exhausted: None,
-            replay_halt_oog: None,
+            additional_gas_charged: Some(20_000),
+            failure_selector_path: Some("[\"0x12345678\"]".into()),
+            ..Default::default()
         },
         call_frames: vec![CallFrameRow {
             call_index: 0,
@@ -102,8 +96,9 @@ fn main() {
             parent_gas_at_call: None,
             gas_requested_on_stack: None,
             eip150_cap_binding: None,
-            state_gas_running: None,
             deployed_bytecode_len: None,
+            repricing_gas_delta: 0,
+            ..Default::default()
         }],
         opcode_counts: vec![OpcodeCountRow {
             call_index: 0,
@@ -112,6 +107,8 @@ fn main() {
             gas_baseline: 60_000,
             gas_schedule: 75_000,
         }],
+        baseline_call_frames: vec![],
+        baseline_opcode_counts: vec![],
         baseline_event_logs: vec![],
         schedule_event_logs: vec![EventLog {
             log_index: 0,
@@ -129,29 +126,27 @@ fn main() {
             block_hash: B256::repeat_byte(0xb1),
             parent_hash: B256::repeat_byte(0xa0),
             timestamp: 1_700_000_000,
-            tx_count: 1,
+            // Two txs: the stored (per-tx forensic) break below, plus one
+            // gas-only tx that rolls into the aggregate class summary.
+            tx_count: 2,
             tx_count_unchanged: 0,
-            tx_count_trace_only: 0,
-            tx_count_gas_only: 0,
-            tx_count_event_logs_changed: 0,
-            tx_count_schedule_rescued: 0,
-            tx_count_wallet_fixable_shallow: 0,
-            tx_count_wallet_fixable_deep_chain: 0,
-            tx_count_inconclusive_needs_higher_sweep: 0,
-            tx_count_contract_broken: 1,
-            tx_count_aa_gas_reestimation: 0,
+            tx_count_gas_only: 1,
+            tx_count_stored: 1,
+            block_gas_used: 15_000_000,
+            block_gas_limit: 30_000_000,
         },
+        // One aggregate-class summary keyed by `class` (the gas-only cohort).
         summaries: vec![BlockSummaryRow {
             schedule_name: "eip-8037".into(),
             block_number: 22_000_000,
-            bucket: Bucket::ContractBroken,
+            class: AggregateClass::GasOnly,
             tx_count: 1,
             gas_delta_sum: Some(20_000),
             gas_delta_sum_sq: Some(20_000i64 * 20_000),
             gas_delta_min: Some(20_000),
             gas_delta_max: Some(20_000),
             gas_delta_log2_hist: Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
-            opcode_totals_7904: vec![OpcodeBucketTotal {
+            opcode_totals: vec![OpcodeBucketTotal {
                 opcode: 0x55,
                 count: 3,
                 gas_baseline: 60_000,
@@ -164,8 +159,21 @@ fn main() {
             tx_count_authorization: None,
             tx_count_runtime_state: None,
             tx_count_no_state: None,
+            cold_account_access_count: None,
+            storage_drivers: None,
+            account_drivers: None,
         }],
         drill_ins: vec![drill_in],
+        // One recipient rollup row keyed by the same aggregate `class`.
+        recipients: vec![RecipientRow {
+            schedule_name: "eip-8037".into(),
+            block_number: 22_000_000,
+            class: AggregateClass::GasOnly,
+            recipient: format!("{:#x}", Address::repeat_byte(0x22)),
+            top_selector: [0x12, 0x34, 0x56, 0x78],
+            tx_count: 1,
+            gas_delta_sum_succeeding: 20_000,
+        }],
     })
     .unwrap();
 
