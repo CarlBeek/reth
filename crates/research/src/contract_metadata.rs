@@ -144,7 +144,7 @@ impl<'a> Cursor<'a> {
         Self { buf, pos: 0 }
     }
 
-    fn next(&mut self) -> Result<u8, MetadataParseError> {
+    const fn next(&mut self) -> Result<u8, MetadataParseError> {
         if self.pos >= self.buf.len() {
             return Err(MetadataParseError::CborDecode("truncated"));
         }
