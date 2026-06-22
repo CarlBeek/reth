@@ -1914,6 +1914,105 @@ impl DivergenceDatabase {
         Ok(item)
     }
 
+    /// Drain up to `limit` most-due export items (oldest `pending`/`retry` with
+    /// `next_attempt_at <= now`), same ordering as [`Self::next_due_export`]. The
+    /// lock is released before the caller contacts `ClickHouse`.
+    pub fn next_due_exports(
+        &self,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<OutboxItem>, DatabaseError> {
+        let conn = self.conn.lock().expect("SQLite connection mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT export_id, analysis_config_hash, schedule_name, schedule_config_hash,
+                    block_number, block_hash, payload_version, payload_zstd,
+                    payload_hash, payload_bytes, attempts, created_at
+             FROM export_outbox
+             WHERE state IN ('pending', 'retry') AND next_attempt_at <= ?
+             ORDER BY next_attempt_at ASC, created_at ASC
+             LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![now as i64, limit as i64], |row| {
+            let block_hash: Vec<u8> = row.get(5)?;
+            let payload_hash: Vec<u8> = row.get(8)?;
+            Ok(OutboxItem {
+                export_id: row.get(0)?,
+                analysis_config_hash: row.get(1)?,
+                schedule_name: row.get(2)?,
+                schedule_config_hash: row.get(3)?,
+                block_number: row.get::<_, i64>(4)? as u64,
+                block_hash: B256::from_slice(&block_hash),
+                payload_version: row.get::<_, i64>(6)? as u16,
+                payload_zstd: row.get(7)?,
+                payload_hash: B256::from_slice(&payload_hash),
+                payload_bytes: row.get::<_, i64>(9)? as usize,
+                attempts: row.get::<_, i64>(10)? as u32,
+                created_at: row.get::<_, i64>(11)? as u64,
+            })
+        })?;
+        let mut items = Vec::new();
+        for item in rows {
+            items.push(item?);
+        }
+        Ok(items)
+    }
+
+    /// Mark many outbox rows `exported` in one transaction (coverage confirmed).
+    pub fn mark_exported_batch(
+        &self,
+        export_ids: &[String],
+        exported_at: u64,
+    ) -> Result<(), DatabaseError> {
+        if export_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().expect("SQLite connection mutex poisoned");
+        let tx = conn.transaction()?;
+        {
+            let now = current_unix_seconds() as i64;
+            let mut stmt = tx.prepare(
+                "UPDATE export_outbox
+                 SET state = 'exported', exported_at = ?, last_error = NULL, updated_at = ?
+                 WHERE export_id = ?",
+            )?;
+            for id in export_ids {
+                stmt.execute(params![exported_at as i64, now, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Move many outbox rows to `retry` in one transaction, incrementing each
+    /// row's `attempts` and scheduling the shared `next_attempt_at`.
+    pub fn mark_export_retry_batch(
+        &self,
+        export_ids: &[String],
+        next_attempt_at: u64,
+        error: &str,
+    ) -> Result<(), DatabaseError> {
+        if export_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().expect("SQLite connection mutex poisoned");
+        let tx = conn.transaction()?;
+        {
+            let now = current_unix_seconds() as i64;
+            let err = truncate_error(error);
+            let mut stmt = tx.prepare(
+                "UPDATE export_outbox
+                 SET state = 'retry', attempts = attempts + 1, next_attempt_at = ?,
+                     last_error = ?, updated_at = ?
+                 WHERE export_id = ?",
+            )?;
+            for id in export_ids {
+                stmt.execute(params![next_attempt_at as i64, err, now, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Record a transient export failure: bump `attempts`, schedule the next
     /// attempt, store a shortened error, and move the row to `retry`.
     pub fn mark_export_retry(

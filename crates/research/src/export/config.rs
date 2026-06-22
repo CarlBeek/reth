@@ -48,6 +48,12 @@ const fn default_exported_retention_secs() -> u64 {
 const fn default_max_pending_bytes() -> u64 {
     50 * 1024 * 1024 * 1024
 }
+const fn default_export_batch_items() -> usize {
+    1000
+}
+const fn default_export_insert_concurrency() -> usize {
+    4
+}
 
 /// Errors raised while loading or validating the export configuration.
 #[derive(Debug, Error)]
@@ -135,6 +141,10 @@ struct RawConfig {
     max_batch_rows: usize,
     #[serde(default = "default_max_batch_bytes")]
     max_batch_bytes: usize,
+    #[serde(default = "default_export_batch_items")]
+    export_batch_items: usize,
+    #[serde(default = "default_export_insert_concurrency")]
+    export_insert_concurrency: usize,
     #[serde(default = "default_max_single_row_bytes")]
     max_single_row_bytes: usize,
     #[serde(default = "default_exported_retention_secs")]
@@ -169,6 +179,10 @@ pub struct ExportConfig {
     pub max_batch_rows: usize,
     /// Maximum encoded bytes per insert request.
     pub max_batch_bytes: usize,
+    /// Outbox items drained and inserted per cycle.
+    pub export_batch_items: usize,
+    /// Max parallel insert requests in flight per cycle.
+    pub export_insert_concurrency: usize,
     /// Hard limit above which a single row is permanently blocked.
     pub max_single_row_bytes: usize,
     /// How long exported audit rows are retained before pruning.
@@ -239,6 +253,8 @@ impl ExportConfig {
             retry_max: Duration::from_secs(raw.retry_max_secs),
             max_batch_rows: raw.max_batch_rows.max(1),
             max_batch_bytes: raw.max_batch_bytes.max(1),
+            export_batch_items: raw.export_batch_items.max(1),
+            export_insert_concurrency: raw.export_insert_concurrency.max(1),
             max_single_row_bytes: raw.max_single_row_bytes.max(1),
             exported_retention: Duration::from_secs(raw.exported_retention_secs),
             max_pending_bytes: raw.max_pending_bytes,
@@ -274,6 +290,8 @@ impl ExportConfig {
             retry_max: Duration::from_secs(60),
             max_batch_rows: 1000,
             max_batch_bytes: 8 * 1024 * 1024,
+            export_batch_items: 1000,
+            export_insert_concurrency: 4,
             max_single_row_bytes: 16 * 1024 * 1024,
             exported_retention: Duration::from_secs(604_800),
             max_pending_bytes: 50 * 1024 * 1024 * 1024,
@@ -298,6 +316,8 @@ mod tests {
             retry_max_secs: default_retry_max_secs(),
             max_batch_rows: default_max_batch_rows(),
             max_batch_bytes: default_max_batch_bytes(),
+            export_batch_items: default_export_batch_items(),
+            export_insert_concurrency: default_export_insert_concurrency(),
             max_single_row_bytes: default_max_single_row_bytes(),
             exported_retention_secs: default_exported_retention_secs(),
             max_pending_bytes: default_max_pending_bytes(),
@@ -375,5 +395,21 @@ mod tests {
         let config =
             ExportConfig::from_raw(raw("http://127.0.0.1:8123", "default", "PW_LOCAL"), false);
         assert!(config.is_ok());
+    }
+
+    #[test]
+    fn export_batch_knobs_default_and_clamp() {
+        // SAFETY: test-only mutation of a process-unique env var.
+        unsafe { std::env::set_var("PW_KNOBS", "x") };
+        let cfg =
+            ExportConfig::from_raw(raw("https://x:8443", "default", "PW_KNOBS"), true).unwrap();
+        assert_eq!(cfg.export_batch_items, 1000);
+        assert_eq!(cfg.export_insert_concurrency, 4);
+        let mut r = raw("https://x:8443", "default", "PW_KNOBS");
+        r.export_batch_items = 0;
+        r.export_insert_concurrency = 0;
+        let cfg = ExportConfig::from_raw(r, true).unwrap();
+        assert_eq!(cfg.export_batch_items, 1);
+        assert_eq!(cfg.export_insert_concurrency, 1);
     }
 }

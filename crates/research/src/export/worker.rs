@@ -20,10 +20,14 @@ use crate::{
         model::{block_output_to_rows, AnalysisManifestV1, ExportEnvelopeV1, RunRow},
     },
 };
+use alloy_primitives::keccak256;
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinSet,
+};
 use tracing::{debug, error, warn};
 
 /// How often the worker prunes old exported audit rows.
@@ -113,13 +117,16 @@ pub async fn run_export_worker(
 }
 
 /// The drain loop, generic over the sink for testability.
-async fn run_loop<S: ClickHouseSink>(
+async fn run_loop<S>(
     db: DivergenceDatabase,
     config: ExportConfig,
     sink: S,
     mut shutdown: watch::Receiver<bool>,
     fatal_tx: mpsc::Sender<ExportError>,
-) -> Result<(), ExportError> {
+) -> Result<(), ExportError>
+where
+    S: ClickHouseSink + Clone + Send + Sync + 'static,
+{
     let mut last_prune = now_secs();
 
     loop {
@@ -128,55 +135,19 @@ async fn run_loop<S: ClickHouseSink>(
         }
 
         let now = now_secs();
-        let due = run_db(&db, move |db| db.next_due_export(now)).await?;
+        let limit = config.export_batch_items;
+        let items = run_db(&db, move |db| db.next_due_exports(now, limit)).await?;
 
-        let Some(item) = due else {
+        if items.is_empty() {
             // Nothing due — wait for the poll interval or an early shutdown.
             tokio::select! {
                 _ = shutdown.changed() => {},
                 _ = tokio::time::sleep(config.poll_interval) => {},
             }
             continue;
-        };
-
-        match process_item(&db, &config, &sink, &item, now_secs()).await {
-            Ok(()) => {
-                let id = item.export_id.clone();
-                run_db(&db, move |db| db.mark_exported(&id, now_secs())).await?;
-                debug!(
-                    target: "exex::research::export",
-                    export_id = %item.export_id,
-                    block = item.block_number,
-                    "exported block to ClickHouse"
-                );
-            }
-            Err(ItemError::Block(msg)) => {
-                error!(
-                    target: "exex::research::export",
-                    export_id = %item.export_id,
-                    block = item.block_number,
-                    error = %msg,
-                    "export item permanently blocked; will not retry"
-                );
-                let id = item.export_id.clone();
-                run_db(&db, move |db| db.mark_export_blocked(&id, &msg)).await?;
-            }
-            Err(ItemError::Retry(msg)) => {
-                let attempts = item.attempts.saturating_add(1);
-                let next_at = now_secs().saturating_add(retry_delay_secs(&config, attempts));
-                warn!(
-                    target: "exex::research::export",
-                    export_id = %item.export_id,
-                    block = item.block_number,
-                    attempts,
-                    retry_at = next_at,
-                    error = %msg,
-                    "export attempt failed; scheduling retry"
-                );
-                let id = item.export_id.clone();
-                run_db(&db, move |db| db.mark_export_retry(&id, attempts, next_at, &msg)).await?;
-            }
         }
+
+        export_batch(&db, &config, &sink, items, now_secs()).await?;
 
         // Backlog protection: fail loudly rather than grow the outbox forever.
         let stats = run_db(&db, move |db| db.export_backlog_stats(now_secs())).await?;
@@ -229,15 +200,35 @@ enum ItemError {
     Block(String),
 }
 
-/// Decode, validate, convert, and insert one outbox item. Returns `Ok(())` once
-/// the coverage row has landed.
-async fn process_item<S: ClickHouseSink>(
+/// Pre-serialized rows for one outbox item, ready to group into a batch. Produced
+/// by [`decode_item`]; the per-row `max_single_row_bytes` check has already passed.
+struct DecodedRows {
+    export_id: String,
+    config_hash: String,
+    run_line: String,
+    divergence_lines: Vec<String>,
+    summary_lines: Vec<String>,
+    coverage_line: String,
+}
+
+/// Rows from many items grouped by destination table, for batched insertion.
+struct GroupedBatch {
+    run_lines: Vec<String>,
+    divergence_lines: Vec<String>,
+    summary_lines: Vec<String>,
+    coverage_lines: Vec<String>,
+    ids: Vec<String>,
+}
+
+/// Decode, validate, convert, and serialize one outbox item's rows. Permanent
+/// problems (bad payload, missing manifest, oversized row) → `Block`; a transient
+/// manifest-lookup failure → `Retry`. Does not contact `ClickHouse`.
+async fn decode_item(
     db: &DivergenceDatabase,
     config: &ExportConfig,
-    sink: &S,
     item: &OutboxItem,
     now: u64,
-) -> Result<(), ItemError> {
+) -> Result<DecodedRows, ItemError> {
     let envelope = ExportEnvelopeV1::decode(&item.payload_zstd, item.payload_hash)
         .map_err(|e| ItemError::Block(format!("payload decode/verify failed: {e}")))?;
     if envelope.analysis_config_hash != item.analysis_config_hash {
@@ -276,20 +267,266 @@ async fn process_item<S: ClickHouseSink>(
     let summary_lines = serialize_rows(&rows.summaries)?;
     let coverage_line = serialize_row(&rows.coverage)?;
 
-    // Order matters: run → divergences → summaries → coverage (last).
-    insert_serialized(sink, config, DestinationTable::Run, &[run_line], &item.export_id).await?;
+    for line in std::iter::once(&run_line)
+        .chain(&divergence_lines)
+        .chain(&summary_lines)
+        .chain(std::iter::once(&coverage_line))
+    {
+        if line.len() > config.max_single_row_bytes {
+            return Err(ItemError::Block(format!(
+                "row exceeds max_single_row_bytes ({} > {})",
+                line.len(),
+                config.max_single_row_bytes
+            )));
+        }
+    }
+
+    Ok(DecodedRows {
+        export_id: item.export_id.clone(),
+        config_hash: item.analysis_config_hash.clone(),
+        run_line,
+        divergence_lines,
+        summary_lines,
+        coverage_line,
+    })
+}
+
+/// Per-item export path (the fallback used when a batch hits a permanent error):
+/// decode one item and insert its tables in order — run → divergences → summaries
+/// → coverage (last).
+async fn process_item<S: ClickHouseSink>(
+    db: &DivergenceDatabase,
+    config: &ExportConfig,
+    sink: &S,
+    item: &OutboxItem,
+    now: u64,
+) -> Result<(), ItemError> {
+    let d = decode_item(db, config, item, now).await?;
+    insert_serialized(sink, config, DestinationTable::Run, &[d.run_line], &item.export_id).await?;
     insert_serialized(
         sink,
         config,
         DestinationTable::Divergence,
-        &divergence_lines,
+        &d.divergence_lines,
         &item.export_id,
     )
     .await?;
-    insert_serialized(sink, config, DestinationTable::Summary, &summary_lines, &item.export_id)
+    insert_serialized(sink, config, DestinationTable::Summary, &d.summary_lines, &item.export_id)
         .await?;
-    insert_serialized(sink, config, DestinationTable::Coverage, &[coverage_line], &item.export_id)
+    insert_serialized(
+        sink,
+        config,
+        DestinationTable::Coverage,
+        &[d.coverage_line],
+        &item.export_id,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Group many decoded items' rows by destination table. The run row is deduped to
+/// one per distinct `analysis_config_hash` (it is identical across a dataset's items).
+fn group_decoded(items: Vec<DecodedRows>) -> GroupedBatch {
+    let mut g = GroupedBatch {
+        run_lines: Vec::new(),
+        divergence_lines: Vec::new(),
+        summary_lines: Vec::new(),
+        coverage_lines: Vec::new(),
+        ids: Vec::new(),
+    };
+    let mut seen_run = std::collections::HashSet::new();
+    for it in items {
+        if seen_run.insert(it.config_hash.clone()) {
+            g.run_lines.push(it.run_line);
+        }
+        g.divergence_lines.extend(it.divergence_lines);
+        g.summary_lines.extend(it.summary_lines);
+        g.coverage_lines.push(it.coverage_line);
+        g.ids.push(it.export_id);
+    }
+    g
+}
+
+/// Split serialized rows into chunks bounded by `max_batch_rows`/`max_batch_bytes`,
+/// returning the newline-delimited `JSONEachRow` chunk bodies. Empty input → empty.
+fn chunk_lines(config: &ExportConfig, lines: &[String]) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut chunk = String::new();
+    let mut chunk_rows = 0usize;
+    for row in lines {
+        let would_overflow = chunk_rows >= config.max_batch_rows ||
+            (!chunk.is_empty() && chunk.len() + 1 + row.len() > config.max_batch_bytes);
+        if chunk_rows > 0 && would_overflow {
+            chunks.push(std::mem::take(&mut chunk));
+            chunk_rows = 0;
+        }
+        if !chunk.is_empty() {
+            chunk.push('\n');
+        }
+        chunk.push_str(row);
+        chunk_rows += 1;
+    }
+    if chunk_rows > 0 {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+/// Map a `ClickHouse` failure to a per-item outcome (retry vs permanent block).
+fn map_ch_err(e: ClickHouseError) -> ItemError {
+    if e.is_retryable() {
+        ItemError::Retry(e.to_string())
+    } else {
+        ItemError::Block(e.to_string())
+    }
+}
+
+/// Insert one table's rows as chunked `JSONEachRow` batches with up to
+/// `export_insert_concurrency` requests in flight. The dedup token is a content
+/// hash, so an identical chunk re-sent on retry is deduplicated by `ClickHouse`,
+/// and `ReplacingMergeTree` collapses any survivors. Returns on the first error,
+/// aborting outstanding requests.
+async fn insert_lines_concurrent<S>(
+    sink: &S,
+    config: &ExportConfig,
+    table: DestinationTable,
+    lines: &[String],
+) -> Result<(), ItemError>
+where
+    S: ClickHouseSink + Clone + Send + Sync + 'static,
+{
+    let chunks = chunk_lines(config, lines);
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    let mut set: JoinSet<Result<(), ItemError>> = JoinSet::new();
+    let mut iter = chunks.into_iter();
+    for _ in 0..config.export_insert_concurrency {
+        let Some(body) = iter.next() else { break };
+        let s = sink.clone();
+        set.spawn(async move {
+            let token = format!("{}:{:x}", table.name(), keccak256(body.as_bytes()));
+            s.insert_rows(table, body, token).await.map_err(map_ch_err)
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(ItemError::Retry(format!("insert task join error: {e}"))),
+        }
+        if let Some(body) = iter.next() {
+            let s = sink.clone();
+            set.spawn(async move {
+                let token = format!("{}:{:x}", table.name(), keccak256(body.as_bytes()));
+                s.insert_rows(table, body, token).await.map_err(map_ch_err)
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Export one drained batch end to end: partition (bad items blocked/retried
+/// individually) → group by table → Phase 1 inserts run/divergence/summary
+/// concurrently, then a barrier, then Phase 2 inserts coverage → mark the batch
+/// `exported`. A transient batch error retries the whole batch; a permanent one
+/// falls back to per-item isolation via [`process_item`].
+async fn export_batch<S>(
+    db: &DivergenceDatabase,
+    config: &ExportConfig,
+    sink: &S,
+    items: Vec<OutboxItem>,
+    now: u64,
+) -> Result<(), ExportError>
+where
+    S: ClickHouseSink + Clone + Send + Sync + 'static,
+{
+    let mut good = Vec::new();
+    let mut max_attempts = 0u32;
+    for item in &items {
+        max_attempts = max_attempts.max(item.attempts);
+        match decode_item(db, config, item, now).await {
+            Ok(rows) => good.push(rows),
+            Err(ItemError::Block(msg)) => {
+                let id = item.export_id.clone();
+                run_db(db, move |db| db.mark_export_blocked(&id, &msg)).await?;
+            }
+            Err(ItemError::Retry(msg)) => {
+                let attempts = item.attempts.saturating_add(1);
+                let next = now.saturating_add(retry_delay_secs(config, attempts));
+                let id = item.export_id.clone();
+                run_db(db, move |db| db.mark_export_retry(&id, attempts, next, &msg)).await?;
+            }
+        }
+    }
+    if good.is_empty() {
+        return Ok(());
+    }
+
+    let batch = group_decoded(good);
+    let ids = batch.ids.clone();
+
+    // Phase 1: everything except coverage (concurrent), then a barrier.
+    let phase1 = async {
+        insert_lines_concurrent(sink, config, DestinationTable::Run, &batch.run_lines).await?;
+        insert_lines_concurrent(
+            sink,
+            config,
+            DestinationTable::Divergence,
+            &batch.divergence_lines,
+        )
         .await?;
+        insert_lines_concurrent(sink, config, DestinationTable::Summary, &batch.summary_lines).await
+    };
+    // Phase 2: coverage last — only once every other row for the batch landed.
+    let outcome = match phase1.await {
+        Ok(()) => {
+            insert_lines_concurrent(sink, config, DestinationTable::Coverage, &batch.coverage_lines)
+                .await
+        }
+        Err(e) => Err(e),
+    };
+
+    match outcome {
+        Ok(()) => {
+            run_db(db, move |db| db.mark_exported_batch(&ids, now_secs())).await?;
+        }
+        Err(ItemError::Retry(msg)) => {
+            let next =
+                now_secs().saturating_add(retry_delay_secs(config, max_attempts.saturating_add(1)));
+            warn!(
+                target: "exex::research::export",
+                error = %msg, n = ids.len(),
+                "export batch failed transiently; scheduling retry"
+            );
+            run_db(db, move |db| db.mark_export_retry_batch(&ids, next, &msg)).await?;
+        }
+        Err(ItemError::Block(msg)) => {
+            warn!(
+                target: "exex::research::export",
+                error = %msg, n = ids.len(),
+                "permanent batch error; isolating per item"
+            );
+            for item in items.iter().filter(|i| ids.contains(&i.export_id)) {
+                match process_item(db, config, sink, item, now_secs()).await {
+                    Ok(()) => {
+                        let id = item.export_id.clone();
+                        run_db(db, move |db| db.mark_exported(&id, now_secs())).await?;
+                    }
+                    Err(ItemError::Block(m)) => {
+                        let id = item.export_id.clone();
+                        run_db(db, move |db| db.mark_export_blocked(&id, &m)).await?;
+                    }
+                    Err(ItemError::Retry(m)) => {
+                        let attempts = item.attempts.saturating_add(1);
+                        let next = now_secs().saturating_add(retry_delay_secs(config, attempts));
+                        let id = item.export_id.clone();
+                        run_db(db, move |db| db.mark_export_retry(&id, attempts, next, &m)).await?;
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -785,6 +1022,69 @@ mod tests {
 
         // Not exported; left as retry for a later attempt.
         assert_eq!(outbox_state(&db, &export_id), Some("retry".to_string()));
+    }
+
+    #[tokio::test]
+    async fn batched_insert_keeps_coverage_after_all_others() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        for b in 30..33u64 {
+            let mut cov = coverage(b, 1);
+            cov.block_hash = B256::repeat_byte(b as u8);
+            let output = BlockOutput {
+                coverage: cov,
+                summaries: vec![summary(b)],
+                drill_ins: vec![divergence(b)],
+                recipients: vec![],
+            };
+            seed(&db, output);
+        }
+        let sink = FakeSink::new();
+        let config = test_config();
+        let items = db.next_due_exports(now_secs() + 1, 100).unwrap();
+        assert_eq!(items.len(), 3);
+        let ids: Vec<String> = items.iter().map(|i| i.export_id.clone()).collect();
+        export_batch(&db, &config, &sink, items, now_secs()).await.unwrap();
+
+        // Every non-coverage insert precedes every coverage insert (the barrier).
+        let tables = sink.tables();
+        let last_other = tables.iter().rposition(|t| *t != DestinationTable::Coverage);
+        let first_cov = tables.iter().position(|t| *t == DestinationTable::Coverage);
+        assert!(
+            matches!((last_other, first_cov), (Some(l), Some(f)) if l < f),
+            "coverage must come after all others: {tables:?}"
+        );
+        for id in &ids {
+            assert_eq!(outbox_state(&db, id).as_deref(), Some("exported"));
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_failure_retries_whole_batch_without_partial_coverage() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        for b in 40..42u64 {
+            let mut cov = coverage(b, 1);
+            cov.block_hash = B256::repeat_byte(b as u8);
+            let output = BlockOutput {
+                coverage: cov,
+                summaries: vec![summary(b)],
+                drill_ins: vec![divergence(b)],
+                recipients: vec![],
+            };
+            seed(&db, output);
+        }
+        let sink = FakeSink::new();
+        sink.fail_on(DestinationTable::Divergence, ClickHouseError::Transient("nope".into()));
+        let config = test_config();
+        let items = db.next_due_exports(now_secs() + 1, 100).unwrap();
+        assert_eq!(items.len(), 2);
+        let ids: Vec<String> = items.iter().map(|i| i.export_id.clone()).collect();
+        export_batch(&db, &config, &sink, items, now_secs()).await.unwrap();
+
+        // No coverage sent, and the whole batch is back to retry (no partial export).
+        assert!(!sink.tables().contains(&DestinationTable::Coverage));
+        for id in &ids {
+            assert_eq!(outbox_state(&db, id).as_deref(), Some("retry"));
+        }
     }
 
     fn outbox_state(db: &DivergenceDatabase, export_id: &str) -> Option<String> {

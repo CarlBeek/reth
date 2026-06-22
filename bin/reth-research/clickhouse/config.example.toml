@@ -35,6 +35,14 @@ retry_max_secs = 60
 max_batch_rows = 1000
 max_batch_bytes = 8388608 # 8 MiB
 
+# How many outbox items to drain and insert per cycle. Larger batches mean fewer,
+# bigger ClickHouse INSERTs — the main lever for bulk-backfill throughput.
+export_batch_items = 1000
+
+# Maximum insert requests in flight at once per cycle. Keep modest on a shared
+# cluster; raise after coordinating with the warehouse operator.
+export_insert_concurrency = 4
+
 # A single row larger than this is permanently blocked (not retried).
 max_single_row_bytes = 16777216 # 16 MiB
 
