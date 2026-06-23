@@ -51,11 +51,17 @@ thiserror.workspace = true
 # `default-features = false` mirrors the workspace declaration (rustls
 # + stream features only — no native-tls baggage).
 reqwest = { workspace = true, features = ["json", "query"] }
-tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros", "net", "io-util"] }
 
 # Config-file parsing for the optional label-backfill credentials
 # (Etherscan API key, URL overrides).
 toml = { workspace = true }
+
+# Compression for the durable export-outbox payloads. The block-output
+# envelope is JSON-encoded then ZSTD-compressed before it's written to
+# SQLite, so a ClickHouse outage grows the outbox far more slowly than
+# raw JSON would. See `export/model.rs`.
+zstd = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.0"
@@ -63,5 +69,5 @@ tempfile = "3.0"
 [features]
 default = []
 test-utils = [
-	"reth-evm/test-utils"
+    "reth-evm/test-utils",
 ]

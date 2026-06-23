@@ -50,6 +50,8 @@ same schedule.
 - `--research.max-divergences-per-block N`
 - `--research.metadata-backfill` (run the contract-metadata backfill in
   one-shot mode instead of starting live analysis; see below)
+- `--research.export-config-path PATH` (enable durable ClickHouse export; see
+  [ClickHouse Export](#clickhouse-export))
 
 At least one schedule flag is required.
 
@@ -182,6 +184,67 @@ After the backfill completes the process exits; the node launch is just
 to get a provider handle on reth state. At least one schedule flag is
 still required because reth-research's CLI parser shares args with the
 live mode.
+
+## ClickHouse Export
+
+Optional. When `--research.export-config-path` points at a TOML config, every
+analyzed block output is also shipped to ClickHouse. SQLite remains the local
+source of truth; ClickHouse is a downstream copy.
+
+### Architecture
+
+```text
+block replay -> BlockOutput
+  -> SQLite analytical rows + export_outbox row (one transaction)
+  -> embedded async export worker
+  -> ClickHouse HTTPS JSONEachRow inserts
+```
+
+The outbox row is written in the **same SQLite transaction** as the analytical
+rows, so there is no crash window where a block is durable locally but its
+export request is lost. An embedded worker drains the outbox and inserts the run
+manifest, divergences, summaries, then **coverage last** (the remote completion
+marker). Delivery is at-least-once; deterministic row IDs plus ClickHouse
+`ReplacingMergeTree` make re-sends idempotent, so a crash mid-flight is recovered
+by simply retrying.
+
+Remote outages never block replay or the SQLite writer. They grow the outbox on
+disk instead; that is observable (logged pending count/bytes/age) and bounded by
+`max_pending_bytes` — once exceeded the process stops loudly rather than grow
+without bound.
+
+### Config
+
+The destination schema lives in
+[`clickhouse/migrations`](./clickhouse/migrations) — golang-migrate up/down
+pairs that create a dedicated `gas_analysis` database with
+`ReplicatedReplacingMergeTree` local tables + `Distributed` wrappers,
+`ON CLUSTER '{cluster}'`. An example config is in
+[`clickhouse/config.example.toml`](./clickhouse/config.example.toml):
+
+```toml
+endpoint = "https://clickhouse.example.org:8443"   # must be https://
+database = "gas_analysis"                            # defaults to gas_analysis
+username = "gas_analysis"
+password_env = "CLICKHOUSE_PASSWORD"                 # password read from env, never a flag
+# ... batching/retry/backlog tunables, optional ca_cert_path ...
+```
+
+The password is **never** a CLI argument or a value in the file — it is resolved
+once at startup from the environment variable named by `password_env`. Grant the
+ingest account only `INSERT` on the four destination tables plus the metadata
+read needed for the startup `DESCRIBE TABLE` schema check.
+
+Apply the migrations in `clickhouse/migrations` to your cluster first (column
+names and types are the fixed producer contract). Then:
+
+```bash
+export CLICKHOUSE_PASSWORD=...
+cargo run --release -p reth-research-bin -- node \
+  --research.eip2780 \
+  --research.db-path ./divergences.sqlite \
+  --research.export-config-path ./clickhouse/config.example.toml
+```
 
 ## Important Limits
 

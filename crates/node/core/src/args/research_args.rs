@@ -110,6 +110,15 @@ pub struct ResearchArgs {
     )]
     pub backfill_min_block: u64,
 
+    /// Inclusive upper bound for backfill. The cursor starts at
+    /// `min(head - 1, backfill_max_block)` and walks down to
+    /// `backfill_min_block`. `None` (the default) starts at `head - 1`
+    /// (today's behavior). Set both bounds to analyze an explicit
+    /// `[min, max]` window — needed for windowed re-analysis, where a fresh
+    /// per-window database carries no dedup state.
+    #[arg(long = "research.backfill-max-block", value_name = "BLOCK", help_heading = "Research")]
+    pub backfill_max_block: Option<u64>,
+
     /// Maximum concurrent backfill workers.
     ///
     /// Each worker analyzes one historical block at a time on a blocking
@@ -181,6 +190,18 @@ pub struct ResearchArgs {
     /// with default mainnet endpoints and no Etherscan rung.
     #[arg(long = "research.label-config-path", value_name = "PATH", help_heading = "Research")]
     pub label_config_path: Option<PathBuf>,
+
+    /// Path to the strict `ClickHouse` export `TOML` config. When set, each
+    /// analyzed block output is durably enqueued in a `SQLite` outbox and
+    /// shipped to `ClickHouse` by an embedded worker. Export is disabled when
+    /// absent.
+    ///
+    /// The endpoint must be `https://`; the password is resolved at startup from
+    /// the environment variable named by `password_env` in the file (never the
+    /// command line). Requires a real on-disk `--research.db-path` (not
+    /// `:memory:`).
+    #[arg(long = "research.export-config-path", value_name = "PATH", help_heading = "Research")]
+    pub export_config_path: Option<PathBuf>,
 }
 
 impl Default for ResearchArgs {
@@ -191,18 +212,21 @@ impl Default for ResearchArgs {
             eip8038: false,
             csv_schedules: Vec::new(),
             multiplier_schedules: Vec::new(),
-            db_path: PathBuf::from("./divergence.db"),
+            // Keep in sync with the `#[arg(default_value = ...)]` on `db_path`.
+            db_path: PathBuf::from("./divergences.sqlite"),
             start_block: 0,
             max_divergences_per_block: None,
             gas_limit_multipliers: vec![1, 2, 4, 8],
             backfill: false,
             backfill_min_block: 0,
+            backfill_max_block: None,
             backfill_concurrency: 0,
             metadata_backfill: false,
             metadata_backfill_interval_secs: 60,
             contract_labels_interval_secs: 0,
             function_signatures_interval_secs: 0,
             label_config_path: None,
+            export_config_path: None,
         }
     }
 }
@@ -447,6 +471,39 @@ mod tests {
         assert_eq!(args.max_divergences_per_block, Some(25));
         assert_eq!(args.gas_limit_multipliers, vec![1, 2, 4, 8]);
         assert_eq!(args.schedule_count(), 3);
+    }
+
+    #[test]
+    fn test_parse_research_args_export_disabled_by_default() {
+        let args = CommandParser::<ResearchArgs>::parse_from(["reth"]).args;
+        assert_eq!(args.export_config_path, None);
+    }
+
+    #[test]
+    fn test_parse_research_args_export_config_path() {
+        let args = CommandParser::<ResearchArgs>::parse_from([
+            "reth",
+            "--research.export-config-path",
+            "/etc/reth-research/clickhouse.toml",
+        ])
+        .args;
+        assert_eq!(
+            args.export_config_path,
+            Some(PathBuf::from("/etc/reth-research/clickhouse.toml"))
+        );
+    }
+
+    #[test]
+    fn test_parse_research_args_backfill_max_block() {
+        let args = CommandParser::<ResearchArgs>::parse_from(["reth"]).args;
+        assert_eq!(args.backfill_max_block, None);
+        let args = CommandParser::<ResearchArgs>::parse_from([
+            "reth",
+            "--research.backfill-max-block",
+            "25000000",
+        ])
+        .args;
+        assert_eq!(args.backfill_max_block, Some(25_000_000));
     }
 
     #[test]

@@ -92,7 +92,7 @@ pub struct OperationCounts {
 /// (`PerScheduleResult` / `TxObservation` / the per-class aggregate) — the eight
 /// counts map 1:1 to the explicit `divergences` / `block_summaries` columns at
 /// insert time. See [`OperationCounts`] for the per-field meaning.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(missing_docs)]
 pub struct StorageDrivers {
     pub sload_cold: u64,
@@ -151,7 +151,7 @@ impl StorageDrivers {
 /// `block_summaries` columns at insert time. The first three are runtime
 /// inspector counts; the two access-list counts come from the tx envelope (the
 /// same value for every replay tier).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(missing_docs)]
 pub struct AccountDrivers {
     /// Warm account accesses (`OperationCounts::warm_account_access_count`).

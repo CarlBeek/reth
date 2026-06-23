@@ -9737,6 +9737,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
