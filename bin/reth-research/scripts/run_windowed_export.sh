@@ -47,7 +47,7 @@ MB_PER_BLOCK="${MB_PER_BLOCK:-6}"        # disk budget per analyzed block (obser
 STOP_GRACE_SECS="${STOP_GRACE_SECS:-180}"
 
 # ─── Logging / helpers ────────────────────────────────────────────────────────
-log()  { printf '%s [windowed] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+log()  { printf '%s [windowed] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }  # stderr: never pollute $(read_resume_point)/$(schedule_count) stdout
 halt() { log "HALT: $*"; exit 1; }
 
 # Read-only SQLite query against a (possibly live, WAL-mode) window DB.
