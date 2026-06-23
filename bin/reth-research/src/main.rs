@@ -361,6 +361,9 @@ struct ResearchExEx<Node: FullNodeComponents> {
     backfill_enabled: bool,
     /// Inclusive lower bound for backfill.
     backfill_min_block: u64,
+    /// Inclusive upper bound for backfill; the cursor starts here (clamped to
+    /// `head - 1`) instead of the chain tip. `None` starts at `head - 1`.
+    backfill_max_block: Option<u64>,
     /// Maximum concurrent backfill workers (>= 1 when backfill is enabled).
     backfill_concurrency: usize,
     /// Cursor for the next backfill block, lazily initialized to `head - 1` on
@@ -496,6 +499,7 @@ where
         gas_limit_multipliers: Vec<u64>,
         backfill: bool,
         backfill_min_block: u64,
+        backfill_max_block: Option<u64>,
         backfill_concurrency: usize,
         metadata_backfill_interval_secs: u64,
         contract_labels_interval_secs: u64,
@@ -830,6 +834,7 @@ where
             start_block,
             backfill_enabled,
             backfill_min_block,
+            backfill_max_block,
             backfill_concurrency,
             next_backfill_block: None,
             backfill_exhausted: false,
@@ -849,6 +854,7 @@ where
             schedule_count = self.analyzer.registry.len(),
             backfill_enabled = self.backfill_enabled,
             backfill_min_block = self.backfill_min_block,
+            backfill_max_block = ?self.backfill_max_block,
             backfill_concurrency = self.backfill_concurrency,
             "Multi-schedule Research ExEx started"
         );
@@ -1058,7 +1064,7 @@ where
                 self.backfill_exhausted = true;
                 return Ok(None);
             }
-            let start = head.saturating_sub(1);
+            let start = initial_backfill_cursor(head, self.backfill_max_block);
             if start < self.backfill_min_block {
                 self.backfill_exhausted = true;
                 info!(
@@ -1073,6 +1079,7 @@ where
                 target: "exex::research::backfill",
                 cursor = start,
                 backfill_min_block = self.backfill_min_block,
+                backfill_max_block = ?self.backfill_max_block,
                 concurrency = self.backfill_concurrency,
                 "Backfill cursor initialized"
             );
@@ -2806,6 +2813,7 @@ async fn research_exex<Node: FullNodeComponents>(
     gas_limit_multipliers: Vec<u64>,
     backfill: bool,
     backfill_min_block: u64,
+    backfill_max_block: Option<u64>,
     backfill_concurrency: usize,
     metadata_backfill_interval_secs: u64,
     contract_labels_interval_secs: u64,
@@ -2829,6 +2837,7 @@ where
         gas_limit_multipliers,
         backfill,
         backfill_min_block,
+        backfill_max_block,
         backfill_concurrency,
         metadata_backfill_interval_secs,
         contract_labels_interval_secs,
@@ -3091,6 +3100,7 @@ fn main() -> eyre::Result<()> {
             let gas_limit_multipliers = research_args.gas_limit_multipliers.clone();
             let backfill = research_args.backfill;
             let backfill_min_block = research_args.backfill_min_block;
+            let backfill_max_block = research_args.backfill_max_block;
             let backfill_concurrency = research_args.backfill_concurrency;
             let metadata_backfill_interval_secs =
                 research_args.metadata_backfill_interval_secs;
@@ -3119,6 +3129,7 @@ fn main() -> eyre::Result<()> {
                 gas_limit_multipliers = ?gas_limit_multipliers,
                 backfill,
                 backfill_min_block,
+                backfill_max_block,
                 backfill_concurrency,
                 metadata_backfill_interval_secs,
                 contract_labels_interval_secs,
@@ -3145,6 +3156,7 @@ fn main() -> eyre::Result<()> {
                             gas_limit_multipliers,
                             backfill,
                             backfill_min_block,
+                            backfill_max_block,
                             backfill_concurrency,
                             metadata_backfill_interval_secs,
                             contract_labels_interval_secs,
@@ -3165,11 +3177,34 @@ fn main() -> eyre::Result<()> {
         })
 }
 
+/// Initial backfill cursor: the inclusive upper bound `backfill_max_block`
+/// clamped to `head - 1`, or `head - 1` when unbounded.
+fn initial_backfill_cursor(head: u64, backfill_max_block: Option<u64>) -> u64 {
+    let tip = head.saturating_sub(1);
+    match backfill_max_block {
+        Some(max) => max.min(tip),
+        None => tip,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::Address;
     use reth_research::divergence::{CallFrame, CallType};
+
+    #[test]
+    fn initial_backfill_cursor_respects_max_and_head() {
+        // Unbounded: start at head - 1.
+        assert_eq!(initial_backfill_cursor(100, None), 99);
+        // Inclusive max below head: start exactly at max.
+        assert_eq!(initial_backfill_cursor(100, Some(50)), 50);
+        // Max at or above head: clamp to head - 1 (can't analyze unknown blocks).
+        assert_eq!(initial_backfill_cursor(100, Some(200)), 99);
+        assert_eq!(initial_backfill_cursor(100, Some(99)), 99);
+        // Degenerate head 0 saturates to 0 (the head==0 guard short-circuits earlier).
+        assert_eq!(initial_backfill_cursor(0, Some(50)), 0);
+    }
 
     fn frame_at(call_index: usize, depth: usize) -> CallFrame {
         CallFrame {

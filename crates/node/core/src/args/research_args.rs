@@ -110,6 +110,15 @@ pub struct ResearchArgs {
     )]
     pub backfill_min_block: u64,
 
+    /// Inclusive upper bound for backfill. The cursor starts at
+    /// `min(head - 1, backfill_max_block)` and walks down to
+    /// `backfill_min_block`. `None` (the default) starts at `head - 1`
+    /// (today's behavior). Set both bounds to analyze an explicit
+    /// `[min, max]` window — needed for windowed re-analysis, where a fresh
+    /// per-window database carries no dedup state.
+    #[arg(long = "research.backfill-max-block", value_name = "BLOCK", help_heading = "Research")]
+    pub backfill_max_block: Option<u64>,
+
     /// Maximum concurrent backfill workers.
     ///
     /// Each worker analyzes one historical block at a time on a blocking
@@ -210,6 +219,7 @@ impl Default for ResearchArgs {
             gas_limit_multipliers: vec![1, 2, 4, 8],
             backfill: false,
             backfill_min_block: 0,
+            backfill_max_block: None,
             backfill_concurrency: 0,
             metadata_backfill: false,
             metadata_backfill_interval_secs: 60,
@@ -481,6 +491,19 @@ mod tests {
             args.export_config_path,
             Some(PathBuf::from("/etc/reth-research/clickhouse.toml"))
         );
+    }
+
+    #[test]
+    fn test_parse_research_args_backfill_max_block() {
+        let args = CommandParser::<ResearchArgs>::parse_from(["reth"]).args;
+        assert_eq!(args.backfill_max_block, None);
+        let args = CommandParser::<ResearchArgs>::parse_from([
+            "reth",
+            "--research.backfill-max-block",
+            "25000000",
+        ])
+        .args;
+        assert_eq!(args.backfill_max_block, Some(25_000_000));
     }
 
     #[test]
