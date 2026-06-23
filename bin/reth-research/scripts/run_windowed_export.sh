@@ -43,7 +43,7 @@ CSV_FLAGS="${CSV_FLAGS:-}"               # e.g. --research.csv 7904-prelim=/path
 EXTRA_NODE_FLAGS="${EXTRA_NODE_FLAGS:-}" # e.g. --research.max-divergences-per-block 1024
 POLL_SECS="${POLL_SECS:-30}"
 DRAIN_STABLE_POLLS="${DRAIN_STABLE_POLLS:-3}"
-MB_PER_BLOCK="${MB_PER_BLOCK:-4}"        # disk budget per analyzed block (generous; real ~3.2)
+MB_PER_BLOCK="${MB_PER_BLOCK:-6}"        # disk budget per analyzed block (observed ~5 on heavy recent blocks)
 STOP_GRACE_SECS="${STOP_GRACE_SECS:-180}"
 
 # ─── Logging / helpers ────────────────────────────────────────────────────────
@@ -55,7 +55,7 @@ sqlite_ro() { sqlite3 -readonly "$1" "$2"; }
 
 # Count schedule-producing flags → one block_coverage row per (schedule, block).
 schedule_count() {
-    grep -oE -- '--research\.(eip[0-9]+|csv|multiplier)' <<<"$SCHEDULE_FLAGS $CSV_FLAGS" | wc -l | tr -d ' '
+    { grep -oE -- '--research\.(eip[0-9]+|csv|multiplier)' <<<"$SCHEDULE_FLAGS $CSV_FLAGS" || true; } | wc -l | tr -d ' '
 }
 
 disk_guard() {
@@ -71,6 +71,7 @@ wait_for_pid_exit() {
         sleep 1; i=$((i + 1))
         [ "$i" -ge "$max" ] && halt "node PID $pid did not exit within ${max}s (use SIGTERM only; investigate)"
     done
+    return 0   # the loop's final `kill -0` fails once the process is gone; don't let that trip `set -e`
 }
 
 dump_blocked() {
@@ -219,7 +220,7 @@ run_window() {   # $1=w_low $2=w_high
     pend=$(sqlite_ro "$sqlite" "SELECT COUNT(*) FILTER (WHERE state IN ('pending','retry')) FROM export_outbox;" 2>/dev/null || echo 1)
     [ "${pend:-1}" -eq 0 ] || halt "window $w_low-$w_high not drained after clean exit (${pend} pending). SQLite preserved at $sqlite."
 
-    local mb; mb=$(du -m "$sqlite" 2>/dev/null | awk '{print $1}')
+    local mb; mb=$(du -m "$sqlite" 2>/dev/null | awk '{print $1}') || mb="?"
     rm -f "$sqlite" "$sqlite-wal" "$sqlite-shm"
     rm -f "$PID_FILE"
     log "window [$w_low, $w_high] sqlite deleted, reclaimed ~${mb:-?} MB"
