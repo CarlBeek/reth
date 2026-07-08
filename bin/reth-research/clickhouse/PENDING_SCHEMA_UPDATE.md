@@ -1,87 +1,82 @@
-# Pending ClickHouse schema update
+# Pending ClickHouse schema update — producer schema v11
 
-The `reth-research` **producer** was rebased onto the merged EIP-8038 / F-series
-research schema (the analytical SQLite tables `block_coverage` / `block_summaries`
-/ `divergences` were reshaped). The Rust export model (`crates/research/src/export/model.rs`)
+> Historical note: the previous version of this file described the v9 → v10
+> F-series delta. That delta is fully implemented by
+> `migrations/002_gas_analysis_v10.up.sql` (merged and applied to the live
+> cluster), so it is no longer pending and was removed from this file.
+
+The `reth-research` **producer** bumped its SQLite schema to **v11**
+(`SCHEMA_VERSION` in `crates/research/src/database.rs`): additive
+per-`(schedule_name, block_number, class)` transaction-taxonomy and
+relative-gas columns on `block_summaries`, requested by the dashboard because
+the aggregate-only cohorts (`unchanged` / `gas_only`) have no per-tx rows to
+derive them from.
+The Rust export model (`SummaryRow` in `crates/research/src/export/model.rs`)
 and the producer's column contract (`DestinationTable::required_columns()` in
-`crates/research/src/export/clickhouse.rs`) have been updated to mirror it.
+`crates/research/src/export/clickhouse.rs`) already mirror it.
 
-**The ClickHouse warehouse schema has NOT been changed by this PR** — neither the
-migration files in this directory (`migrations/001_gas_analysis.up.sql` /
-`.down.sql`) nor the live cluster. That update is owned by the ClickHouse
-maintainer (**@mattevans**) and must be applied before export is enabled.
+**The live cluster must apply `migrations/003_gas_analysis_v11.up.sql`**
+(in this directory) before a v11 producer can export. Until the cluster
+matches, this is **safe**: the worker's startup `DESCRIBE TABLE` check
+refuses to export to a table missing any required column, so no rows are
+shipped against a stale schema. The reverse order is also safe — the check
+is `required ⊆ present`, so a migrated cluster accepts an old producer.
 
-Until the cluster matches, this is **safe**: the worker's startup `DESCRIBE TABLE`
-check (`ClickHouseClient`, driven by `required_columns()`) refuses to export to a
-table missing any required column, so no rows are shipped against a stale schema.
+## `gas_analysis_block_summary` — 10 new columns
 
-**Authoritative target:** the `required_columns()` allow-lists + the
-`CoverageRow` / `SummaryRow` / `DivergenceExportRow` structs in `model.rs`. Apply
-the delta below to `001_gas_analysis.up.sql` (and the live cluster), keeping the
-existing `ReplicatedReplacingMergeTree(..., updated_at)` engine, the `Distributed`
-wrappers, `ON CLUSTER '{cluster}'`, and the `ORDER BY` identity tuples (except the
-one rename noted).
+| Column | Type | Meaning |
+|---|---|---|
+| `tx_count_type_legacy` | `Nullable(UInt32)` | Aggregated txs with EIP-2718 type 0 |
+| `tx_count_type_access_list` | `Nullable(UInt32)` | type 1 (EIP-2930) |
+| `tx_count_type_dynamic_fee` | `Nullable(UInt32)` | type 2 (EIP-1559) |
+| `tx_count_type_blob` | `Nullable(UInt32)` | type 3 (EIP-4844) |
+| `tx_count_type_set_code` | `Nullable(UInt32)` | type 4 (EIP-7702) |
+| `tx_count_type_other` | `Nullable(UInt32)` | any other type — the six always sum to `tx_count` |
+| `tx_count_simple_transfer` | `Nullable(UInt32)` | non-create txs with empty calldata |
+| `tx_count_contract_call` | `Nullable(UInt32)` | non-create txs with non-empty calldata |
+| `gas_delta_pct_hist` | `Array(Int32)` | 13 closed-left bins of `100·gas_delta/baseline_gas_used`, edges `[-100,-50,-25,-10,-1,0,1,10,25,50,100,200,500,+inf)`; bin sum == `tx_count`; `[]` on pre-v11 rows (`Nullable(Array)` is illegal in ClickHouse — empty is the missing marker, as for the existing hist columns) |
+| `baseline_gas_used_sum` | `Nullable(UInt64)` | Σ baseline gas over the class's txs — class-grain denominator for ratio-of-sums against `gas_delta_sum` |
 
-## `gas_analysis_block_coverage`
-- **DROP** the 8 editorial-bucket columns (the taxonomy was removed):
-  `tx_count_trace_only`, `tx_count_event_logs_changed`, `tx_count_schedule_rescued`,
-  `tx_count_wallet_fixable_shallow`, `tx_count_wallet_fixable_deep_chain`,
-  `tx_count_inconclusive_needs_higher_sweep`, `tx_count_contract_broken`,
-  `tx_count_aa_gas_reestimation`.
-- **KEEP** `tx_count_unchanged`, `tx_count_gas_only`.
-- **ADD** `tx_count_stored UInt32`, `block_gas_used UInt64`, `block_gas_limit UInt64`.
-- `ORDER BY` unchanged.
+The migration also **corrects two v10 column comments**: `tx_count_creation`
+and `tx_count_authorization` count **tx-level** facts (envelope create-kind,
+i.e. `to IS NULL`, and the presence of an EIP-7702 authorization list) — the
+old comments claimed "state op", which misled at least one consumer into
+believing a tx-level creation count was missing.
 
-## `gas_analysis_block_summary`
-- **RENAME** `bucket` → `class` (`LowCardinality(String)`), and update the table's
-  `ORDER BY (..., block_hash, bucket)` → `(..., block_hash, class)`.
-- **ADD** (all `Nullable(UInt64)`): `cold_account_access_count`; the F8 storage
-  drivers `sload_cold_count`, `sload_warm_count`, `sstore_cold_count`,
-  `sstore_set_count`, `sstore_reset_count`, `sstore_clear_count`,
-  `sstore_noop_count`, `sstore_dirty_count`; the F2/F3 account drivers
-  `warm_account_access_count`, `value_transfer_count`, `create_opcode_count`,
-  `access_list_address_count`, `access_list_storage_key_count`.
+## Consumer notes
 
-## `gas_analysis_divergence`
-- **DROP** `bucket` (not part of the `ORDER BY`, so index-safe — the merged model
-  has no per-tx class).
-- **RENAME/REPLACE** `would_fit_in_original_limit` → `outer_limit_only_failure`
-  (`Nullable(UInt8)`; the old column was an exact duplicate of `schedule_success`
-  and was dropped from the source — the new column is a distinct witness).
-- **ADD** the full-parity scalar columns (the producer now mirrors every
-  `divergences` scalar). Types follow the mapping table below:
-  - F2 cold-access / F4 surcharge: `cold_account_access_count Nullable(UInt64)`,
-    `additional_gas_charged Nullable(Int64)`, `surcharge_at_oog Nullable(Int64)`.
-  - F6 selector path: `failure_selector_path Nullable(String)`.
-  - F5 tx shape: `tx_type Nullable(UInt8)`, `tx_nonce Nullable(UInt64)`,
-    `entry_selector Nullable(String)` (`0x`-hex), `input_zero_bytes Nullable(UInt64)`,
-    `input_nonzero_bytes Nullable(UInt64)`, `has_authorization Nullable(UInt8)`.
-  - F1/F2 failure: `failure_reason Nullable(String)`, `revert_data Nullable(String)`
-    (`0x`-hex), `revert_decoded Nullable(String)`, `tx_output Nullable(String)` (`0x`-hex).
-  - F7 baseline frame: `baseline_frame_success Nullable(UInt8)`,
-    `baseline_frame_gas_used Nullable(UInt64)`, `baseline_frame_gas_provided Nullable(UInt64)`.
-  - F10 first-gas-divergence: `gas_div_contract Nullable(String)`,
-    `gas_div_pc Nullable(UInt32)`, `gas_div_call_depth Nullable(Int32)`,
-    `gas_div_opcode Nullable(UInt8)`.
-  - F12 tax decomposition: `tax_second_db_read Nullable(Int64)`,
-    `tax_other Nullable(Int64)`, `tax_intrinsic Nullable(Int64)`.
-  - F8 storage drivers (all `Nullable(UInt64)`): `sload_cold_count`,
-    `sload_warm_count`, `sstore_cold_count`, `sstore_set_count`,
-    `sstore_reset_count`, `sstore_clear_count`, `sstore_noop_count`,
-    `sstore_dirty_count`.
-  - F2/F3 account drivers (all `Nullable(UInt64)`): `warm_account_access_count`,
-    `value_transfer_count`, `create_opcode_count`, `access_list_address_count`,
-    `access_list_storage_key_count`.
-  - F1 tier-1 (1×) forensics: `tier1_failure_reason Nullable(String)`,
-    `tier1_oog_opcode Nullable(UInt8)`, `tier1_oog_contract Nullable(String)`,
-    `tier1_oog_pc Nullable(UInt32)`, `tier1_oog_depth Nullable(Int32)`,
-    `tier1_oog_gas_remaining Nullable(UInt64)`,
-    `tier1_failing_selector Nullable(String)` (`0x`-hex),
-    `tier1_failing_gas_provided Nullable(UInt64)`,
-    `tier1_failing_gas_requested Nullable(UInt64)`.
-- The `trace_*` columns and the `block_*` / identity columns are unchanged.
+- **The requested `tx_count_contract_creation` was NOT added** — it already
+  exists as `tx_count_creation` (tx-level create count per class). Partition
+  law: `tx_count_creation + tx_count_simple_transfer + tx_count_contract_call
+  == tx_count`.
+- **Naming**: the request called the histogram `gas_diff_pct_hist`; it ships
+  as `gas_delta_pct_hist` for consistency with the `gas_delta_*` family. Same
+  semantics as requested.
+- `tx_count_simple_transfer` is **envelope-shape** classification: an
+  empty-calldata send *to a contract* (receive()/fallback) still counts, and
+  EIP-7702 set-code txs — as well as empty-calldata blob txs — land here too
+  (cross-filter with `tx_count_type_set_code` / `tx_count_type_blob`).
+  EOA-only transfer detection would need state knowledge the aggregator
+  doesn't have.
+- These columns cover the **aggregated** (non-drill-in) cohorts only; stored
+  txs carry per-tx `tx_type` etc. on `gas_analysis_divergence`.
+- **Always pin `analysis_config_hash`.** Rows written before this change read
+  `NULL` / `[]` in the new columns; v11 producers mint a **new**
+  `analysis_config_hash` (the manifest embeds `producer_schema_version` and
+  the git commit), so mixed-hash reads would see fake empties.
 
-## Rust → ClickHouse type mapping
+## Versions
+
+- SQLite `SCHEMA_VERSION`: 10 → **11** (no in-place migration: a v10
+  `divergences.sqlite` is refused by the v11 binary — start fresh or rename
+  aside after draining its `export_outbox` with the old binary).
+- `ENVELOPE_FORMAT_VERSION`: 2 → **3** (additive `BlockSummaryRow` fields, all
+  `serde(default)` — v2 outbox payloads still decode; the version is
+  provenance, not a decode gate).
+- `TRACE_FORMAT_VERSION`: unchanged (2) — drill-in payloads are untouched.
+
+## Rust → ClickHouse type mapping (reference; the `Vec<i32>` row is new in v11)
+
 | Rust (`model.rs`)            | ClickHouse                |
 |------------------------------|---------------------------|
 | `u32` / `Option<u32>`        | `UInt32` / `Nullable(UInt32)` |
@@ -90,11 +85,7 @@ one rename noted).
 | `i32` (`Option`)             | `Nullable(Int32)`         |
 | `u8` (`Option`)              | `Nullable(UInt8)`         |
 | `bool` / `Option<bool>`      | `UInt8` / `Nullable(UInt8)` (or `Bool`) |
+| `Vec<i32>`                   | `Array(Int32)`            |
 | `String` address (`0x…`, 42) | `String` / `FixedString(42)` |
 | `String` selector (`0x…`, 10)| `Nullable(String)` / `Nullable(FixedString(10))` |
 | `String` hex blob            | `Nullable(String)`        |
-
-## Outbox payload versions (FYI — producer side, already applied)
-`ENVELOPE_FORMAT_VERSION` and `TRACE_FORMAT_VERSION` were bumped `1 → 2`
-(`model.rs`). The `trace_format_version` column in `gas_analysis_divergence` will
-carry `2` for rows produced after this change.

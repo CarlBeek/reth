@@ -124,6 +124,23 @@ struct ClassAccumulator {
     // F2/F3 account-side gas drivers summed over the class's txs.
     account_drivers: AccountDrivers,
 
+    // v11 EIP-2718 type counts, indexed by [`tx_type_bin`] (0..=4 = legacy /
+    // access-list / dynamic-fee / blob / set-code, 5 = other/future types).
+    // Emitted as six discrete columns; the six always sum to `tx_count`.
+    tx_type_counts: [u32; 6],
+    // v11 envelope-shape counts. Together with `tx_count_creation` they
+    // partition the class's txs (creation + simple_transfer + contract_call
+    // == tx_count).
+    tx_count_simple_transfer: u32,
+    tx_count_contract_call: u32,
+    /// 13-bin percentage histogram of `100 * gas_delta / baseline_gas_used`.
+    /// See [`pct_bin`] for the closed-left bin edges. Every aggregated tx is
+    /// binned, so the bin sum equals `tx_count`.
+    gas_delta_pct_hist: [i32; 13],
+    // Baseline gas summed over the class's txs — the ratio-of-sums
+    // denominator paired with `gas_delta_sum`.
+    baseline_gas_used_sum: u64,
+
     // Per-opcode totals — counts + baseline / schedule gas — summed
     // across every frame of every tx in this class for this block.
     // Stored dense (256 wide) for cache-friendly accumulation; emitted
@@ -174,6 +191,11 @@ impl Default for ClassAccumulator {
             cold_account_access_sum: 0,
             storage_drivers: StorageDrivers::default(),
             account_drivers: AccountDrivers::default(),
+            tx_type_counts: [0; 6],
+            tx_count_simple_transfer: 0,
+            tx_count_contract_call: 0,
+            gas_delta_pct_hist: [0; 13],
+            baseline_gas_used_sum: 0,
             opcode_counts: [0; 256],
             opcode_gas_baseline: [0; 256],
             opcode_gas_schedule: [0; 256],
@@ -243,6 +265,56 @@ fn log2_bin(gas_delta: i64) -> usize {
     bits.min(11)
 }
 
+/// Map an EIP-2718 transaction type byte onto the six type-count slots:
+/// `0..=4` (legacy / access-list / dynamic-fee / blob / set-code) map to
+/// themselves; anything else lands in slot 5 (`other`) so the six counts
+/// always partition `tx_count`, even under future tx types.
+const fn tx_type_bin(tx_type: u8) -> usize {
+    if tx_type <= 4 {
+        tx_type as usize
+    } else {
+        5
+    }
+}
+
+/// Pick the bin index for the 13-bin percentage histogram of
+/// `100 * gas_delta / baseline_gas_used`. Closed-left bins with edges
+/// `[-100, -50, -25, -10, -1, 0, 1, 10, 25, 50, 100, 200, 500, +inf)` —
+/// bin 0 is `[-100, -50)`, bin 12 the `[500, +inf)` catch-all.
+///
+/// Membership is decided with exact integer arithmetic in `i128`
+/// (`edge * baseline <= 100 * gas_delta`), so bin edges never suffer float
+/// rounding. `pct >= -100` always holds because schedule gas is
+/// non-negative, so bin 0 needs no lower guard. Degenerate
+/// `baseline_gas_used == 0` (unseen in practice — intrinsic gas is nonzero):
+/// a positive delta is an unbounded relative increase (top bin), a zero
+/// delta is 0% (the `[0, 1)` bin), and a negative delta is unreachable
+/// (`gas_delta >= -baseline`).
+fn pct_bin(gas_delta: i64, baseline_gas_used: u64) -> usize {
+    const EDGES: [i128; 13] = [-100, -50, -25, -10, -1, 0, 1, 10, 25, 50, 100, 200, 500];
+    if baseline_gas_used == 0 {
+        return if gas_delta > 0 {
+            12
+        } else if gas_delta == 0 {
+            5
+        } else {
+            0
+        };
+    }
+    let scaled = 100_i128 * gas_delta as i128;
+    let baseline = baseline_gas_used as i128;
+    // Highest bin whose left edge is <= the tx's percentage.
+    let mut bin = 0;
+    for (i, edge) in EDGES.iter().enumerate() {
+        if edge * baseline <= scaled {
+            bin = i;
+        } else {
+            break;
+        }
+    }
+    bin
+}
+
 /// Observation passed to [`BlockAggregator::observe_tx`].
 ///
 /// Bundles the per-tx storage decision with every metric the aggregator rolls
@@ -299,6 +371,15 @@ pub struct TxObservation {
     /// limit. Gates whether `gas_delta` feeds `gas_delta_sum_succeeding` —
     /// OOG-at-higher-tier txs carry halt-gas `gas_delta` and are excluded.
     pub succeeded_within_limit: bool,
+    /// EIP-2718 transaction envelope type byte (`tx.ty()`), folded into the
+    /// class's six `tx_count_type_*` columns via [`tx_type_bin`].
+    pub tx_type: u8,
+    /// Whether the tx carries non-empty calldata. With `is_creation`, drives
+    /// the simple-transfer / contract-call envelope-shape split.
+    pub has_calldata: bool,
+    /// Baseline (native-schedule) gas the tx used — denominator of the
+    /// percentage histogram and addend of `baseline_gas_used_sum`.
+    pub baseline_gas_used: u64,
 }
 
 impl BlockAggregator {
@@ -387,6 +468,26 @@ impl BlockAggregator {
         } else {
             acc.tx_count_no_state += 1;
         }
+
+        // v11 tx-type / envelope-shape taxonomy. Together with
+        // `tx_count_creation` (above) these partition the class: the six type
+        // counts sum to tx_count, and creation + simple_transfer +
+        // contract_call == tx_count.
+        let tbin = tx_type_bin(obs.tx_type);
+        acc.tx_type_counts[tbin] = acc.tx_type_counts[tbin].saturating_add(1);
+        if !obs.is_creation {
+            if obs.has_calldata {
+                acc.tx_count_contract_call += 1;
+            } else {
+                acc.tx_count_simple_transfer += 1;
+            }
+        }
+
+        // v11 relative gas. Bin every tx (Σ bins == tx_count, like the
+        // multiplier histogram) and accumulate the baseline denominator.
+        let pbin = pct_bin(obs.gas_delta, obs.baseline_gas_used);
+        acc.gas_delta_pct_hist[pbin] = acc.gas_delta_pct_hist[pbin].saturating_add(1);
+        acc.baseline_gas_used_sum = acc.baseline_gas_used_sum.saturating_add(obs.baseline_gas_used);
 
         // Per-opcode totals. Sum across every frame; the class's dense
         // 256-wide arrays absorb everything. saturating_add guards the
@@ -513,6 +614,16 @@ impl BlockAggregator {
                 cold_account_access_count,
                 storage_drivers,
                 account_drivers,
+                tx_count_type_legacy: Some(acc.tx_type_counts[0]),
+                tx_count_type_access_list: Some(acc.tx_type_counts[1]),
+                tx_count_type_dynamic_fee: Some(acc.tx_type_counts[2]),
+                tx_count_type_blob: Some(acc.tx_type_counts[3]),
+                tx_count_type_set_code: Some(acc.tx_type_counts[4]),
+                tx_count_type_other: Some(acc.tx_type_counts[5]),
+                tx_count_simple_transfer: Some(acc.tx_count_simple_transfer),
+                tx_count_contract_call: Some(acc.tx_count_contract_call),
+                gas_delta_pct_hist: Some(acc.gas_delta_pct_hist),
+                baseline_gas_used_sum: Some(acc.baseline_gas_used_sum),
             });
 
             // Fold this class's per-recipient map into top-K rollup rows.
@@ -601,6 +712,9 @@ mod tests {
             recipient: Some(Address::repeat_byte(0xab)),
             selector: Some([0x12, 0x34, 0x56, 0x78]),
             succeeded_within_limit: true,
+            tx_type: 0,
+            has_calldata: false,
+            baseline_gas_used: 100_000,
         }
     }
 
@@ -659,6 +773,10 @@ mod tests {
         // The lone GasOnly tx is the only one in a class aggregate.
         let gas_only = out.summaries.iter().find(|s| s.class == AggregateClass::GasOnly).unwrap();
         assert_eq!(gas_only.tx_count, 1);
+        // v11 taxonomy also ignores stored txs — only the lone aggregated
+        // (type-0, baseline-100k) tx counts; leakage would read 3 / 300k.
+        assert_eq!(gas_only.tx_count_type_legacy, Some(1));
+        assert_eq!(gas_only.baseline_gas_used_sum, Some(100_000));
     }
 
     #[test]
@@ -675,6 +793,189 @@ mod tests {
         assert_eq!(summary.gas_delta_sum_sq, Some(100i64 * 100 + 50i64 * 50 + 200i64 * 200));
         assert_eq!(summary.gas_delta_min, Some(-50));
         assert_eq!(summary.gas_delta_max, Some(200));
+    }
+
+    #[test]
+    fn tx_type_bin_boundaries() {
+        // 0..=4 map to themselves; everything else is `other` (slot 5).
+        for ty in 0u8..=4 {
+            assert_eq!(tx_type_bin(ty), ty as usize);
+        }
+        assert_eq!(tx_type_bin(5), 5);
+        assert_eq!(tx_type_bin(0x7e), 5);
+        assert_eq!(tx_type_bin(u8::MAX), 5);
+    }
+
+    #[test]
+    fn pct_bin_boundaries() {
+        // baseline 100 makes pct == gas_delta, so every left edge is exact.
+        let edges: [(i64, usize); 13] = [
+            (-100, 0),
+            (-50, 1),
+            (-25, 2),
+            (-10, 3),
+            (-1, 4),
+            (0, 5),
+            (1, 6),
+            (10, 7),
+            (25, 8),
+            (50, 9),
+            (100, 10),
+            (200, 11),
+            (500, 12),
+        ];
+        for (delta, bin) in edges {
+            assert_eq!(pct_bin(delta, 100), bin, "left edge {delta}% must open bin {bin}");
+        }
+        // Interior + just-below-edge points (closed-left, open-right).
+        assert_eq!(pct_bin(-51, 100), 0);
+        assert_eq!(pct_bin(-2, 100), 3);
+        assert_eq!(pct_bin(99, 100), 9);
+        assert_eq!(pct_bin(499, 100), 11);
+        assert_eq!(pct_bin(65_000, 100), 12);
+        // Fractional percentages resolve exactly via integer arithmetic:
+        // ±0.5% land in [-1,0) / [0,1), and 2/3 = 66.7% in [50,100).
+        assert_eq!(pct_bin(-5, 1_000), 4);
+        assert_eq!(pct_bin(5, 1_000), 5);
+        assert_eq!(pct_bin(2, 3), 9);
+        // Degenerate zero baseline: positive delta = unbounded relative
+        // increase (top bin), zero = 0%; negative is unreachable but total.
+        assert_eq!(pct_bin(1, 0), 12);
+        assert_eq!(pct_bin(0, 0), 5);
+        assert_eq!(pct_bin(-1, 0), 0);
+        // i128 exactness at the extremes: 100*i64::MAX / u64::MAX is just
+        // UNDER 50% (bin 8) and 100*i64::MIN / u64::MAX just UNDER -50%
+        // (bin 0) — an f64 rewrite rounds both to exactly ±50% and misbins
+        // them (9 / 1); i64 arithmetic overflows.
+        assert_eq!(pct_bin(i64::MAX, u64::MAX), 8);
+        assert_eq!(pct_bin(i64::MIN, u64::MAX), 0);
+        // Below the -100% floor (impossible input): total, answered by the
+        // bin-0 initializer with no lower guard.
+        assert_eq!(pct_bin(-150, 100), 0);
+    }
+
+    #[test]
+    fn tx_type_counts_partition_tx_count() {
+        let mut agg = BlockAggregator::start_block(meta(), 5);
+        for ty in [0u8, 2, 2, 4, 7] {
+            agg.observe_tx(TxObservation { tx_type: ty, ..obs(AggregateClass::GasOnly, 10) }, &[]);
+        }
+        let out = agg.finish_block();
+        let s = out.summaries.iter().find(|s| s.class == AggregateClass::GasOnly).unwrap();
+        assert_eq!(s.tx_count_type_legacy, Some(1));
+        assert_eq!(s.tx_count_type_access_list, Some(0));
+        assert_eq!(s.tx_count_type_dynamic_fee, Some(2));
+        assert_eq!(s.tx_count_type_blob, Some(0));
+        assert_eq!(s.tx_count_type_set_code, Some(1));
+        assert_eq!(s.tx_count_type_other, Some(1));
+        // The six type counts partition the class.
+        let total: u32 = [
+            s.tx_count_type_legacy,
+            s.tx_count_type_access_list,
+            s.tx_count_type_dynamic_fee,
+            s.tx_count_type_blob,
+            s.tx_count_type_set_code,
+            s.tx_count_type_other,
+        ]
+        .iter()
+        .map(|c| c.unwrap())
+        .sum();
+        assert_eq!(total, s.tx_count);
+    }
+
+    #[test]
+    fn shape_counts_partition_with_creation() {
+        let mut agg = BlockAggregator::start_block(meta(), 4);
+        // One creation, one empty-calldata call, two calldata calls. The
+        // creation carries calldata (real creations always ship initcode),
+        // making the partition assertion binding against a refactor that
+        // tests calldata before is_creation.
+        agg.observe_tx(
+            TxObservation {
+                is_creation: true,
+                has_calldata: true,
+                ..obs(AggregateClass::GasOnly, 10)
+            },
+            &[],
+        );
+        agg.observe_tx(obs(AggregateClass::GasOnly, 10), &[]);
+        for _ in 0..2 {
+            agg.observe_tx(
+                TxObservation { has_calldata: true, ..obs(AggregateClass::GasOnly, 10) },
+                &[],
+            );
+        }
+        let out = agg.finish_block();
+        let s = out.summaries.iter().find(|s| s.class == AggregateClass::GasOnly).unwrap();
+        assert_eq!(s.tx_count_creation, Some(1));
+        assert_eq!(s.tx_count_simple_transfer, Some(1));
+        assert_eq!(s.tx_count_contract_call, Some(2));
+        // creation + simple_transfer + contract_call partition the class.
+        assert_eq!(
+            s.tx_count_creation.unwrap() +
+                s.tx_count_simple_transfer.unwrap() +
+                s.tx_count_contract_call.unwrap(),
+            s.tx_count
+        );
+    }
+
+    #[test]
+    fn gas_delta_pct_hist_bins_every_tx_and_sums_to_tx_count() {
+        let mut agg = BlockAggregator::start_block(meta(), 4);
+        // baseline 100_000 (obs default): 0% / +25% / -50% / +600%.
+        for delta in [0i64, 25_000, -50_000, 600_000] {
+            agg.observe_tx(obs(AggregateClass::GasOnly, delta), &[]);
+        }
+        let out = agg.finish_block();
+        let s = out.summaries.iter().find(|s| s.class == AggregateClass::GasOnly).unwrap();
+        let hist = s.gas_delta_pct_hist.expect("pct hist is always emitted");
+        assert_eq!(hist[5], 1, "0% lands in [0,1)");
+        assert_eq!(hist[8], 1, "+25% lands in [25,50)");
+        assert_eq!(hist[1], 1, "-50% lands in [-50,-25)");
+        assert_eq!(hist[12], 1, "+600% lands in the [500,+inf) catch-all");
+        assert_eq!(hist.iter().sum::<i32>() as u32, s.tx_count);
+    }
+
+    #[test]
+    fn unchanged_class_pct_hist_mass_in_zero_bin() {
+        // The unchanged class is gas_delta == 0 by definition: its whole pct
+        // mass sits in the [0,1) bin, and the taxonomy still populates.
+        let mut agg = BlockAggregator::start_block(meta(), 3);
+        for _ in 0..3 {
+            agg.observe_tx(obs(AggregateClass::Unchanged, 0), &[]);
+        }
+        let out = agg.finish_block();
+        let s = out.summaries.iter().find(|s| s.class == AggregateClass::Unchanged).unwrap();
+        let hist = s.gas_delta_pct_hist.unwrap();
+        assert_eq!(hist[5], 3);
+        assert_eq!(hist.iter().sum::<i32>(), 3);
+        assert_eq!(s.tx_count_type_legacy, Some(3));
+        assert_eq!(s.tx_count_simple_transfer, Some(3));
+    }
+
+    #[test]
+    fn baseline_gas_used_sum_accumulates() {
+        let mut agg = BlockAggregator::start_block(meta(), 3);
+        agg.observe_tx(
+            TxObservation { baseline_gas_used: 21_000, ..obs(AggregateClass::GasOnly, 10) },
+            &[],
+        );
+        agg.observe_tx(
+            TxObservation { baseline_gas_used: 50_000, ..obs(AggregateClass::GasOnly, 10) },
+            &[],
+        );
+        // A zero-baseline class still reads Some(0), not None — the column is
+        // a structural denominator, never "n/a".
+        agg.observe_tx(
+            TxObservation { baseline_gas_used: 0, ..obs(AggregateClass::Unchanged, 0) },
+            &[],
+        );
+        let out = agg.finish_block();
+        let gas_only = out.summaries.iter().find(|s| s.class == AggregateClass::GasOnly).unwrap();
+        assert_eq!(gas_only.baseline_gas_used_sum, Some(71_000));
+        let unchanged =
+            out.summaries.iter().find(|s| s.class == AggregateClass::Unchanged).unwrap();
+        assert_eq!(unchanged.baseline_gas_used_sum, Some(0));
     }
 
     /// Observation with an explicit recipient / success flag for the
@@ -702,6 +1003,9 @@ mod tests {
             recipient,
             selector: Some([0xaa, 0xbb, 0xcc, 0xdd]),
             succeeded_within_limit,
+            tx_type: 0,
+            has_calldata: false,
+            baseline_gas_used: 100_000,
         }
     }
 
@@ -829,6 +1133,9 @@ mod tests {
                 recipient: None,
                 selector: None,
                 succeeded_within_limit: false,
+                tx_type: 4,
+                has_calldata: false,
+                baseline_gas_used: 90_000,
             },
             &[],
         );

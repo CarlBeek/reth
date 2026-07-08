@@ -125,7 +125,23 @@ use thiserror::Error;
 ///   export-enabled block output, drained by the embedded export worker) — created via `CREATE
 ///   TABLE IF NOT EXISTS`; they are inert unless `--research.export-config-path` is set, so v10 is
 ///   unchanged for non-export deployments.
-pub const SCHEMA_VERSION: u32 = 10;
+/// - v11: additive per-class transaction-taxonomy + relative-gas columns on `block_summaries`,
+///   requested by the dashboard because the aggregate-only cohorts (`unchanged` / `gas_only`) have
+///   no per-tx rows to derive them from. Six EIP-2718 type counts
+///   `tx_count_type_{legacy,access_list,dynamic_fee,blob,set_code,other}` (`other` catches any type
+///   outside 0..=4, incl. future ones, so the six always sum to `tx_count`); two envelope-shape
+///   counts `tx_count_simple_transfer` (non-create, empty calldata) / `tx_count_contract_call`
+///   (non-create, non-empty calldata) which partition with the pre-existing tx-level
+///   `tx_count_creation` (`creation + simple_transfer + contract_call == tx_count`);
+///   `gas_delta_pct_hist`, a JSON array of exactly 13 ints — closed-left bins of `100 * gas_delta /
+///   baseline_gas_used` with edges `[-100,-50,-25,-10,-1,0,1,10,25,50,100,200,500,+inf)`, every
+///   aggregated tx binned so the bin sum equals `tx_count`; and `baseline_gas_used_sum`, the
+///   class's baseline-gas denominator for ratio-of-sums cross-checks. There is no in-place
+///   migration: a v10 database is rejected by [`enforce_schema_version`] — start a fresh `SQLite`
+///   (or rename the old one aside; drain its `export_outbox` with the old binary first). The
+///   `ClickHouse` dataset identity re-keys automatically because the analysis manifest embeds
+///   `producer_schema_version`.
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Errors raised by the storage layer.
 #[derive(Debug, Error)]
@@ -378,7 +394,7 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             tx_count_unchanged   INTEGER NOT NULL,
             tx_count_gas_only    INTEGER NOT NULL,
             tx_count_stored      INTEGER NOT NULL,
-            -- Native block header values (NULL on rows written before v11 / not
+            -- Native block header values (NULL on rows written before v10 / not
             -- re-touched). gas_used is the actual mainnet baseline the block
             -- consumed; gas_limit is the protocol cap. Together they anchor
             -- utilization, block-fullness shift, and gas-limit-exceedance under
@@ -402,7 +418,8 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
     // each opcode burned and the delta the schedule introduced.
     // `multiplier_log2_hist` and `gas_delta_log2_hist` are JSON arrays of
     // exactly 12 ints (fixed-size
-    // log2 bins) so the CDF charts read pre-binned data.
+    // log2 bins) so the CDF charts read pre-binned data; `gas_delta_pct_hist`
+    // is the same idea with exactly 13 ints (fixed percentage bins).
     //
     // `gas_delta_sum_sq` is REAL (loses precision past 2^53) rather than
     // a hypothetical i128: variance/stddev derived from it are already
@@ -447,6 +464,25 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             create_opcode_count          INTEGER,
             access_list_address_count    INTEGER,
             access_list_storage_key_count INTEGER,
+            -- v11 transaction taxonomy over the class's (aggregated-only) txs.
+            -- The six type counts sum to tx_count (`other` = any EIP-2718
+            -- type outside 0..=4, incl. future ones); creation +
+            -- simple_transfer + contract_call == tx_count
+            -- (tx_count_creation above is the tx-level create count).
+            tx_count_type_legacy      INTEGER,
+            tx_count_type_access_list INTEGER,
+            tx_count_type_dynamic_fee INTEGER,
+            tx_count_type_blob        INTEGER,
+            tx_count_type_set_code    INTEGER,
+            tx_count_type_other       INTEGER,
+            tx_count_simple_transfer  INTEGER,
+            tx_count_contract_call    INTEGER,
+            -- v11: JSON array of exactly 13 ints — closed-left bins of
+            -- 100*gas_delta/baseline_gas_used with edges
+            -- [-100,-50,-25,-10,-1,0,1,10,25,50,100,200,500,+inf); bin sum
+            -- equals tx_count. Baseline-gas denominator alongside.
+            gas_delta_pct_hist        TEXT,
+            baseline_gas_used_sum     INTEGER,
             PRIMARY KEY (schedule_name, block_number, class)
         );",
     )?;
@@ -984,7 +1020,7 @@ pub struct OpcodeBucketTotal {
     pub gas_schedule: u64,
 }
 
-/// Aggregate summary for one (schedule, block, bucket).
+/// Aggregate summary for one (schedule, block, class).
 #[allow(missing_docs)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlockSummaryRow {
@@ -1023,6 +1059,42 @@ pub struct BlockSummaryRow {
     /// when the class saw none of these (warm account access / value transfer /
     /// CREATE / access-list entries).
     pub account_drivers: Option<AccountDrivers>,
+    /// v11 EIP-2718 type counts over the class's txs. Always `Some` from the
+    /// producer (`Some(0)` = measured zero); `serde(default)` keeps pre-v11
+    /// outbox envelopes decodable. The six sum to `tx_count`.
+    #[serde(default)]
+    pub tx_count_type_legacy: Option<u32>,
+    #[serde(default)]
+    pub tx_count_type_access_list: Option<u32>,
+    #[serde(default)]
+    pub tx_count_type_dynamic_fee: Option<u32>,
+    #[serde(default)]
+    pub tx_count_type_blob: Option<u32>,
+    #[serde(default)]
+    pub tx_count_type_set_code: Option<u32>,
+    /// Any EIP-2718 type outside 0..=4, so the type counts stay a partition
+    /// under future tx types.
+    #[serde(default)]
+    pub tx_count_type_other: Option<u32>,
+    /// Non-create txs with empty calldata (the destination may still be a
+    /// contract — envelope-shape classification only). Partition law:
+    /// `tx_count_creation + tx_count_simple_transfer + tx_count_contract_call
+    /// == tx_count`.
+    #[serde(default)]
+    pub tx_count_simple_transfer: Option<u32>,
+    /// Non-create txs with non-empty calldata.
+    #[serde(default)]
+    pub tx_count_contract_call: Option<u32>,
+    /// 13-bin closed-left histogram of `100 * gas_delta / baseline_gas_used`
+    /// with edges `[-100,-50,-25,-10,-1,0,1,10,25,50,100,200,500,+inf)`.
+    /// Every aggregated tx is binned, so the bin sum equals `tx_count`.
+    /// Serialized as JSON.
+    #[serde(default)]
+    pub gas_delta_pct_hist: Option<[i32; 13]>,
+    /// Sum of baseline gas used over the class's txs — the class-grain
+    /// denominator for ratio-of-sums (`gas_delta_sum / baseline_gas_used_sum`).
+    #[serde(default)]
+    pub baseline_gas_used_sum: Option<u64>,
 }
 
 /// Per-tx drill-in record: the `divergences` row plus its dependent
@@ -2226,6 +2298,10 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
         Some(arr) => Some(serde_json::to_string(&arr)?),
         None => None,
     };
+    let gas_delta_pct_hist = match row.gas_delta_pct_hist {
+        Some(arr) => Some(serde_json::to_string(&arr)?),
+        None => None,
+    };
     let opcode_totals = serde_json::to_string(&row.opcode_totals)?;
     let gas_delta_sum_sq_real = row.gas_delta_sum_sq.map(|v| v as f64);
 
@@ -2244,7 +2320,11 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             sstore_set_count, sstore_reset_count, sstore_clear_count,
             sstore_noop_count, sstore_dirty_count,
             warm_account_access_count, value_transfer_count, create_opcode_count,
-            access_list_address_count, access_list_storage_key_count
+            access_list_address_count, access_list_storage_key_count,
+            tx_count_type_legacy, tx_count_type_access_list, tx_count_type_dynamic_fee,
+            tx_count_type_blob, tx_count_type_set_code, tx_count_type_other,
+            tx_count_simple_transfer, tx_count_contract_call,
+            gas_delta_pct_hist, baseline_gas_used_sum
         ) VALUES (?, ?, ?, ?,
                   ?, ?, ?, ?,
                   ?,
@@ -2254,7 +2334,9 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
                   ?, ?, ?, ?,
                   ?,
                   ?, ?, ?, ?, ?, ?, ?, ?,
-                  ?, ?, ?, ?, ?)
+                  ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?, ?, ?,
+                  ?, ?)
         ON CONFLICT (schedule_name, block_number, class) DO UPDATE SET
             tx_count                = excluded.tx_count,
             gas_delta_sum           = excluded.gas_delta_sum,
@@ -2283,7 +2365,17 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             value_transfer_count          = excluded.value_transfer_count,
             create_opcode_count           = excluded.create_opcode_count,
             access_list_address_count     = excluded.access_list_address_count,
-            access_list_storage_key_count = excluded.access_list_storage_key_count",
+            access_list_storage_key_count = excluded.access_list_storage_key_count,
+            tx_count_type_legacy      = excluded.tx_count_type_legacy,
+            tx_count_type_access_list = excluded.tx_count_type_access_list,
+            tx_count_type_dynamic_fee = excluded.tx_count_type_dynamic_fee,
+            tx_count_type_blob        = excluded.tx_count_type_blob,
+            tx_count_type_set_code    = excluded.tx_count_type_set_code,
+            tx_count_type_other       = excluded.tx_count_type_other,
+            tx_count_simple_transfer  = excluded.tx_count_simple_transfer,
+            tx_count_contract_call    = excluded.tx_count_contract_call,
+            gas_delta_pct_hist        = excluded.gas_delta_pct_hist,
+            baseline_gas_used_sum     = excluded.baseline_gas_used_sum",
         params![
             row.schedule_name,
             row.block_number as i64,
@@ -2316,6 +2408,16 @@ fn insert_block_summary(tx: &Transaction<'_>, row: &BlockSummaryRow) -> Result<(
             row.account_drivers.map(|a| a.create_opcode as i64),
             row.account_drivers.map(|a| a.access_list_address as i64),
             row.account_drivers.map(|a| a.access_list_storage_key as i64),
+            row.tx_count_type_legacy.map(|v| v as i64),
+            row.tx_count_type_access_list.map(|v| v as i64),
+            row.tx_count_type_dynamic_fee.map(|v| v as i64),
+            row.tx_count_type_blob.map(|v| v as i64),
+            row.tx_count_type_set_code.map(|v| v as i64),
+            row.tx_count_type_other.map(|v| v as i64),
+            row.tx_count_simple_transfer.map(|v| v as i64),
+            row.tx_count_contract_call.map(|v| v as i64),
+            gas_delta_pct_hist,
+            row.baseline_gas_used_sum.map(|v| v as i64),
         ],
     )?;
     Ok(())
@@ -2973,6 +3075,16 @@ mod tests {
                 cold_account_access_count: None,
                 storage_drivers: None,
                 account_drivers: None,
+                tx_count_type_legacy: None,
+                tx_count_type_access_list: None,
+                tx_count_type_dynamic_fee: None,
+                tx_count_type_blob: None,
+                tx_count_type_set_code: None,
+                tx_count_type_other: None,
+                tx_count_simple_transfer: None,
+                tx_count_contract_call: None,
+                gas_delta_pct_hist: None,
+                baseline_gas_used_sum: None,
             }],
             drill_ins: vec![drill_in],
             recipients: vec![],
@@ -3137,6 +3249,197 @@ mod tests {
         assert!(!addrs.contains(&format!("{proxy:#x}")));
     }
 
+    /// `BlockSummaryRow` fixture with every v11 column populated with
+    /// pairwise-distinct values, so a positional swap or missed binding in
+    /// the insert/upsert paths can't cancel out. Deliberately does NOT
+    /// satisfy the partition laws (Σ type counts == tx_count etc.) —
+    /// `SQLite` doesn't enforce them, and distinctness matters more here.
+    fn fixture_v11_summary(block: u64) -> BlockSummaryRow {
+        BlockSummaryRow {
+            schedule_name: "test".to_string(),
+            block_number: block,
+            class: AggregateClass::GasOnly,
+            tx_count: 4,
+            gas_delta_sum: Some(40),
+            gas_delta_sum_sq: Some(400),
+            gas_delta_min: Some(-10),
+            gas_delta_max: Some(30),
+            gas_delta_log2_hist: Some([0; 12]),
+            opcode_totals: vec![],
+            state_gas_sum: None,
+            state_gas_spillover_sum: None,
+            multiplier_log2_hist: None,
+            tx_count_creation: Some(1),
+            tx_count_authorization: Some(0),
+            tx_count_runtime_state: Some(0),
+            tx_count_no_state: Some(4),
+            cold_account_access_count: None,
+            storage_drivers: None,
+            account_drivers: None,
+            tx_count_type_legacy: Some(1),
+            tx_count_type_access_list: Some(2),
+            tx_count_type_dynamic_fee: Some(3),
+            tx_count_type_blob: Some(4),
+            tx_count_type_set_code: Some(5),
+            tx_count_type_other: Some(6),
+            tx_count_simple_transfer: Some(7),
+            tx_count_contract_call: Some(8),
+            gas_delta_pct_hist: Some([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]),
+            baseline_gas_used_sum: Some(84_000),
+        }
+    }
+
+    #[test]
+    fn pre_v11_summary_json_decodes_with_new_fields_none() {
+        // Pins the `#[serde(default)]` back-compat contract: a pre-v11 outbox
+        // payload (no v11 keys) must decode with the new columns None, not
+        // fail — a decode error would permanently block the outbox row.
+        let mut v = serde_json::to_value(fixture_v11_summary(1)).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        for key in [
+            "tx_count_type_legacy",
+            "tx_count_type_access_list",
+            "tx_count_type_dynamic_fee",
+            "tx_count_type_blob",
+            "tx_count_type_set_code",
+            "tx_count_type_other",
+            "tx_count_simple_transfer",
+            "tx_count_contract_call",
+            "gas_delta_pct_hist",
+            "baseline_gas_used_sum",
+        ] {
+            obj.remove(key).expect("v11 field name drifted");
+        }
+        let row: BlockSummaryRow = serde_json::from_value(v).unwrap();
+        assert_eq!(row.tx_count_type_legacy, None);
+        assert_eq!(row.tx_count_type_access_list, None);
+        assert_eq!(row.tx_count_type_dynamic_fee, None);
+        assert_eq!(row.tx_count_type_blob, None);
+        assert_eq!(row.tx_count_type_set_code, None);
+        assert_eq!(row.tx_count_type_other, None);
+        assert_eq!(row.tx_count_simple_transfer, None);
+        assert_eq!(row.tx_count_contract_call, None);
+        assert_eq!(row.gas_delta_pct_hist, None);
+        assert_eq!(row.baseline_gas_used_sum, None);
+        // Pre-v11 fields survive untouched.
+        assert_eq!(row.tx_count, 4);
+        assert_eq!(row.class, AggregateClass::GasOnly);
+    }
+
+    #[test]
+    fn v11_summary_columns_round_trip() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        db.record_block_output(&BlockOutput {
+            coverage: fixture_coverage("test", 11, 0, 4),
+            summaries: vec![fixture_v11_summary(11)],
+            drill_ins: vec![],
+            recipients: vec![],
+        })
+        .unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let (counts, hist, baseline): ([i64; 8], String, i64) = conn
+            .query_row(
+                "SELECT tx_count_type_legacy, tx_count_type_access_list, \
+                 tx_count_type_dynamic_fee, tx_count_type_blob, tx_count_type_set_code, \
+                 tx_count_type_other, tx_count_simple_transfer, tx_count_contract_call, \
+                 gas_delta_pct_hist, baseline_gas_used_sum \
+                 FROM block_summaries WHERE block_number = 11",
+                [],
+                |r| {
+                    Ok((
+                        [
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                        ],
+                        r.get(8)?,
+                        r.get(9)?,
+                    ))
+                },
+            )
+            .unwrap();
+        // All 10 columns read back exactly; full-array equality on the hist
+        // (len/sum checks would pass on a reordered array).
+        assert_eq!(counts, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(baseline, 84_000);
+        let bins: Vec<i32> = serde_json::from_str(&hist).unwrap();
+        assert_eq!(bins, (1..=13).collect::<Vec<i32>>());
+    }
+
+    #[test]
+    fn summary_upsert_overwrites_new_columns() {
+        // Re-touching a (schedule, block, class) row must overwrite the v11
+        // columns too — guards the ON CONFLICT DO UPDATE list, whose omission
+        // would silently keep stale values on reorg re-analysis.
+        let db = DivergenceDatabase::in_memory().unwrap();
+        let mut summary = fixture_v11_summary(12);
+        db.record_block_output(&BlockOutput {
+            coverage: fixture_coverage("test", 12, 0, 4),
+            summaries: vec![summary.clone()],
+            drill_ins: vec![],
+            recipients: vec![],
+        })
+        .unwrap();
+
+        // Overwrite ALL 10 v11 columns with fresh distinct values so a
+        // forgotten SET line on any one of them is caught.
+        summary.tx_count_type_legacy = Some(11);
+        summary.tx_count_type_access_list = Some(12);
+        summary.tx_count_type_dynamic_fee = Some(13);
+        summary.tx_count_type_blob = Some(14);
+        summary.tx_count_type_set_code = Some(15);
+        summary.tx_count_type_other = Some(16);
+        summary.tx_count_simple_transfer = Some(17);
+        summary.tx_count_contract_call = Some(18);
+        summary.gas_delta_pct_hist = Some([21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33]);
+        summary.baseline_gas_used_sum = Some(99_000);
+        db.record_block_output(&BlockOutput {
+            coverage: fixture_coverage("test", 12, 0, 4),
+            summaries: vec![summary],
+            drill_ins: vec![],
+            recipients: vec![],
+        })
+        .unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let (counts, hist, baseline): ([i64; 8], String, i64) = conn
+            .query_row(
+                "SELECT tx_count_type_legacy, tx_count_type_access_list, \
+                 tx_count_type_dynamic_fee, tx_count_type_blob, tx_count_type_set_code, \
+                 tx_count_type_other, tx_count_simple_transfer, tx_count_contract_call, \
+                 gas_delta_pct_hist, baseline_gas_used_sum \
+                 FROM block_summaries WHERE block_number = 12",
+                [],
+                |r| {
+                    Ok((
+                        [
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                        ],
+                        r.get(8)?,
+                        r.get(9)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(counts, [11, 12, 13, 14, 15, 16, 17, 18]);
+        assert_eq!(baseline, 99_000);
+        let bins: Vec<i32> = serde_json::from_str(&hist).unwrap();
+        assert_eq!(bins, (21..=33).collect::<Vec<i32>>());
+    }
+
     /// F8 storage-reprice drivers + F2/F3 account drivers round-trip on both
     /// `divergences` (per-tx) and `block_summaries` (per-class); the F1 tier1
     /// forensic columns round-trip on `divergences`.
@@ -3197,6 +3500,16 @@ mod tests {
             cold_account_access_count: None,
             storage_drivers: Some(sd),
             account_drivers: Some(ad),
+            tx_count_type_legacy: None,
+            tx_count_type_access_list: None,
+            tx_count_type_dynamic_fee: None,
+            tx_count_type_blob: None,
+            tx_count_type_set_code: None,
+            tx_count_type_other: None,
+            tx_count_simple_transfer: None,
+            tx_count_contract_call: None,
+            gas_delta_pct_hist: None,
+            baseline_gas_used_sum: None,
         };
         db.record_block_output(&BlockOutput {
             coverage: fixture_coverage("test", 9, 1, 1),

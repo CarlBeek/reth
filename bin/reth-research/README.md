@@ -139,9 +139,12 @@ Per (schedule, block):
 
 - `block_coverage`: tx counts split by execution-fact class
   (`unchanged` / `gas_only` / `stored`)
-- `block_summaries`: per-class aggregates (gas-delta histograms,
-  sums/min/max, opcode totals, 8037 state-gas + 8038 cold-account metrics),
-  keyed by `class ∈ {unchanged, gas_only}`
+- `block_summaries`: per-class aggregates (gas-delta histograms — absolute
+  log2 and 13-bin percentage of baseline, sums/min/max, the class's
+  baseline-gas denominator, EIP-2718 tx-type counts, envelope-shape counts
+  (creation / simple-transfer / contract-call), opcode totals, 8037
+  state-gas + 8038 cold-account metrics), keyed by
+  `class ∈ {unchanged, gas_only}`
 - `block_recipients`: top-K recipient/selector attribution per `class`
 
 Per stored transaction (every failure + every trace divergence):
