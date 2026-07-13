@@ -15,12 +15,15 @@ The Rust export model (`SummaryRow` in `crates/research/src/export/model.rs`)
 and the producer's column contract (`DestinationTable::required_columns()` in
 `crates/research/src/export/clickhouse.rs`) already mirror it.
 
-**The live cluster must apply `migrations/003_gas_analysis_v11.up.sql`**
-(in this directory) before a v11 producer can export. Until the cluster
-matches, this is **safe**: the worker's startup `DESCRIBE TABLE` check
-refuses to export to a table missing any required column, so no rows are
-shipped against a stale schema. The reverse order is also safe — the check
-is `required ⊆ present`, so a migrated cluster accepts an old producer.
+**Status: migration 003 was applied to the live cluster on 2026-07-13**
+(schema_migrations version 3, clean) — all ten columns AND both
+`COMMENT COLUMN` corrections verified live via `system.columns`. The v11
+producer's startup `DESCRIBE TABLE` gate now passes.
+
+**003 is frozen.** An applied migration file must never be edited (the
+cluster's golang-migrate state records it as done, so edits would silently
+diverge from reality). Any future gas_analysis schema delta ships as a new
+`004_*` pair in this directory.
 
 ## `gas_analysis_block_summary` — 10 new columns
 
