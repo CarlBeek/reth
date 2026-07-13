@@ -41,7 +41,7 @@ ExecStart=/home/ubuntu/reth/bin/reth-research/scripts/run_xeon_perf.sh \
   --research.backfill \
   --research.backfill-concurrency 22 \
   --research.db-path /home/ubuntu/reth/divergences.sqlite \
-  --research.max-divergences-per-block 1024
+  --research.max-divergences-per-block 8192
 
 [Install]
 WantedBy=multi-user.target
