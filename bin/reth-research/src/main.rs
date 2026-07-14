@@ -2711,6 +2711,9 @@ where
                             // recipient gas sum.
                             succeeded_within_limit: schedule_replay_success &&
                                 schedule_gas <= gas_limit,
+                            tx_type: tx.ty(),
+                            has_calldata: (input_zero_bytes + input_nonzero_bytes) > 0,
+                            baseline_gas_used: normal_gas_used,
                         },
                         opcode_frames_for_agg,
                     );

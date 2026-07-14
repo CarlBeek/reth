@@ -759,6 +759,16 @@ mod tests {
             cold_account_access_count: None,
             storage_drivers: None,
             account_drivers: None,
+            tx_count_type_legacy: None,
+            tx_count_type_access_list: None,
+            tx_count_type_dynamic_fee: None,
+            tx_count_type_blob: None,
+            tx_count_type_set_code: None,
+            tx_count_type_other: None,
+            tx_count_simple_transfer: None,
+            tx_count_contract_call: None,
+            gas_delta_pct_hist: None,
+            baseline_gas_used_sum: None,
         }
     }
 
@@ -796,13 +806,19 @@ mod tests {
     fn seed(db: &DivergenceDatabase, output: BlockOutput) -> (String, OutboxItem) {
         let mut reg = ScheduleRegistry::new();
         reg.register(Eip2780Schedule::new()).unwrap();
-        let manifest =
-            AnalysisManifestV1::build(&reg, normalize_gas_tiers(&[1]), Some(50), 1, 10, "deadbeef");
+        let manifest = AnalysisManifestV1::build(
+            &reg,
+            normalize_gas_tiers(&[1]),
+            Some(50),
+            1,
+            crate::database::SCHEMA_VERSION,
+            "deadbeef",
+        );
         let ach = manifest.analysis_config_hash().unwrap();
         let json = manifest.to_json().unwrap();
         db.upsert_analysis_manifest(&crate::database::AnalysisManifestRecord {
             analysis_config_hash: ach.clone(),
-            schema_version: 10,
+            schema_version: crate::database::SCHEMA_VERSION,
             chain_id: 1,
             producer_git_commit: "deadbeef".to_string(),
             replay_semantics: "canonical_pre_tx_state".to_string(),

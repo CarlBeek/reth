@@ -57,7 +57,11 @@ pub struct ResearchArgs {
     #[arg(long = "research.start-block", default_value_t = 0, help_heading = "Research")]
     pub start_block: u64,
 
-    /// Maximum divergence rows to persist per block.
+    /// Maximum drill-in (divergence) rows persisted per block — one budget
+    /// shared across ALL schedules, spent first-come in tx-major order.
+    /// Dropped drill-ins still count in coverage (`expected_drill_in_count` /
+    /// `drill_ins_truncated`) and never affect the class aggregates. Omit for
+    /// unlimited.
     #[arg(
         long = "research.max-divergences-per-block",
         value_name = "COUNT",

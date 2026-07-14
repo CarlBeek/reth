@@ -162,6 +162,17 @@ fn main() {
             cold_account_access_count: None,
             storage_drivers: None,
             account_drivers: None,
+            tx_count_type_legacy: Some(0),
+            tx_count_type_access_list: Some(0),
+            tx_count_type_dynamic_fee: Some(1),
+            tx_count_type_blob: Some(0),
+            tx_count_type_set_code: Some(0),
+            tx_count_type_other: Some(0),
+            tx_count_simple_transfer: Some(0),
+            tx_count_contract_call: Some(1),
+            // 20_000 gas delta on a 100_000-gas baseline = +20% → bin [10, 25).
+            gas_delta_pct_hist: Some([0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]),
+            baseline_gas_used_sum: Some(100_000),
         }],
         drill_ins: vec![drill_in],
         // One recipient rollup row keyed by the same aggregate `class`.

@@ -39,7 +39,11 @@ pub const MANIFEST_FORMAT_VERSION: u16 = 1;
 /// v2: the `BlockOutput` payload was reshaped for the F-series schema (3-fact
 /// coverage, `class`-keyed summaries, full-parity divergence columns, and the
 /// baseline/schedule trace-kind split).
-pub const ENVELOPE_FORMAT_VERSION: u16 = 2;
+/// v3: additive v11 `BlockSummaryRow` fields — the six EIP-2718
+/// `tx_count_type_*` counts, `tx_count_simple_transfer` /
+/// `tx_count_contract_call`, `gas_delta_pct_hist`, `baseline_gas_used_sum`
+/// (all `serde(default)`, so v2 payloads still decode).
+pub const ENVELOPE_FORMAT_VERSION: u16 = 3;
 
 /// Replay semantics tag baked into the manifest and every remote row. The
 /// research pipeline replays each tx against canonical pre-tx state.
@@ -491,6 +495,19 @@ pub struct SummaryRow {
     pub create_opcode_count: Option<u64>,
     pub access_list_address_count: Option<u64>,
     pub access_list_storage_key_count: Option<u64>,
+    pub tx_count_type_legacy: Option<u32>,
+    pub tx_count_type_access_list: Option<u32>,
+    pub tx_count_type_dynamic_fee: Option<u32>,
+    pub tx_count_type_blob: Option<u32>,
+    pub tx_count_type_set_code: Option<u32>,
+    pub tx_count_type_other: Option<u32>,
+    pub tx_count_simple_transfer: Option<u32>,
+    pub tx_count_contract_call: Option<u32>,
+    /// 13 closed-left percentage bins of `100*gas_delta/baseline_gas_used`
+    /// (edges `[-100,-50,-25,-10,-1,0,1,10,25,50,100,200,500,+inf)`);
+    /// empty when the source summary carried no histogram.
+    pub gas_delta_pct_hist: Vec<i32>,
+    pub baseline_gas_used_sum: Option<u64>,
 }
 
 /// One row for `gas_analysis_divergence`. Copies every scalar from
@@ -822,6 +839,16 @@ fn build_summary_row(
         create_opcode_count: summary.account_drivers.map(|a| a.create_opcode),
         access_list_address_count: summary.account_drivers.map(|a| a.access_list_address),
         access_list_storage_key_count: summary.account_drivers.map(|a| a.access_list_storage_key),
+        tx_count_type_legacy: summary.tx_count_type_legacy,
+        tx_count_type_access_list: summary.tx_count_type_access_list,
+        tx_count_type_dynamic_fee: summary.tx_count_type_dynamic_fee,
+        tx_count_type_blob: summary.tx_count_type_blob,
+        tx_count_type_set_code: summary.tx_count_type_set_code,
+        tx_count_type_other: summary.tx_count_type_other,
+        tx_count_simple_transfer: summary.tx_count_simple_transfer,
+        tx_count_contract_call: summary.tx_count_contract_call,
+        gas_delta_pct_hist: summary.gas_delta_pct_hist.map(|h| h.to_vec()).unwrap_or_default(),
+        baseline_gas_used_sum: summary.baseline_gas_used_sum,
     }
 }
 
@@ -1233,6 +1260,16 @@ mod tests {
             cold_account_access_count: None,
             storage_drivers: None,
             account_drivers: None,
+            tx_count_type_legacy: Some(0),
+            tx_count_type_access_list: Some(0),
+            tx_count_type_dynamic_fee: Some(1),
+            tx_count_type_blob: Some(0),
+            tx_count_type_set_code: Some(0),
+            tx_count_type_other: Some(0),
+            tx_count_simple_transfer: Some(0),
+            tx_count_contract_call: Some(1),
+            gas_delta_pct_hist: Some([0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]),
+            baseline_gas_used_sum: Some(21_000),
         }
     }
 
@@ -1354,6 +1391,32 @@ mod tests {
         // trace_content_hash matches a re-hash of the payload.
         assert_eq!(d.trace_content_hash, format!("{:#x}", keccak256(d.trace_payload.as_bytes())),);
         assert_eq!(d.trace_uncompressed_size_bytes, d.trace_payload.len() as u64);
+    }
+
+    #[test]
+    fn summary_new_columns_map_through() {
+        let reg = registry_2780_8037();
+        let m = manifest(&reg, vec![1]);
+        let ach = m.analysis_config_hash().unwrap();
+        let rows = block_output_to_rows(&sample_output(), &m, &ach, 1).unwrap();
+        let s = &rows.summaries[0];
+        // v11 taxonomy passes through verbatim from the DB row.
+        assert_eq!(s.tx_count_type_dynamic_fee, Some(1));
+        assert_eq!(s.tx_count_type_other, Some(0));
+        assert_eq!(s.tx_count_simple_transfer, Some(0));
+        assert_eq!(s.tx_count_contract_call, Some(1));
+        assert_eq!(s.gas_delta_pct_hist, vec![0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(s.baseline_gas_used_sum, Some(21_000));
+
+        // A summary without a histogram exports an empty array — the missing
+        // marker for ClickHouse Array columns (Nullable(Array) is illegal) —
+        // never null.
+        let mut output = sample_output();
+        output.summaries[0].gas_delta_pct_hist = None;
+        let rows = block_output_to_rows(&output, &m, &ach, 1).unwrap();
+        assert!(rows.summaries[0].gas_delta_pct_hist.is_empty());
+        let json = serde_json::to_string(&rows.summaries[0]).unwrap();
+        assert!(json.contains("\"gas_delta_pct_hist\":[]"));
     }
 
     #[test]
