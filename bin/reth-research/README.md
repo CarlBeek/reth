@@ -38,7 +38,7 @@ same schedule.
 
 - `--research.eip2780`
 - `--research.eip8037`
-- `--research.eip8038` (state access/write repricing, 3x, native-spec; independent of `--research.eip8037`)
+- `--research.eip8038` (state access/write repricing, native-spec; independent of `--research.eip8037`)
 - `--research.csv NAME=PATH`
 - `--research.multiplier NAME=MULT`
 - `--research.db-path PATH` (DuckDB file)

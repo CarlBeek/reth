@@ -1,4 +1,4 @@
-//! End-to-end gas validation for the EIP-8038 (PR 11802 uniform) schedule.
+//! End-to-end gas validation for the EIP-8038 schedule.
 //!
 //! Runs real transactions in an in-memory `CacheDB` (no reth datadir is touched)
 //! under the schedule's `gas_params` overrides and asserts the exact gas charged.
@@ -16,10 +16,11 @@ use reth_research::{
 use revm::{
     bytecode::Bytecode,
     context::{Context, TxEnv},
+    context_interface::transaction::{AccessList, AccessListItem},
     database::CacheDB,
     database_interface::EmptyDB,
     inspector::InspectEvm,
-    primitives::{hardfork::SpecId, keccak256, Address, Bytes, TxKind, U256},
+    primitives::{hardfork::SpecId, keccak256, Address, Bytes, TxKind, B256, U256},
     state::AccountInfo,
     ExecuteEvm, MainBuilder, MainContext,
 };
@@ -73,9 +74,22 @@ fn call_with_value(addr: Address, value: u8) -> Vec<u8> {
     c
 }
 
+/// An access list naming `addr` and, optionally, storage `slots` on it.
+fn access_list(addr: Address, slots: &[u64]) -> AccessList {
+    AccessList(vec![AccessListItem {
+        address: addr,
+        storage_keys: slots.iter().map(|s| B256::from(U256::from(*s))).collect(),
+    }])
+}
+
 /// Build the EVM for `code` as the called contract, optionally applying EIP-8038's
 /// overrides, optionally with extra `probes` accounts inserted. Returns `gas_used`.
-fn run(code: &[u8], apply_8038: bool, probes: &[(Address, AccountInfo)]) -> u64 {
+fn run(
+    code: &[u8],
+    apply_8038: bool,
+    probes: &[(Address, AccountInfo)],
+    access_list: AccessList,
+) -> u64 {
     let mut db = CacheDB::<EmptyDB>::default();
     db.insert_account_info(EXECUTOR, code_account(code));
     db.insert_account_info(
@@ -101,6 +115,7 @@ fn run(code: &[u8], apply_8038: bool, probes: &[(Address, AccountInfo)]) -> u64 
         .kind(TxKind::Call(EXECUTOR))
         .gas_limit(2_000_000)
         .gas_price(0)
+        .access_list(access_list)
         .build()
         .expect("valid tx env");
 
@@ -109,12 +124,21 @@ fn run(code: &[u8], apply_8038: bool, probes: &[(Address, AccountInfo)]) -> u64 
 
 /// Native OSAKA baseline (no 8038 overrides).
 fn run_native(code: &[u8], probes: &[(Address, AccountInfo)]) -> u64 {
-    run(code, false, probes)
+    run(code, false, probes, AccessList::default())
 }
 
 /// EIP-8038 `gas_params` overrides, no inspector (validates the slot back-solve).
 fn run_eip8038(code: &[u8], probes: &[(Address, AccountInfo)]) -> u64 {
-    run(code, true, probes)
+    run(code, true, probes, AccessList::default())
+}
+
+/// EIP-8038 with an explicit access list, to exercise the repriced intrinsic.
+fn run_eip8038_with_access_list(
+    code: &[u8],
+    probes: &[(Address, AccountInfo)],
+    access_list: AccessList,
+) -> u64 {
+    run(code, true, probes, access_list)
 }
 
 /// Full schedule path: EIP-8038 overrides AND the [`ScheduleInspector`] (the only
@@ -162,22 +186,26 @@ fn cold_sload_charges_cold_storage_access() {
     // PUSH1 0; SLOAD; STOP.
     let gas = run_eip8038(&[0x60, 0x00, 0x54, 0x00], &[]);
     // intrinsic(21000) + PUSH1(3) + cold SLOAD.
-    assert_eq!(gas - 21_003, 3_000, "cold SLOAD = COLD_STORAGE_ACCESS 3000; got {gas}");
+    assert_eq!(gas - 21_003, 2_100, "cold SLOAD = COLD_STORAGE_ACCESS 2100; got {gas}");
 }
 
 #[test]
 fn warm_sload_charges_warm_access() {
     // PUSH1 0; SLOAD(cold); POP; PUSH1 0; SLOAD(warm); STOP.
     let gas = run_eip8038(&[0x60, 0x00, 0x54, 0x50, 0x60, 0x00, 0x54, 0x00], &[]);
-    // intrinsic + PUSH1(3) + cold(3000) + POP(2) + PUSH1(3) + warm.
-    let warm = gas - 21_003 - 3_000 - 2 - 3;
+    // intrinsic + PUSH1(3) + cold(2100) + POP(2) + PUSH1(3) + warm.
+    let warm = gas - 21_003 - 2_100 - 2 - 3;
     assert_eq!(warm, 100, "warm SLOAD = WARM_ACCESS 100 (unchanged); got gas_used={gas}");
 }
 
 /// A cold 0→nonzero SSTORE ("new slot") charges
-/// `COLD_STORAGE_ACCESS (3000) + STORAGE_WRITE (10000) = 13000` — proving the
+/// `COLD_STORAGE_ACCESS (2100) + STORAGE_WRITE (10000) = 12100` — proving the
 /// warm-base / cold-add-on / set-surcharge decomposition (revm composes it as
-/// `sstore_static(100) + cold_storage_cost(2900) + sstore_set_without_load(10000)`).
+/// `sstore_static(100) + cold_storage_cost(2000) + sstore_set_without_load(10000)`).
+///
+/// Note this is 100 *below* native's cold-access composition (100 + 2100): EIP-8038
+/// charges the access component once, dropping the redundant warm charge that today's
+/// composite 5000 carries — the spec's own "exceeds the sum of its components by 100".
 #[test]
 fn cold_new_slot_sstore_charges_access_plus_write() {
     // PUSH1 1, PUSH1 0, SSTORE, STOP.
@@ -185,14 +213,14 @@ fn cold_new_slot_sstore_charges_access_plus_write() {
     // gas = intrinsic(21000) + 2×PUSH1(6) + SSTORE + STOP(0).
     assert_eq!(
         gas - 21_006,
-        3_000 + 10_000,
-        "cold new-slot SSTORE = COLD_STORAGE_ACCESS + STORAGE_WRITE = 13000; got {gas}"
+        2_100 + 10_000,
+        "cold new-slot SSTORE = COLD_STORAGE_ACCESS + STORAGE_WRITE = 12100; got {gas}"
     );
 }
 
 // --- Account access: BALANCE / EXTCODE* (uniform — no code/no-code split) --------
 
-/// PR 11802 dropped the code/no-code split: a cold account access costs
+/// EIP-8038 has no code/no-code split: a cold account access costs
 /// `COLD_ACCOUNT_ACCESS (3000)` regardless of whether the target has code.
 #[test]
 fn cold_account_access_is_uniform_3000() {
@@ -202,7 +230,7 @@ fn cold_account_access_is_uniform_3000() {
     assert_eq!(to_contract - ONE_ACCESS_OVERHEAD, 3_000, "cold BALANCE to contract = 3000");
     assert_eq!(to_eoa - ONE_ACCESS_OVERHEAD, 3_000, "cold BALANCE to EOA = 3000");
     assert_eq!(to_absent - ONE_ACCESS_OVERHEAD, 3_000, "cold BALANCE to absent = 3000");
-    // The whole point of PR 11802: all three are identical.
+    // The whole point of the uniform account cost: all three are identical.
     assert_eq!(to_contract, to_eoa);
     assert_eq!(to_eoa, to_absent);
 }
@@ -242,10 +270,10 @@ fn cold_extcodesize_adds_second_read_via_inspector() {
 // --- Value transfer / CREATE: baseline-vs-8038 delta isolates the slot ----------
 
 /// The net cost a value-transfer CALL adds, when the callee (an EOA) leaves the
-/// 2300 stipend unused, is `ACCOUNT_WRITE = 8000`: revm charges the caller
-/// `CALL_VALUE = transfer_value_cost (10300) = ACCOUNT_WRITE + CALL_STIPEND`, and
-/// the unused stipend returns to the caller (10300 − 2300 = 8000). The slot value
-/// itself (10300) is asserted by the schedule's `configure_evm_env` unit test;
+/// 2300 stipend unused, is `ACCOUNT_WRITE = 9000`: revm charges the caller
+/// `CALL_VALUE = transfer_value_cost (11300) = ACCOUNT_WRITE + CALL_STIPEND`, and
+/// the unused stipend returns to the caller (11300 − 2300 = 9000). The slot value
+/// itself (11300) is asserted by the schedule's `configure_evm_env` unit test;
 /// here we confirm the meaningful net charge composes to `ACCOUNT_WRITE`.
 /// Isolated as the delta between a value=1 and value=0 CALL to the same EOA.
 #[test]
@@ -254,14 +282,38 @@ fn value_transfer_call_net_cost_is_account_write() {
     let no_value = run_eip8038(&call_with_value(PROBE, 0), &[(PROBE, eoa_account())]);
     assert_eq!(
         with_value - no_value,
-        8_000,
-        "net value-transfer cost = ACCOUNT_WRITE 8000 (CALL_VALUE 10300 − stipend 2300); \
+        9_000,
+        "net value-transfer cost = ACCOUNT_WRITE 9000 (CALL_VALUE 11300 − stipend 2300); \
          with={with_value} without={no_value}"
     );
 }
 
+/// `ACCOUNT_WRITE` is paid once per value-transferring CALL, inside `CALL_VALUE`.
+/// Reaching a *dead* account (EIP-161 empty — here simply absent from the DB) adds no
+/// further regular gas, because EIP-8038 leaves `GAS_NEW_ACCOUNT` to EIP-8037's
+/// state-gas dimension, which this standalone schedule does not charge. Charging
+/// `ACCOUNT_WRITE` on revm's `new_account_cost` slot would bill the write twice and
+/// silently inflate every first-time transfer in the dataset.
+#[test]
+fn value_transfer_to_dead_account_charges_no_extra_regular_gas() {
+    // Non-vacuity guard: natively this same pair differs by GAS_NEW_ACCOUNT, which
+    // proves the bytecode really does reach the dead-account path. Without it, an
+    // equality assertion would also pass if the path were never taken at all.
+    let native_live = run_native(&call_with_value(PROBE, 1), &[(PROBE, eoa_account())]);
+    let native_dead = run_native(&call_with_value(PROBE, 1), &[]);
+    assert_eq!(native_dead - native_live, 25_000, "native GAS_NEW_ACCOUNT must be exercised here");
+
+    let to_live = run_eip8038(&call_with_value(PROBE, 1), &[(PROBE, eoa_account())]);
+    let to_dead = run_eip8038(&call_with_value(PROBE, 1), &[]);
+    assert_eq!(
+        to_dead, to_live,
+        "a value CALL to a dead account must cost the same as to a live one; \
+         dead={to_dead} live={to_live}"
+    );
+}
+
 /// The CREATE opcode is repriced from native `GAS_CREATE` (32000) to
-/// `CREATE_ACCESS` (11000). Isolated as the baseline-minus-8038 delta over an
+/// `CREATE_ACCESS` (12000). Isolated as the baseline-minus-8038 delta over an
 /// empty-initcode CREATE (the inner frame and everything else cancel).
 #[test]
 fn create_opcode_reprices_to_create_access() {
@@ -271,8 +323,49 @@ fn create_opcode_reprices_to_create_access() {
     let eip8038 = run_eip8038(&code, &[]);
     assert_eq!(
         native - eip8038,
-        32_000 - 11_000,
-        "CREATE 8038 cheaper by GAS_CREATE − CREATE_ACCESS = 21000; native={native} 8038={eip8038}"
+        32_000 - 12_000,
+        "CREATE 8038 cheaper by GAS_CREATE − CREATE_ACCESS = 20000; native={native} 8038={eip8038}"
+    );
+}
+
+// --- Access lists: pre-warming is exactly cost-neutral -------------------------
+
+/// `ACCESS_LIST_STORAGE_KEY_COST = COLD_STORAGE_ACCESS − WARM_ACCESS`, so listing a
+/// slot costs exactly what it saves: 2000 up front plus a 100 warm SLOAD equals the
+/// 2100 cold SLOAD it replaces. Both arms name the same address so the per-address
+/// component cancels. Under the previous full-cold-cost basis these differed by 100.
+#[test]
+fn access_list_slot_prewarm_is_cost_neutral() {
+    // PUSH1 0; SLOAD; STOP — one SLOAD of the executor's own slot 0.
+    let code = [0x60, 0x00, 0x54, 0x00];
+    // Non-vacuity guard: natively, listing the slot is 100 cheaper (1900 + 100 warm
+    // vs 2100 cold). If the access list were not reaching the intrinsic at all, both
+    // arms would be trivially equal and the neutrality assertion would prove nothing.
+    let native_unlisted = run(&code, false, &[], access_list(EXECUTOR, &[]));
+    let native_listed = run(&code, false, &[], access_list(EXECUTOR, &[0]));
+    assert_eq!(native_unlisted - native_listed, 100, "the access list must reach the intrinsic");
+
+    let unlisted = run_eip8038_with_access_list(&code, &[], access_list(EXECUTOR, &[]));
+    let listed = run_eip8038_with_access_list(&code, &[], access_list(EXECUTOR, &[0]));
+    assert_eq!(
+        unlisted, listed,
+        "AL key (2000) + warm SLOAD (100) must equal cold SLOAD (2100); \
+         unlisted={unlisted} listed={listed}"
+    );
+}
+
+/// `ACCESS_LIST_ADDRESS_COST = COLD_ACCOUNT_ACCESS − WARM_ACCESS`: 2900 up front plus
+/// a 100 warm access equals the 3000 cold access it replaces.
+#[test]
+fn access_list_address_prewarm_is_cost_neutral() {
+    let code = one_access(PROBE, 0x31); // BALANCE
+    let probes = [(PROBE, eoa_account())];
+    let unlisted = run_eip8038(&code, &probes);
+    let listed = run_eip8038_with_access_list(&code, &probes, access_list(PROBE, &[]));
+    assert_eq!(
+        unlisted, listed,
+        "AL address (2900) + warm BALANCE (100) must equal cold BALANCE (3000); \
+         unlisted={unlisted} listed={listed}"
     );
 }
 
