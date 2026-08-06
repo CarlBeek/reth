@@ -22,8 +22,8 @@ state so schedule-induced failures can cascade across later transactions in the 
 
 - `EIP-2780` intrinsic repricing
 - `EIP-8037` native state creation gas and reservoir accounting
-- `EIP-8038` state access/write repricing (uniform 3x of access/write/create costs), applied on the
-  block's native spec independently of EIP-8037
+- `EIP-8038` state access/write repricing (cold account access, storage and account writes, create
+  and access-list costs), applied on the block's native spec independently of EIP-8037
 - CSV-driven opcode and precompile repricing
 - Uniform execution gas multipliers
 - Combined intrinsic + execution schedules via the shared `GasSchedule` trait

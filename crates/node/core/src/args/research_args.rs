@@ -25,7 +25,7 @@ pub struct ResearchArgs {
 
     /// Enable EIP-8038 state access/write gas experiment.
     ///
-    /// This reprices state access/write/create costs (3x) on the block's native
+    /// This reprices state access/write/create costs on the block's native
     /// spec, independent of EIP-8037's state-gas reservoir.
     #[arg(long = "research.eip8038", help_heading = "Research")]
     pub eip8038: bool,

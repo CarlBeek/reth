@@ -40,7 +40,7 @@
 //!   - [`schedule::GasSchedule`]: Core trait for gas pricing experiments
 //!   - [`schedule::Eip2780Schedule`]: Transaction category-based intrinsic gas
 //!   - [`schedule::Eip8037Schedule`]: Native EIP-8037 state-gas metering
-//!   - [`schedule::Eip8038Schedule`]: EIP-8038 state access/write repricing (3x)
+//!   - [`schedule::Eip8038Schedule`]: EIP-8038 state access/write repricing
 //!   - [`schedule::CsvPricingSchedule`]: Per-opcode pricing from CSV files
 //!   - [`schedule::MultiplierSchedule`]: Uniform gas multiplier
 //!   - [`schedule::ScheduleRegistry`]: Manages multiple schedules

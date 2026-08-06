@@ -9,7 +9,7 @@
 //! - [`BaselineSchedule`]: No modifications (reference implementation)
 //! - [`Eip2780Schedule`]: Reduced intrinsic gas based on transaction category
 //! - [`Eip8037Schedule`]: Native EIP-8037 state-gas metering
-//! - [`Eip8038Schedule`]: EIP-8038 state access/write repricing (3x, native-spec)
+//! - [`Eip8038Schedule`]: EIP-8038 state access/write repricing (native-spec)
 //! - [`CsvPricingSchedule`]: Per-opcode/precompile pricing from CSV files
 //! - [`MultiplierSchedule`]: Uniform gas cost multiplier
 //! - [`ScheduleRegistry`]: Registry for loading and managing multiple schedules
