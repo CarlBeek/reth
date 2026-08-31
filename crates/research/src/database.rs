@@ -2914,7 +2914,6 @@ fn insert_export_outbox(
             // Identical payload already enqueued (or already exported). Nothing
             // to do — re-recording the same block must not resurrect or
             // duplicate an export.
-            Ok(())
         }
         Some(_) => {
             tracing::warn!(
@@ -2946,7 +2945,6 @@ fn insert_export_outbox(
                     export.export_id,
                 ],
             )?;
-            Ok(())
         }
         None => {
             tx.execute(
@@ -2971,9 +2969,9 @@ fn insert_export_outbox(
                     now,
                 ],
             )?;
-            Ok(())
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
