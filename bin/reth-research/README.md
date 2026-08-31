@@ -2,9 +2,10 @@
 
 This binary runs an execution extension that replays committed canonical
 blocks under one or more alternate gas schedules and writes per-schedule
-results to a DuckDB lake. See
-[`crates/research/docs/storage-redesign.md`](../../crates/research/docs/storage-redesign.md)
-for the schema.
+results to a SQLite file (WAL mode, read by consumers through DuckDB's
+`sqlite_scanner`). The canonical schema is the DDL in
+[`crates/research/src/database.rs`](../../crates/research/src/database.rs);
+its `SCHEMA_VERSION` doc comment carries the per-version history.
 
 ## Status
 
@@ -21,14 +22,16 @@ For each committed block at or above `--research.start-block`:
    `TrackingInspector`.
 4. Re-execute the same transaction once per configured execution schedule
    with `ScheduleInspector`.
-5. Classify each (tx, schedule) pair into one of eight buckets
-   (`unchanged` / `trace_only` / `gas_only` / `event_logs_changed` /
-   `wallet_fixable_shallow` / `wallet_fixable_deep_chain` /
-   `inconclusive_needs_higher_sweep` / `contract_broken`).
-6. Aggregate-only buckets roll into per-block summaries; drill-in buckets
-   (`event_logs_changed`, `inconclusive_needs_higher_sweep`,
-   `contract_broken`) get the full per-tx record (call frames, per-frame
-   opcode counts, event logs).
+5. Write a slim `tx_gas_results` row for every (tx, schedule) pair,
+   whatever the outcome.
+6. Store the full per-tx forensic record (call frames, per-frame opcode
+   counts, event logs) for every pair where anything beyond gas changed —
+   either replay failed at the original limit, baseline failed, or a trace
+   diverged. The complement (both succeeded, traces identical) rolls into
+   per-block aggregates keyed by execution-fact class, `unchanged` or
+   `gas_only`. No editorial taxonomy is applied at write time; the
+   wallet-fixable / contract-broken style cohorts are re-derived downstream
+   from the stored facts.
 
 Each execution-modifying schedule gets its own state view for the block,
 so schedule-induced failures can affect later transactions under that
@@ -41,15 +44,21 @@ same schedule.
   sum of independent single-EIP deltas)
 - `--research.csv NAME=PATH`
 - `--research.multiplier NAME=MULT`
-- `--research.db-path PATH` (DuckDB file)
+- `--research.db-path PATH` (SQLite file)
 - `--research.start-block BLOCK`
 - `--research.backfill`
 - `--research.backfill-min-block BLOCK`
+- `--research.backfill-max-block BLOCK`
 - `--research.backfill-concurrency N`
-- `--research.gas-limit-multiplier MULT`
+- `--research.gas-limit-multipliers MULTS` (comma-separated tier sweep,
+  default `1,2,4,8`; pass `1` to disable)
 - `--research.max-divergences-per-block N`
 - `--research.metadata-backfill` (run the contract-metadata backfill in
   one-shot mode instead of starting live analysis; see below)
+- `--research.metadata-backfill-interval-secs N`
+- `--research.contract-labels-interval-secs N`
+- `--research.function-signatures-interval-secs N`
+- `--research.label-config-path PATH`
 - `--research.export-config-path PATH` (enable durable ClickHouse export; see
   [ClickHouse Export](#clickhouse-export))
 
@@ -78,14 +87,10 @@ slots, per-arm intrinsic, and the EIP-8038 EXT* surcharge measured against a rea
 that renumbers Amsterdam fails those tests and re-keys the dataset through the schedule's
 `config_fingerprint`, which reads the same constants.
 
-The composite schedule's constants are ported from `ethereum/execution-specs` branch
-`forks/amsterdam` and locked by unit tests, because revm's own baked-in `AMSTERDAM` gas table is
-several devnet iterations stale. A devnet renumber breaks those tests and re-keys the dataset via
-`config_fingerprint` rather than silently mixing rows priced under different rules.
+## Analyze The Producer DB
 
-## Analyze With DuckDB
-
-Attach the producer DB directly from the DuckDB shell:
+Open it with the SQLite shell, or attach the same file read-only from DuckDB via
+`sqlite_scanner` for the vectorized analytical queries:
 
 ```bash
 sqlite3 -readonly ./divergences.sqlite
@@ -280,6 +285,7 @@ cargo run --release -p reth-research-bin -- node \
 - A schedule that lowers intrinsic gas is conservatively modelled in the
   execution replay because the baseline EVM transaction pipeline is being
   reused.
-- DuckDB foreign-key enforcement isn't a great fit for the producer's
-  per-block transactional delete pattern; referential integrity across
-  the drill-in tables is maintained at the application layer.
+- SQLite runs with `foreign_keys = OFF`: the producer's per-block
+  transactional delete pattern rewrites whole block outputs, so referential
+  integrity across the drill-in tables is maintained at the application
+  layer instead.

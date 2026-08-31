@@ -4,8 +4,8 @@
 //! modified gas costs across multiple gas pricing experiments simultaneously.
 //!
 //! Supported schedules:
-//! - EIP-2780: Reduced intrinsic gas based on transaction category
-//! - EIP-8037: Native state creation gas and reservoir accounting
+//! - Amsterdam: the Glamsterdam repricing stack (EIP-2780 + 7976 + 7981 + 8037 + 8038) via revm's
+//!   native `SpecId::AMSTERDAM`
 //! - CSV Pricing: Per-opcode/precompile gas repricing from CSV files
 //! - Multiplier: Uniform gas cost multiplication
 //!
@@ -15,7 +15,7 @@
 //! cargo run --release -p reth-research-bin node --dev --dev.block-time 5s \
 //!   --research.amsterdam \
 //!   --research.csv 7904-prelim=./schedules/7904_prelim.csv \
-//!   --research.gas-limit-multiplier 8 \
+//!   --research.gas-limit-multipliers 1,2,4,8 \
 //!   --research.db-path ./divergences.db
 //! ```
 

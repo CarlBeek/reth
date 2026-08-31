@@ -15,7 +15,7 @@
 #   export CLICKHOUSE_PASSWORD=...                 # never passed as an argument
 #   START_BLOCK=25319986 END_BLOCK=22719986 \      # inclusive [END, START]
 #   WINDOW_SIZE=50000 BACKFILL_CONCURRENCY=44 \
-#   SCHEDULE_FLAGS="--research.eip8037 --research.eip8038" \
+#   SCHEDULE_FLAGS="--research.amsterdam" \
 #   nohup ./bin/reth-research/scripts/run_windowed_export.sh >> windowed.log 2>&1 &
 #
 # Stop reth.service first (single MDBX lock). Never touches the chain archive
@@ -38,7 +38,7 @@ START_BLOCK="${START_BLOCK:?set START_BLOCK (inclusive top of the range)}"
 END_BLOCK="${END_BLOCK:?set END_BLOCK (inclusive bottom of the range)}"
 WINDOW_SIZE="${WINDOW_SIZE:-50000}"
 BACKFILL_CONCURRENCY="${BACKFILL_CONCURRENCY:-44}"
-SCHEDULE_FLAGS="${SCHEDULE_FLAGS:---research.eip8037 --research.eip8038}"
+SCHEDULE_FLAGS="${SCHEDULE_FLAGS:---research.amsterdam}"
 CSV_FLAGS="${CSV_FLAGS:-}"               # e.g. --research.csv 7904-prelim=/path.csv (adds 1 schedule)
 EXTRA_NODE_FLAGS="${EXTRA_NODE_FLAGS:-}" # e.g. --research.max-divergences-per-block 8192 (shared across schedules)
 POLL_SECS="${POLL_SECS:-30}"
@@ -55,7 +55,7 @@ sqlite_ro() { sqlite3 -readonly "$1" "$2"; }
 
 # Count schedule-producing flags → one block_coverage row per (schedule, block).
 schedule_count() {
-    { grep -oE -- '--research\.(eip[0-9]+|csv|multiplier)' <<<"$SCHEDULE_FLAGS $CSV_FLAGS" || true; } | wc -l | tr -d ' '
+    { grep -oE -- '--research\.(amsterdam|csv|multiplier)' <<<"$SCHEDULE_FLAGS $CSV_FLAGS" || true; } | wc -l | tr -d ' '
 }
 
 disk_guard() {

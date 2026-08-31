@@ -1,9 +1,12 @@
 //! SQLite-backed storage for the research data model.
 //!
-//! Implements the schema described in `crates/research/docs/storage-redesign.md`:
-//! per-block aggregates for the bucketed cohort (wallet-fixable / gas-only /
-//! trace-only / unchanged) and per-tx drill-in rows for the event-logs-changed,
-//! inconclusive, and contract-broken cohorts.
+//! The DDL below is canonical; `crates/research/docs/storage-redesign.md` is the
+//! v9-era design record that motivated it, not a current schema reference. Three
+//! write granularities: an unconditional `tx_gas_results` row per (schedule,
+//! block, tx), per-tx forensic rows for the txs that failed or diverged in trace
+//! ([`crate::divergence::DivergenceFacts::store_full_forensics`]), and per-block
+//! aggregates keyed by execution-fact class (`unchanged` / `gas_only`) for the
+//! rest. See [`SCHEMA_VERSION`] for how the shape got here.
 //!
 //! Why `SQLite`, not `DuckDB`: we tried `DuckDB` first for its analytical query
 //! performance, but ran into its single-process writer-lock — the dashboard

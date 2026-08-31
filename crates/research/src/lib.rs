@@ -9,8 +9,8 @@
 //! The research system allows you to run transactions under multiple gas pricing
 //! experiments at once, comparing each against baseline Ethereum execution:
 //!
-//! - **EIP-2780**: Reduced intrinsic gas based on transaction category
-//! - **EIP-8037**: Native state creation gas with reservoir accounting
+//! - **Amsterdam**: the Glamsterdam repricing stack (EIP-2780 + 7976 + 7981 + 8037 + 8038) via
+//!   revm's native `SpecId::AMSTERDAM`
 //! - **CSV Pricing**: Per-opcode/precompile gas repricing from CSV files
 //! - **Multipliers**: Uniform gas cost multiplication (e.g., 128x)
 //!
@@ -22,8 +22,8 @@
 //!                    ┌──────────────────────┼──────────────────────┐
 //!                    │                      │                      │
 //!                    ▼                      ▼                      ▼
-//!            EIP-2780 Schedule    CSV Pricing Schedule    Multiplier Schedule
-//!            (Intrinsic Only)    (Execution Gas)         (Execution Gas)
+//!           Amsterdam Schedule    CSV Pricing Schedule    Multiplier Schedule
+//!           (Intrinsic + Exec)    (Execution Gas)         (Execution Gas)
 //!                    │                      │                      │
 //!                    └──────────────────────┴──────────────────────┘
 //!                                           │
@@ -71,8 +71,7 @@
 //!
 //! // Configure schedules
 //! let args = ResearchArgs::new()
-//!     .with_eip2780()  // Enable EIP-2780 intrinsic gas experiment
-//!     .with_eip8037()  // Enable EIP-8037 state-gas experiment
+//!     .with_amsterdam()  // Enable the Amsterdam repricing experiment
 //!     .with_csv("7904-v1", "./schedules/7904_v1.csv")?  // CSV pricing
 //!     .with_multiplier("128x", 128)?  // Uniform 128x multiplier
 //!     .with_db_path(PathBuf::from("research.db"));
@@ -162,7 +161,7 @@
 //!   --research.amsterdam \
 //!   --research.csv 7904-prelim=./7904_prelim.csv \
 //!   --research.multiplier 128x=128 \
-//!   --research.gas-limit-multiplier 8 \
+//!   --research.gas-limit-multipliers 1,2,4,8 \
 //!   --research.db-path ./full-analysis.db
 //! ```
 //!
@@ -171,20 +170,20 @@
 //! Results are stored in `SQLite` for analysis:
 //!
 //! ```sql
-//! -- Divergences by schedule
-//! SELECT schedule_name, COUNT(*) as divergences
-//! FROM schedule_divergences
+//! -- Stored divergences by schedule (failures + trace divergences)
+//! SELECT schedule_name, COUNT(*) AS divergences
+//! FROM divergences
 //! GROUP BY schedule_name;
 //!
-//! -- EIP-2780 category breakdown
-//! SELECT tx_category, COUNT(*), AVG(gas_delta)
-//! FROM schedule_divergences
-//! WHERE schedule_name = 'eip-2780'
-//! GROUP BY tx_category;
+//! -- Repriced gas for every replayed tx, divergent or not
+//! SELECT schedule_name, AVG(schedule_gas_used - baseline_gas_used) AS avg_gas_delta
+//! FROM tx_gas_results
+//! GROUP BY schedule_name;
 //!
-//! -- Status-changing divergences (would cause tx failure)
-//! SELECT * FROM schedule_divergences
-//! WHERE divergence_type = 'status';
+//! -- Transactions the schedule breaks (succeeded at baseline, failed under the
+//! -- schedule at the original gas limit)
+//! SELECT * FROM divergences
+//! WHERE baseline_success AND NOT schedule_success;
 //! ```
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
