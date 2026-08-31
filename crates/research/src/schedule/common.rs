@@ -32,16 +32,24 @@ pub fn gas_params_for(spec: SpecId, overrides: &[(GasId, u64)]) -> GasParams {
 /// This mirrors revm's own `initial_tx_gas` path but lets a schedule inject
 /// overridden intrinsic-cost slots (e.g. access-list or create-transaction
 /// costs) that the top-level `calculate_initial_tx_gas` helper has no hook for.
+///
+/// The recipient-side terms (self-transfer exemption, value cost) are read off
+/// `ctx` and forwarded, so a schedule that overlays the Glamsterdam
+/// `tx_recipient_access_cost` / `tx_value_cost` slots gets the spec's
+/// `recipient_execution_gas`. They are inert for schedules that leave those
+/// slots at their spec defaults of zero.
 pub fn initial_and_floor_gas_for(
     ctx: &TxContext,
     spec: SpecId,
     overrides: &[(GasId, u64)],
 ) -> InitialAndFloorGas {
-    gas_params_for(spec, overrides).initial_tx_gas(
+    gas_params_for(spec, overrides).initial_tx_gas_with_recipient(
         &ctx.input,
         ctx.is_create,
         ctx.access_list_accounts,
         ctx.access_list_storage_slots,
         ctx.authorization_count,
+        ctx.is_self_transfer(),
+        ctx.has_value(),
     )
 }

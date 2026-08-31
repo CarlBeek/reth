@@ -3130,7 +3130,7 @@ fn main() -> eyre::Result<()> {
             // Check if any schedules are configured
             if !research_args.has_schedules() {
                 return Err(eyre::eyre!(
-                    "No research schedules configured. Use --research.eip2780, --research.eip8037, --research.csv, or --research.multiplier"
+                    "No research schedules configured. Use --research.eip2780, --research.eip8037, --research.eip8038, --research.glamsterdam, --research.csv, or --research.multiplier"
                 ));
             }
 

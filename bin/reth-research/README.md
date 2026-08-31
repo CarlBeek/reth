@@ -39,6 +39,9 @@ same schedule.
 - `--research.eip2780`
 - `--research.eip8037`
 - `--research.eip8038` (state access/write repricing, 3x, native-spec; independent of `--research.eip8037`)
+- `--research.glamsterdam` (the whole repricing stack — EIP-2780 + 7976 + 7981 + 8037 + 8038 — in
+  one composite lane, so the recorded gas reflects the EIPs interacting rather than a sum of
+  independent single-EIP deltas)
 - `--research.csv NAME=PATH`
 - `--research.multiplier NAME=MULT`
 - `--research.db-path PATH` (DuckDB file)
@@ -70,6 +73,18 @@ cargo run --release -p reth-research-bin -- node \
 `--research.eip8037` and `--research.eip8038` can run together: each is a separate schedule with its
 own `eip-8037` / `eip-8038` rows, and 8038 stays on the block's native spec so it neither alters
 8037's replay nor its persisted data.
+
+`--research.glamsterdam` is likewise independent, and adding it alongside the single-EIP flags is
+the useful configuration: the isolated lanes attribute gas to one proposal each, while the
+`glamsterdam-v1` lane shows what the stack does when applied together. The difference between the
+composite lane and the sum of the isolated ones *is* the interaction effect — a call that only runs
+out of gas because of the new intrinsic cost changes which cold/warm accesses happen downstream,
+which no single-EIP lane can show.
+
+The composite schedule's constants are ported from `ethereum/execution-specs` branch
+`forks/amsterdam` and locked by unit tests, because revm's own baked-in `AMSTERDAM` gas table is
+several devnet iterations stale. A devnet renumber breaks those tests and re-keys the dataset via
+`config_fingerprint` rather than silently mixing rows priced under different rules.
 
 ## Analyze With DuckDB
 

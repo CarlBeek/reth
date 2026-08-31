@@ -10,7 +10,7 @@ use core::hash::{Hash, Hasher};
 use primitives::{
     eip7702, eip8037,
     hardfork::SpecId::{self},
-    OnceLock, U256,
+    OnceLock, TxKind, U256,
 };
 use std::sync::Arc;
 
@@ -927,6 +927,77 @@ impl GasParams {
         self.get(GasId::tx_base_stipend())
     }
 
+    /// Recipient-side execution gas for a plain call (Glamsterdam
+    /// `COLD_ACCOUNT_ACCESS`). Zero on pre-Glamsterdam specs.
+    #[inline]
+    pub fn tx_recipient_access_cost(&self) -> u64 {
+        self.get(GasId::tx_recipient_access_cost())
+    }
+
+    /// Value-transfer execution gas (Glamsterdam `TX_VALUE_COST`). Zero on
+    /// pre-Glamsterdam specs.
+    #[inline]
+    pub fn tx_value_cost(&self) -> u64 {
+        self.get(GasId::tx_value_cost())
+    }
+
+    /// The transaction's recipient-side execution gas: `TX_BASE`'s companion
+    /// term in the Glamsterdam intrinsic formula.
+    ///
+    /// Mirrors `calculate_intrinsic_cost`'s `recipient_execution_gas` in
+    /// `ethereum/execution-specs` (`forks/amsterdam/transactions.py`):
+    ///
+    /// - contract creation → [`Self::tx_create_cost`] (`CREATE_ACCESS`)
+    /// - self-transfer (`sender == to`) → 0, no recipient or value charge
+    /// - otherwise → `COLD_ACCOUNT_ACCESS` plus `TX_VALUE_COST` when `value > 0`
+    ///
+    /// On pre-Glamsterdam specs the two new slots are zero, so this collapses
+    /// to `tx_create_cost` on creations and 0 otherwise — exactly the previous
+    /// behavior.
+    ///
+    /// Under the Glamsterdam repricing this also anchors the calldata floor —
+    /// see [`Self::tx_floor_anchors_on_recipient_gas`].
+    #[inline]
+    pub fn tx_recipient_execution_gas(
+        &self,
+        is_create: bool,
+        is_self_transfer: bool,
+        has_value: bool,
+    ) -> u64 {
+        if is_create {
+            return self.tx_create_cost();
+        }
+        if is_self_transfer {
+            return 0;
+        }
+        let mut gas = self.tx_recipient_access_cost();
+        if has_value {
+            gas = gas.saturating_add(self.tx_value_cost());
+        }
+        gas
+    }
+
+    /// Whether the calldata floor anchors on
+    /// [`Self::tx_recipient_execution_gas`] in addition to
+    /// [`Self::tx_floor_cost_base_gas`].
+    ///
+    /// Glamsterdam's `calculate_intrinsic_cost` anchors the floor on
+    /// `TX_BASE + recipient_execution_gas` so it can never undercut the
+    /// transaction's own intrinsic base. Under EIP-7623/7976 as shipped
+    /// pre-Glamsterdam the floor anchors on the flat base alone — notably it
+    /// does **not** include `tx_create_cost` for creations.
+    ///
+    /// A non-zero `tx_recipient_access_cost` is the activation marker: that
+    /// slot is zero on every pre-Glamsterdam table (where the recipient's
+    /// access is bundled into `tx_base_stipend`'s flat 21000) and non-zero only
+    /// once the repricing that decomposed it is in play. Gating on the slot
+    /// rather than on a spec id keeps this correct for a research schedule that
+    /// overlays the repricing onto another spec's table.
+    #[inline]
+    pub fn tx_floor_anchors_on_recipient_gas(&self) -> bool {
+        self.tx_recipient_access_cost() != 0
+    }
+
     /// Used in [GasParams::initial_tx_gas] to calculate the create cost.
     ///
     /// Similar to the [`Self::create_cost`] method but it got activated in different fork,
@@ -965,6 +1036,39 @@ impl GasParams {
         access_list_storages: u64,
         authorization_list_num: u64,
     ) -> InitialAndFloorGas {
+        self.initial_tx_gas_with_recipient(
+            input,
+            is_create,
+            access_list_accounts,
+            access_list_storages,
+            authorization_list_num,
+            false,
+            false,
+        )
+    }
+
+    /// Calculates the initial transaction gas, including the recipient-side
+    /// terms the Glamsterdam intrinsic formula introduced.
+    ///
+    /// [`Self::initial_tx_gas`] forwards here with `is_self_transfer` and
+    /// `has_value` both false. That is exact on every pre-Glamsterdam table —
+    /// the recipient and value slots are zero there, so neither flag can change
+    /// the result — but a Glamsterdam table needs the real values, which is why
+    /// [`Self::initial_tx_gas_for_tx`] reads them off the transaction.
+    ///
+    /// See `calculate_intrinsic_cost` in `ethereum/execution-specs`
+    /// (`forks/amsterdam/transactions.py`) for the reference formula.
+    #[allow(clippy::too_many_arguments)]
+    pub fn initial_tx_gas_with_recipient(
+        &self,
+        input: &[u8],
+        is_create: bool,
+        access_list_accounts: u64,
+        access_list_storages: u64,
+        authorization_list_num: u64,
+        is_self_transfer: bool,
+        has_value: bool,
+    ) -> InitialAndFloorGas {
         // Initdate stipend
         let tokens_in_calldata =
             get_tokens_in_calldata(input, self.tx_token_non_zero_byte_multiplier());
@@ -989,10 +1093,16 @@ impl GasParams {
         // EIP-8037: Track auth list state gas separately for reservoir handling.
         let mut initial_state_gas = auth_state_gas;
 
-        if is_create {
-            // EIP-2: Homestead Hard-fork Changes
-            initial_regular_gas += self.tx_create_cost();
+        // Recipient-side execution gas. On pre-Glamsterdam tables this is
+        // `tx_create_cost` for a creation and 0 otherwise — i.e. exactly the
+        // EIP-2 create charge this replaced. On a Glamsterdam table it is
+        // `CREATE_ACCESS` / `COLD_ACCOUNT_ACCESS` (+ `TX_VALUE_COST`) / 0 for
+        // create / call / self-transfer respectively.
+        let recipient_execution_gas =
+            self.tx_recipient_execution_gas(is_create, is_self_transfer, has_value);
+        initial_regular_gas += recipient_execution_gas;
 
+        if is_create {
             // EIP-3860: Limit and meter initcode
             initial_regular_gas += self.tx_initcode_cost(input.len());
 
@@ -1005,8 +1115,16 @@ impl GasParams {
         // extended by EIP-7981 to include access-list data alongside calldata.
         let access_list_floor_tokens =
             self.tx_floor_tokens_in_access_list(access_list_accounts, access_list_storages);
-        let floor_gas =
+        let mut floor_gas =
             self.tx_floor_cost(input) + access_list_floor_tokens * self.tx_floor_cost_per_token();
+
+        // Glamsterdam anchors the floor on `TX_BASE + recipient_execution_gas`
+        // rather than the flat base alone, so it can never undercut the tx's own
+        // intrinsic base. Pre-Glamsterdam floors are unchanged — including for
+        // creations, whose floor deliberately excludes `tx_create_cost`.
+        if self.tx_floor_anchors_on_recipient_gas() {
+            floor_gas = floor_gas.saturating_add(recipient_execution_gas);
+        }
 
         InitialAndFloorGas::default()
             .with_initial_regular_gas(initial_regular_gas)
@@ -1036,12 +1154,21 @@ impl GasParams {
                 .unwrap_or_default();
         }
 
-        self.initial_tx_gas(
+        // Glamsterdam's intrinsic exempts a self-transfer from the recipient
+        // and value charges, and charges `TX_VALUE_COST` only when value is
+        // non-zero. Both are zero-cost reads here and inert on pre-Glamsterdam
+        // tables, where the corresponding slots are zero.
+        let kind = tx.kind();
+        let is_self_transfer = matches!(kind, TxKind::Call(to) if to == tx.caller());
+
+        self.initial_tx_gas_with_recipient(
             tx.input(),
-            tx.kind().is_create(),
+            kind.is_create(),
             accounts,
             storages,
             tx.authorization_list_len() as u64,
+            is_self_transfer,
+            !tx.value().is_zero(),
         )
     }
 }
@@ -1155,6 +1282,8 @@ impl GasId {
             x if x == Self::tx_access_list_floor_byte_multiplier().as_u8() => {
                 "tx_access_list_floor_byte_multiplier"
             }
+            x if x == Self::tx_recipient_access_cost().as_u8() => "tx_recipient_access_cost",
+            x if x == Self::tx_value_cost().as_u8() => "tx_value_cost",
             _ => "unknown",
         }
     }
@@ -1226,6 +1355,8 @@ impl GasId {
             "tx_access_list_floor_byte_multiplier" => {
                 Some(Self::tx_access_list_floor_byte_multiplier())
             }
+            "tx_recipient_access_cost" => Some(Self::tx_recipient_access_cost()),
+            "tx_value_cost" => Some(Self::tx_value_cost()),
             _ => None,
         }
     }
@@ -1475,6 +1606,26 @@ impl GasId {
     pub const fn tx_access_list_floor_byte_multiplier() -> GasId {
         Self::new(46)
     }
+
+    /// Execution gas charged on the transaction's *recipient* for a plain call
+    /// (EIP-2780 / Glamsterdam `COLD_ACCOUNT_ACCESS`).
+    ///
+    /// Zero on every pre-Glamsterdam spec, where the recipient's access is
+    /// bundled into `tx_base_stipend`'s flat 21000. Skipped for contract
+    /// creations (`tx_create_cost` covers those) and for self-transfers.
+    pub const fn tx_recipient_access_cost() -> GasId {
+        Self::new(47)
+    }
+
+    /// Execution gas charged on a value-bearing transaction (Glamsterdam
+    /// `TX_VALUE_COST`), on top of
+    /// [`tx_recipient_access_cost`](Self::tx_recipient_access_cost).
+    ///
+    /// Zero on every pre-Glamsterdam spec. Charged only when `value > 0`, and
+    /// never on a self-transfer or a contract creation.
+    pub const fn tx_value_cost() -> GasId {
+        Self::new(48)
+    }
 }
 
 #[cfg(test)]
@@ -1508,6 +1659,100 @@ mod tests {
             assert_eq!(log2floor(U256::from(u64::MAX) + U256::from(1u64)), 64);
             assert_eq!(log2floor(U256::MAX), 255);
         }
+    }
+
+    /// The recipient/value slots are additive: on every shipped spec they are
+    /// zero, so `initial_tx_gas` must produce byte-identical results to the
+    /// pre-change implementation regardless of the new flags.
+    #[test]
+    fn recipient_slots_are_inert_on_shipped_specs() {
+        let input = [0u8, 1, 2, 0, 0, 3];
+        for spec in [
+            SpecId::BERLIN,
+            SpecId::LONDON,
+            SpecId::SHANGHAI,
+            SpecId::CANCUN,
+            SpecId::PRAGUE,
+            SpecId::OSAKA,
+            SpecId::AMSTERDAM,
+        ] {
+            let p = GasParams::new_spec(spec);
+            assert_eq!(p.tx_recipient_access_cost(), 0, "{spec:?}");
+            assert_eq!(p.tx_value_cost(), 0, "{spec:?}");
+            assert!(!p.tx_floor_anchors_on_recipient_gas(), "{spec:?}");
+
+            // Every (is_create, is_self_transfer, has_value) combination must
+            // agree with the flag-free entry point.
+            let baseline = p.initial_tx_gas(&input, false, 1, 2, 0);
+            for (create, self_xfer, value) in [
+                (false, false, false),
+                (false, true, false),
+                (false, false, true),
+                (false, true, true),
+            ] {
+                let got = p.initial_tx_gas_with_recipient(
+                    &input, create, 1, 2, 0, self_xfer, value,
+                );
+                assert_eq!(got, baseline, "{spec:?} {create} {self_xfer} {value}");
+            }
+
+            // Creations still charge tx_create_cost in the execution intrinsic,
+            // and their floor still EXCLUDES it.
+            let call = p.initial_tx_gas(&input, false, 0, 0, 0);
+            let create = p.initial_tx_gas(&input, true, 0, 0, 0);
+            assert_eq!(
+                create.initial_regular_gas() - call.initial_regular_gas(),
+                p.tx_create_cost() + p.tx_initcode_cost(input.len()),
+                "{spec:?}"
+            );
+            assert_eq!(create.floor_gas(), call.floor_gas(), "{spec:?}");
+        }
+    }
+
+    /// With the Glamsterdam slots overlaid, `initial_tx_gas_with_recipient`
+    /// reproduces `calculate_intrinsic_cost` from
+    /// `ethereum/execution-specs` (`forks/amsterdam/transactions.py`).
+    #[test]
+    fn glamsterdam_recipient_terms_match_spec_formula() {
+        const TX_BASE: u64 = 12_000;
+        const COLD_ACCOUNT_ACCESS: u64 = 3_000;
+        const TX_VALUE_COST: u64 = 6_000;
+        const CREATE_ACCESS: u64 = 12_000;
+
+        let mut p = GasParams::new_spec(SpecId::AMSTERDAM);
+        p.override_gas([
+            (GasId::tx_base_stipend(), TX_BASE),
+            (GasId::tx_recipient_access_cost(), COLD_ACCOUNT_ACCESS),
+            (GasId::tx_value_cost(), TX_VALUE_COST),
+            (GasId::tx_create_cost(), CREATE_ACCESS),
+            (GasId::tx_floor_cost_base_gas(), TX_BASE),
+        ]);
+        assert!(p.tx_floor_anchors_on_recipient_gas());
+
+        // Empty calldata isolates the base + recipient terms.
+        let g = |create, self_xfer, value| {
+            p.initial_tx_gas_with_recipient(&[], create, 0, 0, 0, self_xfer, value)
+        };
+
+        // Plain call, no value: TX_BASE + COLD_ACCOUNT_ACCESS.
+        assert_eq!(g(false, false, false).initial_regular_gas(), TX_BASE + COLD_ACCOUNT_ACCESS);
+        // Plain call with value: + TX_VALUE_COST.
+        assert_eq!(
+            g(false, false, true).initial_regular_gas(),
+            TX_BASE + COLD_ACCOUNT_ACCESS + TX_VALUE_COST
+        );
+        // Self-transfer skips BOTH the recipient and the value charge, even
+        // when value > 0.
+        assert_eq!(g(false, true, true).initial_regular_gas(), TX_BASE);
+        assert_eq!(g(false, true, false).initial_regular_gas(), TX_BASE);
+        // Creation pays CREATE_ACCESS, and no value cost on top.
+        assert_eq!(g(true, false, true).initial_regular_gas(), TX_BASE + CREATE_ACCESS);
+
+        // The floor anchors on TX_BASE + recipient_execution_gas, so it tracks
+        // the recipient term rather than sitting at a flat base.
+        assert_eq!(g(false, false, false).floor_gas(), TX_BASE + COLD_ACCOUNT_ACCESS);
+        assert_eq!(g(false, true, false).floor_gas(), TX_BASE);
+        assert_eq!(g(true, false, false).floor_gas(), TX_BASE + CREATE_ACCESS);
     }
 
     #[test]
@@ -1545,11 +1790,13 @@ mod tests {
             "Not all unique names are resolvable via from_str"
         );
 
-        // We should have exactly 46 known GasIds (based on the indices 1-46 used)
+        // We should have exactly 48 known GasIds (based on the indices 1-48
+        // used). 47/48 are `tx_recipient_access_cost` / `tx_value_cost`, added
+        // for the Glamsterdam intrinsic's recipient-side terms.
         assert_eq!(
             unique_names.len(),
-            46,
-            "Expected 46 unique GasIds, found {}",
+            48,
+            "Expected 48 unique GasIds, found {}",
             unique_names.len()
         );
     }

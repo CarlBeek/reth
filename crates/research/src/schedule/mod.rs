@@ -10,6 +10,8 @@
 //! - [`Eip2780Schedule`]: Reduced intrinsic gas based on transaction category
 //! - [`Eip8037Schedule`]: Native EIP-8037 state-gas metering
 //! - [`Eip8038Schedule`]: EIP-8038 state access/write repricing (3x, native-spec)
+//! - [`GlamsterdamSchedule`]: the full Glamsterdam repricing stack as one composite lane, so
+//!   interaction effects between the individual EIPs are captured
 //! - [`CsvPricingSchedule`]: Per-opcode/precompile pricing from CSV files
 //! - [`MultiplierSchedule`]: Uniform gas cost multiplier
 //! - [`ScheduleRegistry`]: Registry for loading and managing multiple schedules
@@ -35,7 +37,8 @@ mod context;
 mod csv_pricing;
 mod eip2780;
 mod eip8037;
-mod eip8038;
+pub(crate) mod eip8038;
+mod glamsterdam;
 mod multiplier;
 mod registry;
 mod traits;
@@ -49,6 +52,7 @@ pub use eip8037::{Eip8037Constants, Eip8037Schedule};
 pub use eip8038::{
     apply_gas_overrides as apply_eip8038_gas_overrides, Eip8038Constants, Eip8038Schedule,
 };
+pub use glamsterdam::{GlamsterdamConstants, GlamsterdamSchedule};
 pub use multiplier::MultiplierSchedule;
 pub use registry::{ScheduleError, ScheduleRegistry};
 pub use traits::{GasSchedule, GasTaxBreakdown, ScheduleKind};

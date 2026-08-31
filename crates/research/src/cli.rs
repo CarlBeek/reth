@@ -5,7 +5,7 @@
 
 use crate::schedule::{
     CsvPricingError, CsvPricingSchedule, Eip2780Schedule, Eip8037Schedule, Eip8038Schedule,
-    MultiplierSchedule, ScheduleRegistry,
+    GlamsterdamSchedule, MultiplierSchedule, ScheduleRegistry,
 };
 use std::path::PathBuf;
 use thiserror::Error;
@@ -39,7 +39,7 @@ pub enum CliError {
     },
 
     /// No schedules configured
-    #[error("No schedules configured. Enable at least one schedule with --research.eip2780, --research.eip8037, --research.eip8038, --research.csv, or --research.multiplier")]
+    #[error("No schedules configured. Enable at least one schedule with --research.eip2780, --research.eip8037, --research.eip8038, --research.glamsterdam, --research.csv, or --research.multiplier")]
     NoSchedules,
 
     /// Schedule registry error
@@ -144,6 +144,13 @@ pub struct ResearchArgs {
     /// Enable EIP-8038 state access/write gas experiment
     pub eip8038_enabled: bool,
 
+    /// Enable the composite Glamsterdam repricing experiment.
+    ///
+    /// Independent of the single-EIP flags above: enabling this alongside them
+    /// gives the composite lane its own dataset for comparison, rather than
+    /// replacing theirs.
+    pub glamsterdam_enabled: bool,
+
     /// CSV pricing schedules (name=path pairs)
     pub csv_schedules: Vec<NamedCsvSchedule>,
 
@@ -201,6 +208,12 @@ impl ResearchArgs {
     /// Enable EIP-8038 schedule.
     pub const fn with_eip8038(mut self) -> Self {
         self.eip8038_enabled = true;
+        self
+    }
+
+    /// Enable the composite Glamsterdam schedule.
+    pub const fn with_glamsterdam(mut self) -> Self {
+        self.glamsterdam_enabled = true;
         self
     }
 
@@ -274,6 +287,7 @@ impl ResearchArgs {
         self.eip2780_enabled ||
             self.eip8037_enabled ||
             self.eip8038_enabled ||
+            self.glamsterdam_enabled ||
             !self.csv_schedules.is_empty() ||
             !self.multiplier_schedules.is_empty()
     }
@@ -288,6 +302,9 @@ impl ResearchArgs {
             count += 1;
         }
         if self.eip8038_enabled {
+            count += 1;
+        }
+        if self.glamsterdam_enabled {
             count += 1;
         }
         count += self.csv_schedules.len();
@@ -318,6 +335,13 @@ impl ResearchArgs {
             registry.register(Eip8038Schedule::new())?;
         }
 
+        // Add the composite Glamsterdam lane if enabled. Registered alongside
+        // the single-EIP schedules, not instead of them, so the isolated lanes
+        // stay available for comparison and debugging.
+        if self.glamsterdam_enabled {
+            registry.register(GlamsterdamSchedule::new())?;
+        }
+
         // Add CSV schedules
         for csv in &self.csv_schedules {
             let schedule = csv.load()?;
@@ -346,6 +370,10 @@ impl ResearchArgs {
 
         if self.eip8038_enabled {
             parts.push("eip-8038".to_string());
+        }
+
+        if self.glamsterdam_enabled {
+            parts.push("glamsterdam-v1".to_string());
         }
 
         for csv in &self.csv_schedules {
@@ -479,6 +507,31 @@ mod tests {
 
         assert_eq!(registry.len(), 1);
         assert!(registry.get("eip-8037").is_some());
+    }
+
+    #[test]
+    fn test_research_args_build_registry_with_glamsterdam() {
+        let args = ResearchArgs::new().with_glamsterdam();
+        let registry = args.build_registry().unwrap();
+
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get("glamsterdam-v1").is_some());
+        assert!(args.summary().contains("glamsterdam-v1"));
+    }
+
+    /// Registering the composite lane next to the single-EIP lanes must give
+    /// four distinct schedules — each with its own replay pass and dataset.
+    #[test]
+    fn test_glamsterdam_registers_alongside_single_eip_lanes() {
+        let args =
+            ResearchArgs::new().with_eip2780().with_eip8037().with_eip8038().with_glamsterdam();
+        let registry = args.build_registry().unwrap();
+
+        assert_eq!(registry.len(), 4);
+        for name in ["eip-2780", "eip-8037", "eip-8038", "glamsterdam-v1"] {
+            assert!(registry.get(name).is_some(), "missing {name}");
+        }
+        assert_eq!(args.schedule_count(), 4);
     }
 
     #[test]
