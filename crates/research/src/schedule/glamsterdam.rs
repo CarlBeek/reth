@@ -435,7 +435,7 @@ impl GasSchedule for GlamsterdamSchedule {
 /// slots carry `total − WARM_ACCESS`, not the total. Writing the total would
 /// overcharge by `WARM_ACCESS` on every cold access. The write-surcharge and
 /// per-item intrinsic slots are absolute.
-fn glamsterdam_overrides() -> [(GasId, u64); 25] {
+const fn glamsterdam_overrides() -> [(GasId, u64); 25] {
     use GlamsterdamConstants as C;
 
     let cold_account_addon = C::COLD_ACCOUNT_ACCESS - C::WARM_ACCESS; // 2_900
@@ -668,9 +668,11 @@ mod tests {
         use GlamsterdamConstants as C;
         let s = GlamsterdamSchedule::new();
         let mut c = ctx();
-        // 3 zero bytes (1 token each) + 3 non-zero (4 tokens each) = 15 tokens.
         c.input = Bytes::from(vec![0, 0, 0, 1, 2, 3]);
-        let tokens = 3 * 1 + 3 * 4;
+        // `count_tokens_in_data`: a zero byte is 1 token, a non-zero byte is 4.
+        let (zero_bytes, nonzero_bytes) = (3u64, 3u64);
+        let tokens = zero_bytes + nonzero_bytes * 4;
+        assert_eq!(tokens, 15);
         assert_eq!(
             s.intrinsic_gas(&c).unwrap(),
             C::TX_BASE + C::COLD_ACCOUNT_ACCESS + tokens * C::TX_DATA_TOKEN_STANDARD
@@ -693,10 +695,9 @@ mod tests {
 
         // The anchor tracks the recipient arm: a self-transfer's floor drops by
         // exactly COLD_ACCOUNT_ACCESS.
-        let mut c2 = c.clone();
-        c2.recipient = Some(c2.sender);
+        c.recipient = Some(c.sender);
         assert_eq!(
-            s.initial_and_floor_gas(&c2).unwrap().floor_gas(),
+            s.initial_and_floor_gas(&c).unwrap().floor_gas(),
             expected - C::COLD_ACCOUNT_ACCESS
         );
     }
