@@ -677,7 +677,7 @@ mod tests {
             config::ExportConfig,
             model::{export_id, normalize_gas_tiers, AnalysisManifestV1},
         },
-        schedule::{Eip2780Schedule, ScheduleRegistry},
+        schedule::{AmsterdamSchedule, ScheduleRegistry},
     };
     use alloy_primitives::{Address, B256};
     use std::sync::{Arc, Mutex};
@@ -828,7 +828,7 @@ mod tests {
     /// dataset hash and the populated `OutboxItem`.
     fn seed(db: &DivergenceDatabase, output: BlockOutput) -> (String, OutboxItem) {
         let mut reg = ScheduleRegistry::new();
-        reg.register(Eip2780Schedule::new()).unwrap();
+        reg.register(AmsterdamSchedule::new()).unwrap();
         let manifest = AnalysisManifestV1::build(
             &reg,
             normalize_gas_tiers(&[1]),

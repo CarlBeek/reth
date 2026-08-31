@@ -16,7 +16,6 @@ reth-evm.workspace = true
 
 # Revm dependencies
 revm.workspace = true
-revm-interpreter.workspace = true
 
 # Alloy dependencies
 alloy-primitives.workspace = true

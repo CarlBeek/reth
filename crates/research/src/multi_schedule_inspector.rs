@@ -104,11 +104,11 @@ use revm::{
     bytecode::opcode::OpCode,
     context_interface::ContextTr,
     interpreter::{
+        interpreter_types::{InputsTr, Jumps, RuntimeFlag},
         CallInputs, CallOutcome, CreateInputs, CreateOutcome, InstructionResult, Interpreter,
     },
     Inspector,
 };
-use revm_interpreter::interpreter_types::{InputsTr, Jumps, RuntimeFlag};
 use std::{collections::VecDeque, sync::Arc};
 
 /// Whether the instruction result is an OOG-class error (as opposed to a

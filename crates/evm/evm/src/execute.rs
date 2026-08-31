@@ -514,7 +514,8 @@ where
         let block_access_list_hash =
             block_access_list.as_ref().map(|bal| compute_block_access_list_hash(bal.as_slice()));
 
-        let hashed_state = state.hashed_post_state(&db.bundle_state);
+        let hashed_state =
+            state.hashed_post_state(&db.bundle_state).map_err(BlockExecutionError::other)?;
         let (state_root, trie_updates) = match state_root_precomputed {
             Some(precomputed) => precomputed,
             None => state
@@ -633,16 +634,19 @@ where
     where
         H: OnStateHook + 'static,
     {
-        let result = self
+        let mut executor = self
             .strategy_factory
             .executor_for_block(&mut self.db, block)
-            .map_err(BlockExecutionError::other)?
-            .with_state_hook(Some(Box::new(state_hook)))
-            .execute_block(block.transactions_recovered())?;
+            .map_err(BlockExecutionError::other)?;
 
+        executor.evm_mut().db_mut().set_state_hook(Some(Box::new(state_hook)));
+
+        let result = executor.execute_block(block.transactions_recovered());
+
+        self.db.set_state_hook(None);
         self.db.merge_transitions(BundleRetention::Reverts);
 
-        Ok(result)
+        result
     }
 
     fn into_state(self) -> State<DB> {

@@ -20,10 +20,9 @@ state so schedule-induced failures can cascade across later transactions in the 
 
 ## Supported Schedules
 
-- `EIP-2780` intrinsic repricing
-- `EIP-8037` native state creation gas and reservoir accounting
-- `EIP-8038` state access/write repricing (uniform 3x of access/write/create costs), applied on the
-  block's native spec independently of EIP-8037
+- `Amsterdam` — the whole Glamsterdam repricing stack (EIP-2780 + 7976 + 7981 + 8037 + 8038) via
+  revm's native `SpecId::AMSTERDAM`, so the recorded gas reflects the EIPs interacting rather than a
+  sum of independent single-EIP deltas
 - CSV-driven opcode and precompile repricing
 - Uniform execution gas multipliers
 - Combined intrinsic + execution schedules via the shared `GasSchedule` trait
@@ -87,7 +86,7 @@ Use this crate for:
 - spotting candidate breakage patterns
 - quantifying how often a repricing changes gas or status on historical chain data
 
-For EIP-8037 reservoir experiments, use `--research.eip8037` and optionally
+For state-gas reservoir experiments, use `--research.amsterdam` and optionally
 `--research.gas-limit-multiplier <N>`. The multiplier only inflates gas limits for the schedule
 replay (so the reservoir can fill); `would_fit_in_original_limit` and `min_multiplier_to_succeed`
 then tell you whether the original tx survived the schedule unchanged and, if not, how much extra

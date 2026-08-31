@@ -5,8 +5,8 @@
 //! They are created when there is change to the state from loading (making it warm), changes to the balance,
 //! or removal of the storage slot. Check [`JournalEntryTr`] for more details.
 
-use primitives::{Address, StorageKey, StorageValue, KECCAK_EMPTY, PRECOMPILE3, U256};
-use state::{EvmState, TransientStorage};
+use primitives::{Address, StorageKey, StorageValue, B256, PRECOMPILE3, U256};
+use state::{Bytecode, EvmState, TransientStorage};
 
 /// Trait for tracking and reverting state changes in the EVM.
 /// Journal entry contains information about state changes that can be reverted.
@@ -61,7 +61,12 @@ pub trait JournalEntryTr {
     ) -> Self;
 
     /// Creates a journal entry for when an account's code is modified
-    fn code_changed(address: Address) -> Self;
+    ///
+    /// Records the previous code hash and bytecode for reverting: since
+    /// EIP-7702 the code of an already-delegated account can be changed (and
+    /// the change reverted), so the revert cannot assume the previous code was
+    /// empty.
+    fn code_changed(address: Address, had_code_hash: B256, had_code: Option<Bytecode>) -> Self;
 
     /// Reverts the state change recorded by this journal entry
     ///
@@ -225,8 +230,13 @@ pub enum JournalEntry {
     CodeChange {
         /// Address of account that had its code changed.
         address: Address,
+        /// Previous code hash of the account.
+        had_code_hash: B256,
+        /// Previous bytecode of the account (`None` if it was not loaded).
+        had_code: Option<Bytecode>,
     },
 }
+
 impl JournalEntryTr for JournalEntry {
     fn account_warmed(address: Address) -> Self {
         JournalEntry::AccountWarmed { address }
@@ -303,8 +313,12 @@ impl JournalEntryTr for JournalEntry {
         }
     }
 
-    fn code_changed(address: Address) -> Self {
-        JournalEntry::CodeChange { address }
+    fn code_changed(address: Address, had_code_hash: B256, had_code: Option<Bytecode>) -> Self {
+        JournalEntry::CodeChange {
+            address,
+            had_code_hash,
+            had_code,
+        }
     }
 
     fn revert(
@@ -418,19 +432,22 @@ impl JournalEntryTr for JournalEntry {
                 let Some(transient_storage) = transient_storage else {
                     return;
                 };
-                let tkey = (address, key);
                 if had_value.is_zero() {
                     // if previous value is zero, remove it
-                    transient_storage.remove(&tkey);
+                    transient_storage.remove_value(address, key);
                 } else {
                     // if not zero, reinsert old value to transient storage.
-                    transient_storage.insert(tkey, had_value);
+                    transient_storage.insert_value(address, key, had_value);
                 }
             }
-            JournalEntry::CodeChange { address } => {
+            JournalEntry::CodeChange {
+                address,
+                had_code_hash,
+                had_code,
+            } => {
                 let acc = state.get_mut(&address).unwrap();
-                acc.info.code_hash = KECCAK_EMPTY;
-                acc.info.code = None;
+                acc.info.code_hash = had_code_hash;
+                acc.info.code = had_code;
             }
         }
     }

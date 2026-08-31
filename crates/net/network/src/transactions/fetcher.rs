@@ -36,7 +36,10 @@ use crate::{
     metrics::TransactionFetcherMetrics,
 };
 use alloy_consensus::transaction::PooledTransaction;
-use alloy_primitives::{map::FbBuildHasher, TxHash};
+use alloy_primitives::{
+    map::{FbBuildHasher, HashMap},
+    TxHash,
+};
 use derive_more::{Constructor, Deref};
 use futures::{stream::FuturesUnordered, Future, FutureExt, Stream, StreamExt};
 use pin_project::pin_project;
@@ -51,7 +54,6 @@ use reth_network_peers::PeerId;
 use reth_primitives_traits::SignedTransaction;
 use schnellru::ByLength;
 use std::{
-    collections::HashMap,
     pin::Pin,
     task::{ready, Context, Poll},
     time::Duration,
@@ -182,10 +184,7 @@ impl<N: NetworkPrimitives> TransactionFetcher<N> {
     #[inline]
     pub fn is_idle(&self, peer_id: &PeerId) -> bool {
         let Some(inflight_count) = self.active_peers.peek(peer_id) else { return true };
-        if *inflight_count < self.info.max_inflight_requests_per_peer {
-            return true
-        }
-        false
+        *inflight_count < self.info.max_inflight_requests_per_peer
     }
 
     /// Returns any idle peer for the given hash.
@@ -380,10 +379,6 @@ impl<N: NetworkPrimitives> TransactionFetcher<N> {
     pub fn buffer_hashes(&mut self, hashes: RequestTxHashes, fallback_peer: Option<PeerId>) {
         for hash in hashes {
             // hash could have been evicted from bounded lru map
-            if self.hashes_fetch_inflight_and_pending_fetch.peek(&hash).is_none() {
-                continue
-            }
-
             let Some(TxFetchMetadata { retries, fallback_peers, .. }) =
                 self.hashes_fetch_inflight_and_pending_fetch.get(&hash)
             else {
@@ -421,7 +416,7 @@ impl<N: NetworkPrimitives> TransactionFetcher<N> {
     /// the request by checking the transactions seen by the peer against the buffer.
     pub fn on_fetch_pending_hashes(
         &mut self,
-        peers: &HashMap<PeerId, PeerMetadata<N>>,
+        peers: &HashMap<PeerId, PeerMetadata<N>, FbBuildHasher<64>>,
         has_capacity_wrt_pending_pool_imports: impl Fn(usize) -> bool,
     ) -> bool {
         let mut hashes_to_request = RequestTxHashes::with_capacity(
@@ -1495,7 +1490,7 @@ mod test {
         for hash in &seen_hashes {
             peer_2_data.seen_transactions.insert(*hash);
         }
-        let mut peers = HashMap::default();
+        let mut peers: HashMap<PeerId, _, FbBuildHasher<64>> = HashMap::default();
         peers.insert(peer_1, peer_1_data);
         peers.insert(peer_2, peer_2_data);
 
@@ -1555,7 +1550,7 @@ mod test {
         assert_eq!(tx_fetcher.num_pending_hashes(), 1);
 
         // pass empty peers map — both peers are "disconnected"
-        let peers = HashMap::new();
+        let peers: HashMap<PeerId, PeerMetadata, FbBuildHasher<64>> = HashMap::default();
         tx_fetcher.on_fetch_pending_hashes(&peers, |_| true);
 
         // hash should be re-buffered, not lost

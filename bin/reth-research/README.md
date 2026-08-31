@@ -36,12 +36,9 @@ same schedule.
 
 ## Supported Flags
 
-- `--research.eip2780`
-- `--research.eip8037`
-- `--research.eip8038` (state access/write repricing, 3x, native-spec; independent of `--research.eip8037`)
-- `--research.glamsterdam` (the whole repricing stack — EIP-2780 + 7976 + 7981 + 8037 + 8038 — in
-  one composite lane, so the recorded gas reflects the EIPs interacting rather than a sum of
-  independent single-EIP deltas)
+- `--research.amsterdam` (the whole repricing stack — EIP-2780 + 7976 + 7981 + 8037 + 8038 — via
+  revm's native `SpecId::AMSTERDAM`, so the recorded gas reflects the EIPs interacting rather than a
+  sum of independent single-EIP deltas)
 - `--research.csv NAME=PATH`
 - `--research.multiplier NAME=MULT`
 - `--research.db-path PATH` (DuckDB file)
@@ -62,24 +59,24 @@ At least one schedule flag is required.
 
 ```bash
 cargo run --release -p reth-research-bin -- node \
-  --research.eip8037 \
-  --research.eip8038 \
+  --research.amsterdam \
   --research.csv 7904-prelim=./schedules/7904_prelim.csv \
   --research.multiplier 4x=4 \
   --research.db-path ./divergences.sqlite \
   --research.start-block 18000000
 ```
 
-`--research.eip8037` and `--research.eip8038` can run together: each is a separate schedule with its
-own `eip-8037` / `eip-8038` rows, and 8038 stays on the block's native spec so it neither alters
-8037's replay nor its persisted data.
+`--research.amsterdam` replays the stack as one lane rather than as isolated per-EIP lanes, which
+is the only way to see the interaction effect: a call that only runs out of gas *because* of the new
+intrinsic cost changes which cold/warm accesses happen downstream, so the composite result is not
+the sum of independent single-EIP deltas.
 
-`--research.glamsterdam` is likewise independent, and adding it alongside the single-EIP flags is
-the useful configuration: the isolated lanes attribute gas to one proposal each, while the
-`glamsterdam-v1` lane shows what the stack does when applied together. The difference between the
-composite lane and the sum of the isolated ones *is* the interaction effect — a call that only runs
-out of gas because of the new intrinsic cost changes which cold/warm accesses happen downstream,
-which no single-EIP lane can show.
+The lane overrides no gas values — it switches the spec and lets revm charge. That is sound only
+while revm's Amsterdam table matches `execution-specs`, which
+`crates/research/tests/amsterdam_matches_execution_specs.rs` asserts (constants, composed table
+slots, per-arm intrinsic, and the EIP-8038 EXT* surcharge measured against a real EVM). A revm bump
+that renumbers Amsterdam fails those tests and re-keys the dataset through the schedule's
+`config_fingerprint`, which reads the same constants.
 
 The composite schedule's constants are ported from `ethereum/execution-specs` branch
 `forks/amsterdam` and locked by unit tests, because revm's own baked-in `AMSTERDAM` gas table is
@@ -198,7 +195,7 @@ drill-in cohort, run:
 
 ```bash
 cargo run --release -p reth-research-bin -- node \
-  --research.eip2780 \
+  --research.amsterdam \
   --research.db-path ./divergences.sqlite \
   --research.metadata-backfill
 ```
@@ -270,7 +267,7 @@ names and types are the fixed producer contract). Then:
 ```bash
 export CLICKHOUSE_PASSWORD=...
 cargo run --release -p reth-research-bin -- node \
-  --research.eip2780 \
+  --research.amsterdam \
   --research.db-path ./divergences.sqlite \
   --research.export-config-path ./clickhouse/config.example.toml
 ```

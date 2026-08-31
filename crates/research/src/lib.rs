@@ -38,9 +38,8 @@
 //!
 //! - [`schedule`]: Gas schedule trait and implementations
 //!   - [`schedule::GasSchedule`]: Core trait for gas pricing experiments
-//!   - [`schedule::Eip2780Schedule`]: Transaction category-based intrinsic gas
-//!   - [`schedule::Eip8037Schedule`]: Native EIP-8037 state-gas metering
-//!   - [`schedule::Eip8038Schedule`]: EIP-8038 state access/write repricing (3x)
+//!   - [`schedule::AmsterdamSchedule`]: the Amsterdam repricing stack (EIP-2780 + 7976 + 7981 +
+//!     8037 + 8038) via revm's native `SpecId::AMSTERDAM`
 //!   - [`schedule::CsvPricingSchedule`]: Per-opcode pricing from CSV files
 //!   - [`schedule::MultiplierSchedule`]: Uniform gas multiplier
 //!   - [`schedule::ScheduleRegistry`]: Manages multiple schedules
@@ -89,13 +88,13 @@
 //! // ... execute with inspector attached ...
 //! ```
 //!
-//! # Example: EIP-2780 Intrinsic Gas Analysis
+//! # Example: Amsterdam Intrinsic Gas Analysis
 //!
 //! ```rust
 //! use alloy_primitives::{Address, Bytes, U256};
-//! use reth_research::schedule::{Eip2780Schedule, GasSchedule, RecipientInfo, TxContext};
+//! use reth_research::schedule::{AmsterdamSchedule, GasSchedule, RecipientInfo, TxContext};
 //!
-//! let schedule = Eip2780Schedule::new();
+//! let schedule = AmsterdamSchedule::new();
 //!
 //! // Simple ETH transfer to an existing EOA
 //! let ctx = TxContext {
@@ -115,12 +114,12 @@
 //!     ..Default::default()
 //! };
 //!
-//! // EIP-2780 calculates reduced intrinsic gas
+//! // EIP-2780 decomposes the intrinsic: TX_BASE + COLD_ACCOUNT_ACCESS + TX_VALUE_COST
 //! let intrinsic = schedule.intrinsic_gas(&ctx).unwrap();
-//! assert_eq!(intrinsic, 6000); // vs 21000 baseline
+//! assert_eq!(intrinsic, 12_000 + 3_000 + 6_000); // vs 21000 baseline
 //!
 //! let category = schedule.tx_category(&ctx).unwrap();
-//! assert_eq!(category, "transfer_to_eoa");
+//! assert_eq!(category, "value_call");
 //! ```
 //!
 //! # Example: CSV-based Per-Opcode Pricing
@@ -149,8 +148,8 @@
 //! # CLI Usage Examples
 //!
 //! ```bash
-//! # EIP-2780 only
-//! reth-research --research.eip2780 --research.db-path ./results.db
+//! # Amsterdam repricing only
+//! reth-research --research.amsterdam --research.db-path ./results.db
 //!
 //! # Multiple CSV schedules for A/B testing
 //! reth-research \
@@ -160,8 +159,7 @@
 //!
 //! # Combined experiment
 //! reth-research \
-//!   --research.eip2780 \
-//!   --research.eip8037 \
+//!   --research.amsterdam \
 //!   --research.csv 7904-prelim=./7904_prelim.csv \
 //!   --research.multiplier 128x=128 \
 //!   --research.gas-limit-multiplier 8 \

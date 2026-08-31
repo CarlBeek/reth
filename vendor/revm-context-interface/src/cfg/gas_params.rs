@@ -8,9 +8,9 @@ use crate::{
 };
 use core::hash::{Hash, Hasher};
 use primitives::{
-    eip7702, eip8037,
+    eip2780, eip7702, eip8037, eip8038,
     hardfork::SpecId::{self},
-    OnceLock, TxKind, U256,
+    OnceLock, U256,
 };
 use std::sync::Arc;
 
@@ -202,6 +202,7 @@ impl GasParams {
         table[GasId::initcode_per_word().as_usize()] = gas::INITCODE_WORD_COST;
         table[GasId::create().as_usize()] = gas::CREATE;
         table[GasId::call_stipend_reduction().as_usize()] = 64;
+        table[GasId::max_refund_quotient().as_usize()] = 2;
         table[GasId::transfer_value_cost().as_usize()] = gas::CALLVALUE;
         table[GasId::cold_account_additional_cost().as_usize()] = 0;
         table[GasId::new_account_cost().as_usize()] = gas::NEWACCOUNT;
@@ -290,6 +291,7 @@ impl GasParams {
                 gas::WARM_SSTORE_RESET + gas::ACCESS_LIST_STORAGE_KEY;
 
             table[GasId::selfdestruct_refund().as_usize()] = 0;
+            table[GasId::max_refund_quotient().as_usize()] = 5;
         }
 
         if spec.is_enabled_in(SpecId::SHANGHAI) {
@@ -297,11 +299,10 @@ impl GasParams {
         }
 
         if spec.is_enabled_in(SpecId::PRAGUE) {
-            table[GasId::tx_eip7702_per_empty_account_cost().as_usize()] =
-                eip7702::PER_EMPTY_ACCOUNT_COST;
+            table[GasId::tx_eip7702_regular_gas().as_usize()] = eip7702::PER_EMPTY_ACCOUNT_COST;
 
             // EIP-7702 authorization refund for existing accounts
-            table[GasId::tx_eip7702_auth_refund().as_usize()] =
+            table[GasId::tx_eip7702_regular_refund().as_usize()] =
                 eip7702::PER_EMPTY_ACCOUNT_COST - eip7702::PER_AUTH_BASE_COST;
 
             table[GasId::tx_floor_cost_per_token().as_usize()] = gas::TOTAL_COST_FLOOR_PER_TOKEN;
@@ -316,14 +317,7 @@ impl GasParams {
         // once when building the gas table.
         if spec.is_enabled_in(SpecId::AMSTERDAM) {
             // Regular gas changes
-            table[GasId::create().as_usize()] = 9000;
-            table[GasId::tx_create_cost().as_usize()] = 9000;
             table[GasId::code_deposit_cost().as_usize()] = 0;
-            table[GasId::new_account_cost().as_usize()] = 0;
-            table[GasId::new_account_cost_for_selfdestruct().as_usize()] = 0;
-            // GAS_STORAGE_SET regular = GAS_STORAGE_UPDATE - GAS_COLD_SLOAD = 5000 - 2100 = 2900
-            // sstore_set_without_load_cost = 2900 - WARM_STORAGE_READ_COST(100) = 2800
-            table[GasId::sstore_set_without_load_cost().as_usize()] = 2800;
 
             // State gas values with Glamsterdam CPSB baked in.
             table[GasId::sstore_set_state_gas().as_usize()] =
@@ -337,20 +331,8 @@ impl GasParams {
             table[GasId::tx_eip7702_state_gas_bytecode().as_usize()] =
                 eip8037::AUTH_BASE_BYTES * eip8037::CPSB_GLAMSTERDAM;
 
-            // SSTORE refund for 0→X→0 restoration: regular gas only.
-            // The state-gas portion is restored directly
-            // to the reservoir via `GasParams::sstore_state_gas_refill`.
-            table[GasId::sstore_set_refund().as_usize()] = 2800;
-
-            // EIP-7702 under EIP-8037: only the regular-gas slots live here.
-            // The state-gas portions are sourced from `new_account_state_gas`
-            // (per-account) and `tx_eip7702_state_gas_bytecode` (per-bytecode);
-            // helpers in `GasParams` combine the pre-scaled values.
-            //   regular per-auth cost: 7500 (state bytes added pessimistically in `initial_tx_gas`)
-            //   regular refund:        0   (per-auth refund is entirely state gas)
-            table[GasId::tx_eip7702_per_empty_account_cost().as_usize()] =
-                eip8037::EIP7702_PER_EMPTY_ACCOUNT_REGULAR;
-            table[GasId::tx_eip7702_auth_refund().as_usize()] = 0;
+            // EIP-2780: the floor base drops from 21,000 to TX_BASE (12,000).
+            table[GasId::tx_floor_cost_base_gas().as_usize()] = eip2780::TX_BASE_COST;
 
             // EIP-7976: Increase calldata floor cost from 10/40 to 64/64 gas per byte
             // (zero/nonzero). The per-token constant bumps from 10 to 16, and
@@ -361,15 +343,87 @@ impl GasParams {
                 table[GasId::tx_token_non_zero_byte_multiplier().as_usize()];
 
             // EIP-7981: Charge access list data at 64 gas per byte, matching
-            // calldata floor pricing. Per-item costs bake in the data charge:
-            //   address: 2400 + 20 * 64 = 3680
-            //   key:     1900 + 32 * 64 = 3948
-            // And every access-list byte contributes 4 floor tokens (16 * 4 = 64 gas).
-            table[GasId::tx_access_list_address_cost().as_usize()] =
-                gas::ACCESS_LIST_ADDRESS + 20 * 64;
-            table[GasId::tx_access_list_storage_key_cost().as_usize()] =
-                gas::ACCESS_LIST_STORAGE_KEY + 32 * 64;
+            // calldata floor pricing: every access-list byte contributes 4 floor
+            // tokens (16 * 4 = 64 gas). The per-item costs (with the data charge
+            // baked in) are set below on top of the EIP-8038 base.
             table[GasId::tx_access_list_floor_byte_multiplier().as_usize()] = 4;
+
+            // EIP-8038: State-access gas cost update (glamsterdam devnet-8
+            // values). Constants live in `primitives::eip8038`.
+            //   WARM_ACCESS                    100 ->    100  (unchanged)
+            //   COLD_ACCOUNT_ACCESS          2,600 ->  3,000
+            //   ACCOUNT_WRITE                6,700 ->  9,000
+            //   COLD_STORAGE_ACCESS          2,100 ->  2,100  (unchanged)
+            //   STORAGE_WRITE                2,800 -> 10,000
+            //   STORAGE_CLEAR_REFUND         4,800 -> 11,616
+            //   CREATE_ACCESS                7,000 -> 12,000  (ACCOUNT_WRITE + COLD_ACCOUNT_ACCESS)
+            //   ACCESS_LIST_ADDRESS_COST     2,400 ->  2,900  (COLD_ACCOUNT_ACCESS - WARM_ACCESS)
+            //   ACCESS_LIST_STORAGE_KEY_COST 1,900 ->  2,000  (COLD_STORAGE_ACCESS - WARM_ACCESS)
+            //
+            // Account access table values.
+            table[GasId::warm_storage_read_cost().as_usize()] = eip8038::WARM_ACCESS;
+            table[GasId::cold_account_additional_cost().as_usize()] =
+                eip8038::COLD_ACCOUNT_ACCESS_ADDITIONAL;
+            table[GasId::cold_storage_additional_cost().as_usize()] =
+                eip8038::COLD_STORAGE_ACCESS_ADDITIONAL;
+            // EIP-8038 folds the warm base into the cold cost: a cold SSTORE pays
+            // COLD_STORAGE_ACCESS (2100) total, not warm(100)+cold. Since
+            // `sstore_static` (warm, 100) is always charged in `sstore_dynamic_gas`,
+            // the cold add-on here is the premium above warm (2000), unlike pre-8038
+            // forks which add the full `COLD_SLOAD_COST` on top of the warm base.
+            table[GasId::cold_storage_cost().as_usize()] = eip8038::COLD_STORAGE_ACCESS_ADDITIONAL;
+            // CALL_VALUE = ACCOUNT_WRITE + CALL_STIPEND. A value-bearing CALL already
+            // pays the ACCOUNT_WRITE surcharge via `transfer_value_cost`, so creating
+            // the target charges no extra regular gas — only the NEW_ACCOUNT state gas
+            // (hence `new_account_cost` is zero). SELFDESTRUCT has no such bundled
+            // charge, so it still pays a separate ACCOUNT_WRITE when sending balance to
+            // an empty account (execution-specs `selfdestruct`).
+            table[GasId::transfer_value_cost().as_usize()] = eip8038::CALL_VALUE;
+            table[GasId::new_account_cost().as_usize()] = 0;
+            table[GasId::new_account_cost_for_selfdestruct().as_usize()] = eip8038::ACCOUNT_WRITE;
+
+            // SSTORE table values.
+            //   warm-base       = WARM_ACCESS         (sstore_static)
+            //   write surcharge = STORAGE_WRITE       (sstore_set / sstore_reset dynamic)
+            //   refunds         = STORAGE_WRITE / STORAGE_CLEAR_REFUND
+            table[GasId::sstore_static().as_usize()] = eip8038::WARM_ACCESS;
+            table[GasId::sstore_set_without_load_cost().as_usize()] = eip8038::STORAGE_WRITE;
+            table[GasId::sstore_reset_without_cold_load_cost().as_usize()] = eip8038::STORAGE_WRITE;
+            table[GasId::sstore_set_refund().as_usize()] = eip8038::STORAGE_WRITE;
+            table[GasId::sstore_reset_refund().as_usize()] = eip8038::STORAGE_WRITE;
+            table[GasId::sstore_clearing_slot_refund().as_usize()] = eip8038::STORAGE_CLEAR_REFUND;
+
+            // CREATE / CREATE2 regular-gas access cost.
+            //   `create` slot is the regular-gas portion charged at the
+            //   CREATE/CREATE2 opcodes and for create-kind txns.
+            table[GasId::create().as_usize()] = eip8038::CREATE_ACCESS;
+            table[GasId::tx_create_cost().as_usize()] = eip8038::CREATE_ACCESS;
+
+            // Access-list per-item costs: EIP-8038 base (COLD_*_ACCESS, 3,000 each),
+            // keeping the EIP-7981 64 gas/byte data charge on top.
+            table[GasId::tx_access_list_address_cost().as_usize()] =
+                eip8038::ACCESS_LIST_ADDRESS_COST + 20 * 64;
+            table[GasId::tx_access_list_storage_key_cost().as_usize()] =
+                eip8038::ACCESS_LIST_STORAGE_KEY_COST + 32 * 64;
+
+            // EIP-7702 under EIP-2780: the intrinsic per-auth charge is the
+            // state-independent REGULAR_PER_AUTH_BASE_COST (7,816) only. The
+            // state-dependent remainder — ACCOUNT_WRITE plus the new-account
+            // (`new_account_state_gas`) and delegation-bytes
+            // (`tx_eip7702_state_gas_bytecode`) state gas — is charged at the
+            // runtime gas phase, per authority that incurs it, so the
+            // pre-Amsterdam per-auth refund never applies.
+            table[GasId::tx_eip7702_regular_gas().as_usize()] =
+                eip8038::EIP7702_PER_AUTH_BASE_REGULAR;
+            table[GasId::tx_eip7702_regular_refund().as_usize()] = 0;
+
+            // EIP-2780: Intrinsic gas decomposition. The new path uses
+            // `eip2780::TX_BASE_COST` directly for the sender base and these
+            // entries for the additional `to`- and `value`-based charges.
+            // ACCOUNT_WRITE / CREATE_ACCESS source from `eip8038` so a single
+            // change to the placeholder TBD values propagates everywhere.
+            table[GasId::tx_account_write_cost().as_usize()] = eip8038::ACCOUNT_WRITE;
+            table[GasId::tx_create_access_cost().as_usize()] = eip8038::CREATE_ACCESS;
         }
 
         Self::new(Arc::new(table))
@@ -474,6 +528,14 @@ impl GasParams {
     #[inline]
     pub fn sstore_reset_refund(&self) -> u64 {
         self.get(GasId::sstore_reset_refund())
+    }
+
+    /// Maximum gas refund quotient.
+    ///
+    /// The final transaction refund is capped to `gas_used / max_refund_quotient`.
+    #[inline]
+    pub fn max_refund_quotient(&self) -> u64 {
+        self.get(GasId::max_refund_quotient())
     }
 
     /// Dynamic gas cost for SSTORE opcode.
@@ -745,62 +807,31 @@ impl GasParams {
 
     /// Used in [GasParams::initial_tx_gas] to calculate the eip7702 per-auth cost.
     ///
-    /// Under EIP-8037 this combines a regular portion with a state-gas portion.
-    /// Pre-EIP-8037 the state-gas portion is zero so this returns the legacy
-    /// `PER_EMPTY_ACCOUNT_COST`.
+    /// Pre-Amsterdam this is the pessimistic bundled `PER_EMPTY_ACCOUNT_COST`
+    /// (25,000). Under EIP-2780 (Amsterdam) it is the state-independent
+    /// `REGULAR_PER_AUTH_BASE_COST` (7,816) only; the state-dependent remainder
+    /// (`ACCOUNT_WRITE` plus the new-account / delegation-bytes state gas) is
+    /// charged at the runtime gas phase, per authority that incurs it.
     #[inline]
     pub fn tx_eip7702_per_empty_account_cost(&self) -> u64 {
-        let regular = self.get(GasId::tx_eip7702_per_empty_account_cost());
-        let state = self.tx_eip7702_state_gas();
-        regular.saturating_add(state)
+        self.get(GasId::tx_eip7702_regular_gas())
     }
 
-    /// EIP-7702 authorization refund per existing account.
-    ///
-    /// Pre-Amsterdam this is a fixed regular-gas refund (`PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST`).
-    /// Under EIP-8037 the refund is fully state gas, equal to the per-account
-    /// state-gas portion.
-    #[inline]
-    pub fn tx_eip7702_auth_refund(&self) -> u64 {
-        let regular = self.get(GasId::tx_eip7702_auth_refund());
-        let state = self.new_account_state_gas();
-        regular.saturating_add(state)
-    }
-
-    /// EIP-8037: State gas per EIP-7702 authorization (pessimistic).
-    ///
-    /// Sums the new-account and bytecode state-gas portions. Used for
-    /// `initial_state_gas` tracking. Zero before AMSTERDAM.
-    #[inline]
-    pub fn tx_eip7702_state_gas(&self) -> u64 {
-        let new_account = self.get(GasId::new_account_state_gas());
-        let bytecode = self.get(GasId::tx_eip7702_state_gas_bytecode());
-        new_account.saturating_add(bytecode)
-    }
-
-    /// EIP-7702 total state-gas refund for a transaction.
-    ///
-    /// Combines the per-account refund for an existing authorization account
-    /// with the per-bytecode refund for an already deployed delegation target.
-    /// Returns zero before AMSTERDAM.
-    #[inline]
-    pub fn tx_eip7702_state_refund(&self, refunded_accounts: u64, refunded_bytecodes: u64) -> u64 {
-        let per_account = self
-            .get(GasId::new_account_state_gas())
-            .saturating_mul(refunded_accounts);
-        let per_bytecode = self
-            .get(GasId::tx_eip7702_state_gas_bytecode())
-            .saturating_mul(refunded_bytecodes);
-        per_account.saturating_add(per_bytecode)
-    }
-
-    /// EIP-7702 per-auth refund: regular-gas portion only.
+    /// EIP-7702 per-auth refund for an already-existing authority.
     ///
     /// Pre-Amsterdam this is `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` (12500).
-    /// Under EIP-8037 it is zero — the refund is entirely state gas.
+    /// Under EIP-2780 it is zero — the state-dependent per-auth charges are
+    /// applied at the runtime gas phase instead of refunded.
     #[inline]
     pub fn tx_eip7702_auth_refund_regular(&self) -> u64 {
-        self.get(GasId::tx_eip7702_auth_refund())
+        self.get(GasId::tx_eip7702_regular_refund())
+    }
+
+    /// EIP-8037: state gas for one 23-byte EIP-7702 delegation indicator
+    /// (`STATE_BYTES_PER_AUTH_BASE × CPSB`). Zero before AMSTERDAM.
+    #[inline]
+    pub fn tx_eip7702_state_gas_bytecode(&self) -> u64 {
+        self.get(GasId::tx_eip7702_state_gas_bytecode())
     }
 
     /// Used in [GasParams::initial_tx_gas] to calculate the token non zero byte multiplier.
@@ -927,75 +958,20 @@ impl GasParams {
         self.get(GasId::tx_base_stipend())
     }
 
-    /// Recipient-side execution gas for a plain call (Glamsterdam
-    /// `COLD_ACCOUNT_ACCESS`). Zero on pre-Glamsterdam specs.
+    /// EIP-2780/EIP-8038: regular gas cost of an account-leaf write, added
+    /// when `tx.value > 0` and the recipient differs from the sender.
+    /// Zero before AMSTERDAM.
     #[inline]
-    pub fn tx_recipient_access_cost(&self) -> u64 {
-        self.get(GasId::tx_recipient_access_cost())
+    pub fn tx_account_write_cost(&self) -> u64 {
+        self.get(GasId::tx_account_write_cost())
     }
 
-    /// Value-transfer execution gas (Glamsterdam `TX_VALUE_COST`). Zero on
-    /// pre-Glamsterdam specs.
+    /// EIP-2780/EIP-8038: regular gas cost of a top-level CREATE access,
+    /// in addition to [`Self::tx_base_stipend`] and the EIP-8037 state gas.
+    /// Zero before AMSTERDAM.
     #[inline]
-    pub fn tx_value_cost(&self) -> u64 {
-        self.get(GasId::tx_value_cost())
-    }
-
-    /// The transaction's recipient-side execution gas: `TX_BASE`'s companion
-    /// term in the Glamsterdam intrinsic formula.
-    ///
-    /// Mirrors `calculate_intrinsic_cost`'s `recipient_execution_gas` in
-    /// `ethereum/execution-specs` (`forks/amsterdam/transactions.py`):
-    ///
-    /// - contract creation → [`Self::tx_create_cost`] (`CREATE_ACCESS`)
-    /// - self-transfer (`sender == to`) → 0, no recipient or value charge
-    /// - otherwise → `COLD_ACCOUNT_ACCESS` plus `TX_VALUE_COST` when `value > 0`
-    ///
-    /// On pre-Glamsterdam specs the two new slots are zero, so this collapses
-    /// to `tx_create_cost` on creations and 0 otherwise — exactly the previous
-    /// behavior.
-    ///
-    /// Under the Glamsterdam repricing this also anchors the calldata floor —
-    /// see [`Self::tx_floor_anchors_on_recipient_gas`].
-    #[inline]
-    pub fn tx_recipient_execution_gas(
-        &self,
-        is_create: bool,
-        is_self_transfer: bool,
-        has_value: bool,
-    ) -> u64 {
-        if is_create {
-            return self.tx_create_cost();
-        }
-        if is_self_transfer {
-            return 0;
-        }
-        let mut gas = self.tx_recipient_access_cost();
-        if has_value {
-            gas = gas.saturating_add(self.tx_value_cost());
-        }
-        gas
-    }
-
-    /// Whether the calldata floor anchors on
-    /// [`Self::tx_recipient_execution_gas`] in addition to
-    /// [`Self::tx_floor_cost_base_gas`].
-    ///
-    /// Glamsterdam's `calculate_intrinsic_cost` anchors the floor on
-    /// `TX_BASE + recipient_execution_gas` so it can never undercut the
-    /// transaction's own intrinsic base. Under EIP-7623/7976 as shipped
-    /// pre-Glamsterdam the floor anchors on the flat base alone — notably it
-    /// does **not** include `tx_create_cost` for creations.
-    ///
-    /// A non-zero `tx_recipient_access_cost` is the activation marker: that
-    /// slot is zero on every pre-Glamsterdam table (where the recipient's
-    /// access is bundled into `tx_base_stipend`'s flat 21000) and non-zero only
-    /// once the repricing that decomposed it is in play. Gating on the slot
-    /// rather than on a spec id keeps this correct for a research schedule that
-    /// overlays the repricing onto another spec's table.
-    #[inline]
-    pub fn tx_floor_anchors_on_recipient_gas(&self) -> bool {
-        self.tx_recipient_access_cost() != 0
+    pub fn tx_create_access_cost(&self) -> u64 {
+        self.get(GasId::tx_create_access_cost())
     }
 
     /// Used in [GasParams::initial_tx_gas] to calculate the create cost.
@@ -1022,12 +998,18 @@ impl GasParams {
     /// - EIP-7702 auth list state gas (per-auth account creation + metadata costs)
     /// - For CREATE transactions: `create_state_gas` (account creation + contract metadata)
     ///
+    /// When `eip2780` is `Some`, the legacy `21,000`-style base + create-cost
+    /// stipend is replaced with the EIP-2780 decomposition
+    /// (`TX_BASE_COST + to-based + value-based`). Calldata, access list, and
+    /// authorization-list costs are unchanged.
+    ///
     /// Note: `code_deposit_state_gas` is not included since deployed code size is unknown at validation time.
     ///
     /// # Returns
     ///
     /// - Intrinsic gas (including state gas for CREATE)
     /// - Number of tokens in calldata
+    #[allow(clippy::too_many_arguments)]
     pub fn initial_tx_gas(
         &self,
         input: &[u8],
@@ -1035,108 +1017,102 @@ impl GasParams {
         access_list_accounts: u64,
         access_list_storages: u64,
         authorization_list_num: u64,
-    ) -> InitialAndFloorGas {
-        self.initial_tx_gas_with_recipient(
-            input,
-            is_create,
-            access_list_accounts,
-            access_list_storages,
-            authorization_list_num,
-            false,
-            false,
-        )
-    }
-
-    /// Calculates the initial transaction gas, including the recipient-side
-    /// terms the Glamsterdam intrinsic formula introduced.
-    ///
-    /// [`Self::initial_tx_gas`] forwards here with `is_self_transfer` and
-    /// `has_value` both false. That is exact on every pre-Glamsterdam table —
-    /// the recipient and value slots are zero there, so neither flag can change
-    /// the result — but a Glamsterdam table needs the real values, which is why
-    /// [`Self::initial_tx_gas_for_tx`] reads them off the transaction.
-    ///
-    /// See `calculate_intrinsic_cost` in `ethereum/execution-specs`
-    /// (`forks/amsterdam/transactions.py`) for the reference formula.
-    #[allow(clippy::too_many_arguments)]
-    pub fn initial_tx_gas_with_recipient(
-        &self,
-        input: &[u8],
-        is_create: bool,
-        access_list_accounts: u64,
-        access_list_storages: u64,
-        authorization_list_num: u64,
-        is_self_transfer: bool,
-        has_value: bool,
+        eip2780: Option<Eip2780TxInfo>,
     ) -> InitialAndFloorGas {
         // Initdate stipend
         let tokens_in_calldata =
             get_tokens_in_calldata(input, self.tx_token_non_zero_byte_multiplier());
 
-        // EIP-7702: Compute auth list costs.
-        // Under EIP-8037, tx_eip7702_per_empty_account_cost bundles regular + state gas.
-        // We split them: regular goes in initial_regular_gas, state goes in initial_state_gas.
-        let auth_total_cost = authorization_list_num * self.tx_eip7702_per_empty_account_cost();
-        let auth_state_gas = authorization_list_num * self.tx_eip7702_state_gas();
+        // EIP-7702: Compute auth list costs. See
+        // [`tx_eip7702_per_empty_account_cost`](Self::tx_eip7702_per_empty_account_cost)
+        // for the per-auth intrinsic charge per fork.
+        let auth_regular_cost = authorization_list_num * self.tx_eip7702_per_empty_account_cost();
 
-        let auth_regular_cost = auth_total_cost - auth_state_gas;
+        let base_and_to_and_value_gas = match &eip2780 {
+            None => {
+                let mut base = self.tx_base_stipend();
+                if is_create {
+                    // EIP-2: Homestead Hard-fork Changes
+                    base += self.tx_create_cost();
+                }
+                base
+            }
+            Some(info) => self.eip2780_base_to_value_gas(is_create, info),
+        };
 
         let mut initial_regular_gas = tokens_in_calldata * self.tx_token_cost()
             // before berlin tx_access_list_address_cost will be zero
             + access_list_accounts * self.tx_access_list_address_cost()
             // before berlin tx_access_list_storage_key_cost will be zero
             + access_list_storages * self.tx_access_list_storage_key_cost()
-            + self.tx_base_stipend()
+            + base_and_to_and_value_gas
             // EIP-7702: Only the regular portion of auth list cost
             + auth_regular_cost;
-
-        // EIP-8037: Track auth list state gas separately for reservoir handling.
-        let mut initial_state_gas = auth_state_gas;
-
-        // Recipient-side execution gas. On pre-Glamsterdam tables this is
-        // `tx_create_cost` for a creation and 0 otherwise — i.e. exactly the
-        // EIP-2 create charge this replaced. On a Glamsterdam table it is
-        // `CREATE_ACCESS` / `COLD_ACCOUNT_ACCESS` (+ `TX_VALUE_COST`) / 0 for
-        // create / call / self-transfer respectively.
-        let recipient_execution_gas =
-            self.tx_recipient_execution_gas(is_create, is_self_transfer, has_value);
-        initial_regular_gas += recipient_execution_gas;
 
         if is_create {
             // EIP-3860: Limit and meter initcode
             initial_regular_gas += self.tx_initcode_cost(input.len());
-
-            // EIP-8037: State gas for CREATE transactions.
-            // create_state_gas covers both account creation and contract metadata.
-            initial_state_gas += self.create_state_gas();
         }
 
         // Calculate gas floor. Introduced by EIP-7623, updated by EIP-7976, and
         // extended by EIP-7981 to include access-list data alongside calldata.
+        //
+        // Under EIP-2780 the floor is anchored on the decomposed regular-gas
+        // intrinsic base (`TX_BASE + to-based + value-based`, the same sum used
+        // for `base_and_to_and_value_gas` above) rather than the flat
+        // `tx_floor_cost_base_gas`, so it never undercuts the transaction's own
+        // intrinsic base.
         let access_list_floor_tokens =
             self.tx_floor_tokens_in_access_list(access_list_accounts, access_list_storages);
         let mut floor_gas =
             self.tx_floor_cost(input) + access_list_floor_tokens * self.tx_floor_cost_per_token();
-
-        // Glamsterdam anchors the floor on `TX_BASE + recipient_execution_gas`
-        // rather than the flat base alone, so it can never undercut the tx's own
-        // intrinsic base. Pre-Glamsterdam floors are unchanged — including for
-        // creations, whose floor deliberately excludes `tx_create_cost`.
-        if self.tx_floor_anchors_on_recipient_gas() {
-            floor_gas = floor_gas.saturating_add(recipient_execution_gas);
+        if eip2780.is_some() {
+            floor_gas = floor_gas - self.tx_floor_cost_base_gas() + base_and_to_and_value_gas;
         }
 
+        // `initial_state_gas` stays zero at the intrinsic phase: state-dependent
+        // charges are applied at the EIP-2780 runtime gas phase
+        // (`apply_eip2780_runtime_gas`), which adds them to `initial_state_gas`.
         InitialAndFloorGas::default()
             .with_initial_regular_gas(initial_regular_gas)
-            .with_initial_state_gas(initial_state_gas)
             .with_floor_gas(floor_gas)
+    }
+
+    /// EIP-2780: sum of the sender base, `tx.to`-based, and `tx.value`-based
+    /// regular-gas charges. Excludes calldata, access list, authorizations,
+    /// and initcode/state-gas pieces which are added by the caller.
+    ///
+    /// Per execution-specs, a self-transfer (`tx.to == sender`) pays neither
+    /// the `to`- nor `value`-based charge — only the base. Precompile
+    /// recipients are charged the same as any other account (the precompile
+    /// carve-out from the draft is not implemented).
+    fn eip2780_base_to_value_gas(&self, is_create: bool, info: &Eip2780TxInfo) -> u64 {
+        let mut gas = eip2780::TX_BASE_COST;
+
+        if is_create {
+            // tx.to charge: contract-creation access cost. Since glamsterdam
+            // devnet-8, creates pay no value-based charge.
+            gas += self.tx_create_access_cost();
+        } else if !info.is_self_transfer {
+            // tx.to charge: cold account access of the recipient.
+            gas += eip8038::COLD_ACCOUNT_ACCESS;
+            if !info.value.is_zero() {
+                gas += eip2780::TX_VALUE_COST;
+            }
+        }
+
+        gas
     }
 
     /// Calculates the initial transaction gas directly from a [`Transaction`],
     /// deriving the access list counts from the transaction itself.
     ///
     /// See [`GasParams::initial_tx_gas`] for details on the returned gas.
-    pub fn initial_tx_gas_for_tx(&self, tx: impl Transaction) -> InitialAndFloorGas {
+    pub fn initial_tx_gas_for_tx(
+        &self,
+        tx: impl Transaction,
+        eip2780: Option<Eip2780TxInfo>,
+    ) -> InitialAndFloorGas {
         let mut accounts = 0;
         let mut storages = 0;
         // Legacy is the only tx type that does not have an access list.
@@ -1154,23 +1130,30 @@ impl GasParams {
                 .unwrap_or_default();
         }
 
-        // Glamsterdam's intrinsic exempts a self-transfer from the recipient
-        // and value charges, and charges `TX_VALUE_COST` only when value is
-        // non-zero. Both are zero-cost reads here and inert on pre-Glamsterdam
-        // tables, where the corresponding slots are zero.
-        let kind = tx.kind();
-        let is_self_transfer = matches!(kind, TxKind::Call(to) if to == tx.caller());
-
-        self.initial_tx_gas_with_recipient(
+        self.initial_tx_gas(
             tx.input(),
-            kind.is_create(),
+            tx.kind().is_create(),
             accounts,
             storages,
             tx.authorization_list_len() as u64,
-            is_self_transfer,
-            !tx.value().is_zero(),
+            eip2780,
         )
     }
+}
+
+/// EIP-2780 inputs to [`GasParams::initial_tx_gas`].
+///
+/// Carries the transferred value and whether the transaction is a
+/// self-transfer (`tx.to == sender`). The decomposed intrinsic model branches
+/// on `is_create` (already passed to `initial_tx_gas`), whether `tx.value` is
+/// zero, and the self-transfer carve-out; see
+/// `GasParams::eip2780_base_to_value_gas`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Eip2780TxInfo {
+    /// Transferred value.
+    pub value: U256,
+    /// Whether `tx.to == sender` (a `Call` to the sender's own address).
+    pub is_self_transfer: bool,
 }
 
 #[inline]
@@ -1226,6 +1209,7 @@ impl GasId {
             x if x == Self::initcode_per_word().as_u8() => "initcode_per_word",
             x if x == Self::create().as_u8() => "create",
             x if x == Self::call_stipend_reduction().as_u8() => "call_stipend_reduction",
+            x if x == Self::max_refund_quotient().as_u8() => "max_refund_quotient",
             x if x == Self::transfer_value_cost().as_u8() => "transfer_value_cost",
             x if x == Self::cold_account_additional_cost().as_u8() => {
                 "cold_account_additional_cost"
@@ -1250,9 +1234,7 @@ impl GasId {
                 "new_account_cost_for_selfdestruct"
             }
             x if x == Self::code_deposit_cost().as_u8() => "code_deposit_cost",
-            x if x == Self::tx_eip7702_per_empty_account_cost().as_u8() => {
-                "tx_eip7702_per_empty_account_cost"
-            }
+            x if x == Self::tx_eip7702_regular_gas().as_u8() => "tx_eip7702_regular_gas",
             x if x == Self::tx_token_non_zero_byte_multiplier().as_u8() => {
                 "tx_token_non_zero_byte_multiplier"
             }
@@ -1268,7 +1250,7 @@ impl GasId {
             x if x == Self::tx_initcode_cost().as_u8() => "tx_initcode_cost",
             x if x == Self::sstore_set_refund().as_u8() => "sstore_set_refund",
             x if x == Self::sstore_reset_refund().as_u8() => "sstore_reset_refund",
-            x if x == Self::tx_eip7702_auth_refund().as_u8() => "tx_eip7702_auth_refund",
+            x if x == Self::tx_eip7702_regular_refund().as_u8() => "tx_eip7702_regular_refund",
             x if x == Self::sstore_set_state_gas().as_u8() => "sstore_set_state_gas",
             x if x == Self::new_account_state_gas().as_u8() => "new_account_state_gas",
             x if x == Self::code_deposit_state_gas().as_u8() => "code_deposit_state_gas",
@@ -1282,8 +1264,8 @@ impl GasId {
             x if x == Self::tx_access_list_floor_byte_multiplier().as_u8() => {
                 "tx_access_list_floor_byte_multiplier"
             }
-            x if x == Self::tx_recipient_access_cost().as_u8() => "tx_recipient_access_cost",
-            x if x == Self::tx_value_cost().as_u8() => "tx_value_cost",
+            x if x == Self::tx_account_write_cost().as_u8() => "tx_account_write_cost",
+            x if x == Self::tx_create_access_cost().as_u8() => "tx_create_access_cost",
             _ => "unknown",
         }
     }
@@ -1315,6 +1297,7 @@ impl GasId {
             "initcode_per_word" => Some(Self::initcode_per_word()),
             "create" => Some(Self::create()),
             "call_stipend_reduction" => Some(Self::call_stipend_reduction()),
+            "max_refund_quotient" => Some(Self::max_refund_quotient()),
             "transfer_value_cost" => Some(Self::transfer_value_cost()),
             "cold_account_additional_cost" => Some(Self::cold_account_additional_cost()),
             "new_account_cost" => Some(Self::new_account_cost()),
@@ -1331,7 +1314,7 @@ impl GasId {
             "cold_storage_cost" => Some(Self::cold_storage_cost()),
             "new_account_cost_for_selfdestruct" => Some(Self::new_account_cost_for_selfdestruct()),
             "code_deposit_cost" => Some(Self::code_deposit_cost()),
-            "tx_eip7702_per_empty_account_cost" => Some(Self::tx_eip7702_per_empty_account_cost()),
+            "tx_eip7702_regular_gas" => Some(Self::tx_eip7702_regular_gas()),
             "tx_token_non_zero_byte_multiplier" => Some(Self::tx_token_non_zero_byte_multiplier()),
             "tx_token_cost" => Some(Self::tx_token_cost()),
             "tx_floor_cost_per_token" => Some(Self::tx_floor_cost_per_token()),
@@ -1343,7 +1326,7 @@ impl GasId {
             "tx_initcode_cost" => Some(Self::tx_initcode_cost()),
             "sstore_set_refund" => Some(Self::sstore_set_refund()),
             "sstore_reset_refund" => Some(Self::sstore_reset_refund()),
-            "tx_eip7702_auth_refund" => Some(Self::tx_eip7702_auth_refund()),
+            "tx_eip7702_regular_refund" => Some(Self::tx_eip7702_regular_refund()),
             "sstore_set_state_gas" => Some(Self::sstore_set_state_gas()),
             "new_account_state_gas" => Some(Self::new_account_state_gas()),
             "code_deposit_state_gas" => Some(Self::code_deposit_state_gas()),
@@ -1355,8 +1338,8 @@ impl GasId {
             "tx_access_list_floor_byte_multiplier" => {
                 Some(Self::tx_access_list_floor_byte_multiplier())
             }
-            "tx_recipient_access_cost" => Some(Self::tx_recipient_access_cost()),
-            "tx_value_cost" => Some(Self::tx_value_cost()),
+            "tx_account_write_cost" => Some(Self::tx_account_write_cost()),
+            "tx_create_access_cost" => Some(Self::tx_create_access_cost()),
             _ => None,
         }
     }
@@ -1419,6 +1402,11 @@ impl GasId {
     /// Call stipend reduction. Call stipend is reduced by 1/64 of the gas limit.
     pub const fn call_stipend_reduction() -> GasId {
         Self::new(12)
+    }
+
+    /// Maximum gas refund quotient.
+    pub const fn max_refund_quotient() -> GasId {
+        Self::new(47)
     }
 
     /// Transfer value cost
@@ -1494,8 +1482,13 @@ impl GasId {
         Self::new(26)
     }
 
-    /// EIP-7702 PER_EMPTY_ACCOUNT_COST gas
-    pub const fn tx_eip7702_per_empty_account_cost() -> GasId {
+    /// EIP-7702 per-auth intrinsic gas.
+    ///
+    /// Pre-Amsterdam this holds the pessimistic bundled `PER_EMPTY_ACCOUNT_COST`;
+    /// under EIP-2780 it holds the state-independent `REGULAR_PER_AUTH_BASE_COST`
+    /// only (the state-dependent remainder is charged at the runtime gas phase).
+    /// Exposed via [`GasParams::tx_eip7702_per_empty_account_cost`].
+    pub const fn tx_eip7702_regular_gas() -> GasId {
         Self::new(27)
     }
 
@@ -1554,10 +1547,14 @@ impl GasId {
         Self::new(38)
     }
 
-    /// EIP-7702 authorization refund per existing account.
-    /// This is the refund given when an authorization is applied to an already existing account.
-    /// Calculated as PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST (25000 - 12500 = 12500).
-    pub const fn tx_eip7702_auth_refund() -> GasId {
+    /// EIP-7702 per-auth regular-gas refund (the non-state portion).
+    ///
+    /// This is the refund given when an authorization is applied to an already
+    /// existing account. Pre-EIP-8037 it is `PER_EMPTY_ACCOUNT_COST -
+    /// PER_AUTH_BASE_COST` (25000 - 12500 = 12500); under EIP-8037 the refund is
+    /// entirely state gas so this is zero. Read it through
+    /// [`GasParams::tx_eip7702_auth_refund_regular`].
+    pub const fn tx_eip7702_regular_refund() -> GasId {
         Self::new(39)
     }
 
@@ -1607,24 +1604,18 @@ impl GasId {
         Self::new(46)
     }
 
-    /// Execution gas charged on the transaction's *recipient* for a plain call
-    /// (EIP-2780 / Glamsterdam `COLD_ACCOUNT_ACCESS`).
-    ///
-    /// Zero on every pre-Glamsterdam spec, where the recipient's access is
-    /// bundled into `tx_base_stipend`'s flat 21000. Skipped for contract
-    /// creations (`tx_create_cost` covers those) and for self-transfers.
-    pub const fn tx_recipient_access_cost() -> GasId {
-        Self::new(47)
+    /// EIP-2780/EIP-8038: regular gas cost of an account-leaf write at the
+    /// intrinsic level (added when `tx.value > 0` and the recipient differs
+    /// from the sender). Zero before AMSTERDAM.
+    pub const fn tx_account_write_cost() -> GasId {
+        Self::new(48)
     }
 
-    /// Execution gas charged on a value-bearing transaction (Glamsterdam
-    /// `TX_VALUE_COST`), on top of
-    /// [`tx_recipient_access_cost`](Self::tx_recipient_access_cost).
-    ///
-    /// Zero on every pre-Glamsterdam spec. Charged only when `value > 0`, and
-    /// never on a self-transfer or a contract creation.
-    pub const fn tx_value_cost() -> GasId {
-        Self::new(48)
+    /// EIP-2780/EIP-8038: regular gas cost of a top-level CREATE access, in
+    /// addition to [`Self::tx_base_stipend`] and the EIP-8037 state gas.
+    /// Zero before AMSTERDAM.
+    pub const fn tx_create_access_cost() -> GasId {
+        Self::new(49)
     }
 }
 
@@ -1659,100 +1650,6 @@ mod tests {
             assert_eq!(log2floor(U256::from(u64::MAX) + U256::from(1u64)), 64);
             assert_eq!(log2floor(U256::MAX), 255);
         }
-    }
-
-    /// The recipient/value slots are additive: on every shipped spec they are
-    /// zero, so `initial_tx_gas` must produce byte-identical results to the
-    /// pre-change implementation regardless of the new flags.
-    #[test]
-    fn recipient_slots_are_inert_on_shipped_specs() {
-        let input = [0u8, 1, 2, 0, 0, 3];
-        for spec in [
-            SpecId::BERLIN,
-            SpecId::LONDON,
-            SpecId::SHANGHAI,
-            SpecId::CANCUN,
-            SpecId::PRAGUE,
-            SpecId::OSAKA,
-            SpecId::AMSTERDAM,
-        ] {
-            let p = GasParams::new_spec(spec);
-            assert_eq!(p.tx_recipient_access_cost(), 0, "{spec:?}");
-            assert_eq!(p.tx_value_cost(), 0, "{spec:?}");
-            assert!(!p.tx_floor_anchors_on_recipient_gas(), "{spec:?}");
-
-            // Every (is_create, is_self_transfer, has_value) combination must
-            // agree with the flag-free entry point.
-            let baseline = p.initial_tx_gas(&input, false, 1, 2, 0);
-            for (create, self_xfer, value) in [
-                (false, false, false),
-                (false, true, false),
-                (false, false, true),
-                (false, true, true),
-            ] {
-                let got = p.initial_tx_gas_with_recipient(
-                    &input, create, 1, 2, 0, self_xfer, value,
-                );
-                assert_eq!(got, baseline, "{spec:?} {create} {self_xfer} {value}");
-            }
-
-            // Creations still charge tx_create_cost in the execution intrinsic,
-            // and their floor still EXCLUDES it.
-            let call = p.initial_tx_gas(&input, false, 0, 0, 0);
-            let create = p.initial_tx_gas(&input, true, 0, 0, 0);
-            assert_eq!(
-                create.initial_regular_gas() - call.initial_regular_gas(),
-                p.tx_create_cost() + p.tx_initcode_cost(input.len()),
-                "{spec:?}"
-            );
-            assert_eq!(create.floor_gas(), call.floor_gas(), "{spec:?}");
-        }
-    }
-
-    /// With the Glamsterdam slots overlaid, `initial_tx_gas_with_recipient`
-    /// reproduces `calculate_intrinsic_cost` from
-    /// `ethereum/execution-specs` (`forks/amsterdam/transactions.py`).
-    #[test]
-    fn glamsterdam_recipient_terms_match_spec_formula() {
-        const TX_BASE: u64 = 12_000;
-        const COLD_ACCOUNT_ACCESS: u64 = 3_000;
-        const TX_VALUE_COST: u64 = 6_000;
-        const CREATE_ACCESS: u64 = 12_000;
-
-        let mut p = GasParams::new_spec(SpecId::AMSTERDAM);
-        p.override_gas([
-            (GasId::tx_base_stipend(), TX_BASE),
-            (GasId::tx_recipient_access_cost(), COLD_ACCOUNT_ACCESS),
-            (GasId::tx_value_cost(), TX_VALUE_COST),
-            (GasId::tx_create_cost(), CREATE_ACCESS),
-            (GasId::tx_floor_cost_base_gas(), TX_BASE),
-        ]);
-        assert!(p.tx_floor_anchors_on_recipient_gas());
-
-        // Empty calldata isolates the base + recipient terms.
-        let g = |create, self_xfer, value| {
-            p.initial_tx_gas_with_recipient(&[], create, 0, 0, 0, self_xfer, value)
-        };
-
-        // Plain call, no value: TX_BASE + COLD_ACCOUNT_ACCESS.
-        assert_eq!(g(false, false, false).initial_regular_gas(), TX_BASE + COLD_ACCOUNT_ACCESS);
-        // Plain call with value: + TX_VALUE_COST.
-        assert_eq!(
-            g(false, false, true).initial_regular_gas(),
-            TX_BASE + COLD_ACCOUNT_ACCESS + TX_VALUE_COST
-        );
-        // Self-transfer skips BOTH the recipient and the value charge, even
-        // when value > 0.
-        assert_eq!(g(false, true, true).initial_regular_gas(), TX_BASE);
-        assert_eq!(g(false, true, false).initial_regular_gas(), TX_BASE);
-        // Creation pays CREATE_ACCESS, and no value cost on top.
-        assert_eq!(g(true, false, true).initial_regular_gas(), TX_BASE + CREATE_ACCESS);
-
-        // The floor anchors on TX_BASE + recipient_execution_gas, so it tracks
-        // the recipient term rather than sitting at a flat base.
-        assert_eq!(g(false, false, false).floor_gas(), TX_BASE + COLD_ACCOUNT_ACCESS);
-        assert_eq!(g(false, true, false).floor_gas(), TX_BASE);
-        assert_eq!(g(true, false, false).floor_gas(), TX_BASE + CREATE_ACCESS);
     }
 
     #[test]
@@ -1790,15 +1687,32 @@ mod tests {
             "Not all unique names are resolvable via from_str"
         );
 
-        // We should have exactly 48 known GasIds (based on the indices 1-48
-        // used). 47/48 are `tx_recipient_access_cost` / `tx_value_cost`, added
-        // for the Glamsterdam intrinsic's recipient-side terms.
+        // We should have exactly 49 known GasIds (based on the indices 1-49 used)
         assert_eq!(
             unique_names.len(),
-            48,
-            "Expected 48 unique GasIds, found {}",
+            49,
+            "Expected 49 unique GasIds, found {}",
             unique_names.len()
         );
+    }
+
+    #[test]
+    fn test_max_refund_quotient_defaults_and_override() {
+        let frontier = GasParams::new_spec(SpecId::FRONTIER);
+        assert_eq!(frontier.max_refund_quotient(), 2);
+        assert_eq!(frontier.get(GasId::max_refund_quotient()), 2);
+
+        let london = GasParams::new_spec(SpecId::LONDON);
+        assert_eq!(london.max_refund_quotient(), 5);
+        assert_eq!(
+            GasId::from_name("max_refund_quotient"),
+            Some(GasId::max_refund_quotient())
+        );
+        assert_eq!(GasId::max_refund_quotient().name(), "max_refund_quotient");
+
+        let mut custom = london;
+        custom.override_gas([(GasId::max_refund_quotient(), 10)]);
+        assert_eq!(custom.max_refund_quotient(), 10);
     }
 
     #[test]
@@ -1842,44 +1756,93 @@ mod tests {
 
     #[test]
     fn test_initial_state_gas_for_create() {
-        // Use AMSTERDAM spec since EIP-8037 state gas is only enabled starting from Amsterdam.
+        // State-dependent charges are applied at the EIP-2780 runtime gas
+        // phase, so the intrinsic state gas is zero even for CREATE
+        // transactions at AMSTERDAM.
         let gas_params = GasParams::new_spec(SpecId::AMSTERDAM);
         // Test CREATE transaction (is_create = true)
-        let create_gas = gas_params.initial_tx_gas(b"", true, 0, 0, 0);
-        let expected_state_gas = gas_params.create_state_gas();
+        let create_gas = gas_params.initial_tx_gas(b"", true, 0, 0, 0, None);
+        assert_eq!(create_gas.initial_state_gas_final(), 0);
 
-        assert_eq!(create_gas.initial_state_gas_final(), expected_state_gas);
-        assert_eq!(
-            create_gas.initial_state_gas_final(),
-            eip8037::NEW_ACCOUNT_BYTES * eip8037::CPSB_GLAMSTERDAM
-        );
-
-        // initial_total_gas() returns both regular and state gas combined
         let create_cost = gas_params.tx_create_cost();
         let initcode_cost = gas_params.tx_initcode_cost(0);
         assert_eq!(
             create_gas.initial_total_gas(),
-            gas_params.tx_base_stipend() + create_cost + initcode_cost + expected_state_gas
+            gas_params.tx_base_stipend() + create_cost + initcode_cost
         );
 
         // Test CALL transaction (is_create = false)
-        let call_gas = gas_params.initial_tx_gas(b"", false, 0, 0, 0);
+        let call_gas = gas_params.initial_tx_gas(b"", false, 0, 0, 0, None);
         assert_eq!(call_gas.initial_state_gas_final(), 0);
         // initial_gas should be unchanged for calls
         assert_eq!(call_gas.initial_total_gas(), gas_params.tx_base_stipend());
     }
 
     #[test]
+    fn test_initial_tx_gas_eip2780_runtime_split() {
+        let gas_params = GasParams::new_spec(SpecId::AMSTERDAM);
+        let info = || Eip2780TxInfo {
+            value: U256::ZERO,
+            is_self_transfer: false,
+        };
+
+        // Create transaction: the new-account state gas is no longer intrinsic —
+        // it moves to the runtime phase, charged only when the deployment
+        // target does not already exist.
+        let create_gas = gas_params.initial_tx_gas(b"", true, 0, 0, 0, Some(info()));
+        assert_eq!(create_gas.initial_state_gas, 0);
+        assert_eq!(
+            create_gas.initial_regular_gas,
+            eip2780::TX_BASE_COST + eip8038::CREATE_ACCESS
+        );
+
+        // EIP-7702 authorizations: intrinsic per-auth charge is the
+        // state-independent REGULAR_PER_AUTH_BASE_COST (7,816) only; the
+        // ACCOUNT_WRITE and state-gas portions are runtime charges.
+        assert_eq!(
+            gas_params.tx_eip7702_per_empty_account_cost(),
+            eip8038::EIP7702_PER_AUTH_BASE_REGULAR
+        );
+        let auth_gas = gas_params.initial_tx_gas(b"", false, 0, 0, 2, Some(info()));
+        assert_eq!(auth_gas.initial_state_gas, 0);
+        assert_eq!(
+            auth_gas.initial_regular_gas,
+            eip2780::TX_BASE_COST
+                + eip8038::COLD_ACCOUNT_ACCESS
+                + 2 * eip8038::EIP7702_PER_AUTH_BASE_REGULAR
+        );
+
+        // Pre-Amsterdam the per-auth charge is the bundled pessimistic
+        // PER_EMPTY_ACCOUNT_COST (25,000) and the intrinsic state gas is zero.
+        let legacy_params = GasParams::new_spec(SpecId::PRAGUE);
+        assert_eq!(
+            legacy_params.tx_eip7702_per_empty_account_cost(),
+            eip7702::PER_EMPTY_ACCOUNT_COST
+        );
+        let legacy_auth_gas = legacy_params.initial_tx_gas(b"", false, 0, 0, 1, None);
+        assert_eq!(legacy_auth_gas.initial_state_gas, 0);
+        assert_eq!(
+            legacy_auth_gas.initial_regular_gas,
+            legacy_params.tx_base_stipend() + eip7702::PER_EMPTY_ACCOUNT_COST
+        );
+        let legacy_create_gas = legacy_params.initial_tx_gas(b"", true, 0, 0, 0, None);
+        assert_eq!(legacy_create_gas.initial_state_gas, 0);
+    }
+
+    #[test]
     fn test_eip7981_access_list_cost_amsterdam() {
         // EIP-7981 folds a 64 gas/byte data charge into the per-item access-list cost
         // and adds 4 floor tokens per access-list byte on top of the EIP-7976 floor.
+        // EIP-8038 sets the per-item base to the cold-minus-warm premium:
+        // COLD_ACCOUNT_ACCESS - WARM_ACCESS (2,900) per address and
+        // COLD_STORAGE_ACCESS - WARM_ACCESS (2,000) per storage key.
         let params = GasParams::new_spec(SpecId::AMSTERDAM);
 
         // Per-item intrinsic cost: base + bytes * 64
-        assert_eq!(params.tx_access_list_address_cost(), 2400 + 20 * 64);
-        assert_eq!(params.tx_access_list_storage_key_cost(), 1900 + 32 * 64);
-        assert_eq!(params.tx_access_list_cost(1, 0), 2400 + 20 * 64);
-        assert_eq!(params.tx_access_list_cost(0, 1), 1900 + 32 * 64);
+        assert_eq!(params.tx_access_list_address_cost(), 2900 + 20 * 64);
+        assert_eq!(params.tx_access_list_storage_key_cost(), 2000 + 32 * 64);
+        assert_eq!(params.tx_access_list_cost(1, 0), 2900 + 20 * 64);
+        assert_eq!(params.tx_access_list_cost(0, 1), 2000 + 32 * 64);
 
         // Floor multiplier activates at AMSTERDAM.
         assert_eq!(params.tx_access_list_floor_byte_multiplier(), 4);
@@ -1887,7 +1850,7 @@ mod tests {
         assert_eq!(params.tx_floor_tokens_in_access_list(2, 3), (40 + 96) * 4);
 
         // Floor gas includes both calldata (empty here) and access-list contribution.
-        let gas = params.initial_tx_gas(b"", false, 2, 3, 0);
+        let gas = params.initial_tx_gas(b"", false, 2, 3, 0, None);
         let expected_al_floor = (40 + 96) * 4 * params.tx_floor_cost_per_token();
         assert_eq!(
             gas.floor_gas(),
@@ -1898,7 +1861,7 @@ mod tests {
         let prague = GasParams::new_spec(SpecId::PRAGUE);
         assert_eq!(prague.tx_access_list_floor_byte_multiplier(), 0);
         assert_eq!(prague.tx_floor_tokens_in_access_list(2, 3), 0);
-        let prague_gas = prague.initial_tx_gas(b"", false, 2, 3, 0);
+        let prague_gas = prague.initial_tx_gas(b"", false, 2, 3, 0, None);
         assert_eq!(prague_gas.floor_gas(), prague.tx_floor_cost_base_gas());
     }
 }

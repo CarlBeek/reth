@@ -1132,14 +1132,14 @@ mod tests {
     use super::*;
     use crate::{
         database::{BlockCoverageRow, BlockOutput, DrillInRecord, OpcodeBucketTotal},
-        schedule::{Eip2780Schedule, Eip8037Schedule, MultiplierSchedule, ScheduleRegistry},
+        schedule::{AmsterdamSchedule, MultiplierSchedule, ScheduleRegistry},
     };
     use alloy_primitives::{Address, Bytes, B256};
 
-    fn registry_2780_8037() -> ScheduleRegistry {
+    fn registry_two_lanes() -> ScheduleRegistry {
         let mut r = ScheduleRegistry::new();
-        r.register(Eip2780Schedule::new()).unwrap();
-        r.register(Eip8037Schedule::new()).unwrap();
+        r.register(AmsterdamSchedule::new()).unwrap();
+        r.register(MultiplierSchedule::new("128x".to_string(), 128)).unwrap();
         r
     }
 
@@ -1149,7 +1149,7 @@ mod tests {
 
     #[test]
     fn manifest_hash_is_stable_for_identical_input() {
-        let reg = registry_2780_8037();
+        let reg = registry_two_lanes();
         let a = manifest(&reg, vec![1, 2, 4]).analysis_config_hash().unwrap();
         let b = manifest(&reg, vec![1, 2, 4]).analysis_config_hash().unwrap();
         assert_eq!(a, b);
@@ -1159,12 +1159,12 @@ mod tests {
     #[test]
     fn manifest_hash_ignores_registry_order() {
         let mut reg_a = ScheduleRegistry::new();
-        reg_a.register(Eip2780Schedule::new()).unwrap();
-        reg_a.register(Eip8037Schedule::new()).unwrap();
+        reg_a.register(AmsterdamSchedule::new()).unwrap();
+        reg_a.register(MultiplierSchedule::new("128x".to_string(), 128)).unwrap();
 
         let mut reg_b = ScheduleRegistry::new();
-        reg_b.register(Eip8037Schedule::new()).unwrap();
-        reg_b.register(Eip2780Schedule::new()).unwrap();
+        reg_b.register(MultiplierSchedule::new("128x".to_string(), 128)).unwrap();
+        reg_b.register(AmsterdamSchedule::new()).unwrap();
 
         assert_eq!(
             manifest(&reg_a, vec![1]).analysis_config_hash().unwrap(),
@@ -1174,7 +1174,7 @@ mod tests {
 
     #[test]
     fn gas_tier_order_and_duplicates_normalize_to_same_hash() {
-        let reg = registry_2780_8037();
+        let reg = registry_two_lanes();
         let a = manifest(&reg, vec![4, 2, 1, 2]).analysis_config_hash().unwrap();
         let b = manifest(&reg, vec![1, 2, 4]).analysis_config_hash().unwrap();
         assert_eq!(a, b);
@@ -1189,7 +1189,7 @@ mod tests {
 
     #[test]
     fn changing_gas_tiers_changes_hash() {
-        let reg = registry_2780_8037();
+        let reg = registry_two_lanes();
         assert_ne!(
             manifest(&reg, vec![1]).analysis_config_hash().unwrap(),
             manifest(&reg, vec![1, 2]).analysis_config_hash().unwrap(),
@@ -1198,7 +1198,7 @@ mod tests {
 
     #[test]
     fn changing_drill_in_cap_changes_hash() {
-        let reg = registry_2780_8037();
+        let reg = registry_two_lanes();
         let tiers = normalize_gas_tiers(&[1]);
         let a = AnalysisManifestV1::build(&reg, tiers.clone(), Some(10), 1, 10, "c")
             .analysis_config_hash()
@@ -1211,7 +1211,7 @@ mod tests {
 
     #[test]
     fn changing_commit_or_chain_changes_hash() {
-        let reg = registry_2780_8037();
+        let reg = registry_two_lanes();
         let tiers = normalize_gas_tiers(&[1]);
         let base = AnalysisManifestV1::build(&reg, tiers.clone(), None, 1, 10, "aaaa")
             .analysis_config_hash()
@@ -1230,10 +1230,10 @@ mod tests {
     fn changing_schedule_set_changes_hash() {
         let reg_small = {
             let mut r = ScheduleRegistry::new();
-            r.register(Eip2780Schedule::new()).unwrap();
+            r.register(AmsterdamSchedule::new()).unwrap();
             r
         };
-        let reg_big = registry_2780_8037();
+        let reg_big = registry_two_lanes();
         assert_ne!(
             manifest(&reg_small, vec![1]).analysis_config_hash().unwrap(),
             manifest(&reg_big, vec![1]).analysis_config_hash().unwrap(),
@@ -1452,7 +1452,7 @@ mod tests {
             })
             .collect();
 
-        let reg = registry_2780_8037();
+        let reg = registry_two_lanes();
         let manifest = manifest(&reg, vec![1, 2, 4]);
         let rows = block_output_to_rows(&output, &manifest, "0xabc", 1_700_000_100).unwrap();
         assert_eq!(rows.tx_gas_results.len(), 3);
@@ -1507,7 +1507,7 @@ mod tests {
         use crate::export::clickhouse::DestinationTable;
         use std::collections::BTreeSet;
 
-        let reg = registry_2780_8037();
+        let reg = registry_two_lanes();
         let m = manifest(&reg, vec![1, 2, 4]);
         let ach = m.analysis_config_hash().unwrap();
         let rows = block_output_to_rows(&sample_output(), &m, &ach, 1_700_000_000).unwrap();
@@ -1537,7 +1537,7 @@ mod tests {
 
     #[test]
     fn conversion_inherits_block_and_config_hashes() {
-        let reg = registry_2780_8037();
+        let reg = registry_two_lanes();
         let m = manifest(&reg, vec![1]);
         let ach = m.analysis_config_hash().unwrap();
         let output = sample_output();
@@ -1567,7 +1567,7 @@ mod tests {
 
     #[test]
     fn summary_new_columns_map_through() {
-        let reg = registry_2780_8037();
+        let reg = registry_two_lanes();
         let m = manifest(&reg, vec![1]);
         let ach = m.analysis_config_hash().unwrap();
         let rows = block_output_to_rows(&sample_output(), &m, &ach, 1).unwrap();
@@ -1593,7 +1593,7 @@ mod tests {
 
     #[test]
     fn conversion_optionals_stay_null_not_zero() {
-        let reg = registry_2780_8037();
+        let reg = registry_two_lanes();
         let m = manifest(&reg, vec![1]);
         let ach = m.analysis_config_hash().unwrap();
         let rows = block_output_to_rows(&sample_output(), &m, &ach, 1).unwrap();
@@ -1606,7 +1606,7 @@ mod tests {
 
     #[test]
     fn jsoneachrow_one_object_per_line() {
-        let reg = registry_2780_8037();
+        let reg = registry_two_lanes();
         let m = manifest(&reg, vec![1]);
         let ach = m.analysis_config_hash().unwrap();
         let rows = block_output_to_rows(&sample_output(), &m, &ach, 1).unwrap();
