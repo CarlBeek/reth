@@ -207,6 +207,7 @@ struct DecodedRows {
     config_hash: String,
     run_line: String,
     divergence_lines: Vec<String>,
+    tx_gas_result_lines: Vec<String>,
     summary_lines: Vec<String>,
     coverage_line: String,
 }
@@ -215,6 +216,7 @@ struct DecodedRows {
 struct GroupedBatch {
     run_lines: Vec<String>,
     divergence_lines: Vec<String>,
+    tx_gas_result_lines: Vec<String>,
     summary_lines: Vec<String>,
     coverage_lines: Vec<String>,
     ids: Vec<String>,
@@ -264,11 +266,13 @@ async fn decode_item(
 
     let run_line = serialize_row(&run_row)?;
     let divergence_lines = serialize_rows(&rows.divergences)?;
+    let tx_gas_result_lines = serialize_rows(&rows.tx_gas_results)?;
     let summary_lines = serialize_rows(&rows.summaries)?;
     let coverage_line = serialize_row(&rows.coverage)?;
 
     for line in std::iter::once(&run_line)
         .chain(&divergence_lines)
+        .chain(&tx_gas_result_lines)
         .chain(&summary_lines)
         .chain(std::iter::once(&coverage_line))
     {
@@ -286,14 +290,15 @@ async fn decode_item(
         config_hash: item.analysis_config_hash.clone(),
         run_line,
         divergence_lines,
+        tx_gas_result_lines,
         summary_lines,
         coverage_line,
     })
 }
 
 /// Per-item export path (the fallback used when a batch hits a permanent error):
-/// decode one item and insert its tables in order — run → divergences → summaries
-/// → coverage (last).
+/// decode one item and insert its tables in order — run → divergences →
+/// tx gas results → summaries → coverage (last).
 async fn process_item<S: ClickHouseSink>(
     db: &DivergenceDatabase,
     config: &ExportConfig,
@@ -308,6 +313,14 @@ async fn process_item<S: ClickHouseSink>(
         config,
         DestinationTable::Divergence,
         &d.divergence_lines,
+        &item.export_id,
+    )
+    .await?;
+    insert_serialized(
+        sink,
+        config,
+        DestinationTable::TxGasResult,
+        &d.tx_gas_result_lines,
         &item.export_id,
     )
     .await?;
@@ -330,6 +343,7 @@ fn group_decoded(items: Vec<DecodedRows>) -> GroupedBatch {
     let mut g = GroupedBatch {
         run_lines: Vec::new(),
         divergence_lines: Vec::new(),
+        tx_gas_result_lines: Vec::new(),
         summary_lines: Vec::new(),
         coverage_lines: Vec::new(),
         ids: Vec::new(),
@@ -340,6 +354,7 @@ fn group_decoded(items: Vec<DecodedRows>) -> GroupedBatch {
             g.run_lines.push(it.run_line);
         }
         g.divergence_lines.extend(it.divergence_lines);
+        g.tx_gas_result_lines.extend(it.tx_gas_result_lines);
         g.summary_lines.extend(it.summary_lines);
         g.coverage_lines.push(it.coverage_line);
         g.ids.push(it.export_id);
@@ -474,6 +489,13 @@ where
             config,
             DestinationTable::Divergence,
             &batch.divergence_lines,
+        )
+        .await?;
+        insert_lines_concurrent(
+            sink,
+            config,
+            DestinationTable::TxGasResult,
+            &batch.tx_gas_result_lines,
         )
         .await?;
         insert_lines_concurrent(sink, config, DestinationTable::Summary, &batch.summary_lines).await
@@ -734,6 +756,7 @@ mod tests {
             tx_count_stored: drill,
             block_gas_used: 21000,
             block_gas_limit: 30_000_000,
+            block_base_fee_per_gas: Some(1_000_000_000),
         }
     }
 
@@ -852,6 +875,7 @@ mod tests {
             summaries: vec![summary(10)],
             drill_ins: vec![],
             recipients: vec![],
+            tx_gas_results: vec![],
         };
         let (_ach, item) = seed(&db, output);
         let sink = FakeSink::new();
@@ -872,6 +896,7 @@ mod tests {
             summaries: vec![summary(11)],
             drill_ins: vec![divergence(11)],
             recipients: vec![],
+            tx_gas_results: vec![],
         };
         let (_ach, item) = seed(&db, output);
         let sink = FakeSink::new();
@@ -897,6 +922,7 @@ mod tests {
             summaries: vec![],
             drill_ins: vec![],
             recipients: vec![],
+            tx_gas_results: vec![],
         };
         let (_ach, item) = seed(&db, output);
         let sink = FakeSink::new();
@@ -915,6 +941,7 @@ mod tests {
             summaries: vec![],
             drill_ins: vec![],
             recipients: vec![],
+            tx_gas_results: vec![],
         };
         let (_ach, item) = seed(&db, output);
         let sink = FakeSink::new();
@@ -933,6 +960,7 @@ mod tests {
             summaries: vec![],
             drill_ins: vec![],
             recipients: vec![],
+            tx_gas_results: vec![],
         };
         let (_ach, item) = seed(&db, output);
         let sink = FakeSink::new();
@@ -951,6 +979,7 @@ mod tests {
             summaries: vec![],
             drill_ins: vec![],
             recipients: vec![],
+            tx_gas_results: vec![],
         };
         let (_ach, item) = seed(&db, output);
         let sink = FakeSink::new();
@@ -977,6 +1006,7 @@ mod tests {
             summaries: vec![],
             drill_ins: vec![],
             recipients: vec![],
+            tx_gas_results: vec![],
         };
         let (_ach, item) = seed(&db, output);
         let export_id = item.export_id.clone();
@@ -1014,6 +1044,7 @@ mod tests {
             summaries: vec![],
             drill_ins: vec![],
             recipients: vec![],
+            tx_gas_results: vec![],
         };
         let (_ach, item) = seed(&db, output);
         let export_id = item.export_id.clone();
@@ -1051,6 +1082,7 @@ mod tests {
                 summaries: vec![summary(b)],
                 drill_ins: vec![divergence(b)],
                 recipients: vec![],
+                tx_gas_results: vec![],
             };
             seed(&db, output);
         }
@@ -1085,6 +1117,7 @@ mod tests {
                 summaries: vec![summary(b)],
                 drill_ins: vec![divergence(b)],
                 recipients: vec![],
+                tx_gas_results: vec![],
             };
             seed(&db, output);
         }

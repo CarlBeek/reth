@@ -20,11 +20,13 @@ pub const COVERAGE_TABLE: &str = "gas_analysis_block_coverage";
 pub const SUMMARY_TABLE: &str = "gas_analysis_block_summary";
 /// Destination table for `gas_analysis_divergence`.
 pub const DIVERGENCE_TABLE: &str = "gas_analysis_divergence";
+/// Destination table for `gas_analysis_tx_gas_result`.
+pub const TX_GAS_RESULT_TABLE: &str = "gas_analysis_tx_gas_result";
 
 /// Maximum bytes of a remote error response body included in an error message.
 const ERROR_BODY_SNIPPET_BYTES: usize = 500;
 
-/// The four destination tables. Names are code constants — never config — so a
+/// The five destination tables. Names are code constants — never config — so a
 /// malformed config can't redirect inserts to an attacker-chosen table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DestinationTable {
@@ -36,12 +38,15 @@ pub enum DestinationTable {
     Summary,
     /// `gas_analysis_divergence`
     Divergence,
+    /// `gas_analysis_tx_gas_result`
+    TxGasResult,
 }
 
 impl DestinationTable {
     /// Every destination table, in insert order (run, divergence, summary,
     /// coverage — coverage last is enforced by the worker, not this list).
-    pub const ALL: [Self; 4] = [Self::Run, Self::Coverage, Self::Summary, Self::Divergence];
+    pub const ALL: [Self; 5] =
+        [Self::Run, Self::Coverage, Self::Summary, Self::Divergence, Self::TxGasResult];
 
     /// The `ClickHouse` table name.
     pub const fn name(self) -> &'static str {
@@ -50,6 +55,7 @@ impl DestinationTable {
             Self::Coverage => COVERAGE_TABLE,
             Self::Summary => SUMMARY_TABLE,
             Self::Divergence => DIVERGENCE_TABLE,
+            Self::TxGasResult => TX_GAS_RESULT_TABLE,
         }
     }
 
@@ -88,9 +94,41 @@ impl DestinationTable {
                 "tx_count_stored",
                 "block_gas_used",
                 "block_gas_limit",
+                "block_base_fee_per_gas",
                 "expected_drill_in_count",
                 "retained_drill_in_count",
                 "drill_ins_truncated",
+            ],
+            Self::TxGasResult => &[
+                "updated_at",
+                "row_id",
+                "analysis_config_hash",
+                "chain_id",
+                "producer_schema_version",
+                "producer_git_commit",
+                "replay_semantics",
+                "schedule_name",
+                "schedule_config_hash",
+                "block_number",
+                "block_hash",
+                "block_timestamp",
+                "tx_index",
+                "tx_hash",
+                "tx_type",
+                "tx_gas_limit",
+                "max_fee_per_gas",
+                "max_priority_fee_per_gas",
+                "baseline_success",
+                "baseline_gas_used",
+                "baseline_total_gas_spent",
+                "schedule_success",
+                "schedule_gas_used",
+                "schedule_total_gas_spent",
+                "schedule_gas_refunded",
+                "schedule_floor_gas",
+                "schedule_state_gas_spent",
+                "schedule_intrinsic_gas",
+                "min_multiplier_to_succeed",
             ],
             Self::Summary => &[
                 "updated_at",

@@ -22,7 +22,8 @@
 
 use crate::{
     database::{
-        BlockCoverageRow, BlockOutput, BlockSummaryRow, CallFrameRow, DivergenceRow, OpcodeCountRow,
+        BlockCoverageRow, BlockOutput, BlockSummaryRow, CallFrameRow, DivergenceRow,
+        OpcodeCountRow, TxGasResultRow,
     },
     divergence::{AggregateClass, EventLog},
     schedule::{GasSchedule, ScheduleRegistry},
@@ -43,7 +44,10 @@ pub const MANIFEST_FORMAT_VERSION: u16 = 1;
 /// `tx_count_type_*` counts, `tx_count_simple_transfer` /
 /// `tx_count_contract_call`, `gas_delta_pct_hist`, `baseline_gas_used_sum`
 /// (all `serde(default)`, so v2 payloads still decode).
-pub const ENVELOPE_FORMAT_VERSION: u16 = 3;
+/// v4: additive v12 fields — `BlockOutput::tx_gas_results` (the unconditional
+/// per-tx gas spine) and `BlockCoverageRow::block_base_fee_per_gas` (both
+/// `serde(default)`, so v3 payloads still decode as empty / `None`).
+pub const ENVELOPE_FORMAT_VERSION: u16 = 4;
 
 /// Replay semantics tag baked into the manifest and every remote row. The
 /// research pipeline replays each tx against canonical pre-tx state.
@@ -248,6 +252,16 @@ pub fn divergence_row_id(export_id: &str, tx_index: u32, tx_hash: B256) -> Strin
     ])
 }
 
+/// Deterministic `gas_analysis_tx_gas_result.row_id`.
+pub fn tx_gas_result_row_id(export_id: &str, tx_index: u32, tx_hash: B256) -> String {
+    framed_keccak(&[
+        export_id.as_bytes(),
+        &tx_index.to_le_bytes(),
+        tx_hash.as_slice(),
+        b"tx_gas_result",
+    ])
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Export envelope
 // ─────────────────────────────────────────────────────────────────────────────
@@ -442,9 +456,48 @@ pub struct CoverageRow {
     pub tx_count_stored: u32,
     pub block_gas_used: u64,
     pub block_gas_limit: u64,
+    pub block_base_fee_per_gas: Option<u64>,
     pub expected_drill_in_count: u32,
     pub retained_drill_in_count: u32,
     pub drill_ins_truncated: bool,
+}
+
+/// One row for `gas_analysis_tx_gas_result` — the unconditional per-tx gas
+/// spine, one row per (schedule, block, tx). See the `tx_gas_results` `SQLite`
+/// DDL for the post-refund vs pre-refund gas distinction.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Serialize)]
+pub struct TxGasResultExportRow {
+    pub updated_at: u64,
+    pub row_id: String,
+    pub analysis_config_hash: String,
+    pub chain_id: u64,
+    pub producer_schema_version: u32,
+    pub producer_git_commit: String,
+    pub replay_semantics: String,
+    pub schedule_name: String,
+    pub schedule_config_hash: String,
+    pub block_number: u64,
+    pub block_hash: String,
+    pub block_timestamp: u64,
+    pub tx_index: u32,
+    pub tx_hash: String,
+    pub tx_type: u8,
+    pub tx_gas_limit: u64,
+    /// U256 decimal strings, matching the `SQLite` representation.
+    pub max_fee_per_gas: String,
+    pub max_priority_fee_per_gas: Option<String>,
+    pub baseline_success: bool,
+    pub baseline_gas_used: u64,
+    pub baseline_total_gas_spent: u64,
+    pub schedule_success: bool,
+    pub schedule_gas_used: u64,
+    pub schedule_total_gas_spent: u64,
+    pub schedule_gas_refunded: u64,
+    pub schedule_floor_gas: u64,
+    pub schedule_state_gas_spent: u64,
+    pub schedule_intrinsic_gas: Option<u64>,
+    pub min_multiplier_to_succeed: Option<f64>,
 }
 
 /// One row for `gas_analysis_block_summary`.
@@ -673,6 +726,8 @@ pub struct BlockClickHouseRows {
     pub summaries: Vec<SummaryRow>,
     /// Zero or more per-tx divergence rows.
     pub divergences: Vec<DivergenceExportRow>,
+    /// One row per tx in the block — the unconditional gas spine.
+    pub tx_gas_results: Vec<TxGasResultExportRow>,
 }
 
 /// Convert a block's output into its `ClickHouse` rows.
@@ -734,7 +789,66 @@ pub fn block_output_to_rows(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(BlockClickHouseRows { coverage: coverage_row, summaries, divergences })
+    let tx_gas_results = output
+        .tx_gas_results
+        .iter()
+        .map(|row| {
+            build_tx_gas_result_row(
+                row,
+                manifest,
+                analysis_config_hash,
+                &export_id,
+                block_hash,
+                block_timestamp,
+                updated_at,
+            )
+        })
+        .collect();
+
+    Ok(BlockClickHouseRows { coverage: coverage_row, summaries, divergences, tx_gas_results })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_tx_gas_result_row(
+    row: &TxGasResultRow,
+    manifest: &AnalysisManifestV1,
+    analysis_config_hash: &str,
+    export_id: &str,
+    block_hash: B256,
+    block_timestamp: u64,
+    updated_at: u64,
+) -> TxGasResultExportRow {
+    TxGasResultExportRow {
+        updated_at,
+        row_id: tx_gas_result_row_id(export_id, row.tx_index, row.tx_hash),
+        analysis_config_hash: analysis_config_hash.to_string(),
+        chain_id: manifest.chain_id,
+        producer_schema_version: manifest.producer_schema_version,
+        producer_git_commit: manifest.producer_git_commit.clone(),
+        replay_semantics: manifest.replay_semantics.clone(),
+        schedule_name: row.schedule_name.clone(),
+        schedule_config_hash: row.schedule_config_hash.clone(),
+        block_number: row.block_number,
+        block_hash: hash66(block_hash),
+        block_timestamp,
+        tx_index: row.tx_index,
+        tx_hash: hash66(row.tx_hash),
+        tx_type: row.tx_type,
+        tx_gas_limit: row.tx_gas_limit,
+        max_fee_per_gas: row.max_fee_per_gas.clone(),
+        max_priority_fee_per_gas: row.max_priority_fee_per_gas.clone(),
+        baseline_success: row.baseline_success,
+        baseline_gas_used: row.baseline_gas_used,
+        baseline_total_gas_spent: row.baseline_total_gas_spent,
+        schedule_success: row.schedule_success,
+        schedule_gas_used: row.schedule_gas_used,
+        schedule_total_gas_spent: row.schedule_total_gas_spent,
+        schedule_gas_refunded: row.schedule_gas_refunded,
+        schedule_floor_gas: row.schedule_floor_gas,
+        schedule_state_gas_spent: row.schedule_state_gas_spent,
+        schedule_intrinsic_gas: row.schedule_intrinsic_gas,
+        min_multiplier_to_succeed: row.min_multiplier_to_succeed,
+    }
 }
 
 fn build_coverage_row(
@@ -765,6 +879,7 @@ fn build_coverage_row(
         tx_count_stored: coverage.tx_count_stored,
         block_gas_used: coverage.block_gas_used,
         block_gas_limit: coverage.block_gas_limit,
+        block_base_fee_per_gas: coverage.block_base_fee_per_gas,
         expected_drill_in_count: capture.expected_drill_in_count,
         retained_drill_in_count: capture.retained_drill_in_count,
         drill_ins_truncated: capture.drill_ins_truncated,
@@ -1177,6 +1292,7 @@ mod tests {
             tx_count_stored: drill_in_buckets,
             block_gas_used: 21000,
             block_gas_limit: 30_000_000,
+            block_base_fee_per_gas: Some(1_000_000_000),
         }
     }
 
@@ -1292,6 +1408,7 @@ mod tests {
                 schedule_event_logs: vec![],
             }],
             recipients: vec![],
+            tx_gas_results: vec![],
         }
     }
 
@@ -1305,6 +1422,61 @@ mod tests {
         assert_eq!(decoded.analysis_config_hash, "0xabc");
         assert_eq!(decoded.output.coverage.block_number, 100);
         assert_eq!(decoded.output.drill_ins.len(), 1);
+    }
+
+    #[test]
+    fn tx_gas_result_rows_are_built_for_every_tx() {
+        let mut output = sample_output();
+        output.tx_gas_results = (0..3)
+            .map(|i| TxGasResultRow {
+                schedule_name: "eip-2780".to_string(),
+                schedule_config_hash: "0x".to_string() + &"cd".repeat(32),
+                block_number: 100,
+                tx_index: i,
+                tx_hash: B256::repeat_byte(0x50 + i as u8),
+                tx_type: 2,
+                tx_gas_limit: 300_000,
+                max_fee_per_gas: "30000000000".to_string(),
+                max_priority_fee_per_gas: Some("1000000000".to_string()),
+                baseline_success: true,
+                baseline_gas_used: 21_000,
+                baseline_total_gas_spent: 21_000,
+                schedule_success: true,
+                schedule_gas_used: 33_000,
+                schedule_total_gas_spent: 35_000,
+                schedule_gas_refunded: 2_000,
+                schedule_floor_gas: 21_000,
+                schedule_state_gas_spent: 0,
+                schedule_intrinsic_gas: Some(15_000),
+                min_multiplier_to_succeed: Some(0.11),
+            })
+            .collect();
+
+        let reg = registry_2780_8037();
+        let manifest = manifest(&reg, vec![1, 2, 4]);
+        let rows = block_output_to_rows(&output, &manifest, "0xabc", 1_700_000_100).unwrap();
+        assert_eq!(rows.tx_gas_results.len(), 3);
+        // Coverage now carries the base fee that completes the fee-market view.
+        assert_eq!(rows.coverage.block_base_fee_per_gas, Some(1_000_000_000));
+
+        // row_id must be distinct per tx, and distinct from the divergence
+        // row_id for the same (export_id, tx_index, tx_hash) — the two tables
+        // describe the same tx and must not collide.
+        let ids: std::collections::HashSet<_> =
+            rows.tx_gas_results.iter().map(|r| r.row_id.clone()).collect();
+        assert_eq!(ids.len(), 3);
+        let eid = export_id("0xabc", "eip-2780", B256::repeat_byte(0xaa));
+        assert_ne!(
+            tx_gas_result_row_id(&eid, 0, B256::repeat_byte(0x50)),
+            divergence_row_id(&eid, 0, B256::repeat_byte(0x50)),
+        );
+
+        // The pre-refund figure survives the hop distinctly from the
+        // sender-facing one.
+        let first = &rows.tx_gas_results[0];
+        assert_eq!(first.schedule_gas_used, 33_000);
+        assert_eq!(first.schedule_total_gas_spent, 35_000);
+        assert_eq!(first.max_fee_per_gas, "30000000000");
     }
 
     #[test]

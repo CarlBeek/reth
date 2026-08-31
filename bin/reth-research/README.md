@@ -147,6 +147,17 @@ Per (schedule, block):
   `class ∈ {unchanged, gas_only}`
 - `block_recipients`: top-K recipient/selector attribution per `class`
 
+Per transaction, unconditionally — **every** tx, not just the divergent ones:
+
+- `tx_gas_results`: the slim per-tx gas spine a repricing simulator needs.
+  Gas limit, fee caps (`max_fee_per_gas` / `max_priority_fee_per_gas` as U256
+  decimal strings), baseline vs schedule gas, and the schedule's
+  intrinsic / floor / state-gas figures. Two gas columns that are **not**
+  interchangeable: `schedule_gas_used` is sender-facing (post-refund,
+  floor-applied), while `schedule_total_gas_spent` is pre-refund — the
+  figure EIP-7778 block-level accounting uses. Unlike the drill-in tables
+  below this is never truncated by `--research.max-divergences-per-block`.
+
 Per stored transaction (every failure + every trace divergence):
 
 - `divergences`: outcome flags, gas figures, OOG / divergence location,

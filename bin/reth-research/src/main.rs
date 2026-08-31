@@ -1434,6 +1434,7 @@ where
                     timestamp: block_timestamp,
                     gas_used: block.header().gas_used(),
                     gas_limit: block.header().gas_limit(),
+                    base_fee_per_gas: block.header().base_fee_per_gas(),
                 };
                 (
                     schedule.name().to_string(),
@@ -1461,6 +1462,12 @@ where
             let access_list_storage_slots =
                 tx.access_list().map(|list| list.storage_keys_count()).unwrap_or_default() as u64;
             let authorization_count = tx.authorization_count().unwrap_or_default();
+            // Fee caps for `tx_gas_results`. Rendered as decimal strings rather
+            // than narrowed to u64/i64: they're u128 here and U256 in principle,
+            // and a fee-market simulation should never silently see a truncated
+            // cap. `max_priority_fee_per_gas` is None for legacy / access-list.
+            let max_fee_per_gas = tx.max_fee_per_gas().to_string();
+            let max_priority_fee_per_gas = tx.max_priority_fee_per_gas().map(|fee| fee.to_string());
             // `schedule_execution_gas_limit` is now per-tier; computed inside
             // the tier-sweep loop in the schedule replay block below.
             let baseline_intrinsic_gas = Self::baseline_intrinsic_gas(
@@ -2679,6 +2686,40 @@ where
                 // drill-ins. Recompute the slice here from the same source.
                 let opcode_frames_for_agg =
                     exec_result.map(|r| r.frame_opcode_counts.as_slice()).unwrap_or(&[]);
+
+                // Unconditional per-tx gas row. Every field here is already
+                // computed above for the drill-in path; the only difference is
+                // that this one is emitted for all txs rather than the
+                // `store_full_forensics` minority, and is never truncated by
+                // `max_divergences_per_block`.
+                let tx_gas_result = reth_research::database::TxGasResultRow {
+                    schedule_name: schedule_name.to_string(),
+                    schedule_config_hash: self
+                        .schedule_metadata
+                        .get(schedule_name)
+                        .expect("all schedules should have static metadata")
+                        .config_hash
+                        .clone(),
+                    block_number,
+                    tx_index: tx_idx as u32,
+                    tx_hash,
+                    tx_type: tx.ty(),
+                    tx_gas_limit: gas_limit,
+                    max_fee_per_gas: max_fee_per_gas.clone(),
+                    max_priority_fee_per_gas: max_priority_fee_per_gas.clone(),
+                    baseline_success: normal_success,
+                    baseline_gas_used: normal_gas_used,
+                    baseline_total_gas_spent,
+                    schedule_success,
+                    schedule_gas_used: schedule_gas,
+                    schedule_total_gas_spent,
+                    schedule_gas_refunded,
+                    schedule_floor_gas,
+                    schedule_state_gas_spent,
+                    schedule_intrinsic_gas,
+                    min_multiplier_to_succeed,
+                };
+
                 aggregators
                     .get_mut(schedule_name)
                     .expect("aggregator exists for every schedule")
@@ -2714,6 +2755,7 @@ where
                             tx_type: tx.ty(),
                             has_calldata: (input_zero_bytes + input_nonzero_bytes) > 0,
                             baseline_gas_used: normal_gas_used,
+                            tx_gas_result,
                         },
                         opcode_frames_for_agg,
                     );
