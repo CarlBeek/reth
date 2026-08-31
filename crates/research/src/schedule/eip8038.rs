@@ -385,7 +385,8 @@ mod tests {
         // EXTCODESIZE / EXTCODECOPY: +WARM_ACCESS for the second DB read.
         assert_eq!(s.opcode_gas_delta(0x3B, &ctx), 100); // EXTCODESIZE
         assert_eq!(s.opcode_gas_delta(0x3C, &ctx), 100); // EXTCODECOPY
-                                                         // Every other affected opcode is repriced via native gas_params → delta 0.
+                                                         // Every other affected opcode is repriced
+                                                         // via native gas_params → delta 0.
         assert_eq!(s.opcode_gas_delta(0x3F, &ctx), 0); // EXTCODEHASH
         assert_eq!(s.opcode_gas_delta(0x31, &ctx), 0); // BALANCE
         assert_eq!(s.opcode_gas_delta(0x54, &ctx), 0); // SLOAD

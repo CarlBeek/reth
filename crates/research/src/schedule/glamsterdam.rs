@@ -42,9 +42,14 @@
 //! | `ACCOUNT_WRITE` | 9,000 | 8,000 |
 //! | `REFUND_STORAGE_CLEAR` | 11,616 | 12,480 |
 //! | `CREATE_ACCESS` | 12,000 (`+COLD_ACCOUNT_ACCESS`) | 11,000 (`+COLD_STORAGE_ACCESS`) |
+//! | `CALL_VALUE` | 11,300 | 10,300 |
+//! | `TX_ACCESS_LIST_ADDRESS` | 2,900 | 3,000 |
+//! | `TX_ACCESS_LIST_STORAGE_KEY` | 2,000 | 3,000 |
 //!
-//! So this module carries its own constant table and must never reuse
-//! `Eip8038Constants`.
+//! Seven of the twelve shared constants differ. Only `WARM_ACCESS`,
+//! `COLD_ACCOUNT_ACCESS`, `STORAGE_WRITE`, `CALL_STIPEND` and the EXT\*
+//! second-read surcharge agree. So this module carries its own constant table
+//! and must never reuse `Eip8038Constants`.
 //!
 //! # Charging
 //!
@@ -60,20 +65,38 @@
 //! is `true` and the runner applies no post-hoc compensation. That is what makes
 //! the replay's execution path faithful rather than merely its reported total.
 //!
-//! # Known deviation from the spec: EIP-7702 state gas
+//! # Known deviation from the spec: EIP-7702 charge timing
 //!
-//! The spec charges an authorization's `NEW_ACCOUNT`/`AUTH_BASE` state gas at
-//! the top frame in `set_delegation`, not intrinsically. revm's EIP-8037 model
-//! instead reserves it up front in `initial_tx_gas` ("pessimistically"), and
-//! `tx_eip7702_per_empty_account_cost` is a *bundled* regular+state slot that
-//! `initial_tx_gas` splits back apart. We follow revm's structure — as
-//! `eip8037.rs` already does — so the composed slot is
-//! `EXECUTION_PER_AUTH_BASE_COST + AUTH_STATE_GAS`.
+//! The spec charges an authorization's state-dependent costs at the **top
+//! frame** in `set_delegation`, and carries *no* intrinsic state gas at all —
+//! `IntrinsicGasCost` has only `execution` and `calldata_floor` fields, and
+//! `allocate_evm_gas` budgets from `intrinsic.execution` alone.
 //!
-//! Total gas for a successful tx is unaffected; what differs is *when* the state
-//! gas hits the reservoir, which shifts `schedule_initial_state_gas` /
-//! `schedule_initial_reservoir` versus a spec-exact implementation. Recorded in
-//! the fingerprint as `auth_state_gas=intrinsic`.
+//! revm instead reserves `n × (NEW_ACCOUNT + AUTH_BASE)` state gas in
+//! `initial_tx_gas` and credits back, in `apply_eip7702_auth_list`, whatever
+//! turned out to be unnecessary. The net charge is arithmetically identical to
+//! the spec's:
+//!
+//! ```text
+//! n×(NEW_ACCOUNT + AUTH_BASE) − (existing×NEW_ACCOUNT + deployed×AUTH_BASE)
+//!   = (n−existing)×NEW_ACCOUNT + (n−deployed)×AUTH_BASE
+//! ```
+//!
+//! and the credit lands in `pre_execution`, before the frame runs, so mid-tx
+//! headroom is right too. We follow revm's structure — as `eip8037.rs` already
+//! does — because the alternative is structural: revm applies the authorization
+//! list in `pre_execution`, before a frame or gas meter exists, where the only
+//! error channel is a transaction *rejection* rather than an OOG halt. And
+//! `initial_gas_and_reservoir` subtracts `initial_state_gas` with raw
+//! arithmetic, relying on validation having already proved it affordable, so a
+//! post-validation increase would underflow rather than halt.
+//!
+//! **The one materially observable consequence** is that validation runs before
+//! the credit: `initial_total_gas()` uses the full pessimistic reservation, so a
+//! 7702 transaction whose gas limit covers the spec's requirement but not
+//! ~218,790 gas per authorization on top is *rejected* where the spec would run
+//! it. Rejections carry no execution trace, so they read differently downstream
+//! from a genuine OOG. Recorded in the fingerprint as `auth_state_gas=intrinsic`.
 
 use super::{
     common::initial_and_floor_gas_for,
@@ -170,11 +193,40 @@ impl GlamsterdamConstants {
     pub const PRECOMPILE_ECRECOVER: u64 = 3_000;
     /// **Derived**: `AUTH_TUPLE_BYTES × TX_DATA_TOKEN_FLOOR + ecrecover +
     /// COLD_ACCOUNT_ACCESS + 2 × WARM_ACCESS` = 7,816.
+    ///
+    /// This is only the *state-independent* part, which the spec pays in the
+    /// intrinsic. `set_delegation` charges [`Self::ACCOUNT_WRITE`] on top at the
+    /// top frame — see [`AUTH_REGULAR_PER_AUTH`](Self::AUTH_REGULAR_PER_AUTH).
     pub const EXECUTION_PER_AUTH_BASE_COST: u64 = Self::AUTH_TUPLE_BYTES *
         Self::TX_DATA_TOKEN_FLOOR +
         Self::PRECOMPILE_ECRECOVER +
         Self::COLD_ACCOUNT_ACCESS +
         2 * Self::WARM_ACCESS;
+
+    /// Total **execution** gas charged per authorization:
+    /// `EXECUTION_PER_AUTH_BASE_COST + ACCOUNT_WRITE` = 16,816.
+    ///
+    /// `eoa_delegation.py::set_delegation` charges `GasCosts.ACCOUNT_WRITE`
+    /// (execution gas) for the delegation write, on top of the intrinsic
+    /// `EXECUTION_PER_AUTH_BASE_COST`. revm charges no equivalent anywhere in
+    /// its EIP-7702 path — `apply_auth_list` only counts refunds and writes the
+    /// designator — so without this the schedule undercharges every
+    /// authorization by 9,000 execution gas.
+    ///
+    /// We fold it into the intrinsic slot rather than charging it at the top
+    /// frame, because revm applies the authorization list in `pre_execution`,
+    /// before a frame or its gas meter exists, and the only error channel there
+    /// is a transaction *rejection* rather than an OOG halt. Pre-validating the
+    /// charge keeps the downstream gas arithmetic underflow-free.
+    ///
+    /// The spec exempts three cases this cannot see, so it over-charges 9,000
+    /// in each: an authorization on the sender's own account (already covered by
+    /// `TX_BASE`), on the recipient of a value-bearing transaction (covered by
+    /// `TX_VALUE_COST`), and the second and later authorizations on one
+    /// authority (the spec charges once per authority, not per tuple). All three
+    /// are rare next to the dominant shape — a sponsor delegating an account
+    /// that is neither the sender nor the recipient, once — where this is exact.
+    pub const AUTH_REGULAR_PER_AUTH: u64 = Self::EXECUTION_PER_AUTH_BASE_COST + Self::ACCOUNT_WRITE;
 
     // ── EIP-8037 state gas (`StateGasCosts`) ────────────────────────────
 
@@ -235,7 +287,7 @@ impl GasSchedule for GlamsterdamSchedule {
              call_value={}|create_access={}|refund_storage_clear={}|\
              tx_base={}|tx_value={}|token_standard={}|token_floor={}|\
              al_address={}|al_key={}|al_addr_tokens={}|al_key_tokens={}|\
-             auth_base={}|cpsb={}|account_bytes={}|storage_bytes={}|auth_bytes={}|\
+             auth_base={}|auth_regular={}|cpsb={}|account_bytes={}|storage_bytes={}|auth_bytes={}|\
              ext_second_read={}|auth_state_gas=intrinsic|native_revm=true",
             GlamsterdamConstants::WARM_ACCESS,
             GlamsterdamConstants::COLD_ACCOUNT_ACCESS,
@@ -254,6 +306,7 @@ impl GasSchedule for GlamsterdamSchedule {
             GlamsterdamConstants::ACCESS_LIST_ADDRESS_FLOOR_TOKENS,
             GlamsterdamConstants::ACCESS_LIST_STORAGE_KEY_FLOOR_TOKENS,
             GlamsterdamConstants::EXECUTION_PER_AUTH_BASE_COST,
+            GlamsterdamConstants::AUTH_REGULAR_PER_AUTH,
             GlamsterdamConstants::CPSB,
             GlamsterdamConstants::STATE_BYTES_PER_NEW_ACCOUNT,
             GlamsterdamConstants::STATE_BYTES_PER_STORAGE_SET,
@@ -426,7 +479,13 @@ fn glamsterdam_overrides() -> [(GasId, u64); 25] {
         // two back apart. Writing the combined figure here would double-count
         // the state gas. See the module docs on the intrinsic-vs-top-frame
         // deviation.
-        (GasId::tx_eip7702_per_empty_account_cost(), C::EXECUTION_PER_AUTH_BASE_COST),
+        //
+        // The regular portion is `EXECUTION_PER_AUTH_BASE_COST + ACCOUNT_WRITE`,
+        // not the base cost alone: revm charges no `ACCOUNT_WRITE` anywhere in
+        // its EIP-7702 path, so the base cost by itself undercharges every
+        // authorization by 9,000 execution gas. See
+        // [`GlamsterdamConstants::AUTH_REGULAR_PER_AUTH`].
+        (GasId::tx_eip7702_per_empty_account_cost(), C::AUTH_REGULAR_PER_AUTH),
         // ── Access (runtime) ───────────────────────────────────────────
         (GasId::warm_storage_read_cost(), C::WARM_ACCESS),
         (GasId::sstore_static(), C::WARM_ACCESS),
@@ -523,15 +582,30 @@ mod tests {
         use crate::schedule::eip8038::Eip8038Constants as P;
         use GlamsterdamConstants as C;
 
-        assert_ne!(C::COLD_STORAGE_ACCESS, P::COLD_STORAGE_ACCESS.1);
-        assert_ne!(C::ACCOUNT_WRITE, P::ACCOUNT_WRITE.1);
-        assert_ne!(C::REFUND_STORAGE_CLEAR, P::REFUND_STORAGE_CLEAR.1);
-        assert_ne!(C::CREATE_ACCESS, P::CREATE);
-        // Where they agree, they agree — so the difference is specific, not a
-        // wholesale divergence.
+        // All seven divergences, so a devnet renumber that converges ANY of
+        // them trips this test and prompts a re-check rather than leaving a
+        // stale duplicate table in place.
+        assert_ne!(C::COLD_STORAGE_ACCESS, P::COLD_STORAGE_ACCESS.1); // 2100 vs 3000
+        assert_ne!(C::ACCOUNT_WRITE, P::ACCOUNT_WRITE.1); // 9000 vs 8000
+        assert_ne!(C::REFUND_STORAGE_CLEAR, P::REFUND_STORAGE_CLEAR.1); // 11616 vs 12480
+        assert_ne!(C::CREATE_ACCESS, P::CREATE); // 12000 vs 11000
+        assert_ne!(C::CALL_VALUE, P::CALL_VALUE); // 11300 vs 10300
+        assert_ne!(C::TX_ACCESS_LIST_ADDRESS, P::TX_ACCESS_LIST_ADDRESS.1); // 2900 vs 3000
+        assert_ne!(C::TX_ACCESS_LIST_STORAGE_KEY, P::TX_ACCESS_LIST_STORAGE_KEY.1); // 2000 vs 3000
+
+        // The two also DERIVE their composites differently: the spec builds
+        // CREATE_ACCESS from the account access, PR 11802 from the storage
+        // access. Same shape, different second term.
+        assert_eq!(C::CREATE_ACCESS, C::ACCOUNT_WRITE + C::COLD_ACCOUNT_ACCESS);
+        assert_eq!(P::CREATE, P::ACCOUNT_WRITE.1 + P::COLD_STORAGE_ACCESS.1);
+
+        // Where they agree, they agree — so the divergence is specific, not
+        // wholesale, and the five agreements are load-bearing context for
+        // anyone comparing the two datasets.
         assert_eq!(C::WARM_ACCESS, P::WARM_ACCESS.1);
         assert_eq!(C::COLD_ACCOUNT_ACCESS, P::COLD_ACCOUNT_ACCESS.1);
         assert_eq!(C::STORAGE_WRITE, P::STORAGE_WRITE.1);
+        assert_eq!(C::CALL_STIPEND, P::CALL_STIPEND);
         assert_eq!(C::EXT_SECOND_READ, P::EXT_SECOND_READ);
     }
 
@@ -668,10 +742,11 @@ mod tests {
         c.authorization_count = 2;
 
         let split = s.initial_and_floor_gas(&c).unwrap();
-        // Regular: the spec's EXECUTION_PER_AUTH_BASE_COST per tuple.
+        // Regular: the spec's EXECUTION_PER_AUTH_BASE_COST plus the
+        // ACCOUNT_WRITE that `set_delegation` charges and revm omits.
         assert_eq!(
             split.initial_regular_gas(),
-            C::TX_BASE + C::COLD_ACCOUNT_ACCESS + 2 * C::EXECUTION_PER_AUTH_BASE_COST
+            C::TX_BASE + C::COLD_ACCOUNT_ACCESS + 2 * C::AUTH_REGULAR_PER_AUTH
         );
         // State: the documented deviation — reserved intrinsically rather than
         // at the top frame, following revm's EIP-8037 model.
@@ -691,14 +766,37 @@ mod tests {
         // The raw slot: regular only.
         assert_eq!(
             params.get(GasId::tx_eip7702_per_empty_account_cost()),
-            C::EXECUTION_PER_AUTH_BASE_COST
+            C::AUTH_REGULAR_PER_AUTH
         );
         // The accessor: regular + state.
         assert_eq!(
             params.tx_eip7702_per_empty_account_cost(),
-            C::EXECUTION_PER_AUTH_BASE_COST + C::AUTH_STATE_GAS
+            C::AUTH_REGULAR_PER_AUTH + C::AUTH_STATE_GAS
         );
         assert_eq!(params.tx_eip7702_state_gas(), C::AUTH_STATE_GAS);
+    }
+
+    /// `set_delegation` charges `ACCOUNT_WRITE` execution gas per authorization
+    /// on top of the intrinsic base cost, and revm charges no equivalent — its
+    /// `apply_auth_list` only counts refunds and writes the designator. Without
+    /// folding it in, every authorization is undercharged by 9,000 execution gas.
+    #[test]
+    fn auth_regular_cost_includes_the_account_write_revm_omits() {
+        use GlamsterdamConstants as C;
+        assert_eq!(C::EXECUTION_PER_AUTH_BASE_COST, 7_816);
+        assert_eq!(C::AUTH_REGULAR_PER_AUTH, 7_816 + 9_000);
+        assert_eq!(C::AUTH_REGULAR_PER_AUTH, 16_816);
+        // The gap is exactly one ACCOUNT_WRITE — the charge revm never makes.
+        assert_eq!(C::AUTH_REGULAR_PER_AUTH - C::EXECUTION_PER_AUTH_BASE_COST, C::ACCOUNT_WRITE);
+
+        // And it reaches the intrinsic: one authorization costs a full
+        // ACCOUNT_WRITE more than the base cost alone would give.
+        let s = GlamsterdamSchedule::new();
+        let mut c = ctx();
+        c.authorization_count = 1;
+        let with_auth = s.initial_and_floor_gas(&c).unwrap().initial_regular_gas();
+        let without = s.initial_and_floor_gas(&ctx()).unwrap().initial_regular_gas();
+        assert_eq!(with_auth - without, C::AUTH_REGULAR_PER_AUTH);
     }
 
     /// Every slot the schedule claims to set must actually land, at the
@@ -862,6 +960,7 @@ mod tests {
         assert!(fp.contains("create_access=12000"));
         assert!(fp.contains("refund_storage_clear=11616"));
         assert!(fp.contains("auth_base=7816"));
+        assert!(fp.contains("auth_regular=16816"));
         assert!(fp.contains("cpsb=1530"));
         assert!(fp.contains("auth_state_gas=intrinsic"));
         // Distinct from the single-EIP lanes, so datasets never collide.

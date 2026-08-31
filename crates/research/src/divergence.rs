@@ -716,7 +716,8 @@ mod tests {
         assert!(facts(true, false, 0).store_full_forensics()); // schedule broke it
         assert!(facts(false, true, 0).store_full_forensics()); // schedule rescued it
         assert!(facts(false, false, 0).store_full_forensics()); // failed under both
-                                                                // A trace divergence with both succeeding → stored.
+                                                                // A trace divergence with both
+                                                                // succeeding → stored.
         let mut t = facts(true, true, 0);
         t.event_logs_changed = true;
         assert!(t.store_full_forensics());

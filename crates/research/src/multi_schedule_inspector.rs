@@ -1554,8 +1554,12 @@ mod tests {
         // Clean slot (original == current):
         assert_eq!(classify_sstore_transition(z, z, a), SstoreTransition::Set); // 0 → nonzero
         assert_eq!(classify_sstore_transition(a, a, z), SstoreTransition::Clear); // nonzero → 0
-        assert_eq!(classify_sstore_transition(a, a, b), SstoreTransition::Reset); // nonzero → other nonzero
-                                                                                  // Already dirtied this tx (original != current) → dirty re-write.
+        assert_eq!(classify_sstore_transition(a, a, b), SstoreTransition::Reset); // nonzero → other
+                                                                                  // nonzero
+                                                                                  // Already dirtied
+                                                                                  // this tx (original
+                                                                                  // != current) →
+                                                                                  // dirty re-write.
         assert_eq!(classify_sstore_transition(z, a, b), SstoreTransition::Dirty);
         assert_eq!(classify_sstore_transition(a, b, z), SstoreTransition::Dirty);
     }
