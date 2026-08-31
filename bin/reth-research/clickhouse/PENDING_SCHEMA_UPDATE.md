@@ -8,9 +8,15 @@
 > **002 and 003 are frozen** — an applied migration file must never be edited.
 
 The `reth-research` **producer** bumped its SQLite schema to **v12**
-(`SCHEMA_VERSION` in `crates/research/src/database.rs`): a new
-**unconditional per-tx gas spine**, written for every transaction rather than
-only the `store_full_forensics` minority that earns a `divergences` row.
+(`SCHEMA_VERSION` in `crates/research/src/database.rs`): a new **per-tx gas
+spine**, written for every transaction rather than only the
+`store_full_forensics` minority that earns a `divergences` row.
+
+Collection is **opt-in per run** (`--research.tx-gas-results`). The table and
+its columns are part of v12 either way; a run that leaves the flag off writes
+no rows into it. The flag is recorded in the analysis manifest, so it changes
+`analysis_config_hash` — a spine dataset and a spine-less one are never the
+same dataset (see *Always pin `analysis_config_hash`* below).
 
 The motivation is a consumer the existing tables can't serve. The forensic
 tables answer "what broke and why" for the divergent tail; a repricing
@@ -29,9 +35,10 @@ The Rust export model (`TxGasResultExportRow` in
 
 ## New table — `gas_analysis_tx_gas_result`
 
-One row per `(schedule_name, block_number, tx_index)`. Slim (no
-`trace_payload`, no call frames, no opcode counts) and **uncapped** — unlike
-drill-ins, which `--research.max-divergences-per-block` truncates.
+One row per `(schedule_name, block_number, tx_index)`, for runs that enable
+`--research.tx-gas-results`. Slim (no `trace_payload`, no call frames, no
+opcode counts) and **uncapped** — unlike drill-ins, which
+`--research.max-divergences-per-block` truncates.
 
 **Volume warning.** Expect roughly `tx_count` rows per `(schedule, block)`,
 against the divergence table's divergent-tail-only row count. On a
@@ -96,8 +103,9 @@ the divergence table, `ZSTD(1)` on every column.
 - **`would_fit_in_original_limit` was deliberately not added.** v10 dropped it
   from `gas_analysis_divergence` as an exact duplicate of `schedule_success`;
   re-adding it here would reintroduce the same redundancy.
-- **The two per-tx tables overlap by design.** A tx that earns a
-  `gas_analysis_divergence` row also gets a `gas_analysis_tx_gas_result` row.
+- **The two per-tx tables overlap by design.** In a spine-collecting run, a tx
+  that earns a `gas_analysis_divergence` row also gets a
+  `gas_analysis_tx_gas_result` row.
   Join on `(analysis_config_hash, schedule_name, block_hash, tx_index,
   tx_hash)`; do **not** union them.
 - **Reorgs**: the producer clears `tx_gas_results` for the reverted range in
@@ -108,7 +116,12 @@ the divergence table, `ZSTD(1)` on every column.
   no `gas_analysis_tx_gas_result` rows at all and read `NULL` in
   `block_base_fee_per_gas`; v12 producers mint a **new**
   `analysis_config_hash` (the manifest embeds `producer_schema_version` and
-  the git commit), so mixed-hash reads would see fake gaps.
+  the producer commit), so mixed-hash reads would see fake gaps. The same
+  holds within v12: a run without `--research.tx-gas-results` carries its own
+  hash and legitimately has an empty spine, so an empty
+  `gas_analysis_tx_gas_result` for a pinned hash means "this dataset never
+  collected it", not "the rows are missing". `gas_analysis_run.manifest_json`
+  carries `tx_gas_results_collected` for the datasets that did.
 
 ## Versions
 

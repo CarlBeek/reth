@@ -11,10 +11,11 @@ The current system is centered on the `reth-research` ExEx in
 1. It loads historical state at `block - 1`.
 2. It executes each transaction once under baseline gas pricing.
 3. It re-executes the same transaction once per configured execution schedule.
-4. It writes, to SQLite, a `tx_gas_results` row for every (tx, schedule) pair, a full per-tx
-   forensic record for each pair that failed or diverged in trace, and per-block coverage +
-   aggregates keyed by execution-fact class (`unchanged` / `gas_only`) for the rest. The DDL in
-   [`src/database.rs`](src/database.rs) is canonical.
+4. It writes, to SQLite, a full per-tx forensic record for each (tx, schedule) pair that failed or
+   diverged in trace, and per-block coverage + aggregates keyed by execution-fact class
+   (`unchanged` / `gas_only`) for the rest. With `--research.tx-gas-results` it additionally
+   writes a slim `tx_gas_results` row for every (tx, schedule) pair, whatever the outcome. The DDL
+   in [`src/database.rs`](src/database.rs) is canonical.
 
 Execution schedules are isolated from one another: each configured schedule gets its own per-block
 state so schedule-induced failures can cascade across later transactions in the same block.

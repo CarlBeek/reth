@@ -2,8 +2,9 @@
 //!
 //! The DDL below is canonical; `crates/research/docs/storage-redesign.md` is the
 //! v9-era design record that motivated it, not a current schema reference. Three
-//! write granularities: an unconditional `tx_gas_results` row per (schedule,
-//! block, tx), per-tx forensic rows for the txs that failed or diverged in trace
+//! write granularities: an opt-in `tx_gas_results` row per (schedule, block,
+//! tx) (`--research.tx-gas-results`), per-tx forensic rows for the txs that
+//! failed or diverged in trace
 //! ([`crate::divergence::DivergenceFacts::store_full_forensics`]), and per-block
 //! aggregates keyed by execution-fact class (`unchanged` / `gas_only`) for the
 //! rest. See [`SCHEMA_VERSION`] for how the shape got here.
@@ -144,22 +145,24 @@ use thiserror::Error;
 ///   (or rename the old one aside; drain its `export_outbox` with the old binary first). The
 ///   `ClickHouse` dataset identity re-keys automatically because the analysis manifest embeds
 ///   `producer_schema_version`.
-/// - v12: new `tx_gas_results` table — one row per (schedule, block, tx), written
-///   **unconditionally** rather than only for the `store_full_forensics` minority. The forensic
-///   tables answer "what broke and why" for the divergent tail; a repricing *simulator* needs the
-///   repriced gas of every transaction, including the byte-identical majority that previously
-///   dissolved into a `block_summaries` class aggregate. Columns are the slim per-tx gas facts the
-///   analyze loop already computes (`schedule_gas_used`, `schedule_total_gas_spent` — the
-///   pre-refund figure EIP-7778 block accounting needs — `schedule_gas_refunded`,
-///   `schedule_floor_gas`, `schedule_intrinsic_gas`, `schedule_state_gas_spent`,
-///   `min_multiplier_to_succeed`) plus per-tx fee fields (`max_fee_per_gas`,
-///   `max_priority_fee_per_gas`, decimal-string U256) that were in scope for `TxEnv` but never
-///   persisted. `block_coverage` additionally gains `block_base_fee_per_gas`. Together these remove
-///   the simulator's dependency on an external per-tx fee source (Xatu): fee data, gas limits, and
-///   repriced gas now all come from the replay itself. Deliberately NOT re-added:
-///   `would_fit_in_original_limit`, dropped in v10 as an exact duplicate of `schedule_success`.
-///   There is no in-place migration: a v11 database is rejected by [`enforce_schema_version`] —
-///   start a fresh `SQLite` (drain the old one's `export_outbox` with the old binary first).
+/// - v12: new `tx_gas_results` table — one row per (schedule, block, tx), covering **every** tx
+///   rather than only the `store_full_forensics` minority. Collection is opt-in per run
+///   (`--research.tx-gas-results`); the table exists in every v12 database but stays empty unless
+///   the run asks for it, and `analysis_manifests` records which it was. The forensic tables answer
+///   "what broke and why" for the divergent tail; a repricing *simulator* needs the repriced gas of
+///   every transaction, including the byte-identical majority that previously dissolved into a
+///   `block_summaries` class aggregate. Columns are the slim per-tx gas facts the analyze loop
+///   already computes (`schedule_gas_used`, `schedule_total_gas_spent` — the pre-refund figure
+///   EIP-7778 block accounting needs — `schedule_gas_refunded`, `schedule_floor_gas`,
+///   `schedule_intrinsic_gas`, `schedule_state_gas_spent`, `min_multiplier_to_succeed`) plus per-tx
+///   fee fields (`max_fee_per_gas`, `max_priority_fee_per_gas`, decimal-string U256) that were in
+///   scope for `TxEnv` but never persisted. `block_coverage` additionally gains
+///   `block_base_fee_per_gas`. Together these remove the simulator's dependency on an external
+///   per-tx fee source (Xatu): fee data, gas limits, and repriced gas now all come from the replay
+///   itself. Deliberately NOT re-added: `would_fit_in_original_limit`, dropped in v10 as an exact
+///   duplicate of `schedule_success`. There is no in-place migration: a v11 database is rejected by
+///   [`enforce_schema_version`] — start a fresh `SQLite` (drain the old one's `export_outbox` with
+///   the old binary first).
 pub const SCHEMA_VERSION: u32 = 12;
 
 /// Errors raised by the storage layer.
@@ -429,8 +432,13 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
         );",
     )?;
 
-    // One row per (schedule, block, tx) — written for EVERY transaction, not
-    // only the `store_full_forensics` minority that earns a `divergences` row.
+    // One row per (schedule, block, tx) — covering EVERY transaction, not only
+    // the `store_full_forensics` minority that earns a `divergences` row.
+    //
+    // The table is created unconditionally so the schema is identical across
+    // runs, but collection is opt-in (`--research.tx-gas-results`): it is the
+    // largest table the producer writes, and only a repricing simulator needs
+    // it. A run that leaves it off simply writes no rows here.
     //
     // The forensic tables are built to explain the divergent tail; a repricing
     // simulator instead needs the repriced gas of every tx, including the
@@ -1032,9 +1040,10 @@ pub struct BlockOutput {
     pub drill_ins: Vec<DrillInRecord>,
     /// Per-(class) top-recipient rollup rows. Go to `block_recipients`.
     pub recipients: Vec<RecipientRow>,
-    /// One row per tx in the block, unconditionally. Go to `tx_gas_results`.
-    /// Unlike [`Self::drill_ins`] this is never truncated — the simulator needs
-    /// every tx, not a capped sample.
+    /// One row per tx in the block. Go to `tx_gas_results`. Unlike
+    /// [`Self::drill_ins`] this is never truncated — the simulator needs every
+    /// tx, not a capped sample. Empty for runs that didn't opt into the spine
+    /// with `--research.tx-gas-results`.
     ///
     /// `serde(default)` so a pre-v12 outbox envelope still decodes (as an empty
     /// vec) instead of failing the whole payload — the format version is
@@ -1044,7 +1053,8 @@ pub struct BlockOutput {
 }
 
 /// One row of `tx_gas_results`: the slim per-tx gas facts for a single
-/// (schedule, block, tx), emitted for every transaction.
+/// (schedule, block, tx), emitted for every transaction of a run that opted
+/// into the spine (`--research.tx-gas-results`).
 ///
 /// See the table DDL for the `schedule_gas_used` (post-refund, sender-facing)
 /// vs `schedule_total_gas_spent` (pre-refund, EIP-7778 block accounting)
@@ -3167,7 +3177,7 @@ mod tests {
         }
     }
 
-    /// Minimal `TxGasResultRow` fixture for the unconditional per-tx table.
+    /// Minimal `TxGasResultRow` fixture for the per-tx gas table.
     fn fixture_tx_gas_result(schedule: &str, block: u64, tx_index: u32) -> TxGasResultRow {
         TxGasResultRow {
             schedule_name: schedule.to_string(),

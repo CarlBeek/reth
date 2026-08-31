@@ -332,6 +332,10 @@ struct Analyzer<Node: FullNodeComponents> {
     schedule_metadata: HashMap<String, ScheduleMetadata>,
     /// Maximum divergence rows to persist per block.
     max_divergences_per_block: Option<usize>,
+    /// Whether to collect the per-tx gas spine (`tx_gas_results`). Opt-in: it's
+    /// the largest table the producer writes, and only repricing simulation
+    /// needs a row for every tx rather than just the divergent tail.
+    collect_tx_gas_results: bool,
     /// Tiered gas-limit-multiplier sweep applied during schedule replay.
     /// Each tier is tried in order; the first tier whose replay succeeds is
     /// accepted. Defaults to `[1, 2, 4, 8]` from the CLI layer.
@@ -502,6 +506,7 @@ where
         db_path: std::path::PathBuf,
         start_block: u64,
         max_divergences_per_block: Option<usize>,
+        collect_tx_gas_results: bool,
         gas_limit_multipliers: Vec<u64>,
         backfill: bool,
         backfill_min_block: u64,
@@ -577,6 +582,7 @@ where
                     &registry,
                     normalized_gas_tiers.clone(),
                     max_divergences_per_block,
+                    collect_tx_gas_results,
                     chain_id,
                     SCHEMA_VERSION,
                     producer_git_commit,
@@ -747,6 +753,7 @@ where
             has_intrinsic_schedules,
             schedule_metadata,
             max_divergences_per_block,
+            collect_tx_gas_results,
             // Normalized once above (clamp ≥1, sort, dedup, never empty) and
             // shared with the export manifest so the dataset identity matches
             // the tiers actually replayed.
@@ -2637,38 +2644,40 @@ where
                 let opcode_frames_for_agg =
                     exec_result.map(|r| r.frame_opcode_counts.as_slice()).unwrap_or(&[]);
 
-                // Unconditional per-tx gas row. Every field here is already
-                // computed above for the drill-in path; the only difference is
-                // that this one is emitted for all txs rather than the
-                // `store_full_forensics` minority, and is never truncated by
-                // `max_divergences_per_block`.
-                let tx_gas_result = reth_research::database::TxGasResultRow {
-                    schedule_name: schedule_name.to_string(),
-                    schedule_config_hash: self
-                        .schedule_metadata
-                        .get(schedule_name)
-                        .expect("all schedules should have static metadata")
-                        .config_hash
-                        .clone(),
-                    block_number,
-                    tx_index: tx_idx as u32,
-                    tx_hash,
-                    tx_type: tx.ty(),
-                    tx_gas_limit: gas_limit,
-                    max_fee_per_gas: max_fee_per_gas.clone(),
-                    max_priority_fee_per_gas: max_priority_fee_per_gas.clone(),
-                    baseline_success: normal_success,
-                    baseline_gas_used: normal_gas_used,
-                    baseline_total_gas_spent,
-                    schedule_success,
-                    schedule_gas_used: schedule_gas,
-                    schedule_total_gas_spent,
-                    schedule_gas_refunded,
-                    schedule_floor_gas,
-                    schedule_state_gas_spent,
-                    schedule_intrinsic_gas,
-                    min_multiplier_to_succeed,
-                };
+                // Per-tx gas row, emitted for all txs rather than the
+                // `store_full_forensics` minority and never truncated by
+                // `max_divergences_per_block`. Every field is already computed
+                // above for the drill-in path, so the only cost of collecting it
+                // is the row itself — skipped entirely when the run didn't opt
+                // in, since it's the largest table the producer writes.
+                let tx_gas_result =
+                    self.collect_tx_gas_results.then(|| reth_research::database::TxGasResultRow {
+                        schedule_name: schedule_name.to_string(),
+                        schedule_config_hash: self
+                            .schedule_metadata
+                            .get(schedule_name)
+                            .expect("all schedules should have static metadata")
+                            .config_hash
+                            .clone(),
+                        block_number,
+                        tx_index: tx_idx as u32,
+                        tx_hash,
+                        tx_type: tx.ty(),
+                        tx_gas_limit: gas_limit,
+                        max_fee_per_gas: max_fee_per_gas.clone(),
+                        max_priority_fee_per_gas: max_priority_fee_per_gas.clone(),
+                        baseline_success: normal_success,
+                        baseline_gas_used: normal_gas_used,
+                        baseline_total_gas_spent,
+                        schedule_success,
+                        schedule_gas_used: schedule_gas,
+                        schedule_total_gas_spent,
+                        schedule_gas_refunded,
+                        schedule_floor_gas,
+                        schedule_state_gas_spent,
+                        schedule_intrinsic_gas,
+                        min_multiplier_to_succeed,
+                    });
 
                 aggregators
                     .get_mut(schedule_name)
@@ -2805,6 +2814,7 @@ async fn research_exex<Node: FullNodeComponents>(
     db_path: std::path::PathBuf,
     start_block: u64,
     max_divergences_per_block: Option<usize>,
+    collect_tx_gas_results: bool,
     gas_limit_multipliers: Vec<u64>,
     backfill: bool,
     backfill_min_block: u64,
@@ -2829,6 +2839,7 @@ where
         db_path,
         start_block,
         max_divergences_per_block,
+        collect_tx_gas_results,
         gas_limit_multipliers,
         backfill,
         backfill_min_block,
@@ -3092,6 +3103,7 @@ fn main() -> eyre::Result<()> {
             let db_path = research_args.db_path.clone();
             let start_block = research_args.start_block;
             let max_divergences_per_block = research_args.max_divergences_per_block;
+            let collect_tx_gas_results = research_args.tx_gas_results;
             let gas_limit_multipliers = research_args.gas_limit_multipliers.clone();
             let backfill = research_args.backfill;
             let backfill_min_block = research_args.backfill_min_block;
@@ -3121,6 +3133,7 @@ fn main() -> eyre::Result<()> {
                 db_path = ?db_path,
                 start_block,
                 max_divergences_per_block,
+                collect_tx_gas_results,
                 gas_limit_multipliers = ?gas_limit_multipliers,
                 backfill,
                 backfill_min_block,
@@ -3148,6 +3161,7 @@ fn main() -> eyre::Result<()> {
                             db_path,
                             start_block,
                             max_divergences_per_block,
+                            collect_tx_gas_results,
                             gas_limit_multipliers,
                             backfill,
                             backfill_min_block,

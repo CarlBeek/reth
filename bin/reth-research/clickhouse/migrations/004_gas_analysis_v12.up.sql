@@ -1,4 +1,4 @@
--- Producer schema v12: unconditional per-tx gas spine.
+-- Producer schema v12: opt-in per-tx gas spine.
 --
 -- Adds gas_analysis_tx_gas_result, one row per (schedule, block, tx) written
 -- for EVERY transaction rather than only the store_full_forensics minority
@@ -12,6 +12,12 @@
 -- max-divergences-per-block setting truncates. Expect roughly tx_count rows
 -- per (schedule, block) -- a materially larger row count than the divergence
 -- table, hence the same partitioning and a ZSTD(1) column codec throughout.
+--
+-- Producers collect the spine only when started with --research.tx-gas-results,
+-- and that choice is part of the analysis manifest, so an empty table for a
+-- pinned analysis_config_hash means that dataset never collected it rather than
+-- that rows are missing. The table is created regardless: the v12 startup
+-- DESCRIBE TABLE gate expects it whether or not the run fills it.
 --
 -- Gas column semantics that are NOT interchangeable:
 --   schedule_gas_used        -- sender-facing: post-refund, floor-applied.

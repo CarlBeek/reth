@@ -58,6 +58,22 @@ pub struct ResearchArgs {
     )]
     pub max_divergences_per_block: Option<usize>,
 
+    /// Collect the per-tx gas spine: one `tx_gas_results` row per
+    /// (schedule, block, tx), for every transaction rather than only the
+    /// failures and trace divergences that earn a `divergences` row.
+    ///
+    /// Off by default because it is the largest table the producer writes —
+    /// roughly `tx_count` rows per (schedule, block), uncapped by
+    /// `--research.max-divergences-per-block`. Enable it for repricing
+    /// simulation, which needs the repriced gas of every transaction including
+    /// the byte-identical majority that otherwise only reaches a
+    /// `block_summaries` class aggregate.
+    ///
+    /// This changes the analysis manifest, and therefore the `ClickHouse`
+    /// `analysis_config_hash`: runs with and without it are distinct datasets.
+    #[arg(long = "research.tx-gas-results", help_heading = "Research")]
+    pub tx_gas_results: bool,
+
     /// Tiered sweep of gas-limit multipliers to try during schedule replay.
     ///
     /// The replay runs at `tx_gas_limit × multiplier` for each tier in order;
@@ -207,6 +223,7 @@ impl Default for ResearchArgs {
             db_path: PathBuf::from("./divergences.sqlite"),
             start_block: 0,
             max_divergences_per_block: None,
+            tx_gas_results: false,
             gas_limit_multipliers: vec![1, 2, 4, 8],
             backfill: false,
             backfill_min_block: 0,
@@ -256,6 +273,10 @@ impl ResearchArgs {
             args = args.with_max_divergences_per_block(max);
         }
 
+        if self.tx_gas_results {
+            args = args.with_tx_gas_results();
+        }
+
         if self.amsterdam {
             args = args.with_amsterdam();
         }
@@ -292,6 +313,10 @@ impl ResearchArgs {
 
         if let Some(max) = self.max_divergences_per_block {
             args = args.with_max_divergences_per_block(max);
+        }
+
+        if self.tx_gas_results {
+            args = args.with_tx_gas_results();
         }
 
         if self.amsterdam {
@@ -424,6 +449,16 @@ mod tests {
         assert_eq!(args.max_divergences_per_block, Some(25));
         assert_eq!(args.gas_limit_multipliers, vec![1, 2, 4, 8]);
         assert_eq!(args.schedule_count(), 3);
+    }
+
+    #[test]
+    fn test_parse_research_args_tx_gas_results_opt_in() {
+        let default = CommandParser::<ResearchArgs>::parse_from(["reth"]).args;
+        assert!(!default.tx_gas_results);
+
+        let enabled =
+            CommandParser::<ResearchArgs>::parse_from(["reth", "--research.tx-gas-results"]).args;
+        assert!(enabled.tx_gas_results);
     }
 
     #[test]

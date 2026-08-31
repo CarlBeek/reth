@@ -187,8 +187,9 @@ fn main() {
             tx_count: 1,
             gas_delta_sum_succeeding: 20_000,
         }],
-        // v12: one row per tx in the block, unconditionally — the forensic tx
-        // plus the gas-only tx that only appears in the class summary above.
+        // v12: one row per tx in the block when the producer collects the
+        // spine — the forensic tx plus the gas-only tx that only appears in the
+        // class summary above.
         tx_gas_results: vec![
             TxGasResultRow {
                 schedule_name: "amsterdam".into(),

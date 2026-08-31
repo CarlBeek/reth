@@ -22,8 +22,8 @@ For each committed block at or above `--research.start-block`:
    `TrackingInspector`.
 4. Re-execute the same transaction once per configured execution schedule
    with `ScheduleInspector`.
-5. Write a slim `tx_gas_results` row for every (tx, schedule) pair,
-   whatever the outcome.
+5. With `--research.tx-gas-results`, write a slim `tx_gas_results` row for
+   every (tx, schedule) pair, whatever the outcome.
 6. Store the full per-tx forensic record (call frames, per-frame opcode
    counts, event logs) for every pair where anything beyond gas changed —
    either replay failed at the original limit, baseline failed, or a trace
@@ -53,6 +53,11 @@ same schedule.
 - `--research.gas-limit-multipliers MULTS` (comma-separated tier sweep,
   default `1,2,4,8`; pass `1` to disable)
 - `--research.max-divergences-per-block N`
+- `--research.tx-gas-results` (opt into the per-tx gas spine — one
+  `tx_gas_results` row per (schedule, block, tx). Off by default: it is the
+  largest table the producer writes, ~`tx_count` rows per (schedule, block).
+  Changes the analysis manifest, so runs with and without it are distinct
+  ClickHouse datasets)
 - `--research.metadata-backfill` (run the contract-metadata backfill in
   one-shot mode instead of starting live analysis; see below)
 - `--research.metadata-backfill-interval-secs N`
@@ -164,7 +169,8 @@ Per (schedule, block):
   `class ∈ {unchanged, gas_only}`
 - `block_recipients`: top-K recipient/selector attribution per `class`
 
-Per transaction, unconditionally — **every** tx, not just the divergent ones:
+Per transaction — **every** tx, not just the divergent ones — when the run
+opts in with `--research.tx-gas-results` (empty otherwise):
 
 - `tx_gas_results`: the slim per-tx gas spine a repricing simulator needs.
   Gas limit, fee caps (`max_fee_per_gas` / `max_priority_fee_per_gas` as U256

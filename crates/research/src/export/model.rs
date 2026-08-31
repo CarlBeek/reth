@@ -44,8 +44,8 @@ pub const MANIFEST_FORMAT_VERSION: u16 = 1;
 /// `tx_count_type_*` counts, `tx_count_simple_transfer` /
 /// `tx_count_contract_call`, `gas_delta_pct_hist`, `baseline_gas_used_sum`
 /// (all `serde(default)`, so v2 payloads still decode).
-/// v4: additive v12 fields — `BlockOutput::tx_gas_results` (the unconditional
-/// per-tx gas spine) and `BlockCoverageRow::block_base_fee_per_gas` (both
+/// v4: additive v12 fields — `BlockOutput::tx_gas_results` (the per-tx gas
+/// spine, empty unless the run opted in) and `BlockCoverageRow::block_base_fee_per_gas` (both
 /// `serde(default)`, so v3 payloads still decode as empty / `None`).
 pub const ENVELOPE_FORMAT_VERSION: u16 = 4;
 
@@ -114,6 +114,15 @@ pub struct AnalysisManifestV1 {
     pub gas_limit_multipliers: Vec<u64>,
     /// Drill-in retention cap, which changes retained output.
     pub max_divergences_per_block: Option<usize>,
+    /// Whether the run collected the per-tx gas spine (`tx_gas_results`).
+    ///
+    /// Serialized only when `true`, so an absent field means "not collected" —
+    /// the state of every manifest written before the knob existed. That keeps
+    /// the identity of those datasets byte-stable (the worker re-derives the
+    /// hash from the stored JSON and rejects a mismatch), while opting in mints
+    /// a distinct hash for the materially larger dataset it produces.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tx_gas_results_collected: bool,
     /// Per-schedule manifests, sorted by `name`.
     pub schedules: Vec<ScheduleManifestV1>,
 }
@@ -159,6 +168,7 @@ impl AnalysisManifestV1 {
         registry: &ScheduleRegistry,
         normalized_gas_tiers: Vec<u64>,
         max_divergences_per_block: Option<usize>,
+        tx_gas_results_collected: bool,
         chain_id: u64,
         producer_schema_version: u32,
         producer_git_commit: impl Into<String>,
@@ -175,6 +185,7 @@ impl AnalysisManifestV1 {
             replay_semantics: REPLAY_SEMANTICS.to_string(),
             gas_limit_multipliers: normalized_gas_tiers,
             max_divergences_per_block,
+            tx_gas_results_collected,
             schedules,
         }
     }
@@ -190,6 +201,13 @@ impl AnalysisManifestV1 {
     pub fn analysis_config_hash(&self) -> Result<String, ExportModelError> {
         Ok(format!("{:#x}", keccak256(self.to_json()?.as_bytes())))
     }
+}
+
+/// `skip_serializing_if` predicate for manifest flags whose `false` value must
+/// serialize as an absent field — see
+/// [`AnalysisManifestV1::tx_gas_results_collected`].
+const fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 /// Normalize the gas-limit-multiplier tiers: clamp each to at least 1, sort
@@ -462,8 +480,8 @@ pub struct CoverageRow {
     pub drill_ins_truncated: bool,
 }
 
-/// One row for `gas_analysis_tx_gas_result` — the unconditional per-tx gas
-/// spine, one row per (schedule, block, tx). See the `tx_gas_results` `SQLite`
+/// One row for `gas_analysis_tx_gas_result` — the per-tx gas spine, one row
+/// per (schedule, block, tx) for runs that collect it. See the `tx_gas_results` `SQLite`
 /// DDL for the post-refund vs pre-refund gas distinction.
 #[allow(missing_docs)]
 #[derive(Debug, Clone, Serialize)]
@@ -726,7 +744,8 @@ pub struct BlockClickHouseRows {
     pub summaries: Vec<SummaryRow>,
     /// Zero or more per-tx divergence rows.
     pub divergences: Vec<DivergenceExportRow>,
-    /// One row per tx in the block — the unconditional gas spine.
+    /// One row per tx in the block — the gas spine. Empty unless the run
+    /// opted into collecting it.
     pub tx_gas_results: Vec<TxGasResultExportRow>,
 }
 
@@ -1144,7 +1163,15 @@ mod tests {
     }
 
     fn manifest(reg: &ScheduleRegistry, tiers: Vec<u64>) -> AnalysisManifestV1 {
-        AnalysisManifestV1::build(reg, normalize_gas_tiers(&tiers), Some(50), 1, 10, "deadbeef")
+        AnalysisManifestV1::build(
+            reg,
+            normalize_gas_tiers(&tiers),
+            Some(50),
+            false,
+            1,
+            10,
+            "deadbeef",
+        )
     }
 
     #[test]
@@ -1200,26 +1227,55 @@ mod tests {
     fn changing_drill_in_cap_changes_hash() {
         let reg = registry_two_lanes();
         let tiers = normalize_gas_tiers(&[1]);
-        let a = AnalysisManifestV1::build(&reg, tiers.clone(), Some(10), 1, 10, "c")
+        let a = AnalysisManifestV1::build(&reg, tiers.clone(), Some(10), false, 1, 10, "c")
             .analysis_config_hash()
             .unwrap();
-        let b = AnalysisManifestV1::build(&reg, tiers, Some(20), 1, 10, "c")
+        let b = AnalysisManifestV1::build(&reg, tiers, Some(20), false, 1, 10, "c")
             .analysis_config_hash()
             .unwrap();
         assert_ne!(a, b);
+    }
+
+    /// Opting into the per-tx gas spine produces a materially different
+    /// dataset, so it must produce a different identity.
+    #[test]
+    fn collecting_tx_gas_results_changes_hash() {
+        let reg = registry_two_lanes();
+        let tiers = normalize_gas_tiers(&[1]);
+        let off = AnalysisManifestV1::build(&reg, tiers.clone(), None, false, 1, 10, "c")
+            .analysis_config_hash()
+            .unwrap();
+        let on = AnalysisManifestV1::build(&reg, tiers, None, true, 1, 10, "c")
+            .analysis_config_hash()
+            .unwrap();
+        assert_ne!(off, on);
+    }
+
+    /// The flag serializes as an absent field when off, so a manifest persisted
+    /// before the knob existed still round-trips to its original JSON — the
+    /// worker re-derives the hash from the stored JSON and rejects a mismatch.
+    #[test]
+    fn absent_tx_gas_results_flag_round_trips_to_identical_json() {
+        let reg = registry_two_lanes();
+        let json = manifest(&reg, vec![1]).to_json().unwrap();
+        assert!(!json.contains("tx_gas_results_collected"));
+
+        let parsed: AnalysisManifestV1 = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.tx_gas_results_collected);
+        assert_eq!(parsed.to_json().unwrap(), json);
     }
 
     #[test]
     fn changing_commit_or_chain_changes_hash() {
         let reg = registry_two_lanes();
         let tiers = normalize_gas_tiers(&[1]);
-        let base = AnalysisManifestV1::build(&reg, tiers.clone(), None, 1, 10, "aaaa")
+        let base = AnalysisManifestV1::build(&reg, tiers.clone(), None, false, 1, 10, "aaaa")
             .analysis_config_hash()
             .unwrap();
-        let diff_commit = AnalysisManifestV1::build(&reg, tiers.clone(), None, 1, 9, "bbbb")
+        let diff_commit = AnalysisManifestV1::build(&reg, tiers.clone(), None, false, 1, 9, "bbbb")
             .analysis_config_hash()
             .unwrap();
-        let diff_chain = AnalysisManifestV1::build(&reg, tiers, None, 11155111, 9, "aaaa")
+        let diff_chain = AnalysisManifestV1::build(&reg, tiers, None, false, 11155111, 9, "aaaa")
             .analysis_config_hash()
             .unwrap();
         assert_ne!(base, diff_commit);

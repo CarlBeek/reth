@@ -162,6 +162,11 @@ pub struct ResearchArgs {
     /// Maximum divergences to record per block
     pub max_divergences_per_block: Option<usize>,
 
+    /// Collect the per-tx gas spine (`tx_gas_results`) — one row per
+    /// (schedule, block, tx). Off by default: it's the largest table the
+    /// producer writes, and only a repricing simulator needs it.
+    pub collect_tx_gas_results: bool,
+
     /// Tiered gas-limit-multiplier sweep applied during schedule replay.
     /// `None` falls back to the single-tier `[1]` default at the call
     /// site; `Some(vec![1, 2, 4, 8])` runs the replay at each tier in
@@ -238,6 +243,12 @@ impl ResearchArgs {
     /// Set the maximum divergences to persist per block.
     pub const fn with_max_divergences_per_block(mut self, count: usize) -> Self {
         self.max_divergences_per_block = Some(count);
+        self
+    }
+
+    /// Enable per-tx gas spine collection (`tx_gas_results`).
+    pub const fn with_tx_gas_results(mut self) -> Self {
+        self.collect_tx_gas_results = true;
         self
     }
 

@@ -833,6 +833,7 @@ mod tests {
             &reg,
             normalize_gas_tiers(&[1]),
             Some(50),
+            true,
             1,
             crate::database::SCHEMA_VERSION,
             "deadbeef",

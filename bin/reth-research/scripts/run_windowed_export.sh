@@ -40,7 +40,8 @@ WINDOW_SIZE="${WINDOW_SIZE:-50000}"
 BACKFILL_CONCURRENCY="${BACKFILL_CONCURRENCY:-44}"
 SCHEDULE_FLAGS="${SCHEDULE_FLAGS:---research.amsterdam}"
 CSV_FLAGS="${CSV_FLAGS:-}"               # e.g. --research.csv 7904-prelim=/path.csv (adds 1 schedule)
-EXTRA_NODE_FLAGS="${EXTRA_NODE_FLAGS:-}" # e.g. --research.max-divergences-per-block 8192 (shared across schedules)
+EXTRA_NODE_FLAGS="${EXTRA_NODE_FLAGS:-}" # e.g. --research.max-divergences-per-block 8192 (shared across schedules),
+                                         # or --research.tx-gas-results for the per-tx gas spine (off by default)
 POLL_SECS="${POLL_SECS:-30}"
 DRAIN_STABLE_POLLS="${DRAIN_STABLE_POLLS:-3}"
 MB_PER_BLOCK="${MB_PER_BLOCK:-6}"        # disk budget per analyzed block (observed ~5 on heavy recent blocks)

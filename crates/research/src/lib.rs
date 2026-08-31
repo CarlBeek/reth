@@ -175,7 +175,8 @@
 //! FROM divergences
 //! GROUP BY schedule_name;
 //!
-//! -- Repriced gas for every replayed tx, divergent or not
+//! -- Repriced gas for every replayed tx, divergent or not (requires
+//! -- --research.tx-gas-results)
 //! SELECT schedule_name, AVG(schedule_gas_used - baseline_gas_used) AS avg_gas_delta
 //! FROM tx_gas_results
 //! GROUP BY schedule_name;
