@@ -6,24 +6,25 @@ recording per-transaction divergences.
 ## What It Does
 
 The current system is centered on the `reth-research` ExEx in
-[`bin/reth-research`](/Users/carl/projects/reth/bin/reth-research). For each committed block:
+[`bin/reth-research`](../../bin/reth-research). For each committed block:
 
 1. It loads historical state at `block - 1`.
 2. It executes each transaction once under baseline gas pricing.
 3. It re-executes the same transaction once per configured execution schedule.
-4. It classifies each (tx, schedule) into a storage bucket (see
-   [`docs/storage-redesign.md`](docs/storage-redesign.md)) and writes the
-   block's coverage + per-bucket summaries + drill-in rows to SQLite.
+4. It writes, to SQLite, a full per-tx forensic record for each (tx, schedule) pair that failed or
+   diverged in trace, and per-block coverage + aggregates keyed by execution-fact class
+   (`unchanged` / `gas_only`) for the rest. With `--research.tx-gas-results` it additionally
+   writes a slim `tx_gas_results` row for every (tx, schedule) pair, whatever the outcome. The DDL
+   in [`src/database.rs`](src/database.rs) is canonical.
 
 Execution schedules are isolated from one another: each configured schedule gets its own per-block
 state so schedule-induced failures can cascade across later transactions in the same block.
 
 ## Supported Schedules
 
-- `EIP-2780` intrinsic repricing
-- `EIP-8037` native state creation gas and reservoir accounting
-- `EIP-8038` state access/write repricing (uniform 3x of access/write/create costs), applied on the
-  block's native spec independently of EIP-8037
+- `Amsterdam` — the whole Glamsterdam repricing stack (EIP-2780 + 7976 + 7981 + 8037 + 8038) via
+  revm's native `SpecId::AMSTERDAM`, so the recorded gas reflects the EIPs interacting rather than a
+  sum of independent single-EIP deltas
 - CSV-driven opcode and precompile repricing
 - Uniform execution gas multipliers
 - Combined intrinsic + execution schedules via the shared `GasSchedule` trait
@@ -41,9 +42,6 @@ For each schedule divergence, the live path can persist:
 - first detected OOG / divergence location metadata
 - baseline vs schedule call frames when the call tree differs
 - baseline vs schedule event logs when emitted logs differ
-- `would_fit_in_original_limit`: whether the schedule's `gas_used` would still
-  fit inside the transaction's original `tx_gas_limit` (i.e. the original tx
-  would have survived the schedule unchanged)
 - `min_multiplier_to_succeed`: smallest gas-limit multiplier (`gas_used /
   tx_gas_limit`) that lets the replay finish; `NULL` when the replay halted
   for non-gas reasons or even at the inflated limit
@@ -52,8 +50,8 @@ For each schedule divergence, the live path can persist:
 - `baseline_gas_refunded` / `schedule_gas_refunded`: raw `Gas::refunded()`
   (capped per EIP-3529) — lets you separate refund effects from raw cost
 - `schedule_state_gas_spent`: net state gas charged under the schedule (initial
-  + runtime, already net of EIP-7702 reservoir refund). Zero unless EIP-8037 is
-  enabled
+  + runtime, already net of EIP-7702 reservoir refund). Zero for schedules that
+  don't engage EIP-8037 — i.e. everything but `Amsterdam`
 - `schedule_initial_state_gas`: state gas charged at tx start (auth-list +
   create-tx state gas, gross of EIP-7702 reservoir refund). Lets you derive
   `runtime_state_gas ≈ schedule_state_gas_spent - schedule_initial_state_gas`
@@ -87,10 +85,10 @@ Use this crate for:
 - spotting candidate breakage patterns
 - quantifying how often a repricing changes gas or status on historical chain data
 
-For EIP-8037 reservoir experiments, use `--research.eip8037` and optionally
-`--research.gas-limit-multiplier <N>`. The multiplier only inflates gas limits for the schedule
-replay (so the reservoir can fill); `would_fit_in_original_limit` and `min_multiplier_to_succeed`
-then tell you whether the original tx survived the schedule unchanged and, if not, how much extra
-gas it would have needed.
+For state-gas reservoir experiments, use `--research.amsterdam` and optionally
+`--research.gas-limit-multipliers <N,...>`. The multipliers only inflate gas limits for the schedule
+replay (so the reservoir can fill); success is still judged at the transaction's original limit, so
+`schedule_success` tells you whether the original tx survived the schedule unchanged and
+`min_multiplier_to_succeed` how much extra gas it would have needed.
 
 Do not use it as the sole basis for ship / no-ship decisions on Ethereum protocol changes.

@@ -7,10 +7,11 @@ use crate::divergence::{
 use alloy_primitives::Address;
 use revm::{
     context_interface::ContextTr,
-    interpreter::{CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter},
+    interpreter::{
+        interpreter_types::Jumps, CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter,
+    },
     Inspector,
 };
-use revm_interpreter::interpreter_types::Jumps;
 
 /// Inspector that tracks operation counts without modifying execution.
 ///

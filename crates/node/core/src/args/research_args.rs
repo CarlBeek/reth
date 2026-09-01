@@ -10,25 +10,14 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
 #[command(next_help_heading = "Research")]
 pub struct ResearchArgs {
-    /// Enable EIP-2780 intrinsic gas experiment.
+    /// Enable the Amsterdam repricing experiment.
     ///
-    /// This reduces intrinsic gas costs based on transaction category
-    /// (e.g., simple transfers cost less than contract calls).
-    #[arg(long = "research.eip2780", help_heading = "Research")]
-    pub eip2780: bool,
-
-    /// Enable EIP-8037 state creation gas experiment.
-    ///
-    /// This uses revm's native EIP-8037 state-gas and reservoir accounting.
-    #[arg(long = "research.eip8037", help_heading = "Research")]
-    pub eip8037: bool,
-
-    /// Enable EIP-8038 state access/write gas experiment.
-    ///
-    /// This reprices state access/write/create costs (3x) on the block's native
-    /// spec, independent of EIP-8037's state-gas reservoir.
-    #[arg(long = "research.eip8038", help_heading = "Research")]
-    pub eip8038: bool,
+    /// Replays each block under revm's native `SpecId::AMSTERDAM`, which
+    /// implements the whole repricing stack (EIP-2780 + 7976 + 7981 + 8037 +
+    /// 8038), so the recorded gas reflects the EIPs interacting rather than a
+    /// sum of independent single-EIP deltas.
+    #[arg(long = "research.amsterdam", help_heading = "Research")]
+    pub amsterdam: bool,
 
     /// Add a CSV-based gas pricing schedule.
     ///
@@ -68,6 +57,22 @@ pub struct ResearchArgs {
         help_heading = "Research"
     )]
     pub max_divergences_per_block: Option<usize>,
+
+    /// Collect the per-tx gas spine: one `tx_gas_results` row per
+    /// (schedule, block, tx), for every transaction rather than only the
+    /// failures and trace divergences that earn a `divergences` row.
+    ///
+    /// Off by default because it is the largest table the producer writes —
+    /// roughly `tx_count` rows per (schedule, block), uncapped by
+    /// `--research.max-divergences-per-block`. Enable it for repricing
+    /// simulation, which needs the repriced gas of every transaction including
+    /// the byte-identical majority that otherwise only reaches a
+    /// `block_summaries` class aggregate.
+    ///
+    /// This changes the analysis manifest, and therefore the `ClickHouse`
+    /// `analysis_config_hash`: runs with and without it are distinct datasets.
+    #[arg(long = "research.tx-gas-results", help_heading = "Research")]
+    pub tx_gas_results: bool,
 
     /// Tiered sweep of gas-limit multipliers to try during schedule replay.
     ///
@@ -211,15 +216,14 @@ pub struct ResearchArgs {
 impl Default for ResearchArgs {
     fn default() -> Self {
         Self {
-            eip2780: false,
-            eip8037: false,
-            eip8038: false,
+            amsterdam: false,
             csv_schedules: Vec::new(),
             multiplier_schedules: Vec::new(),
             // Keep in sync with the `#[arg(default_value = ...)]` on `db_path`.
             db_path: PathBuf::from("./divergences.sqlite"),
             start_block: 0,
             max_divergences_per_block: None,
+            tx_gas_results: false,
             gas_limit_multipliers: vec![1, 2, 4, 8],
             backfill: false,
             backfill_min_block: 0,
@@ -238,23 +242,13 @@ impl Default for ResearchArgs {
 impl ResearchArgs {
     /// Check if any research schedules are configured.
     pub const fn has_schedules(&self) -> bool {
-        self.eip2780 ||
-            self.eip8037 ||
-            self.eip8038 ||
-            !self.csv_schedules.is_empty() ||
-            !self.multiplier_schedules.is_empty()
+        self.amsterdam || !self.csv_schedules.is_empty() || !self.multiplier_schedules.is_empty()
     }
 
     /// Get the number of configured schedules.
     pub const fn schedule_count(&self) -> usize {
         let mut count = 0;
-        if self.eip2780 {
-            count += 1;
-        }
-        if self.eip8037 {
-            count += 1;
-        }
-        if self.eip8038 {
+        if self.amsterdam {
             count += 1;
         }
         count += self.csv_schedules.len();
@@ -279,16 +273,12 @@ impl ResearchArgs {
             args = args.with_max_divergences_per_block(max);
         }
 
-        if self.eip2780 {
-            args = args.with_eip2780();
+        if self.tx_gas_results {
+            args = args.with_tx_gas_results();
         }
 
-        if self.eip8037 {
-            args = args.with_eip8037();
-        }
-
-        if self.eip8038 {
-            args = args.with_eip8038();
+        if self.amsterdam {
+            args = args.with_amsterdam();
         }
 
         args = args.with_gas_limit_multipliers(self.gas_limit_multipliers.clone());
@@ -325,16 +315,12 @@ impl ResearchArgs {
             args = args.with_max_divergences_per_block(max);
         }
 
-        if self.eip2780 {
-            args = args.with_eip2780();
+        if self.tx_gas_results {
+            args = args.with_tx_gas_results();
         }
 
-        if self.eip8037 {
-            args = args.with_eip8037();
-        }
-
-        if self.eip8038 {
-            args = args.with_eip8038();
+        if self.amsterdam {
+            args = args.with_amsterdam();
         }
 
         args = args.with_gas_limit_multipliers(self.gas_limit_multipliers.clone());
@@ -373,40 +359,28 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_research_args_eip2780() {
-        let args = CommandParser::<ResearchArgs>::parse_from(["reth", "--research.eip2780"]).args;
-        assert!(args.eip2780);
+    fn test_parse_research_args_amsterdam() {
+        let args = CommandParser::<ResearchArgs>::parse_from(["reth", "--research.amsterdam"]).args;
+        assert!(args.amsterdam);
         assert!(args.has_schedules());
         assert_eq!(args.schedule_count(), 1);
     }
 
+    /// The Amsterdam lane runs *alongside* the sweep lanes, so each keeps its
+    /// own replay pass and dataset.
     #[test]
-    fn test_parse_research_args_eip8037() {
-        let args = CommandParser::<ResearchArgs>::parse_from(["reth", "--research.eip8037"]).args;
-        assert!(args.eip8037);
-        assert!(args.has_schedules());
-        assert_eq!(args.schedule_count(), 1);
-    }
-
-    #[test]
-    fn test_parse_research_args_eip8038() {
-        let args = CommandParser::<ResearchArgs>::parse_from(["reth", "--research.eip8038"]).args;
-        assert!(args.eip8038);
-        assert!(args.has_schedules());
-        assert_eq!(args.schedule_count(), 1);
-    }
-
-    #[test]
-    fn test_parse_research_args_eip8037_and_eip8038() {
+    fn test_amsterdam_coexists_with_sweep_flags() {
         let args = CommandParser::<ResearchArgs>::parse_from([
             "reth",
-            "--research.eip8037",
-            "--research.eip8038",
+            "--research.amsterdam",
+            "--research.multiplier",
+            "128x=128",
+            "--research.multiplier",
+            "256x=256",
         ])
         .args;
-        assert!(args.eip8037);
-        assert!(args.eip8038);
-        assert_eq!(args.schedule_count(), 2);
+        assert!(args.amsterdam);
+        assert_eq!(args.schedule_count(), 3);
     }
 
     #[test]
@@ -452,7 +426,7 @@ mod tests {
     fn test_parse_research_args_combined() {
         let args = CommandParser::<ResearchArgs>::parse_from([
             "reth",
-            "--research.eip2780",
+            "--research.amsterdam",
             "--research.csv",
             "7904-prelim=./7904.csv",
             "--research.multiplier",
@@ -467,7 +441,7 @@ mod tests {
             "1,2,4,8",
         ])
         .args;
-        assert!(args.eip2780);
+        assert!(args.amsterdam);
         assert_eq!(args.csv_schedules, vec!["7904-prelim=./7904.csv"]);
         assert_eq!(args.multiplier_schedules, vec!["128x=128"]);
         assert_eq!(args.db_path, PathBuf::from("./results.db"));
@@ -475,6 +449,16 @@ mod tests {
         assert_eq!(args.max_divergences_per_block, Some(25));
         assert_eq!(args.gas_limit_multipliers, vec![1, 2, 4, 8]);
         assert_eq!(args.schedule_count(), 3);
+    }
+
+    #[test]
+    fn test_parse_research_args_tx_gas_results_opt_in() {
+        let default = CommandParser::<ResearchArgs>::parse_from(["reth"]).args;
+        assert!(!default.tx_gas_results);
+
+        let enabled =
+            CommandParser::<ResearchArgs>::parse_from(["reth", "--research.tx-gas-results"]).args;
+        assert!(enabled.tx_gas_results);
     }
 
     #[test]

@@ -4,8 +4,7 @@
 //! to configure multi-schedule research experiments.
 
 use crate::schedule::{
-    CsvPricingError, CsvPricingSchedule, Eip2780Schedule, Eip8037Schedule, Eip8038Schedule,
-    MultiplierSchedule, ScheduleRegistry,
+    AmsterdamSchedule, CsvPricingError, CsvPricingSchedule, MultiplierSchedule, ScheduleRegistry,
 };
 use std::path::PathBuf;
 use thiserror::Error;
@@ -39,7 +38,7 @@ pub enum CliError {
     },
 
     /// No schedules configured
-    #[error("No schedules configured. Enable at least one schedule with --research.eip2780, --research.eip8037, --research.eip8038, --research.csv, or --research.multiplier")]
+    #[error("No schedules configured. Enable at least one schedule with --research.amsterdam, --research.csv, or --research.multiplier")]
     NoSchedules,
 
     /// Schedule registry error
@@ -135,14 +134,9 @@ impl NamedMultiplierSchedule {
 /// Can be used with clap or similar CLI parsing libraries.
 #[derive(Debug, Clone, Default)]
 pub struct ResearchArgs {
-    /// Enable EIP-2780 intrinsic gas experiment
-    pub eip2780_enabled: bool,
-
-    /// Enable EIP-8037 state creation gas experiment
-    pub eip8037_enabled: bool,
-
-    /// Enable EIP-8038 state access/write gas experiment
-    pub eip8038_enabled: bool,
+    /// Enable the Amsterdam repricing experiment (EIP-2780 + 7976 + 7981 +
+    /// 8037 + 8038, via revm's native `SpecId::AMSTERDAM`).
+    pub amsterdam_enabled: bool,
 
     /// CSV pricing schedules (name=path pairs)
     pub csv_schedules: Vec<NamedCsvSchedule>,
@@ -168,6 +162,11 @@ pub struct ResearchArgs {
     /// Maximum divergences to record per block
     pub max_divergences_per_block: Option<usize>,
 
+    /// Collect the per-tx gas spine (`tx_gas_results`) — one row per
+    /// (schedule, block, tx). Off by default: it's the largest table the
+    /// producer writes, and only a repricing simulator needs it.
+    pub collect_tx_gas_results: bool,
+
     /// Tiered gas-limit-multiplier sweep applied during schedule replay.
     /// `None` falls back to the single-tier `[1]` default at the call
     /// site; `Some(vec![1, 2, 4, 8])` runs the replay at each tier in
@@ -186,21 +185,9 @@ impl ResearchArgs {
         }
     }
 
-    /// Enable EIP-2780 schedule.
-    pub const fn with_eip2780(mut self) -> Self {
-        self.eip2780_enabled = true;
-        self
-    }
-
-    /// Enable EIP-8037 schedule.
-    pub const fn with_eip8037(mut self) -> Self {
-        self.eip8037_enabled = true;
-        self
-    }
-
-    /// Enable EIP-8038 schedule.
-    pub const fn with_eip8038(mut self) -> Self {
-        self.eip8038_enabled = true;
+    /// Enable the Amsterdam schedule.
+    pub const fn with_amsterdam(mut self) -> Self {
+        self.amsterdam_enabled = true;
         self
     }
 
@@ -259,6 +246,12 @@ impl ResearchArgs {
         self
     }
 
+    /// Enable per-tx gas spine collection (`tx_gas_results`).
+    pub const fn with_tx_gas_results(mut self) -> Self {
+        self.collect_tx_gas_results = true;
+        self
+    }
+
     /// Set the schedule replay gas-limit-multiplier sweep tiers.
     ///
     /// Replay runs at `tx_gas_limit × tier` for each tier in order;
@@ -271,9 +264,7 @@ impl ResearchArgs {
 
     /// Check if any schedules are configured.
     pub const fn has_schedules(&self) -> bool {
-        self.eip2780_enabled ||
-            self.eip8037_enabled ||
-            self.eip8038_enabled ||
+        self.amsterdam_enabled ||
             !self.csv_schedules.is_empty() ||
             !self.multiplier_schedules.is_empty()
     }
@@ -281,13 +272,7 @@ impl ResearchArgs {
     /// Get the number of configured schedules.
     pub const fn schedule_count(&self) -> usize {
         let mut count = 0;
-        if self.eip2780_enabled {
-            count += 1;
-        }
-        if self.eip8037_enabled {
-            count += 1;
-        }
-        if self.eip8038_enabled {
+        if self.amsterdam_enabled {
             count += 1;
         }
         count += self.csv_schedules.len();
@@ -303,19 +288,9 @@ impl ResearchArgs {
 
         let mut registry = ScheduleRegistry::new();
 
-        // Add EIP-2780 if enabled
-        if self.eip2780_enabled {
-            registry.register(Eip2780Schedule::new())?;
-        }
-
-        // Add EIP-8037 if enabled
-        if self.eip8037_enabled {
-            registry.register(Eip8037Schedule::new())?;
-        }
-
-        // Add EIP-8038 if enabled
-        if self.eip8038_enabled {
-            registry.register(Eip8038Schedule::new())?;
+        // Add the Amsterdam lane if enabled
+        if self.amsterdam_enabled {
+            registry.register(AmsterdamSchedule::new())?;
         }
 
         // Add CSV schedules
@@ -336,16 +311,8 @@ impl ResearchArgs {
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
 
-        if self.eip2780_enabled {
-            parts.push("eip-2780".to_string());
-        }
-
-        if self.eip8037_enabled {
-            parts.push("eip-8037".to_string());
-        }
-
-        if self.eip8038_enabled {
-            parts.push("eip-8038".to_string());
+        if self.amsterdam_enabled {
+            parts.push("amsterdam".to_string());
         }
 
         for csv in &self.csv_schedules {
@@ -415,16 +382,14 @@ mod tests {
     #[test]
     fn test_research_args_builder() {
         let args = ResearchArgs::new()
-            .with_eip2780()
-            .with_eip8037()
+            .with_amsterdam()
             .with_multiplier("128x", 128)
             .unwrap()
             .with_start_block(1000000)
             .with_gas_limit_multipliers(vec![1, 2, 4, 8])
             .with_db_path(PathBuf::from("./test.db"));
 
-        assert!(args.eip2780_enabled);
-        assert!(args.eip8037_enabled);
+        assert!(args.amsterdam_enabled);
         assert_eq!(args.multiplier_schedules.len(), 1);
         assert_eq!(args.start_block, 1000000);
         assert_eq!(args.gas_limit_multipliers, Some(vec![1, 2, 4, 8]));
@@ -434,23 +399,22 @@ mod tests {
     #[test]
     fn test_research_args_schedule_count() {
         let args = ResearchArgs::new()
-            .with_eip2780()
-            .with_eip8037()
+            .with_amsterdam()
             .with_multiplier("128x", 128)
             .unwrap()
             .with_multiplier("256x", 256)
             .unwrap();
 
-        assert_eq!(args.schedule_count(), 4);
+        assert_eq!(args.schedule_count(), 3);
     }
 
     #[test]
     fn test_research_args_summary() {
-        let args = ResearchArgs::new().with_eip2780().with_multiplier("128x", 128).unwrap();
+        let args = ResearchArgs::new().with_amsterdam().with_multiplier("128x", 128).unwrap();
 
         let summary = args.summary();
         assert!(summary.contains("2 schedules"));
-        assert!(summary.contains("eip-2780"));
+        assert!(summary.contains("amsterdam"));
         assert!(summary.contains("128x"));
     }
 
@@ -464,41 +428,32 @@ mod tests {
     }
 
     #[test]
-    fn test_research_args_build_registry_with_eip2780() {
-        let args = ResearchArgs::new().with_eip2780();
+    fn test_research_args_build_registry_with_amsterdam() {
+        let args = ResearchArgs::new().with_amsterdam();
         let registry = args.build_registry().unwrap();
 
         assert_eq!(registry.len(), 1);
-        assert!(registry.get("eip-2780").is_some());
+        assert!(registry.get("amsterdam").is_some());
+        assert!(args.summary().contains("amsterdam"));
     }
 
+    /// The Amsterdam lane registers alongside the sweep lanes, each with its own
+    /// replay pass and dataset.
     #[test]
-    fn test_research_args_build_registry_with_eip8037() {
-        let args = ResearchArgs::new().with_eip8037();
+    fn test_amsterdam_registers_alongside_multiplier_lanes() {
+        let args = ResearchArgs::new()
+            .with_amsterdam()
+            .with_multiplier("128x", 128)
+            .unwrap()
+            .with_multiplier("256x", 256)
+            .unwrap();
         let registry = args.build_registry().unwrap();
 
-        assert_eq!(registry.len(), 1);
-        assert!(registry.get("eip-8037").is_some());
-    }
-
-    #[test]
-    fn test_research_args_build_registry_with_eip8038() {
-        let args = ResearchArgs::new().with_eip8038();
-        let registry = args.build_registry().unwrap();
-
-        assert_eq!(registry.len(), 1);
-        assert!(registry.get("eip-8038").is_some());
-    }
-
-    #[test]
-    fn test_research_args_eip8037_and_eip8038_independent() {
-        // Both schedules register side by side; 8038 must not collide with 8037.
-        let args = ResearchArgs::new().with_eip8037().with_eip8038();
-        let registry = args.build_registry().unwrap();
-
-        assert_eq!(registry.len(), 2);
-        assert!(registry.get("eip-8037").is_some());
-        assert!(registry.get("eip-8038").is_some());
+        assert_eq!(registry.len(), 3);
+        for name in ["amsterdam", "128x", "256x"] {
+            assert!(registry.get(name).is_some(), "missing {name}");
+        }
+        assert_eq!(args.schedule_count(), 3);
     }
 
     #[test]

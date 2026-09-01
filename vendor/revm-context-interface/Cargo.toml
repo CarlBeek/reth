@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.91.0"
 name = "revm-context-interface"
-version = "19.0.3"
+version = "43.0.0"
 authors = ["Dragan Rakita <dragan0rakita@gmail.com>"]
 build = false
 autolib = false
@@ -79,7 +79,7 @@ default-features = false
 version = "1.3.0"
 
 [dependencies.database-interface]
-version = "12.1.1"
+version = "43.0.0"
 default-features = false
 package = "revm-database-interface"
 
@@ -88,7 +88,7 @@ version = "1.15.0"
 default-features = false
 
 [dependencies.primitives]
-version = "24.0.1"
+version = "43.0.0"
 default-features = false
 package = "revm-primitives"
 
@@ -102,7 +102,7 @@ optional = true
 default-features = false
 
 [dependencies.state]
-version = "12.0.1"
+version = "43.0.0"
 default-features = false
 package = "revm-state"
 

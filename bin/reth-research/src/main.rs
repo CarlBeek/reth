@@ -4,8 +4,8 @@
 //! modified gas costs across multiple gas pricing experiments simultaneously.
 //!
 //! Supported schedules:
-//! - EIP-2780: Reduced intrinsic gas based on transaction category
-//! - EIP-8037: Native state creation gas and reservoir accounting
+//! - Amsterdam: the Glamsterdam repricing stack (EIP-2780 + 7976 + 7981 + 8037 + 8038) via revm's
+//!   native `SpecId::AMSTERDAM`
 //! - CSV Pricing: Per-opcode/precompile gas repricing from CSV files
 //! - Multiplier: Uniform gas cost multiplication
 //!
@@ -13,10 +13,9 @@
 //!
 //! ```sh
 //! cargo run --release -p reth-research-bin node --dev --dev.block-time 5s \
-//!   --research.eip2780 \
-//!   --research.eip8037 \
+//!   --research.amsterdam \
 //!   --research.csv 7904-prelim=./schedules/7904_prelim.csv \
-//!   --research.gas-limit-multiplier 8 \
+//!   --research.gas-limit-multipliers 1,2,4,8 \
 //!   --research.db-path ./divergences.db
 //! ```
 
@@ -58,8 +57,10 @@ use reth_research::{
 };
 use reth_revm::{database::StateProviderDatabase, db::State, Database, DatabaseCommit};
 use reth_tracing::tracing::{debug, info, warn};
-use revm::{context::BlockEnv, context_interface::Cfg, primitives::hardfork::SpecId};
-use revm_interpreter::gas::calculate_initial_tx_gas;
+use revm::{
+    context::BlockEnv, context_interface::Cfg, interpreter::gas::calculate_initial_tx_gas,
+    primitives::hardfork::SpecId,
+};
 use std::{
     collections::HashMap,
     sync::{
@@ -331,6 +332,10 @@ struct Analyzer<Node: FullNodeComponents> {
     schedule_metadata: HashMap<String, ScheduleMetadata>,
     /// Maximum divergence rows to persist per block.
     max_divergences_per_block: Option<usize>,
+    /// Whether to collect the per-tx gas spine (`tx_gas_results`). Opt-in: it's
+    /// the largest table the producer writes, and only repricing simulation
+    /// needs a row for every tx rather than just the divergent tail.
+    collect_tx_gas_results: bool,
     /// Tiered gas-limit-multiplier sweep applied during schedule replay.
     /// Each tier is tried in order; the first tier whose replay succeeds is
     /// accepted. Defaults to `[1, 2, 4, 8]` from the CLI layer.
@@ -457,8 +462,12 @@ where
         access_list_accounts: u64,
         access_list_storage_slots: u64,
         authorization_list_num: u64,
-        spec_id: impl Into<revm_primitives::hardfork::SpecId>,
+        spec_id: impl Into<revm::primitives::hardfork::SpecId>,
     ) -> u64 {
+        // `None`: this is the *baseline* intrinsic, computed under the block's
+        // own (pre-Amsterdam) spec, where EIP-2780's decomposed base does not
+        // apply. Replaying a block whose native spec is already Amsterdam would
+        // need the real `Eip2780TxInfo` here.
         calculate_initial_tx_gas(
             spec_id.into(),
             input,
@@ -466,6 +475,7 @@ where
             access_list_accounts,
             access_list_storage_slots,
             authorization_list_num,
+            None,
         )
         .initial_total_gas()
     }
@@ -496,6 +506,7 @@ where
         db_path: std::path::PathBuf,
         start_block: u64,
         max_divergences_per_block: Option<usize>,
+        collect_tx_gas_results: bool,
         gas_limit_multipliers: Vec<u64>,
         backfill: bool,
         backfill_min_block: u64,
@@ -571,6 +582,7 @@ where
                     &registry,
                     normalized_gas_tiers.clone(),
                     max_divergences_per_block,
+                    collect_tx_gas_results,
                     chain_id,
                     SCHEMA_VERSION,
                     producer_git_commit,
@@ -741,6 +753,7 @@ where
             has_intrinsic_schedules,
             schedule_metadata,
             max_divergences_per_block,
+            collect_tx_gas_results,
             // Normalized once above (clamp ≥1, sort, dedup, never empty) and
             // shared with the export manifest so the dataset identity matches
             // the tiers actually replayed.
@@ -1434,6 +1447,7 @@ where
                     timestamp: block_timestamp,
                     gas_used: block.header().gas_used(),
                     gas_limit: block.header().gas_limit(),
+                    base_fee_per_gas: block.header().base_fee_per_gas(),
                 };
                 (
                     schedule.name().to_string(),
@@ -1461,6 +1475,12 @@ where
             let access_list_storage_slots =
                 tx.access_list().map(|list| list.storage_keys_count()).unwrap_or_default() as u64;
             let authorization_count = tx.authorization_count().unwrap_or_default();
+            // Fee caps for `tx_gas_results`. Rendered as decimal strings rather
+            // than narrowed to u64/i64: they're u128 here and U256 in principle,
+            // and a fee-market simulation should never silently see a truncated
+            // cap. `max_priority_fee_per_gas` is None for legacy / access-list.
+            let max_fee_per_gas = tx.max_fee_per_gas().to_string();
+            let max_priority_fee_per_gas = tx.max_priority_fee_per_gas().map(|fee| fee.to_string());
             // `schedule_execution_gas_limit` is now per-tier; computed inside
             // the tier-sweep loop in the schedule replay block below.
             let baseline_intrinsic_gas = Self::baseline_intrinsic_gas(
@@ -1698,41 +1718,22 @@ where
                 // use the state-gas budget. Until then, downstream forensics
                 // should treat reservoir-utilisation panels as "all rows fall
                 // in the overflow bucket" by design, not as a data bug.
-                let (
-                    schedule_initial_total_gas,
-                    schedule_initial_state_gas,
-                    schedule_initial_reservoir,
-                    native_initial_total_gas,
-                    native_initial_state_gas,
-                ) = if uses_schedule_eip8037 {
-                    let ctx = tx_context
-                        .as_ref()
-                        .expect("EIP-8037 schedule modifies intrinsic gas and requires tx context");
-                    let init_gas = schedule
-                        .initial_and_floor_gas(ctx)
-                        .expect("EIP-8037 schedule must expose its overridden initial gas split");
-                    let native_init_gas = calculate_initial_tx_gas(
-                        SpecId::AMSTERDAM,
-                        &input,
-                        is_create,
-                        access_list_accounts,
-                        access_list_storage_slots,
-                        authorization_count,
-                    );
-                    let (_limit, reservoir) = init_gas.initial_gas_and_reservoir(
-                        gas_limit,
-                        revm::primitives::eip7825::TX_GAS_LIMIT_CAP,
-                    );
-                    (
-                        init_gas.initial_total_gas(),
-                        init_gas.initial_state_gas,
-                        reservoir,
-                        native_init_gas.initial_total_gas(),
-                        native_init_gas.initial_state_gas,
-                    )
-                } else {
-                    (0, 0, 0, 0, 0)
-                };
+                let (schedule_initial_state_gas, schedule_initial_reservoir) =
+                    if uses_schedule_eip8037 {
+                        let ctx = tx_context.as_ref().expect(
+                            "EIP-8037 schedule modifies intrinsic gas and requires tx context",
+                        );
+                        let init_gas = schedule
+                            .initial_and_floor_gas(ctx)
+                            .expect("EIP-8037 schedule must expose its initial gas split");
+                        let (_limit, reservoir) = init_gas.initial_gas_and_reservoir(
+                            gas_limit,
+                            revm::primitives::eip7825::TX_GAS_LIMIT_CAP,
+                        );
+                        (init_gas.initial_state_gas, reservoir)
+                    } else {
+                        (0, 0)
+                    };
 
                 // Tier-sweep loop. Try each multiplier in
                 // `self.gas_limit_multipliers` (sorted ascending in the
@@ -1792,30 +1793,12 @@ where
                     // initial transaction gas helper.
                     let mut sched_tx_env = tx_env.clone();
                     sched_tx_env.set_gas_limit(schedule_execution_gas_limit);
-                    if uses_schedule_eip8037 {
-                        let intrinsic_delta = i128::from(schedule_initial_total_gas) -
-                            i128::from(native_initial_total_gas);
-                        let replay_limit = i128::from(schedule_execution_gas_limit);
-                        let raw_adjusted = replay_limit - intrinsic_delta;
-                        let adjusted = raw_adjusted.clamp(0, replay_limit) as u64;
-                        if raw_adjusted < 0 || raw_adjusted > replay_limit {
-                            debug!(
-                                target: "exex::research",
-                                block = block_number,
-                                tx_idx,
-                                schedule = schedule.name(),
-                                tier,
-                                %intrinsic_delta,
-                                %gas_limit,
-                                %schedule_execution_gas_limit,
-                                %adjusted,
-                                "Gas limit clamped for native EIP-8037 schedule — execution \
-                                 budget may be conservative"
-                            );
-                        }
-                        sched_tx_env.set_gas_limit(adjusted);
-                    } else if schedule.modifies_intrinsic() && !schedule.uses_native_intrinsic_gas()
-                    {
+                    // A native-intrinsic schedule needs no compensation: the EVM
+                    // charges the schedule's own intrinsic, because the schedule
+                    // *is* the spec table revm builds from. (Earlier revisions
+                    // overlaid overrides that revm's initial-tx-gas helper
+                    // ignored, so the replay limit had to absorb the difference.)
+                    if schedule.modifies_intrinsic() && !schedule.uses_native_intrinsic_gas() {
                         if let Some(ref ctx) = tx_context {
                             if let Some(schedule_intrinsic) = schedule.intrinsic_gas(ctx) {
                                 let intrinsic_delta = i128::from(schedule_intrinsic) -
@@ -1934,47 +1917,28 @@ where
                     let sched_success = result.result.is_success();
                     let mut sched_gas_used = result.result.tx_gas_used();
                     let mut sched_total_gas_spent = result.result.gas().total_gas_spent();
-                    let mut sched_state_gas_spent = result.result.gas().state_gas_spent_final();
+                    let sched_state_gas_spent = result.result.gas().state_gas_spent_final();
                     // Runtime state gas the tx attempted (survives OOG); raw —
                     // not intrinsic-normalized, since it's a sum of runtime
                     // record_state_cost charges, not the tx-start intrinsic.
                     let sched_state_gas_demanded = result.result.gas().state_gas_demanded();
-                    if uses_schedule_eip8037 {
-                        // revm reports totals with its built-in Amsterdam
-                        // intrinsic state-gas component. Normalize the
-                        // persisted research fields to this schedule's
-                        // PR-11616 initial split before downstream
-                        // runtime-state/spillover derivation.
-                        let total_intrinsic_delta = i128::from(schedule_initial_total_gas) -
-                            i128::from(native_initial_total_gas);
-                        let state_intrinsic_delta = i128::from(schedule_initial_state_gas) -
-                            i128::from(native_initial_state_gas);
-                        sched_gas_used =
-                            Self::apply_signed_gas_delta(sched_gas_used, total_intrinsic_delta);
-                        sched_total_gas_spent = Self::apply_signed_gas_delta(
-                            sched_total_gas_spent,
-                            total_intrinsic_delta,
-                        );
-                        sched_state_gas_spent = Self::apply_signed_gas_delta(
-                            sched_state_gas_spent,
-                            state_intrinsic_delta,
-                        );
-                    } else if schedule.modifies_intrinsic() &&
+                    // A native-intrinsic schedule needs no normalization: revm
+                    // already reported these totals against the schedule's own
+                    // intrinsic, since the schedule is the spec table revm built
+                    // from. Only a schedule that reprices the intrinsic *outside*
+                    // the EVM env needs the correction below.
+                    if schedule.modifies_intrinsic() &&
                         !schedule.uses_native_intrinsic_gas() &&
                         let Some(ctx) = tx_context.as_ref() &&
                         let Some(schedule_intrinsic) = schedule.intrinsic_gas(ctx)
                     {
                         // Non-native "Both" schedule (one that reprices
                         // intrinsic gas via the inspector rather than the EVM
-                        // env — EIP-8038 takes the native path above and never
-                        // reaches here): revm deducted the block's *native*
-                        // intrinsic during execution (its initial-tx-gas helper
-                        // ignores `cfg.gas_params` overrides), so the reported
-                        // regular gas reflects baseline intrinsic, not the
-                        // schedule's. Normalize by the intrinsic delta —
-                        // mirroring the native EIP-8037 path above — so
-                        // `gas_delta` includes the schedule's intrinsic
-                        // repricing (access-list / create-tx). State gas is
+                        // env): revm deducted the block's *native* intrinsic
+                        // during execution, so the reported regular gas reflects
+                        // baseline intrinsic, not the schedule's. Normalize by
+                        // the intrinsic delta so `gas_delta` includes the
+                        // schedule's intrinsic repricing. State gas is
                         // unaffected (zero here).
                         let intrinsic_delta =
                             i128::from(schedule_intrinsic) - i128::from(baseline_intrinsic_gas);
@@ -2679,6 +2643,42 @@ where
                 // drill-ins. Recompute the slice here from the same source.
                 let opcode_frames_for_agg =
                     exec_result.map(|r| r.frame_opcode_counts.as_slice()).unwrap_or(&[]);
+
+                // Per-tx gas row, emitted for all txs rather than the
+                // `store_full_forensics` minority and never truncated by
+                // `max_divergences_per_block`. Every field is already computed
+                // above for the drill-in path, so the only cost of collecting it
+                // is the row itself — skipped entirely when the run didn't opt
+                // in, since it's the largest table the producer writes.
+                let tx_gas_result =
+                    self.collect_tx_gas_results.then(|| reth_research::database::TxGasResultRow {
+                        schedule_name: schedule_name.to_string(),
+                        schedule_config_hash: self
+                            .schedule_metadata
+                            .get(schedule_name)
+                            .expect("all schedules should have static metadata")
+                            .config_hash
+                            .clone(),
+                        block_number,
+                        tx_index: tx_idx as u32,
+                        tx_hash,
+                        tx_type: tx.ty(),
+                        tx_gas_limit: gas_limit,
+                        max_fee_per_gas: max_fee_per_gas.clone(),
+                        max_priority_fee_per_gas: max_priority_fee_per_gas.clone(),
+                        baseline_success: normal_success,
+                        baseline_gas_used: normal_gas_used,
+                        baseline_total_gas_spent,
+                        schedule_success,
+                        schedule_gas_used: schedule_gas,
+                        schedule_total_gas_spent,
+                        schedule_gas_refunded,
+                        schedule_floor_gas,
+                        schedule_state_gas_spent,
+                        schedule_intrinsic_gas,
+                        min_multiplier_to_succeed,
+                    });
+
                 aggregators
                     .get_mut(schedule_name)
                     .expect("aggregator exists for every schedule")
@@ -2714,6 +2714,7 @@ where
                             tx_type: tx.ty(),
                             has_calldata: (input_zero_bytes + input_nonzero_bytes) > 0,
                             baseline_gas_used: normal_gas_used,
+                            tx_gas_result,
                         },
                         opcode_frames_for_agg,
                     );
@@ -2813,6 +2814,7 @@ async fn research_exex<Node: FullNodeComponents>(
     db_path: std::path::PathBuf,
     start_block: u64,
     max_divergences_per_block: Option<usize>,
+    collect_tx_gas_results: bool,
     gas_limit_multipliers: Vec<u64>,
     backfill: bool,
     backfill_min_block: u64,
@@ -2837,6 +2839,7 @@ where
         db_path,
         start_block,
         max_divergences_per_block,
+        collect_tx_gas_results,
         gas_limit_multipliers,
         backfill,
         backfill_min_block,
@@ -3088,7 +3091,7 @@ fn main() -> eyre::Result<()> {
             // Check if any schedules are configured
             if !research_args.has_schedules() {
                 return Err(eyre::eyre!(
-                    "No research schedules configured. Use --research.eip2780, --research.eip8037, --research.csv, or --research.multiplier"
+                    "No research schedules configured. Use --research.amsterdam, --research.csv, or --research.multiplier"
                 ));
             }
 
@@ -3100,6 +3103,7 @@ fn main() -> eyre::Result<()> {
             let db_path = research_args.db_path.clone();
             let start_block = research_args.start_block;
             let max_divergences_per_block = research_args.max_divergences_per_block;
+            let collect_tx_gas_results = research_args.tx_gas_results;
             let gas_limit_multipliers = research_args.gas_limit_multipliers.clone();
             let backfill = research_args.backfill;
             let backfill_min_block = research_args.backfill_min_block;
@@ -3129,6 +3133,7 @@ fn main() -> eyre::Result<()> {
                 db_path = ?db_path,
                 start_block,
                 max_divergences_per_block,
+                collect_tx_gas_results,
                 gas_limit_multipliers = ?gas_limit_multipliers,
                 backfill,
                 backfill_min_block,
@@ -3156,6 +3161,7 @@ fn main() -> eyre::Result<()> {
                             db_path,
                             start_block,
                             max_divergences_per_block,
+                            collect_tx_gas_results,
                             gas_limit_multipliers,
                             backfill,
                             backfill_min_block,

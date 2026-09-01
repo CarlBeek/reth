@@ -14,6 +14,7 @@ use reth_research::{
     database::{
         BlockCoverageRow, BlockOutput, BlockSummaryRow, CallFrameRow, DivergenceDatabase,
         DivergenceRow, DrillInRecord, OpcodeBucketTotal, OpcodeCountRow, RecipientRow,
+        TxGasResultRow,
     },
     divergence::{AggregateClass, EventLog},
 };
@@ -26,14 +27,14 @@ fn main() {
     let _ = std::fs::remove_file(format!("{path}-shm"));
 
     let db = DivergenceDatabase::open(&path).expect("open");
-    db.record_analysis_run_start("eip-8037", "config-v1", Some("sample"), Some("cross-repo test"))
+    db.record_analysis_run_start("amsterdam", "config-v1", Some("sample"), Some("cross-repo test"))
         .unwrap();
 
     // One contract-broken tx with a per-frame opcode count + an event log,
     // matching the shape the consumer's dashboard expects.
     let drill_in = DrillInRecord {
         divergence: DivergenceRow {
-            schedule_name: "eip-8037".into(),
+            schedule_name: "amsterdam".into(),
             schedule_config_hash: "config-v1".into(),
             block_number: 22_000_000,
             tx_index: 0,
@@ -120,7 +121,7 @@ fn main() {
 
     db.record_block_output(&BlockOutput {
         coverage: BlockCoverageRow {
-            schedule_name: "eip-8037".into(),
+            schedule_name: "amsterdam".into(),
             schedule_config_hash: "config-v1".into(),
             block_number: 22_000_000,
             block_hash: B256::repeat_byte(0xb1),
@@ -134,10 +135,11 @@ fn main() {
             tx_count_stored: 1,
             block_gas_used: 15_000_000,
             block_gas_limit: 30_000_000,
+            block_base_fee_per_gas: Some(12_000_000_000),
         },
         // One aggregate-class summary keyed by `class` (the gas-only cohort).
         summaries: vec![BlockSummaryRow {
-            schedule_name: "eip-8037".into(),
+            schedule_name: "amsterdam".into(),
             block_number: 22_000_000,
             class: AggregateClass::GasOnly,
             tx_count: 1,
@@ -177,7 +179,7 @@ fn main() {
         drill_ins: vec![drill_in],
         // One recipient rollup row keyed by the same aggregate `class`.
         recipients: vec![RecipientRow {
-            schedule_name: "eip-8037".into(),
+            schedule_name: "amsterdam".into(),
             block_number: 22_000_000,
             class: AggregateClass::GasOnly,
             recipient: format!("{:#x}", Address::repeat_byte(0x22)),
@@ -185,6 +187,55 @@ fn main() {
             tx_count: 1,
             gas_delta_sum_succeeding: 20_000,
         }],
+        // v12: one row per tx in the block when the producer collects the
+        // spine — the forensic tx plus the gas-only tx that only appears in the
+        // class summary above.
+        tx_gas_results: vec![
+            TxGasResultRow {
+                schedule_name: "amsterdam".into(),
+                schedule_config_hash: "config-v1".into(),
+                block_number: 22_000_000,
+                tx_index: 0,
+                tx_hash: B256::repeat_byte(0x11),
+                tx_type: 2,
+                tx_gas_limit: 200_000,
+                max_fee_per_gas: "20000000000".into(),
+                max_priority_fee_per_gas: Some("1000000000".into()),
+                baseline_success: true,
+                baseline_gas_used: 100_000,
+                baseline_total_gas_spent: 100_000,
+                schedule_success: true,
+                schedule_gas_used: 120_000,
+                schedule_total_gas_spent: 120_000,
+                schedule_gas_refunded: 0,
+                schedule_floor_gas: 0,
+                schedule_state_gas_spent: 97_920,
+                schedule_intrinsic_gas: Some(12_000),
+                min_multiplier_to_succeed: Some(0.6),
+            },
+            TxGasResultRow {
+                schedule_name: "amsterdam".into(),
+                schedule_config_hash: "config-v1".into(),
+                block_number: 22_000_000,
+                tx_index: 1,
+                tx_hash: B256::repeat_byte(0x22),
+                tx_type: 2,
+                tx_gas_limit: 150_000,
+                max_fee_per_gas: "20000000000".into(),
+                max_priority_fee_per_gas: Some("1000000000".into()),
+                baseline_success: true,
+                baseline_gas_used: 100_000,
+                baseline_total_gas_spent: 100_000,
+                schedule_success: true,
+                schedule_gas_used: 120_000,
+                schedule_total_gas_spent: 120_000,
+                schedule_gas_refunded: 0,
+                schedule_floor_gas: 0,
+                schedule_state_gas_spent: 0,
+                schedule_intrinsic_gas: Some(12_000),
+                min_multiplier_to_succeed: Some(0.8),
+            },
+        ],
     })
     .unwrap();
 

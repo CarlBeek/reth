@@ -9,8 +9,8 @@
 //! The research system allows you to run transactions under multiple gas pricing
 //! experiments at once, comparing each against baseline Ethereum execution:
 //!
-//! - **EIP-2780**: Reduced intrinsic gas based on transaction category
-//! - **EIP-8037**: Native state creation gas with reservoir accounting
+//! - **Amsterdam**: the Glamsterdam repricing stack (EIP-2780 + 7976 + 7981 + 8037 + 8038) via
+//!   revm's native `SpecId::AMSTERDAM`
 //! - **CSV Pricing**: Per-opcode/precompile gas repricing from CSV files
 //! - **Multipliers**: Uniform gas cost multiplication (e.g., 128x)
 //!
@@ -22,8 +22,8 @@
 //!                    ┌──────────────────────┼──────────────────────┐
 //!                    │                      │                      │
 //!                    ▼                      ▼                      ▼
-//!            EIP-2780 Schedule    CSV Pricing Schedule    Multiplier Schedule
-//!            (Intrinsic Only)    (Execution Gas)         (Execution Gas)
+//!           Amsterdam Schedule    CSV Pricing Schedule    Multiplier Schedule
+//!           (Intrinsic + Exec)    (Execution Gas)         (Execution Gas)
 //!                    │                      │                      │
 //!                    └──────────────────────┴──────────────────────┘
 //!                                           │
@@ -38,9 +38,8 @@
 //!
 //! - [`schedule`]: Gas schedule trait and implementations
 //!   - [`schedule::GasSchedule`]: Core trait for gas pricing experiments
-//!   - [`schedule::Eip2780Schedule`]: Transaction category-based intrinsic gas
-//!   - [`schedule::Eip8037Schedule`]: Native EIP-8037 state-gas metering
-//!   - [`schedule::Eip8038Schedule`]: EIP-8038 state access/write repricing (3x)
+//!   - [`schedule::AmsterdamSchedule`]: the Amsterdam repricing stack (EIP-2780 + 7976 + 7981 +
+//!     8037 + 8038) via revm's native `SpecId::AMSTERDAM`
 //!   - [`schedule::CsvPricingSchedule`]: Per-opcode pricing from CSV files
 //!   - [`schedule::MultiplierSchedule`]: Uniform gas multiplier
 //!   - [`schedule::ScheduleRegistry`]: Manages multiple schedules
@@ -72,8 +71,7 @@
 //!
 //! // Configure schedules
 //! let args = ResearchArgs::new()
-//!     .with_eip2780()  // Enable EIP-2780 intrinsic gas experiment
-//!     .with_eip8037()  // Enable EIP-8037 state-gas experiment
+//!     .with_amsterdam()  // Enable the Amsterdam repricing experiment
 //!     .with_csv("7904-v1", "./schedules/7904_v1.csv")?  // CSV pricing
 //!     .with_multiplier("128x", 128)?  // Uniform 128x multiplier
 //!     .with_db_path(PathBuf::from("research.db"));
@@ -89,13 +87,13 @@
 //! // ... execute with inspector attached ...
 //! ```
 //!
-//! # Example: EIP-2780 Intrinsic Gas Analysis
+//! # Example: Amsterdam Intrinsic Gas Analysis
 //!
 //! ```rust
 //! use alloy_primitives::{Address, Bytes, U256};
-//! use reth_research::schedule::{Eip2780Schedule, GasSchedule, RecipientInfo, TxContext};
+//! use reth_research::schedule::{AmsterdamSchedule, GasSchedule, RecipientInfo, TxContext};
 //!
-//! let schedule = Eip2780Schedule::new();
+//! let schedule = AmsterdamSchedule::new();
 //!
 //! // Simple ETH transfer to an existing EOA
 //! let ctx = TxContext {
@@ -115,12 +113,12 @@
 //!     ..Default::default()
 //! };
 //!
-//! // EIP-2780 calculates reduced intrinsic gas
+//! // EIP-2780 decomposes the intrinsic: TX_BASE + COLD_ACCOUNT_ACCESS + TX_VALUE_COST
 //! let intrinsic = schedule.intrinsic_gas(&ctx).unwrap();
-//! assert_eq!(intrinsic, 6000); // vs 21000 baseline
+//! assert_eq!(intrinsic, 12_000 + 3_000 + 6_000); // vs 21000 baseline
 //!
 //! let category = schedule.tx_category(&ctx).unwrap();
-//! assert_eq!(category, "transfer_to_eoa");
+//! assert_eq!(category, "value_call");
 //! ```
 //!
 //! # Example: CSV-based Per-Opcode Pricing
@@ -149,8 +147,8 @@
 //! # CLI Usage Examples
 //!
 //! ```bash
-//! # EIP-2780 only
-//! reth-research --research.eip2780 --research.db-path ./results.db
+//! # Amsterdam repricing only
+//! reth-research --research.amsterdam --research.db-path ./results.db
 //!
 //! # Multiple CSV schedules for A/B testing
 //! reth-research \
@@ -160,11 +158,10 @@
 //!
 //! # Combined experiment
 //! reth-research \
-//!   --research.eip2780 \
-//!   --research.eip8037 \
+//!   --research.amsterdam \
 //!   --research.csv 7904-prelim=./7904_prelim.csv \
 //!   --research.multiplier 128x=128 \
-//!   --research.gas-limit-multiplier 8 \
+//!   --research.gas-limit-multipliers 1,2,4,8 \
 //!   --research.db-path ./full-analysis.db
 //! ```
 //!
@@ -173,20 +170,21 @@
 //! Results are stored in `SQLite` for analysis:
 //!
 //! ```sql
-//! -- Divergences by schedule
-//! SELECT schedule_name, COUNT(*) as divergences
-//! FROM schedule_divergences
+//! -- Stored divergences by schedule (failures + trace divergences)
+//! SELECT schedule_name, COUNT(*) AS divergences
+//! FROM divergences
 //! GROUP BY schedule_name;
 //!
-//! -- EIP-2780 category breakdown
-//! SELECT tx_category, COUNT(*), AVG(gas_delta)
-//! FROM schedule_divergences
-//! WHERE schedule_name = 'eip-2780'
-//! GROUP BY tx_category;
+//! -- Repriced gas for every replayed tx, divergent or not (requires
+//! -- --research.tx-gas-results)
+//! SELECT schedule_name, AVG(schedule_gas_used - baseline_gas_used) AS avg_gas_delta
+//! FROM tx_gas_results
+//! GROUP BY schedule_name;
 //!
-//! -- Status-changing divergences (would cause tx failure)
-//! SELECT * FROM schedule_divergences
-//! WHERE divergence_type = 'status';
+//! -- Transactions the schedule breaks (succeeded at baseline, failed under the
+//! -- schedule at the original gas limit)
+//! SELECT * FROM divergences
+//! WHERE baseline_success AND NOT schedule_success;
 //! ```
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]

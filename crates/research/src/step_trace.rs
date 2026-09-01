@@ -26,10 +26,11 @@ use alloy_primitives::Address;
 use revm::{
     bytecode::opcode::OpCode,
     context_interface::ContextTr,
-    interpreter::{CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter},
+    interpreter::{
+        interpreter_types::Jumps, CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter,
+    },
     Inspector,
 };
-use revm_interpreter::interpreter_types::Jumps;
 
 /// Upper bound on recorded steps. A trace longer than this is marked
 /// `truncated` and the diff is skipped — comparing partial traces would risk
