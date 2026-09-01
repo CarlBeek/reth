@@ -3,7 +3,7 @@
 -- Adds gas_analysis_tx_gas_result, one row per (schedule, block, tx) written
 -- for EVERY transaction rather than only the store_full_forensics minority
 -- that earns a gas_analysis_divergence row. The divergence table explains the
--- divergent tail; a repricing simulator instead needs the repriced gas of
+-- divergent tail. A repricing simulator instead needs the repriced gas of
 -- every tx, including the byte-identical majority that only ever reaches a
 -- gas_analysis_block_summary class aggregate.
 --
