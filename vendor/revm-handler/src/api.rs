@@ -8,9 +8,13 @@ use context::{
     },
     Block, ContextSetters, ContextTr, Database, Evm, JournalTr, Transaction,
 };
+#[cfg(feature = "asyncdb")]
+use database_interface::async_db::{on_fiber_result_with_stack, AsyncResult};
 use database_interface::DatabaseCommit;
 use interpreter::{interpreter::EthInterpreter, InterpreterResult};
 use state::EvmState;
+#[cfg(feature = "asyncdb")]
+use std::ptr::NonNull;
 use std::vec::Vec;
 
 /// Type alias for the result of transact_many_finalize to reduce type complexity.
@@ -139,9 +143,17 @@ pub trait ExecuteCommitEvm: ExecuteEvm {
     }
 
     /// Transact the transaction and commit to the state.
+    ///
+    /// # Outcome of Error
+    ///
+    /// If the transaction fails, the journal is finalized (not committed) so it
+    /// does not leak into the next transaction.
     #[inline]
     fn transact_commit(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
-        let output = self.transact_one(tx)?;
+        let output = self.transact_one(tx).inspect_err(|_| {
+            // finalize (clear) the journal on error; do not commit it.
+            let _ = self.finalize();
+        })?;
         self.commit_inner();
         Ok(output)
     }
@@ -168,6 +180,25 @@ pub trait ExecuteCommitEvm: ExecuteEvm {
         self.commit(result.state);
         Ok(result.result)
     }
+}
+
+/// Async extension of the [`ExecuteEvm`] trait that runs execution on an async fiber.
+#[cfg(feature = "asyncdb")]
+pub trait ExecuteEvmAsync: ExecuteEvm {
+    /// Execute transaction and store state inside journal on an async fiber.
+    fn transact_one_async(
+        &mut self,
+        tx: Self::Tx,
+    ) -> impl core::future::Future<Output = AsyncResult<Self::ExecutionResult, Self::Error>> + Send + '_;
+
+    /// Transact the given transaction and finalize in a single operation on an async fiber.
+    fn transact_async(
+        &mut self,
+        tx: Self::Tx,
+    ) -> impl core::future::Future<
+        Output = AsyncResult<ExecResultAndState<Self::ExecutionResult, Self::State>, Self::Error>,
+    > + Send
+           + '_;
 }
 
 impl<CTX, INSP, INST, PRECOMPILES> ExecuteEvm
@@ -201,10 +232,56 @@ where
 
     #[inline]
     fn replay(&mut self) -> Result<ResultAndState<HaltReason>, Self::Error> {
-        MainnetHandler::default().run(self).map(|result| {
-            let state = self.finalize();
-            ResultAndState::new(result, state)
-        })
+        MainnetHandler::default()
+            .run(self)
+            // finalize (clear) the journal on error; on success the `map`
+            // branch below finalizes it.
+            .inspect_err(|_| {
+                let _ = self.finalize();
+            })
+            .map(|result| {
+                let state = self.finalize();
+                ResultAndState::new(result, state)
+            })
+    }
+}
+
+#[cfg(feature = "asyncdb")]
+impl<CTX, INSP, INST, PRECOMPILES> ExecuteEvmAsync
+    for Evm<CTX, INSP, INST, PRECOMPILES, EthFrame<EthInterpreter>>
+where
+    CTX: ContextTr<Journal: JournalTr<State = EvmState>> + ContextSetters,
+    INST: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    PRECOMPILES: PrecompileProvider<CTX, Output = InterpreterResult>,
+    ExecutionResult<HaltReason>: Send,
+    EvmState: Send,
+    EVMError<<CTX::Db as Database>::Error, InvalidTransaction>: Send,
+    <CTX as ContextTr>::Tx: Send,
+{
+    #[inline]
+    fn transact_one_async(
+        &mut self,
+        tx: Self::Tx,
+    ) -> impl core::future::Future<Output = AsyncResult<Self::ExecutionResult, Self::Error>> + Send + '_
+    {
+        let stack = NonNull::from(&mut self.async_stack);
+        // SAFETY: The returned future owns the exclusive `&mut self` borrow, so nothing else can
+        // access the EVM stack slot until that future is dropped.
+        unsafe { on_fiber_result_with_stack(stack, move || self.transact_one(tx)) }
+    }
+
+    #[inline]
+    fn transact_async(
+        &mut self,
+        tx: Self::Tx,
+    ) -> impl core::future::Future<
+        Output = AsyncResult<ExecResultAndState<Self::ExecutionResult, Self::State>, Self::Error>,
+    > + Send
+           + '_ {
+        let stack = NonNull::from(&mut self.async_stack);
+        // SAFETY: The returned future owns the exclusive `&mut self` borrow, so nothing else can
+        // access the EVM stack slot until that future is dropped.
+        unsafe { on_fiber_result_with_stack(stack, move || self.transact(tx)) }
     }
 }
 

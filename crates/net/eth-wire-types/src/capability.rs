@@ -32,6 +32,11 @@ impl RawCapabilityMessage {
     pub const fn eth(id: EthMessageID, payload: Bytes) -> Self {
         Self::new(id.to_u8() as usize, payload)
     }
+
+    /// Encodes this message (`id` followed by its payload) to bytes.
+    pub fn encoded(&self) -> Bytes {
+        alloy_rlp::encode(self).into()
+    }
 }
 
 impl Encodable for RawCapabilityMessage {
@@ -125,11 +130,6 @@ impl Capability {
         Self::eth(EthVersion::Eth72)
     }
 
-    /// Returns the `snap/1` capability.
-    pub const fn snap_1() -> Self {
-        Self::snap(SnapVersion::V1)
-    }
-
     /// Returns the `snap/2` capability.
     pub const fn snap_2() -> Self {
         Self::snap(SnapVersion::V2)
@@ -207,7 +207,8 @@ impl From<EthVersion> for Capability {
 impl<'a> arbitrary::Arbitrary<'a> for Capability {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let version = u.int_in_range(66..=71)?; // Valid eth protocol versions are 66-71
-                                                // Only generate valid eth protocol name for now since it's the only supported protocol
+                                                // Only generate valid eth protocol name for now
+                                                // since it's the only supported protocol
         Ok(Self::new_static("eth", version))
     }
 }

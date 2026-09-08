@@ -3,6 +3,16 @@
 Companion to `docs/storage-redesign.md` in the `repricing-forensics`
 repo. This doc covers what changes in the producer (this crate).
 
+**Historical (schema v9 era).** It records why the storage model looks the way
+it does — SQLite over DuckDB, aggregates over per-tx rows for the silent
+majority — and the DDL it quotes is the v9 shape. The schema has moved since:
+v10 deleted the editorial bucket taxonomy this doc describes (`bucket` columns,
+wallet-fixable / contract-broken cohorts) in favour of a two-value
+execution-fact `class`, and v12 added the opt-in per-tx `tx_gas_results`
+table (`--research.tx-gas-results`). For the current schema read the DDL in
+`crates/research/src/database.rs`; its `SCHEMA_VERSION` doc comment carries the
+version-by-version history.
+
 > **Engine update (post-deploy)**: we tried DuckDB as the single
 > writer+reader file. It hit DuckDB's hard cross-process lock — when
 > reth holds the writer no other process can attach, even read-only.

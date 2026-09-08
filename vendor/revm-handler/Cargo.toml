@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.91.0"
 name = "revm-handler"
-version = "20.0.3"
+version = "43.0.0"
 authors = ["Dragan Rakita <dragan0rakita@gmail.com>"]
 build = false
 autolib = false
@@ -41,6 +41,11 @@ rustdoc-args = [
 ]
 
 [features]
+asyncdb = [
+    "std",
+    "context/asyncdb",
+    "database-interface/asyncdb",
+]
 default = ["std"]
 serde = [
     "dep:serde",
@@ -76,22 +81,22 @@ path = "src/lib.rs"
 version = "1.3.0"
 
 [dependencies.bytecode]
-version = "11.0.1"
+version = "43.0.0"
 default-features = false
 package = "revm-bytecode"
 
 [dependencies.context]
-version = "18.0.3"
+version = "43.0.0"
 default-features = false
 package = "revm-context"
 
 [dependencies.context-interface]
-version = "19.0.3"
+version = "43.0.0"
 default-features = false
 package = "revm-context-interface"
 
 [dependencies.database-interface]
-version = "12.1.1"
+version = "43.0.0"
 default-features = false
 package = "revm-database-interface"
 
@@ -100,17 +105,17 @@ version = "1.6"
 default-features = false
 
 [dependencies.interpreter]
-version = "37.0.3"
+version = "43.0.0"
 default-features = false
 package = "revm-interpreter"
 
 [dependencies.precompile]
-version = "36.0.3"
+version = "43.0.0"
 default-features = false
 package = "revm-precompile"
 
 [dependencies.primitives]
-version = "24.0.1"
+version = "43.0.0"
 default-features = false
 package = "revm-primitives"
 
@@ -124,7 +129,7 @@ optional = true
 default-features = false
 
 [dependencies.state]
-version = "12.0.1"
+version = "43.0.0"
 default-features = false
 package = "revm-state"
 
@@ -137,7 +142,7 @@ version = "2.0.0"
 default-features = false
 
 [dev-dependencies.database]
-version = "15.0.2"
+version = "43.0.0"
 default-features = false
 package = "revm-database"
 

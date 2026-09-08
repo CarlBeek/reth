@@ -30,8 +30,6 @@ alloy-primitives.workspace = true
 
 # Revm
 revm.workspace = true
-revm-interpreter.workspace = true
-revm-primitives.workspace = true
 
 # Standard
 eyre.workspace = true

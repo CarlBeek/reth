@@ -1,9 +1,13 @@
 //! SQLite-backed storage for the research data model.
 //!
-//! Implements the schema described in `crates/research/docs/storage-redesign.md`:
-//! per-block aggregates for the bucketed cohort (wallet-fixable / gas-only /
-//! trace-only / unchanged) and per-tx drill-in rows for the event-logs-changed,
-//! inconclusive, and contract-broken cohorts.
+//! The DDL below is canonical; `crates/research/docs/storage-redesign.md` is the
+//! v9-era design record that motivated it, not a current schema reference. Three
+//! write granularities: an opt-in `tx_gas_results` row per (schedule, block,
+//! tx) (`--research.tx-gas-results`), per-tx forensic rows for the txs that
+//! failed or diverged in trace
+//! ([`crate::divergence::DivergenceFacts::store_full_forensics`]), and per-block
+//! aggregates keyed by execution-fact class (`unchanged` / `gas_only`) for the
+//! rest. See [`SCHEMA_VERSION`] for how the shape got here.
 //!
 //! Why `SQLite`, not `DuckDB`: we tried `DuckDB` first for its analytical query
 //! performance, but ran into its single-process writer-lock — the dashboard
@@ -141,7 +145,25 @@ use thiserror::Error;
 ///   (or rename the old one aside; drain its `export_outbox` with the old binary first). The
 ///   `ClickHouse` dataset identity re-keys automatically because the analysis manifest embeds
 ///   `producer_schema_version`.
-pub const SCHEMA_VERSION: u32 = 11;
+/// - v12: new `tx_gas_results` table — one row per (schedule, block, tx), covering **every** tx
+///   rather than only the `store_full_forensics` minority. Collection is opt-in per run
+///   (`--research.tx-gas-results`); the table exists in every v12 database but stays empty unless
+///   the run asks for it, and `analysis_manifests` records which it was. The forensic tables answer
+///   "what broke and why" for the divergent tail; a repricing *simulator* needs the repriced gas of
+///   every transaction, including the byte-identical majority that previously dissolved into a
+///   `block_summaries` class aggregate. Columns are the slim per-tx gas facts the analyze loop
+///   already computes (`schedule_gas_used`, `schedule_total_gas_spent` — the pre-refund figure
+///   EIP-7778 block accounting needs — `schedule_gas_refunded`, `schedule_floor_gas`,
+///   `schedule_intrinsic_gas`, `schedule_state_gas_spent`, `min_multiplier_to_succeed`) plus per-tx
+///   fee fields (`max_fee_per_gas`, `max_priority_fee_per_gas`, decimal-string U256) that were in
+///   scope for `TxEnv` but never persisted. `block_coverage` additionally gains
+///   `block_base_fee_per_gas`. Together these remove the simulator's dependency on an external
+///   per-tx fee source (Xatu): fee data, gas limits, and repriced gas now all come from the replay
+///   itself. Deliberately NOT re-added: `would_fit_in_original_limit`, dropped in v10 as an exact
+///   duplicate of `schedule_success`. There is no in-place migration: a v11 database is rejected by
+///   [`enforce_schema_version`] — start a fresh `SQLite` (drain the old one's `export_outbox` with
+///   the old binary first).
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// Errors raised by the storage layer.
 #[derive(Debug, Error)]
@@ -402,7 +424,66 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
             -- existing DB leaves historical rows readable as 'n/a'.
             block_gas_used                     INTEGER,
             block_gas_limit                    INTEGER,
+            -- EIP-1559 base fee from the header. With the per-tx fee caps in
+            -- `tx_gas_results` this is everything a fee-market simulation needs,
+            -- so no external per-tx fee source is required.
+            block_base_fee_per_gas             INTEGER,
             PRIMARY KEY (schedule_name, block_number, block_hash)
+        );",
+    )?;
+
+    // One row per (schedule, block, tx) — covering EVERY transaction, not only
+    // the `store_full_forensics` minority that earns a `divergences` row.
+    //
+    // The table is created unconditionally so the schema is identical across
+    // runs, but collection is opt-in (`--research.tx-gas-results`): it is the
+    // largest table the producer writes, and only a repricing simulator needs
+    // it. A run that leaves it off simply writes no rows here.
+    //
+    // The forensic tables are built to explain the divergent tail; a repricing
+    // simulator instead needs the repriced gas of every tx, including the
+    // byte-identical majority that only ever reaches a `block_summaries` class
+    // aggregate. This table is that per-tx spine: slim (no call frames, no
+    // opcode counts, no capped returndata) and uncapped (unlike drill-ins,
+    // which `--research.max-divergences-per-block` truncates).
+    //
+    // Gas column semantics, which differ in ways that matter downstream:
+    //   * `schedule_gas_used`        — sender-facing: post-refund, floor-applied.
+    //   * `schedule_total_gas_spent` — PRE-refund. EIP-7778 makes block-level gas accounting ignore
+    //     refunds, so this (not `schedule_gas_used`) is the figure that feeds block-fill /
+    //     gas-limit analysis.
+    //   * `schedule_gas_refunded`    — the difference, retained explicitly so neither figure has to
+    //     be back-derived.
+    // `schedule_intrinsic_gas` is NULL for execution-only schedules (they have
+    // no intrinsic opinion); every other gas column is a measured value.
+    //
+    // Fee caps are TEXT because they are U256 in principle — bound as decimal
+    // strings rather than risking an i64 overflow on a hostile value.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tx_gas_results (
+            schedule_name        TEXT    NOT NULL,
+            schedule_config_hash TEXT    NOT NULL,
+            block_number         INTEGER NOT NULL,
+            tx_index             INTEGER NOT NULL,
+            tx_hash              BLOB    NOT NULL,
+            tx_type              INTEGER NOT NULL,
+            tx_gas_limit         INTEGER NOT NULL,
+            -- U256 decimal strings; max_priority_fee_per_gas is NULL for
+            -- legacy / access-list txs that carry no priority cap.
+            max_fee_per_gas          TEXT,
+            max_priority_fee_per_gas TEXT,
+            baseline_success             INTEGER NOT NULL,
+            baseline_gas_used            INTEGER NOT NULL,
+            baseline_total_gas_spent     INTEGER NOT NULL,
+            schedule_success             INTEGER NOT NULL,
+            schedule_gas_used            INTEGER NOT NULL,
+            schedule_total_gas_spent     INTEGER NOT NULL,
+            schedule_gas_refunded        INTEGER NOT NULL,
+            schedule_floor_gas           INTEGER NOT NULL,
+            schedule_state_gas_spent     INTEGER NOT NULL,
+            schedule_intrinsic_gas       INTEGER,
+            min_multiplier_to_succeed    REAL,
+            PRIMARY KEY (schedule_name, block_number, tx_index)
         );",
     )?;
 
@@ -875,6 +956,9 @@ fn initialize_schema(conn: &Connection) -> Result<(), DatabaseError> {
          CREATE INDEX IF NOT EXISTS idx_bs_schedule_opcode_totals
              ON block_summaries(schedule_name)
              WHERE opcode_totals IS NOT NULL AND opcode_totals <> '[]';
+         CREATE INDEX IF NOT EXISTS idx_tgr_sched_block
+             ON tx_gas_results(schedule_name, block_number);
+         CREATE INDEX IF NOT EXISTS idx_tgr_tx_hash     ON tx_gas_results(tx_hash);
          CREATE INDEX IF NOT EXISTS idx_br_sched_recipient
              ON block_recipients(schedule_name, recipient);",
     )?;
@@ -956,6 +1040,54 @@ pub struct BlockOutput {
     pub drill_ins: Vec<DrillInRecord>,
     /// Per-(class) top-recipient rollup rows. Go to `block_recipients`.
     pub recipients: Vec<RecipientRow>,
+    /// One row per tx in the block. Go to `tx_gas_results`. Unlike
+    /// [`Self::drill_ins`] this is never truncated — the simulator needs every
+    /// tx, not a capped sample. Empty for runs that didn't opt into the spine
+    /// with `--research.tx-gas-results`.
+    ///
+    /// `serde(default)` so a pre-v12 outbox envelope still decodes (as an empty
+    /// vec) instead of failing the whole payload — the format version is
+    /// provenance, not a decode gate.
+    #[serde(default)]
+    pub tx_gas_results: Vec<TxGasResultRow>,
+}
+
+/// One row of `tx_gas_results`: the slim per-tx gas facts for a single
+/// (schedule, block, tx), emitted for every transaction of a run that opted
+/// into the spine (`--research.tx-gas-results`).
+///
+/// See the table DDL for the `schedule_gas_used` (post-refund, sender-facing)
+/// vs `schedule_total_gas_spent` (pre-refund, EIP-7778 block accounting)
+/// distinction — they are not interchangeable.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TxGasResultRow {
+    pub schedule_name: String,
+    pub schedule_config_hash: String,
+    pub block_number: u64,
+    pub tx_index: u32,
+    pub tx_hash: B256,
+    /// EIP-2718 envelope type byte.
+    pub tx_type: u8,
+    pub tx_gas_limit: u64,
+    /// Fee caps as U256 decimal strings. `max_priority_fee_per_gas` is `None`
+    /// for envelope types that carry no priority cap (legacy, access-list).
+    pub max_fee_per_gas: String,
+    pub max_priority_fee_per_gas: Option<String>,
+    pub baseline_success: bool,
+    pub baseline_gas_used: u64,
+    pub baseline_total_gas_spent: u64,
+    pub schedule_success: bool,
+    /// Sender-facing: post-refund, floor-applied.
+    pub schedule_gas_used: u64,
+    /// Pre-refund — the EIP-7778 block-accounting figure.
+    pub schedule_total_gas_spent: u64,
+    pub schedule_gas_refunded: u64,
+    pub schedule_floor_gas: u64,
+    pub schedule_state_gas_spent: u64,
+    /// `None` for execution-only schedules, which have no intrinsic opinion.
+    pub schedule_intrinsic_gas: Option<u64>,
+    pub min_multiplier_to_succeed: Option<f64>,
 }
 
 /// One row of the `block_recipients` rollup: a single destination's share of a
@@ -1000,6 +1132,11 @@ pub struct BlockCoverageRow {
     /// Native block header `gas_limit` — the protocol cap, for block-fullness
     /// and gas-limit-exceedance analysis under a repricing schedule.
     pub block_gas_limit: u64,
+    /// Native block header `base_fee_per_gas`. `None` for pre-London blocks.
+    /// With the per-tx fee caps in [`TxGasResultRow`] this completes the
+    /// fee-market picture without an external per-tx fee source.
+    #[serde(default)]
+    pub block_base_fee_per_gas: Option<u64>,
 }
 
 /// Per-opcode totals for one (block, bucket) row in `block_summaries`,
@@ -1451,6 +1588,9 @@ impl DivergenceDatabase {
         for recipient in &output.recipients {
             insert_recipient(&tx, recipient)?;
         }
+        for tx_gas_result in &output.tx_gas_results {
+            insert_tx_gas_result(&tx, tx_gas_result)?;
+        }
         for drill_in in &output.drill_ins {
             let divergence_id = insert_divergence(&tx, &drill_in.divergence)?;
             for frame in &drill_in.call_frames {
@@ -1535,6 +1675,10 @@ impl DivergenceDatabase {
             "DELETE FROM divergences WHERE block_number BETWEEN ? AND ?",
             params![from_block as i64, to_block as i64],
         )?;
+        let tx_gas_results_deleted = tx.execute(
+            "DELETE FROM tx_gas_results WHERE block_number >= ? AND block_number <= ?",
+            params![from_block as i64, to_block as i64],
+        )?;
         let summaries_deleted = tx.execute(
             "DELETE FROM block_summaries WHERE block_number >= ? AND block_number <= ?",
             params![from_block as i64, to_block as i64],
@@ -1563,6 +1707,7 @@ impl DivergenceDatabase {
             coverage: coverage_deleted,
             summaries: summaries_deleted,
             recipients: recipients_deleted,
+            tx_gas_results: tx_gas_results_deleted,
             divergences: divergences_deleted,
             call_frames: call_frames_deleted,
             opcode_counts: opcode_counts_deleted,
@@ -2214,6 +2359,7 @@ pub struct BlockRangeDeleteCounts {
     pub coverage: usize,
     pub summaries: usize,
     pub recipients: usize,
+    pub tx_gas_results: usize,
     pub divergences: usize,
     pub call_frames: usize,
     pub opcode_counts: usize,
@@ -2231,18 +2377,19 @@ fn insert_block_coverage(
             schedule_name, schedule_config_hash, block_number, block_hash,
             parent_hash, timestamp, tx_count,
             tx_count_unchanged, tx_count_gas_only, tx_count_stored,
-            block_gas_used, block_gas_limit
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            block_gas_used, block_gas_limit, block_base_fee_per_gas
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (schedule_name, block_number, block_hash) DO UPDATE SET
-            schedule_config_hash = excluded.schedule_config_hash,
-            parent_hash          = excluded.parent_hash,
-            timestamp            = excluded.timestamp,
-            tx_count             = excluded.tx_count,
-            tx_count_unchanged   = excluded.tx_count_unchanged,
-            tx_count_gas_only    = excluded.tx_count_gas_only,
-            tx_count_stored      = excluded.tx_count_stored,
-            block_gas_used       = excluded.block_gas_used,
-            block_gas_limit      = excluded.block_gas_limit",
+            schedule_config_hash   = excluded.schedule_config_hash,
+            parent_hash            = excluded.parent_hash,
+            timestamp              = excluded.timestamp,
+            tx_count               = excluded.tx_count,
+            tx_count_unchanged     = excluded.tx_count_unchanged,
+            tx_count_gas_only      = excluded.tx_count_gas_only,
+            tx_count_stored        = excluded.tx_count_stored,
+            block_gas_used         = excluded.block_gas_used,
+            block_gas_limit        = excluded.block_gas_limit,
+            block_base_fee_per_gas = excluded.block_base_fee_per_gas",
         params![
             row.schedule_name,
             row.schedule_config_hash,
@@ -2256,6 +2403,64 @@ fn insert_block_coverage(
             row.tx_count_stored as i64,
             row.block_gas_used as i64,
             row.block_gas_limit as i64,
+            row.block_base_fee_per_gas.map(|f| f as i64),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Insert one `tx_gas_results` row. Upsert on the natural key so an
+/// idempotent re-replay of a block refreshes it in place.
+fn insert_tx_gas_result(tx: &Transaction<'_>, row: &TxGasResultRow) -> Result<(), DatabaseError> {
+    tx.execute(
+        "INSERT INTO tx_gas_results (
+            schedule_name, schedule_config_hash, block_number, tx_index,
+            tx_hash, tx_type, tx_gas_limit,
+            max_fee_per_gas, max_priority_fee_per_gas,
+            baseline_success, baseline_gas_used, baseline_total_gas_spent,
+            schedule_success, schedule_gas_used, schedule_total_gas_spent,
+            schedule_gas_refunded, schedule_floor_gas, schedule_state_gas_spent,
+            schedule_intrinsic_gas, min_multiplier_to_succeed
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (schedule_name, block_number, tx_index) DO UPDATE SET
+            schedule_config_hash     = excluded.schedule_config_hash,
+            tx_hash                  = excluded.tx_hash,
+            tx_type                  = excluded.tx_type,
+            tx_gas_limit             = excluded.tx_gas_limit,
+            max_fee_per_gas          = excluded.max_fee_per_gas,
+            max_priority_fee_per_gas = excluded.max_priority_fee_per_gas,
+            baseline_success         = excluded.baseline_success,
+            baseline_gas_used        = excluded.baseline_gas_used,
+            baseline_total_gas_spent = excluded.baseline_total_gas_spent,
+            schedule_success         = excluded.schedule_success,
+            schedule_gas_used        = excluded.schedule_gas_used,
+            schedule_total_gas_spent = excluded.schedule_total_gas_spent,
+            schedule_gas_refunded    = excluded.schedule_gas_refunded,
+            schedule_floor_gas       = excluded.schedule_floor_gas,
+            schedule_state_gas_spent = excluded.schedule_state_gas_spent,
+            schedule_intrinsic_gas   = excluded.schedule_intrinsic_gas,
+            min_multiplier_to_succeed = excluded.min_multiplier_to_succeed",
+        params![
+            row.schedule_name,
+            row.schedule_config_hash,
+            row.block_number as i64,
+            row.tx_index as i64,
+            row.tx_hash.as_slice(),
+            row.tx_type as i64,
+            row.tx_gas_limit as i64,
+            row.max_fee_per_gas,
+            row.max_priority_fee_per_gas,
+            row.baseline_success as i64,
+            row.baseline_gas_used as i64,
+            row.baseline_total_gas_spent as i64,
+            row.schedule_success as i64,
+            row.schedule_gas_used as i64,
+            row.schedule_total_gas_spent as i64,
+            row.schedule_gas_refunded as i64,
+            row.schedule_floor_gas as i64,
+            row.schedule_state_gas_spent as i64,
+            row.schedule_intrinsic_gas.map(|g| g as i64),
+            row.min_multiplier_to_succeed,
         ],
     )?;
     Ok(())
@@ -2719,7 +2924,6 @@ fn insert_export_outbox(
             // Identical payload already enqueued (or already exported). Nothing
             // to do — re-recording the same block must not resurrect or
             // duplicate an export.
-            Ok(())
         }
         Some(_) => {
             tracing::warn!(
@@ -2751,7 +2955,6 @@ fn insert_export_outbox(
                     export.export_id,
                 ],
             )?;
-            Ok(())
         }
         None => {
             tx.execute(
@@ -2776,9 +2979,9 @@ fn insert_export_outbox(
                     now,
                 ],
             )?;
-            Ok(())
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2970,7 +3173,194 @@ mod tests {
             tx_count_stored: stored,
             block_gas_used: 15_000_000,
             block_gas_limit: 30_000_000,
+            block_base_fee_per_gas: Some(1_000_000_000),
         }
+    }
+
+    /// Minimal `TxGasResultRow` fixture for the per-tx gas table.
+    fn fixture_tx_gas_result(schedule: &str, block: u64, tx_index: u32) -> TxGasResultRow {
+        TxGasResultRow {
+            schedule_name: schedule.to_string(),
+            schedule_config_hash: "config".to_string(),
+            block_number: block,
+            tx_index,
+            tx_hash: B256::repeat_byte(0x11),
+            tx_type: 2,
+            tx_gas_limit: 500_000,
+            max_fee_per_gas: "30000000000".to_string(),
+            max_priority_fee_per_gas: Some("1000000000".to_string()),
+            baseline_success: true,
+            baseline_gas_used: 21_000,
+            baseline_total_gas_spent: 21_000,
+            schedule_success: true,
+            schedule_gas_used: 33_000,
+            schedule_total_gas_spent: 35_000,
+            schedule_gas_refunded: 2_000,
+            schedule_floor_gas: 21_000,
+            schedule_state_gas_spent: 0,
+            schedule_intrinsic_gas: Some(15_000),
+            min_multiplier_to_succeed: Some(0.066),
+        }
+    }
+
+    #[test]
+    fn tx_gas_results_round_trips_every_column() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        let row = fixture_tx_gas_result("test", 100, 3);
+        db.record_block_output(&BlockOutput {
+            coverage: fixture_coverage("test", 100, 0, 1),
+            summaries: vec![],
+            drill_ins: vec![],
+            recipients: vec![],
+            tx_gas_results: vec![row.clone()],
+        })
+        .unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let (
+            tx_hash,
+            tx_type,
+            gas_limit,
+            max_fee,
+            max_prio,
+            sched_gas,
+            pre_refund,
+            refunded,
+            intrinsic,
+            multiplier,
+        ): (
+            Vec<u8>,
+            i64,
+            i64,
+            String,
+            Option<String>,
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+            Option<f64>,
+        ) = conn
+            .query_row(
+                "SELECT tx_hash, tx_type, tx_gas_limit, max_fee_per_gas,
+                        max_priority_fee_per_gas, schedule_gas_used,
+                        schedule_total_gas_spent, schedule_gas_refunded,
+                        schedule_intrinsic_gas, min_multiplier_to_succeed
+                 FROM tx_gas_results WHERE block_number = 100 AND tx_index = 3",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(tx_hash, row.tx_hash.as_slice());
+        assert_eq!(tx_type, row.tx_type as i64);
+        assert_eq!(gas_limit, row.tx_gas_limit as i64);
+        // Fee caps stay decimal strings — never narrowed to an integer column.
+        assert_eq!(max_fee, row.max_fee_per_gas);
+        assert_eq!(max_prio, row.max_priority_fee_per_gas);
+        assert_eq!(sched_gas, row.schedule_gas_used as i64);
+        // The pre-refund figure (EIP-7778 block accounting) must be stored
+        // distinctly from the post-refund sender-facing one.
+        assert_eq!(pre_refund, row.schedule_total_gas_spent as i64);
+        assert_ne!(pre_refund, sched_gas);
+        assert_eq!(refunded, row.schedule_gas_refunded as i64);
+        assert_eq!(intrinsic, Some(row.schedule_intrinsic_gas.unwrap() as i64));
+        assert_eq!(multiplier, row.min_multiplier_to_succeed);
+    }
+
+    #[test]
+    fn tx_gas_results_written_for_every_tx_not_just_drill_ins() {
+        // The whole point of the table: a block whose txs produced NO
+        // divergence rows still yields one gas row per tx.
+        let db = DivergenceDatabase::in_memory().unwrap();
+        let rows: Vec<_> = (0..5).map(|i| fixture_tx_gas_result("test", 200, i)).collect();
+        db.record_block_output(&BlockOutput {
+            coverage: fixture_coverage("test", 200, 0, 5),
+            summaries: vec![],
+            drill_ins: vec![],
+            recipients: vec![],
+            tx_gas_results: rows,
+        })
+        .unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let divergences: i64 =
+            conn.query_row("SELECT COUNT(*) FROM divergences", [], |r| r.get(0)).unwrap();
+        let gas_rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM tx_gas_results", [], |r| r.get(0)).unwrap();
+        assert_eq!(divergences, 0);
+        assert_eq!(gas_rows, 5);
+    }
+
+    #[test]
+    fn tx_gas_results_upsert_on_replay_and_clear_on_reorg() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        let mut row = fixture_tx_gas_result("test", 300, 0);
+        let output = |r: TxGasResultRow| BlockOutput {
+            coverage: fixture_coverage("test", 300, 0, 1),
+            summaries: vec![],
+            drill_ins: vec![],
+            recipients: vec![],
+            tx_gas_results: vec![r],
+        };
+
+        db.record_block_output(&output(row.clone())).unwrap();
+        // Idempotent re-replay refreshes in place rather than duplicating.
+        row.schedule_gas_used = 99_999;
+        db.record_block_output(&output(row)).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            let (count, gas): (i64, i64) = conn
+                .query_row("SELECT COUNT(*), MAX(schedule_gas_used) FROM tx_gas_results", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(gas, 99_999);
+        }
+
+        // A reorg must drop the rows with everything else for the range,
+        // or the next replay would leave stale per-tx gas behind.
+        let deleted = db.delete_block_range(300, 300).unwrap();
+        assert_eq!(deleted.tx_gas_results, 1);
+        let conn = db.conn.lock().unwrap();
+        let remaining: i64 =
+            conn.query_row("SELECT COUNT(*) FROM tx_gas_results", [], |r| r.get(0)).unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn block_coverage_stores_base_fee() {
+        let db = DivergenceDatabase::in_memory().unwrap();
+        db.record_block_output(&BlockOutput {
+            coverage: fixture_coverage("test", 400, 0, 1),
+            summaries: vec![],
+            drill_ins: vec![],
+            recipients: vec![],
+            tx_gas_results: vec![],
+        })
+        .unwrap();
+        let conn = db.conn.lock().unwrap();
+        let base_fee: Option<i64> = conn
+            .query_row(
+                "SELECT block_base_fee_per_gas FROM block_coverage WHERE block_number = 400",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(base_fee, Some(1_000_000_000));
     }
 
     /// Minimal `DivergenceRow` fixture for write-path tests. All optional
@@ -3088,6 +3478,7 @@ mod tests {
             }],
             drill_ins: vec![drill_in],
             recipients: vec![],
+            tx_gas_results: vec![],
         };
 
         db.record_block_output(&output).unwrap();
@@ -3179,6 +3570,7 @@ mod tests {
             summaries: vec![],
             drill_ins: vec![drill_in],
             recipients: vec![],
+            tx_gas_results: vec![],
         };
         db.record_block_output(&output).unwrap();
 
@@ -3240,6 +3632,7 @@ mod tests {
             summaries: vec![],
             drill_ins: vec![drill_in],
             recipients: vec![],
+            tx_gas_results: vec![],
         })
         .unwrap();
 
@@ -3334,6 +3727,7 @@ mod tests {
             summaries: vec![fixture_v11_summary(11)],
             drill_ins: vec![],
             recipients: vec![],
+            tx_gas_results: vec![],
         })
         .unwrap();
 
@@ -3384,6 +3778,7 @@ mod tests {
             summaries: vec![summary.clone()],
             drill_ins: vec![],
             recipients: vec![],
+            tx_gas_results: vec![],
         })
         .unwrap();
 
@@ -3404,6 +3799,7 @@ mod tests {
             summaries: vec![summary],
             drill_ins: vec![],
             recipients: vec![],
+            tx_gas_results: vec![],
         })
         .unwrap();
 
@@ -3516,6 +3912,7 @@ mod tests {
             summaries: vec![summary],
             drill_ins: vec![drill_in],
             recipients: vec![],
+            tx_gas_results: vec![],
         })
         .unwrap();
 
@@ -3611,6 +4008,7 @@ mod tests {
                 summaries: vec![],
                 drill_ins: vec![drill_in],
                 recipients: vec![],
+                tx_gas_results: vec![],
             };
             db.record_block_output(&output).unwrap();
         }
@@ -3646,6 +4044,7 @@ mod tests {
             summaries: vec![],
             drill_ins: vec![],
             recipients: vec![],
+            tx_gas_results: vec![],
         };
         db.record_block_output(&output).unwrap();
 
@@ -3742,6 +4141,7 @@ mod tests {
                 summaries: vec![],
                 drill_ins: vec![drill_in],
                 recipients: vec![],
+                tx_gas_results: vec![],
             };
             db.record_block_output(&output).unwrap();
         }
@@ -3803,6 +4203,7 @@ mod tests {
                 summaries: vec![],
                 drill_ins: vec![drill_in],
                 recipients: vec![],
+                tx_gas_results: vec![],
             };
             db.record_block_output(&output).unwrap();
             tx_index += 1;
@@ -3873,6 +4274,7 @@ mod tests {
             summaries: vec![],
             drill_ins: vec![drill_in],
             recipients: vec![],
+            tx_gas_results: vec![],
         })
         .unwrap();
 
@@ -3938,6 +4340,7 @@ mod tests {
                 summaries: vec![],
                 drill_ins: vec![drill_in],
                 recipients: vec![],
+                tx_gas_results: vec![],
             })
             .unwrap();
         }
@@ -4062,6 +4465,7 @@ mod tests {
                     summaries: vec![],
                     drill_ins: vec![],
                     recipients: vec![],
+                    tx_gas_results: vec![],
                 },
                 &make_export("e-old", b"payload"),
             )
@@ -4086,6 +4490,7 @@ mod tests {
                 summaries: vec![],
                 drill_ins: vec![],
                 recipients: vec![],
+                tx_gas_results: vec![],
             },
             &make_export("e-5", b"payload-5"),
         )
@@ -4113,6 +4518,7 @@ mod tests {
             summaries: vec![],
             drill_ins: vec![drill_in.clone()],
             recipients: vec![],
+            tx_gas_results: vec![],
         })
         .unwrap();
 
@@ -4124,6 +4530,7 @@ mod tests {
                 summaries: vec![],
                 drill_ins: vec![drill_in],
                 recipients: vec![],
+                tx_gas_results: vec![],
             },
             &make_export("e-7", b"payload-7"),
         );
@@ -4139,6 +4546,7 @@ mod tests {
             summaries: vec![],
             drill_ins: vec![],
             recipients: vec![],
+            tx_gas_results: vec![],
         };
         let export = make_export("e-8", b"same-payload");
         db.record_block_output_with_export(&output, &export).unwrap();
@@ -4159,6 +4567,7 @@ mod tests {
             summaries: vec![],
             drill_ins: vec![],
             recipients: vec![],
+            tx_gas_results: vec![],
         };
         db.record_block_output_with_export(&output, &make_export("e-9", b"v1")).unwrap();
         db.mark_exported("e-9", current_unix_seconds()).unwrap();
@@ -4185,6 +4594,7 @@ mod tests {
                     summaries: vec![],
                     drill_ins: vec![],
                     recipients: vec![],
+                    tx_gas_results: vec![],
                 },
                 &make_export(id, format!("p{i}").as_bytes()),
             )
@@ -4205,6 +4615,7 @@ mod tests {
                 summaries: vec![],
                 drill_ins: vec![],
                 recipients: vec![],
+                tx_gas_results: vec![],
             },
             &make_export("e-30", b"0123456789"),
         )
@@ -4244,6 +4655,7 @@ mod tests {
                     summaries: vec![],
                     drill_ins: vec![],
                     recipients: vec![],
+                    tx_gas_results: vec![],
                 },
                 &make_export(id, id.as_bytes()),
             )

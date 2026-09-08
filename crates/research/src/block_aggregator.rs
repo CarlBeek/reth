@@ -14,7 +14,7 @@
 use crate::{
     database::{
         BlockCoverageRow, BlockOutput, BlockSummaryRow, DrillInRecord, OpcodeBucketTotal,
-        RecipientRow,
+        RecipientRow, TxGasResultRow,
     },
     divergence::{AccountDrivers, AggregateClass, FrameOpcodeCounts, StorageDrivers},
 };
@@ -48,6 +48,8 @@ pub struct BlockMeta {
     pub gas_used: u64,
     /// Native block header `gas_limit` — the protocol cap.
     pub gas_limit: u64,
+    /// Native block header `base_fee_per_gas`. `None` for pre-London blocks.
+    pub base_fee_per_gas: Option<u64>,
 }
 
 /// Accumulates per-tx execution facts and metrics for a single block.
@@ -70,6 +72,10 @@ pub struct BlockAggregator {
     /// Drill-in records collected for txs where we keep per-tx state
     /// (`store_full_forensics`). The order matches `observe_tx` invocations.
     drill_ins: Vec<DrillInRecord>,
+    /// One row per observed tx, regardless of class or forensics — collected
+    /// before the `store_full_forensics` split so the simulator sees every tx.
+    /// Empty for runs that didn't opt into the per-tx gas spine.
+    tx_gas_results: Vec<TxGasResultRow>,
 }
 
 #[derive(Debug)]
@@ -380,6 +386,11 @@ pub struct TxObservation {
     /// Baseline (native-schedule) gas the tx used — denominator of the
     /// percentage histogram and addend of `baseline_gas_used_sum`.
     pub baseline_gas_used: u64,
+    /// Per-tx gas row for `tx_gas_results`. `Some` for every tx when per-tx gas
+    /// collection is enabled (`--research.tx-gas-results`); `None` throughout
+    /// when it isn't. Unlike [`Self::drill_in_record`] the choice is per-run,
+    /// not per-tx: either every tx in the run contributes a row or none does.
+    pub tx_gas_result: Option<TxGasResultRow>,
 }
 
 impl BlockAggregator {
@@ -393,6 +404,10 @@ impl BlockAggregator {
             tx_count_stored: 0,
             classes: BTreeMap::new(),
             drill_ins: Vec::with_capacity(tx_count_hint),
+            // Grown on demand rather than pre-sized: the per-tx gas spine is
+            // opt-in, so pre-allocating `tx_count_hint` rows would allocate for
+            // every (schedule, block) of every run that leaves it off.
+            tx_gas_results: Vec::new(),
         }
     }
 
@@ -409,6 +424,14 @@ impl BlockAggregator {
     /// observation or a test).
     pub fn observe_tx(&mut self, obs: TxObservation, opcode_frames: &[FrameOpcodeCounts]) {
         self.tx_count += 1;
+
+        // Collected before the `store_full_forensics` split below: the per-tx
+        // gas spine covers every tx, including the aggregate-only classes that
+        // return early and never reach a `divergences` row. `None` when the run
+        // didn't opt into the spine at all.
+        if let Some(row) = obs.tx_gas_result {
+            self.tx_gas_results.push(row);
+        }
 
         // Stored txs (failures + trace divergences) get a per-tx forensic row
         // and do NOT feed any class aggregate — their opcode/state/cold/gas
@@ -542,6 +565,7 @@ impl BlockAggregator {
             tx_count_stored: self.tx_count_stored,
             block_gas_used: self.meta.gas_used,
             block_gas_limit: self.meta.gas_limit,
+            block_base_fee_per_gas: self.meta.base_fee_per_gas,
         };
         let mut summaries = Vec::with_capacity(self.classes.len());
         let mut recipients_out = Vec::new();
@@ -671,7 +695,13 @@ impl BlockAggregator {
             }
         }
 
-        BlockOutput { coverage, summaries, drill_ins: self.drill_ins, recipients: recipients_out }
+        BlockOutput {
+            coverage,
+            summaries,
+            drill_ins: self.drill_ins,
+            recipients: recipients_out,
+            tx_gas_results: self.tx_gas_results,
+        }
     }
 }
 
@@ -689,6 +719,34 @@ mod tests {
             timestamp: 1_700_000_000,
             gas_used: 15_000_000,
             gas_limit: 30_000_000,
+            base_fee_per_gas: Some(1_000_000_000),
+        }
+    }
+
+    /// Minimal `TxGasResultRow` for tests that only exercise the aggregate
+    /// paths. The per-tx gas spine is asserted separately.
+    fn tx_gas_result() -> TxGasResultRow {
+        TxGasResultRow {
+            schedule_name: "test".to_string(),
+            schedule_config_hash: "cfg".to_string(),
+            block_number: 42,
+            tx_index: 0,
+            tx_hash: B256::repeat_byte(0x11),
+            tx_type: 0,
+            tx_gas_limit: 100_000,
+            max_fee_per_gas: "0".to_string(),
+            max_priority_fee_per_gas: None,
+            baseline_success: true,
+            baseline_gas_used: 100_000,
+            baseline_total_gas_spent: 100_000,
+            schedule_success: true,
+            schedule_gas_used: 100_000,
+            schedule_total_gas_spent: 100_000,
+            schedule_gas_refunded: 0,
+            schedule_floor_gas: 0,
+            schedule_state_gas_spent: 0,
+            schedule_intrinsic_gas: None,
+            min_multiplier_to_succeed: None,
         }
     }
 
@@ -715,6 +773,7 @@ mod tests {
             tx_type: 0,
             has_calldata: false,
             baseline_gas_used: 100_000,
+            tx_gas_result: Some(tx_gas_result()),
         }
     }
 
@@ -1006,6 +1065,7 @@ mod tests {
             tx_type: 0,
             has_calldata: false,
             baseline_gas_used: 100_000,
+            tx_gas_result: Some(tx_gas_result()),
         }
     }
 
@@ -1136,6 +1196,7 @@ mod tests {
                 tx_type: 4,
                 has_calldata: false,
                 baseline_gas_used: 90_000,
+                tx_gas_result: Some(tx_gas_result()),
             },
             &[],
         );
@@ -1335,5 +1396,39 @@ mod tests {
         assert_eq!(unchanged.opcode_totals.len(), 1);
         assert_eq!(unchanged.opcode_totals[0].opcode, 0x20);
         assert_eq!(unchanged.opcode_totals[0].count, 99);
+    }
+
+    /// With the spine enabled every tx contributes a row — including the
+    /// `store_full_forensics` txs that return early from the class rollup.
+    #[test]
+    fn tx_gas_spine_collects_every_tx_when_enabled() {
+        let mut agg = BlockAggregator::start_block(meta(), 3);
+        agg.observe_tx(obs(AggregateClass::Unchanged, 0), &[]);
+        agg.observe_tx(obs(AggregateClass::GasOnly, 500), &[]);
+        agg.observe_tx(obs_stored(-200), &[]);
+
+        let out = agg.finish_block();
+        assert_eq!(out.tx_gas_results.len(), 3);
+        assert_eq!(out.coverage.tx_count, 3);
+    }
+
+    /// `tx_gas_result: None` suppresses the spine without touching the class
+    /// aggregates, the drill-ins, or coverage.
+    #[test]
+    fn tx_gas_spine_empty_when_disabled() {
+        let mut agg = BlockAggregator::start_block(meta(), 3);
+        agg.observe_tx(
+            TxObservation { tx_gas_result: None, ..obs(AggregateClass::GasOnly, 500) },
+            &[],
+        );
+        agg.observe_tx(TxObservation { tx_gas_result: None, ..obs_stored(-200) }, &[]);
+
+        let out = agg.finish_block();
+        assert!(out.tx_gas_results.is_empty());
+        assert_eq!(out.coverage.tx_count, 2);
+        assert_eq!(out.coverage.tx_count_stored, 1);
+        assert_eq!(out.summaries.len(), 1);
+        assert_eq!(out.summaries[0].tx_count, 1);
+        assert_eq!(out.drill_ins.len(), 1);
     }
 }

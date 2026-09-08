@@ -2,9 +2,10 @@
 
 This binary runs an execution extension that replays committed canonical
 blocks under one or more alternate gas schedules and writes per-schedule
-results to a DuckDB lake. See
-[`crates/research/docs/storage-redesign.md`](../../crates/research/docs/storage-redesign.md)
-for the schema.
+results to a SQLite file (WAL mode, read by consumers through DuckDB's
+`sqlite_scanner`). The canonical schema is the DDL in
+[`crates/research/src/database.rs`](../../crates/research/src/database.rs);
+its `SCHEMA_VERSION` doc comment carries the per-version history.
 
 ## Status
 
@@ -21,14 +22,16 @@ For each committed block at or above `--research.start-block`:
    `TrackingInspector`.
 4. Re-execute the same transaction once per configured execution schedule
    with `ScheduleInspector`.
-5. Classify each (tx, schedule) pair into one of eight buckets
-   (`unchanged` / `trace_only` / `gas_only` / `event_logs_changed` /
-   `wallet_fixable_shallow` / `wallet_fixable_deep_chain` /
-   `inconclusive_needs_higher_sweep` / `contract_broken`).
-6. Aggregate-only buckets roll into per-block summaries; drill-in buckets
-   (`event_logs_changed`, `inconclusive_needs_higher_sweep`,
-   `contract_broken`) get the full per-tx record (call frames, per-frame
-   opcode counts, event logs).
+5. With `--research.tx-gas-results`, write a slim `tx_gas_results` row for
+   every (tx, schedule) pair, whatever the outcome.
+6. Store the full per-tx forensic record (call frames, per-frame opcode
+   counts, event logs) for every pair where anything beyond gas changed —
+   either replay failed at the original limit, baseline failed, or a trace
+   diverged. The complement (both succeeded, traces identical) rolls into
+   per-block aggregates keyed by execution-fact class, `unchanged` or
+   `gas_only`. No editorial taxonomy is applied at write time; the
+   wallet-fixable / contract-broken style cohorts are re-derived downstream
+   from the stored facts.
 
 Each execution-modifying schedule gets its own state view for the block,
 so schedule-induced failures can affect later transactions under that
@@ -36,20 +39,31 @@ same schedule.
 
 ## Supported Flags
 
-- `--research.eip2780`
-- `--research.eip8037`
-- `--research.eip8038` (state access/write repricing, 3x, native-spec; independent of `--research.eip8037`)
+- `--research.amsterdam` (the whole repricing stack — EIP-2780 + 7976 + 7981 + 8037 + 8038 — via
+  revm's native `SpecId::AMSTERDAM`, so the recorded gas reflects the EIPs interacting rather than a
+  sum of independent single-EIP deltas)
 - `--research.csv NAME=PATH`
 - `--research.multiplier NAME=MULT`
-- `--research.db-path PATH` (DuckDB file)
+- `--research.db-path PATH` (SQLite file)
 - `--research.start-block BLOCK`
 - `--research.backfill`
 - `--research.backfill-min-block BLOCK`
+- `--research.backfill-max-block BLOCK`
 - `--research.backfill-concurrency N`
-- `--research.gas-limit-multiplier MULT`
+- `--research.gas-limit-multipliers MULTS` (comma-separated tier sweep,
+  default `1,2,4,8`; pass `1` to disable)
 - `--research.max-divergences-per-block N`
+- `--research.tx-gas-results` (opt into the per-tx gas spine — one
+  `tx_gas_results` row per (schedule, block, tx). Off by default: it is the
+  largest table the producer writes, ~`tx_count` rows per (schedule, block).
+  Changes the analysis manifest, so runs with and without it are distinct
+  ClickHouse datasets)
 - `--research.metadata-backfill` (run the contract-metadata backfill in
   one-shot mode instead of starting live analysis; see below)
+- `--research.metadata-backfill-interval-secs N`
+- `--research.contract-labels-interval-secs N`
+- `--research.function-signatures-interval-secs N`
+- `--research.label-config-path PATH`
 - `--research.export-config-path PATH` (enable durable ClickHouse export; see
   [ClickHouse Export](#clickhouse-export))
 
@@ -59,21 +73,29 @@ At least one schedule flag is required.
 
 ```bash
 cargo run --release -p reth-research-bin -- node \
-  --research.eip8037 \
-  --research.eip8038 \
+  --research.amsterdam \
   --research.csv 7904-prelim=./schedules/7904_prelim.csv \
   --research.multiplier 4x=4 \
   --research.db-path ./divergences.sqlite \
   --research.start-block 18000000
 ```
 
-`--research.eip8037` and `--research.eip8038` can run together: each is a separate schedule with its
-own `eip-8037` / `eip-8038` rows, and 8038 stays on the block's native spec so it neither alters
-8037's replay nor its persisted data.
+`--research.amsterdam` replays the stack as one lane rather than as isolated per-EIP lanes, which
+is the only way to see the interaction effect: a call that only runs out of gas *because* of the new
+intrinsic cost changes which cold/warm accesses happen downstream, so the composite result is not
+the sum of independent single-EIP deltas.
 
-## Analyze With DuckDB
+The lane overrides no gas values — it switches the spec and lets revm charge. That is sound only
+while revm's Amsterdam table matches `execution-specs`, which
+`crates/research/tests/amsterdam_matches_execution_specs.rs` asserts (constants, composed table
+slots, per-arm intrinsic, and the EIP-8038 EXT* surcharge measured against a real EVM). A revm bump
+that renumbers Amsterdam fails those tests and re-keys the dataset through the schedule's
+`config_fingerprint`, which reads the same constants.
 
-Attach the producer DB directly from the DuckDB shell:
+## Analyze The Producer DB
+
+Open it with the SQLite shell, or attach the same file read-only from DuckDB via
+`sqlite_scanner` for the vectorized analytical queries:
 
 ```bash
 sqlite3 -readonly ./divergences.sqlite
@@ -147,6 +169,18 @@ Per (schedule, block):
   `class ∈ {unchanged, gas_only}`
 - `block_recipients`: top-K recipient/selector attribution per `class`
 
+Per transaction — **every** tx, not just the divergent ones — when the run
+opts in with `--research.tx-gas-results` (empty otherwise):
+
+- `tx_gas_results`: the slim per-tx gas spine a repricing simulator needs.
+  Gas limit, fee caps (`max_fee_per_gas` / `max_priority_fee_per_gas` as U256
+  decimal strings), baseline vs schedule gas, and the schedule's
+  intrinsic / floor / state-gas figures. Two gas columns that are **not**
+  interchangeable: `schedule_gas_used` is sender-facing (post-refund,
+  floor-applied), while `schedule_total_gas_spent` is pre-refund — the
+  figure EIP-7778 block-level accounting uses. Unlike the drill-in tables
+  below this is never truncated by `--research.max-divergences-per-block`.
+
 Per stored transaction (every failure + every trace divergence):
 
 - `divergences`: outcome flags, gas figures, OOG / divergence location,
@@ -172,7 +206,7 @@ drill-in cohort, run:
 
 ```bash
 cargo run --release -p reth-research-bin -- node \
-  --research.eip2780 \
+  --research.amsterdam \
   --research.db-path ./divergences.sqlite \
   --research.metadata-backfill
 ```
@@ -244,7 +278,7 @@ names and types are the fixed producer contract). Then:
 ```bash
 export CLICKHOUSE_PASSWORD=...
 cargo run --release -p reth-research-bin -- node \
-  --research.eip2780 \
+  --research.amsterdam \
   --research.db-path ./divergences.sqlite \
   --research.export-config-path ./clickhouse/config.example.toml
 ```
@@ -257,6 +291,7 @@ cargo run --release -p reth-research-bin -- node \
 - A schedule that lowers intrinsic gas is conservatively modelled in the
   execution replay because the baseline EVM transaction pipeline is being
   reused.
-- DuckDB foreign-key enforcement isn't a great fit for the producer's
-  per-block transactional delete pattern; referential integrity across
-  the drill-in tables is maintained at the application layer.
+- SQLite runs with `foreign_keys = OFF`: the producer's per-block
+  transactional delete pattern rewrites whole block outputs, so referential
+  integrity across the drill-in tables is maintained at the application
+  layer instead.

@@ -502,7 +502,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 ctx.receipts_prune_mode
                     .is_some_and(|mode| mode.should_prune(block_number, ctx.tip))
             {
-                continue;
+                continue
             }
 
             for (i, receipt) in block.execution_outcome().receipts.iter().enumerate() {
@@ -1347,18 +1347,18 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                         // If the block body indices can not be found, then it means that static
                         // files is ahead of database, and the `ensure_invariants` check will fix
                         // it by comparing with stage checkpoints.
-                        break;
+                        break
                     };
 
                     debug!(target: "reth::providers::static_file", last_block, last_tx_num = indices.last_tx_num(), "Found block body indices");
 
                     if indices.last_tx_num() <= highest_tx {
-                        break;
+                        break
                     }
 
                     if last_block == 0 {
                         debug!(target: "reth::providers::static_file", "Reached block 0 in verification loop");
-                        break;
+                        break
                     }
 
                     last_block -= 1;
@@ -1479,7 +1479,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             StaticFileSegment::StorageChangeSets => {
                 if EitherWriter::storage_changesets_destination(provider).is_database() {
                     debug!(target: "reth::providers::static_file", ?segment, "Skipping storage changesets segment: changesets stored in database");
-                    return false;
+                    return false
                 }
                 true
             }
@@ -1573,7 +1573,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         highest_block: Option<BlockNumber>,
     ) -> ProviderResult<Option<BlockNumber>>
     where
-        Provider: DBProvider + BlockReader + StageCheckpointReader,
+        Provider: DBProvider + BlockReader + StageCheckpointReader + PruneCheckpointReader,
         N: NodePrimitives<Receipt: Value, BlockHeader: Value, SignedTx: Value>,
     {
         match segment {
@@ -1645,7 +1645,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         highest_static_file_block: Option<BlockNumber>,
     ) -> ProviderResult<Option<BlockNumber>>
     where
-        Provider: DBProvider + BlockReader + StageCheckpointReader,
+        Provider: DBProvider + BlockReader + StageCheckpointReader + PruneCheckpointReader,
     {
         debug!(target: "reth::providers::static_file", "Ensuring invariants");
         let mut db_cursor = provider.tx_ref().cursor_read::<T>()?;
@@ -1675,7 +1675,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     .is_none_or(|highest_entry| db_last_entry > highest_entry)
             {
                 debug!(target: "reth::providers::static_file", db_last_entry, "Database has entries beyond static files, no unwind needed");
-                return Ok(None);
+                return Ok(None)
             }
         } else {
             debug!(target: "reth::providers::static_file", "No database entries found");
@@ -1691,15 +1691,18 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             provider.get_stage_checkpoint(stage_id)?.unwrap_or_default().block_number;
         debug!(target: "reth::providers::static_file", ?stage_id, checkpoint_block_number, "Retrieved stage checkpoint");
 
+        let effective_coverage_block =
+            Self::effective_coverage_block(provider, segment, highest_static_file_block)?;
+
         // If the checkpoint is ahead, then we lost static file data. May be data corruption.
-        if checkpoint_block_number > highest_static_file_block {
+        if checkpoint_block_number > effective_coverage_block {
             info!(
                 target: "reth::providers::static_file",
                 checkpoint_block_number,
-                unwind_target = highest_static_file_block,
+                unwind_target = effective_coverage_block,
                 "Setting unwind target."
             );
-            return Ok(Some(highest_static_file_block));
+            return Ok(Some(effective_coverage_block));
         }
 
         // If the checkpoint is ahead, or matches, then nothing to do.
@@ -1779,7 +1782,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         block_from_key: F,
     ) -> ProviderResult<Option<BlockNumber>>
     where
-        Provider: DBProvider + BlockReader + StageCheckpointReader,
+        Provider: DBProvider + BlockReader + StageCheckpointReader + PruneCheckpointReader,
         T: Table,
         F: Fn(&T::Key) -> BlockNumber,
     {
@@ -1804,7 +1807,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     ?segment,
                     "Setting unwind target."
                 );
-                return Ok(Some(highest_block));
+                return Ok(Some(highest_block))
             }
 
             if let Some((db_last_key, _)) = db_cursor.last()? &&
@@ -1816,7 +1819,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     ?segment,
                     "Database has entries beyond static files, no unwind needed"
                 );
-                return Ok(None);
+                return Ok(None)
             }
         } else {
             debug!(target: "reth::providers::static_file", ?segment, "No database entries found");
@@ -1828,15 +1831,18 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         let checkpoint_block_number =
             provider.get_stage_checkpoint(stage_id)?.unwrap_or_default().block_number;
 
-        if checkpoint_block_number > highest_static_file_block {
+        let effective_coverage_block =
+            Self::effective_coverage_block(provider, segment, highest_static_file_block)?;
+
+        if checkpoint_block_number > effective_coverage_block {
             info!(
                 target: "reth::providers::static_file",
                 checkpoint_block_number,
-                unwind_target = highest_static_file_block,
+                unwind_target = effective_coverage_block,
                 ?segment,
                 "Setting unwind target."
             );
-            return Ok(Some(highest_static_file_block));
+            return Ok(Some(effective_coverage_block))
         }
 
         if checkpoint_block_number < highest_static_file_block {
@@ -1861,6 +1867,46 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         }
 
         Ok(None)
+    }
+
+    /// Returns the highest block accounted for in this segment, either through data
+    /// present in static files or through data intentionally removed by pruning.
+    ///
+    /// Data below a segment's prune checkpoint has been intentionally deleted, so its
+    /// absence from static files is not an inconsistency. Without this, a pruned segment
+    /// whose stage checkpoint is ahead of its (empty) static files is treated as data
+    /// corruption and triggers an unwind to block 0, which aborts the node on startup.
+    /// See <https://github.com/paradigmxyz/reth/issues/23463>.
+    fn effective_coverage_block<Provider>(
+        provider: &Provider,
+        segment: StaticFileSegment,
+        highest_static_file_block: BlockNumber,
+    ) -> ProviderResult<BlockNumber>
+    where
+        Provider: PruneCheckpointReader,
+    {
+        let Some(prune_segment) = Self::prune_segment_for_static_file(segment) else {
+            return Ok(highest_static_file_block)
+        };
+
+        let prune_checkpoint_block = provider
+            .get_prune_checkpoint(prune_segment)?
+            .and_then(|checkpoint| checkpoint.block_number)
+            .unwrap_or_default();
+
+        Ok(highest_static_file_block.max(prune_checkpoint_block))
+    }
+
+    /// Returns the prune segment that governs data availability for a static file segment,
+    /// or `None` if the segment is never pruned.
+    const fn prune_segment_for_static_file(segment: StaticFileSegment) -> Option<PruneSegment> {
+        match segment {
+            StaticFileSegment::Receipts => Some(PruneSegment::Receipts),
+            StaticFileSegment::TransactionSenders => Some(PruneSegment::SenderRecovery),
+            StaticFileSegment::AccountChangeSets => Some(PruneSegment::AccountHistory),
+            StaticFileSegment::StorageChangeSets => Some(PruneSegment::StorageHistory),
+            StaticFileSegment::Headers | StaticFileSegment::Transactions => None,
+        }
     }
 
     /// Returns the earliest available block number that has not been expired and is still

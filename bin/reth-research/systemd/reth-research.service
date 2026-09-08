@@ -37,7 +37,7 @@ ExecStartPre=/usr/bin/rm -f /home/ubuntu/reth/target/release/reth-research
 ExecStart=/home/ubuntu/reth/bin/reth-research/scripts/run_xeon_perf.sh \
   --authrpc.jwtsecret /secrets/jwt.hex \
   --research.csv 7904-prelim=/home/ubuntu/test_configs/7904_prelim_numbers.csv \
-  --research.eip8037 \
+  --research.amsterdam \
   --research.backfill \
   --research.backfill-concurrency 22 \
   --research.db-path /home/ubuntu/reth/divergences.sqlite \

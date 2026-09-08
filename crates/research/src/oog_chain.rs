@@ -7,8 +7,7 @@
 //!
 //! See the `Analyzer` ExEx in `bin/reth-research` for how this is wired into
 //! the divergence pipeline; the outputs feed into the `oog_chain_proportional`,
-//! `oog_bottleneck_depth`, and `oog_bottleneck_kind` columns of
-//! `schedule_divergences`.
+//! `oog_bottleneck_depth`, and `oog_bottleneck_kind` columns of `divergences`.
 
 use crate::divergence::{CallFrame, CallType};
 

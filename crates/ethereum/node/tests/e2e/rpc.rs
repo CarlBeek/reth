@@ -1,18 +1,25 @@
 use crate::utils::{eth_payload_attributes, eth_payload_attributes_amsterdam};
-use alloy_eips::{eip2718::Encodable2718, eip7910::EthConfig};
+use alloy_eips::{eip2718::Encodable2718, eip7910::EthConfig, BlockNumberOrTag};
 use alloy_genesis::Genesis;
 use alloy_primitives::{Address, Bytes, B256, U256};
-use alloy_provider::{network::EthereumWallet, Provider, ProviderBuilder, SendableTx};
+use alloy_provider::{
+    ext::DebugApi, network::EthereumWallet, Provider, ProviderBuilder, SendableTx,
+};
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
     BuilderBlockValidationRequestV6, SignedBidSubmissionV3, SignedBidSubmissionV4,
     SignedBidSubmissionV6,
 };
-use alloy_rpc_types_engine::{BlobsBundleV1, ExecutionPayloadV3};
-use alloy_rpc_types_eth::TransactionRequest;
+use alloy_rpc_types_engine::{
+    BlobsBundleV1, CancunPayloadFields, ExecutionPayload, ExecutionPayloadSidecar,
+    ExecutionPayloadV3, PraguePayloadFields,
+};
+use alloy_rpc_types_eth::{error::EthRpcErrorCode, TransactionRequest};
+use alloy_rpc_types_trace::geth::{ChainBlockTraceResult, GethDebugTracingOptions};
+use jsonrpsee::core::client::{ClientT, Subscription, SubscriptionClientT};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use reth_chainspec::{ChainSpecBuilder, EthChainSpec, MAINNET};
-use reth_e2e_test_utils::setup_engine;
+use reth_e2e_test_utils::{setup_engine, E2ETestSetupBuilder};
 use reth_network::{types::NatResolver, PeersInfo};
 use reth_node_builder::{NodeBuilder, NodeHandle};
 use reth_node_core::{
@@ -21,7 +28,9 @@ use reth_node_core::{
 };
 use reth_node_ethereum::EthereumNode;
 use reth_payload_primitives::BuiltPayload;
+use reth_primitives_traits::Block as _;
 use reth_rpc_api::servers::AdminApiServer;
+use reth_rpc_server_types::RpcModuleSelection;
 use reth_tasks::Runtime;
 use std::{
     net::{IpAddr, Ipv4Addr},
@@ -41,6 +50,47 @@ alloy_sol_types::sol! {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn test_block_access_list_lookup_semantics() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let chain_spec = Arc::new(
+        ChainSpecBuilder::default()
+            .chain(MAINNET.chain)
+            .genesis(serde_json::from_str(include_str!("../assets/genesis.json")).unwrap())
+            .cancun_activated()
+            .build(),
+    );
+
+    let (mut nodes, _) = setup_engine::<EthereumNode>(
+        1,
+        chain_spec,
+        false,
+        Default::default(),
+        eth_payload_attributes,
+    )
+    .await?;
+    let node = nodes.pop().unwrap();
+    let client = node.rpc_client().unwrap();
+
+    let pending: Option<serde_json::Value> =
+        client.request("eth_getBlockAccessList", (BlockNumberOrTag::Pending,)).await?;
+    assert_eq!(pending, None);
+
+    for method in ["eth_getBlockAccessList", "debug_getRawBlockAccessList"] {
+        let error = client
+            .request::<serde_json::Value, _>(method, (BlockNumberOrTag::Latest,))
+            .await
+            .unwrap_err();
+        let jsonrpsee::core::client::Error::Call(error) = error else {
+            panic!("expected a resource not found error, got {error:?}")
+        };
+        assert_eq!(error.code(), EthRpcErrorCode::ResourceNotFound.code());
+    }
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -128,6 +178,85 @@ async fn test_fee_history() -> eyre::Result<()> {
             prev_header = header;
         }
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_debug_trace_chain_subscription() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let chain_spec = Arc::new(
+        ChainSpecBuilder::default()
+            .chain(MAINNET.chain)
+            .genesis(serde_json::from_str(include_str!("../assets/genesis.json")).unwrap())
+            .cancun_activated()
+            .build(),
+    );
+    let (mut nodes, wallet) =
+        E2ETestSetupBuilder::<EthereumNode, _>::new(1, chain_spec, eth_payload_attributes)
+            .with_node_config_modifier(|config| {
+                config.with_rpc(
+                    RpcServerArgs::default()
+                        .with_unused_ports()
+                        .with_http()
+                        .with_http_api(RpcModuleSelection::All)
+                        .with_ws()
+                        .with_ws_api(RpcModuleSelection::All),
+                )
+            })
+            .build()
+            .await?;
+    let mut node = nodes.pop().unwrap();
+    let provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::new(wallet.wallet_gen().swap_remove(0)))
+        .connect_http(node.rpc_url());
+
+    // Geth suppresses empty intermediate blocks but always emits the end block.
+    node.advance_block().await?;
+    let _ = GasWaster::deploy_builder(&provider, U256::from(5)).send().await?;
+    let _ = GasWaster::deploy_builder(&provider, U256::from(7)).send().await?;
+    node.advance_block().await?;
+    node.advance_block().await?;
+
+    let client = node.inner.rpc_server_handle().ws_client().await.unwrap();
+    let invalid: Result<Subscription<ChainBlockTraceResult>, _> = client
+        .subscribe(
+            "debug_subscribe",
+            jsonrpsee::rpc_params!["traceChain", "0x3", "0x3"],
+            "debug_unsubscribe",
+        )
+        .await;
+    assert!(invalid.is_err(), "equal endpoints must be rejected");
+
+    let mut subscription: Subscription<ChainBlockTraceResult> = client
+        .subscribe(
+            "debug_subscribe",
+            jsonrpsee::rpc_params![
+                "traceChain",
+                BlockNumberOrTag::Number(0),
+                BlockNumberOrTag::Number(3),
+                GethDebugTracingOptions::default()
+            ],
+            "debug_unsubscribe",
+        )
+        .await?;
+
+    let traced = subscription.next().await.unwrap()?;
+    assert_eq!(traced.block, U256::from(2));
+    let expected = provider
+        .debug_trace_block_by_number(
+            BlockNumberOrTag::Number(2),
+            GethDebugTracingOptions::default(),
+        )
+        .await?;
+    assert_eq!(expected.len(), 2, "both transactions must be traced");
+    assert_eq!(traced.traces, expected.into_iter().map(Some).collect::<Vec<_>>());
+
+    let terminal = subscription.next().await.unwrap()?;
+    assert_eq!(terminal.block, U256::from(3));
+    assert!(terminal.traces.is_empty());
+    subscription.unsubscribe().await?;
 
     Ok(())
 }
@@ -373,6 +502,34 @@ async fn test_flashbots_validate_v6() -> eyre::Result<()> {
         .await
         .is_err());
 
+    // undecodable block access list bytes are rejected before the payload is processed
+    let mut undecodable_bal_request = request.clone();
+    undecodable_bal_request.request.execution_payload.block_access_list =
+        Bytes::from_static(&[0x80]);
+    let err = provider
+        .raw_request::<_, ()>(
+            "flashbots_validateBuilderSubmissionV6".into(),
+            (&undecodable_bal_request,),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("invalid block access list"), "{err}");
+
+    // an empty block access list with a consistent block hash is rejected because the access
+    // list rebuilt during execution doesn't match the submitted one
+    let mut mismatched_bal_request = request.clone();
+    mismatched_bal_request.request.execution_payload.block_access_list =
+        Bytes::from_static(&[0xc0]);
+    update_block_hash_v6(&mut mismatched_bal_request)?;
+    let err = provider
+        .raw_request::<_, ()>(
+            "flashbots_validateBuilderSubmissionV6".into(),
+            (&mismatched_bal_request,),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("block access list hash mismatch"), "{err}");
+
     request.request.execution_payload.payload_inner.payload_inner.payload_inner.state_root =
         B256::ZERO;
     assert!(provider
@@ -380,6 +537,27 @@ async fn test_flashbots_validate_v6() -> eyre::Result<()> {
         .await
         .is_err());
 
+    Ok(())
+}
+
+/// Recomputes the block hash of the request after its execution payload has been modified and
+/// updates it in the payload and the bid trace.
+fn update_block_hash_v6(request: &mut BuilderBlockValidationRequestV6) -> eyre::Result<()> {
+    let block_hash = ExecutionPayload::V4(request.request.execution_payload.clone())
+        .try_into_block_with_sidecar::<reth_ethereum_primitives::TransactionSigned>(
+            &ExecutionPayloadSidecar::v4(
+                CancunPayloadFields {
+                    parent_beacon_block_root: request.parent_beacon_block_root,
+                    versioned_hashes: request.request.blobs_bundle.versioned_hashes(),
+                },
+                PraguePayloadFields::new(request.request.execution_requests.to_requests()),
+            ),
+        )?
+        .seal_slow()
+        .hash();
+    request.request.execution_payload.payload_inner.payload_inner.payload_inner.block_hash =
+        block_hash;
+    request.request.message.block_hash = block_hash;
     Ok(())
 }
 
